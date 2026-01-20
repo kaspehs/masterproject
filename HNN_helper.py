@@ -30,6 +30,7 @@ class DataConfig:
     middle_time_plot: list[float] = field(default_factory=lambda: [15.0, 17.0])
     use_generated_train_series: bool = False
     train_series_dir: str = "Data_Gen/generated_series"
+    context_len: int = 20
 
 @dataclass
 class ModelConfig:
@@ -67,6 +68,10 @@ class ArchitectureConfig:
     residual_kwargs: dict[str, Any] = field(default_factory=_default_residual_kwargs)
     mlp_kwargs: dict[str, Any] = field(default_factory=_default_mlp_kwargs)
     pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
+    force_context_mode: str = "none"  # options: none, flatten, cnn
+    context_cnn_channels: int = 64
+    cnn_kwargs: dict[str, Any] = field(default_factory=dict)
+    append_current_state: bool = False
 
 @dataclass
 class SmoothingConfig:
@@ -220,25 +225,43 @@ def log_validation_epoch(
     middle_time_plot: list[float] | tuple[float, float],
     hamiltonian_data: np.ndarray | None,
 ) -> dict[str, float]:
-    rollout = rollout_model(model, y_data_t, val_vel, m_eff, dt, t, D, k, device)
+    context_mode = getattr(model, "force_context_mode", "none")
+    model_context_len = max(1, int(getattr(model, "context_len", 1)))
+    start_idx = max(0, model_context_len - 1)
+
+    rollout = rollout_model(
+        model,
+        y_data_t,
+        val_vel,
+        m_eff,
+        dt,
+        t,
+        D,
+        k,
+        device,
+        start_idx=start_idx,
+    )
     metrics: dict[str, float] = {}
     y_pred_raw = rollout["y_norm"] * D
-    disp_range_raw = float(np.ptp(y_data_raw))
-    if disp_range_raw <= 0.0:
-        disp_range_raw = 1.0
-    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_range_raw
+    y_true_raw_aligned = y_data_raw[start_idx : start_idx + y_pred_raw.shape[0]]
+    y_true_norm_aligned = y_true_norm[start_idx : start_idx + y_pred_raw.shape[0]]
+    disp_std_raw = float(np.std(y_true_raw_aligned))
+    if not np.isfinite(disp_std_raw) or disp_std_raw <= 0.0:
+        disp_std_raw = 1.0
+    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_true_raw_aligned) ** 2))) / disp_std_raw
     metrics["rel_rmse_y"] = rel_rmse_disp
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
-    force_target = np.asarray(force_data).reshape(-1)
+    force_target_full = np.asarray(force_data).reshape(-1)
+    force_target = force_target_full[start_idx : start_idx + force_total_pred.shape[0]]
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
     if min_len > 0:
         rmse_force = float(
             np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
         )
-        force_range = float(np.ptp(force_target[:min_len]))
-        if force_range <= 0.0:
-            force_range = 1.0
-        metrics["rel_rmse_force_total"] = rmse_force / force_range
+        force_std = float(np.std(force_target[:min_len]))
+        if not np.isfinite(force_std) or force_std <= 0.0:
+            force_std = 1.0
+        metrics["rel_rmse_force_total"] = rmse_force / force_std
         force_model_aligned = force_total_pred[:min_len]
         force_true_aligned = force_target[:min_len]
         damage_true = fatigue_damage(force_true_aligned)
@@ -249,8 +272,8 @@ def log_validation_epoch(
     else:
         force_model_aligned = force_total_pred
         force_true_aligned = force_target
-    half_idx_disp = len(y_true_norm) // 2
-    y_true_half = y_true_norm[half_idx_disp:]
+    half_idx_disp = len(y_true_norm_aligned) // 2
+    y_true_half = y_true_norm_aligned[half_idx_disp:]
     y_model_half = rollout["y_norm"][half_idx_disp:]
     half_idx_force = force_true_aligned.size // 2
     force_true_half = force_true_aligned[half_idx_force:]
@@ -260,19 +283,38 @@ def log_validation_epoch(
         if np.isfinite(spectral_rel_err):
             metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
     with torch.no_grad():
-        z_true = torch.stack(
-            (y_data_t, val_vel * m_eff), dim=1
-        )
-        force_on_data = model.u_theta(z_true).squeeze(-1).detach().cpu().numpy()
+        z_true_full = torch.stack((y_data_t, val_vel * m_eff), dim=1)
+        z_true = z_true_full[start_idx:]
+        context_mode = getattr(model, "force_context_mode", "none")
+        model_context_len = max(1, int(getattr(model, "context_len", 1)))
+        if z_true.shape[0] == 0:
+            force_on_data = np.asarray([])
+        elif context_mode != "none" and model_context_len > 1:
+            contexts: list[torch.Tensor] = []
+            x_batch_list: list[torch.Tensor] = []
+            total_len = z_true.shape[0]
+            for end in range(1, total_len + 1):
+                start_window = max(0, end - model_context_len)
+                ctx = z_true[start_window:end]
+                if ctx.shape[0] < model_context_len:
+                    pad = ctx[0:1].repeat(model_context_len - ctx.shape[0], 1)
+                    ctx = torch.cat((pad, ctx), dim=0)
+                contexts.append(ctx)
+                x_batch_list.append(ctx[-1])
+            context_batch = torch.stack(contexts, dim=0).to(device)  # (N, context_len, 2)
+            x_batch = torch.stack(x_batch_list, dim=0).to(device)    # (N, 2)
+            force_on_data = model.u_theta(x_batch, context_z=context_batch).squeeze(-1).detach().cpu().numpy()
+        else:
+            force_on_data = model.u_theta(z_true).squeeze(-1).detach().cpu().numpy()
     min_len_data = min(force_on_data.shape[0], force_target.shape[0])
     if min_len_data > 0:
         force_data_pred = force_on_data[:min_len_data]
         force_data_true = force_target[:min_len_data]
         rmse_force_data = float(np.sqrt(np.mean((force_data_pred - force_data_true) ** 2)))
-        force_range_data = float(np.ptp(force_data_true))
-        if force_range_data <= 0.0:
-            force_range_data = 1.0
-        metrics["rel_rmse_force_on_data"] = rmse_force_data / force_range_data
+        force_std_data = float(np.std(force_data_true))
+        if not np.isfinite(force_std_data) or force_std_data <= 0.0:
+            force_std_data = 1.0
+        metrics["rel_rmse_force_on_data"] = rmse_force_data / force_std_data
         damage_true_data = fatigue_damage(force_data_true)
         damage_pred_data = fatigue_damage(force_data_pred)
         damage_rel_data = relative_error(damage_pred_data, damage_true_data)
@@ -280,13 +322,14 @@ def log_validation_epoch(
             metrics["force_fatigue_damage_rel_error_on_data"] = damage_rel_data
     for name, value in metrics.items():
         writer.add_scalar(f"val/{name}", value, epoch)
-    zoom_mask = create_zoom_mask(t)
-    middle_mask = create_window_mask(t, middle_time_plot)
+    t_aligned = t[start_idx:]
+    zoom_mask = create_zoom_mask(t_aligned)
+    middle_mask = create_window_mask(t_aligned, middle_time_plot)
     log_displacement_plots(
         writer,
         epoch,
-        t,
-        y_true_norm,
+        t_aligned,
+        y_true_norm_aligned,
         rollout["y_norm"],
         rollout["p_norm"],
         zoom_mask,
@@ -296,11 +339,11 @@ def log_validation_epoch(
     log_force_plots(
         writer,
         epoch,
-        t,
+        t_aligned,
         rollout["force_total"],
         rollout["force_drag"],
         rollout["force_model"],
-        force_data,
+        force_target,
         zoom_mask,
         middle_mask,
         middle_time_plot,
@@ -309,12 +352,12 @@ def log_validation_epoch(
     log_hamiltonian_plots(
         writer,
         epoch,
-        t,
+        t_aligned,
         rollout["hamiltonian_model"],
         zoom_mask,
         middle_mask,
         middle_time_plot,
-        hamiltonian_data=hamiltonian_data,
+        hamiltonian_data=hamiltonian_data[start_idx:] if hamiltonian_data is not None else None,
     )
     return metrics
 
@@ -550,6 +593,11 @@ class PHVIV(nn.Module):
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
+        context_len: int = 20,
+        force_context_mode: str = "none",
+        context_cnn_channels: int = 64,
+        context_cnn_kwargs: dict[str, Any] | None = None,
+        append_current_state: bool = False,
     ):
         super().__init__()
         self.dt = dt
@@ -567,6 +615,13 @@ class PHVIV(nn.Module):
         self.use_feature_engineering = bool(use_feature_engineering)
         self.engineered_feature_dim = 7
         self.force_input_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
+        self.context_len = max(1, int(context_len))
+        self.force_context_mode = str(force_context_mode).lower()
+        if self.force_context_mode not in {"none", "flatten", "cnn"}:
+            raise ValueError("force_context_mode must be one of {'none', 'flatten', 'cnn'}.")
+        self.context_cnn_channels = int(context_cnn_channels)
+        self.context_cnn_kwargs = dict(context_cnn_kwargs or {})
+        self.append_current_state = bool(append_current_state)
 
         residual_cfg = _default_residual_kwargs()
         if residual_kwargs:
@@ -591,9 +646,16 @@ class PHVIV(nn.Module):
         self.use_fourier_features = bool(use_fourier_features)
         self.fourier_features = int(fourier_features)
         self.fourier_sigma = float(fourier_sigma)
+        if self.force_context_mode != "none" and self.use_fourier_features:
+            # simplify: disable Fourier features when using context encoders
+            self.use_fourier_features = False
+        if self.force_context_mode != "none" and self.use_feature_engineering:
+            # still allowed, but context operates on engineered features
+            pass
         self.force_embed = None
         base_force_dim = self.force_input_dim
         force_in_features = base_force_dim
+        context_out_dim = None
         selected_net = force_net_type if force_net_type not in (None, "") else ("pirate" if use_pirate_force else "residual")
         net_type = str(selected_net).lower()
         valid_types = {"residual", "mlp", "pirate"}
@@ -601,7 +663,94 @@ class PHVIV(nn.Module):
             raise ValueError(f"force_net_type must be one of {valid_types}, got '{force_net_type}'.")
         self.use_pirate_force = net_type == "pirate"
         self.residual_net = net_type == "residual"
-        if self.use_fourier_features:
+        self.context_cnn = None
+        if self.force_context_mode != "none" and self.use_pirate_force:
+            raise ValueError("force_context_mode requires force_net_type to be 'mlp' or 'residual', not 'pirate'.")
+        if self.force_context_mode == "flatten":
+            force_in_features = self.force_input_dim * self.context_len
+            if self.append_current_state:
+                force_in_features += self.force_input_dim
+            self.force_embed = None
+        elif self.force_context_mode == "cnn":
+            self.force_embed = None
+            context_in_channels = self.force_input_dim
+
+            cnn_cfg = self.context_cnn_kwargs
+            channels_cfg = cnn_cfg.get("channels", self.context_cnn_channels)
+            if isinstance(channels_cfg, int):
+                channels = [int(channels_cfg)]
+            elif isinstance(channels_cfg, (list, tuple)):
+                channels = [int(c) for c in channels_cfg]
+            else:
+                raise ValueError("cnn_kwargs.channels must be int or list of ints.")
+            if not channels:
+                channels = [self.context_cnn_channels]
+
+            def _expand_param(val, n, default):
+                if isinstance(val, (list, tuple)):
+                    vals = [int(v) for v in val]
+                    if len(vals) < n:
+                        vals = vals + [vals[-1]] * (n - len(vals))
+                    else:
+                        vals = vals[:n]
+                    return vals
+                if val is None:
+                    return [default] * n
+                return [int(val)] * n
+
+            kernel_sizes = _expand_param(cnn_cfg.get("kernel_sizes", 3), len(channels), 3)
+            default_dilations = [2, 4, 4] if len(channels) >= 3 else [1] * len(channels)
+            dilations = _expand_param(cnn_cfg.get("dilations", default_dilations), len(channels), 1)
+            paddings_raw = cnn_cfg.get("paddings")
+            paddings = (
+                _expand_param(paddings_raw, len(channels), 0) if paddings_raw is not None else None
+            )
+            strides = _expand_param(cnn_cfg.get("strides", 1), len(channels), 1)
+
+            pool_type = str(cnn_cfg.get("pool", "global")).lower()
+            pool_kernel = int(cnn_cfg.get("pool_kernel", 2))
+            pool_stride = int(cnn_cfg.get("pool_stride", pool_kernel))
+
+            layers: list[nn.Module] = []
+            in_ch = context_in_channels
+            seq_len = self.context_len
+            for out_ch, ksz, dil, stride, idx in zip(
+                channels, kernel_sizes, dilations, strides, range(len(channels))
+            ):
+                if ksz < 1:
+                    raise ValueError("kernel_sizes must be >= 1")
+                if stride < 1:
+                    raise ValueError("strides must be >= 1")
+                pad = paddings[idx] if paddings is not None else int(dil * (ksz - 1) / 2)
+                layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=ksz, padding=pad, dilation=dil, stride=stride))
+                layers.append(nn.GELU())
+                # update sequence length estimate
+                seq_len = int(math.floor((seq_len + 2 * pad - dil * (ksz - 1) - 1) / stride + 1))
+                seq_len = max(seq_len, 1)
+                in_ch = out_ch
+
+            if pool_type == "global":
+                layers.append(nn.AdaptiveAvgPool1d(1))
+                seq_len = 1
+            elif pool_type == "avg":
+                layers.append(nn.AvgPool1d(kernel_size=pool_kernel, stride=pool_stride))
+                seq_len = int(math.floor((seq_len - pool_kernel) / pool_stride + 1))
+                seq_len = max(seq_len, 1)
+            elif pool_type == "max":
+                layers.append(nn.MaxPool1d(kernel_size=pool_kernel, stride=pool_stride))
+                seq_len = int(math.floor((seq_len - pool_kernel) / pool_stride + 1))
+                seq_len = max(seq_len, 1)
+            elif pool_type != "none":
+                raise ValueError("pool must be one of {'global', 'avg', 'max', 'none'}.")
+
+            layers.append(nn.Flatten(start_dim=1))
+            self.context_cnn = nn.Sequential(*layers)
+            force_in_features = in_ch * seq_len
+            if self.append_current_state:
+                force_in_features += self.force_input_dim
+            # keep attribute for compatibility
+            self.context_cnn_channels = in_ch
+        elif self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
             if self.use_pirate_force:
@@ -688,6 +837,7 @@ class PHVIV(nn.Module):
         cfg: dict[str, object],
         arch_cfg: dict[str, object] | None = None,
         device: torch.device | None = None,
+        context_len: int = 20,
     ) -> tuple["PHVIV", dict[str, float]]:
         rho = float(cfg.get("rho", 1000.0))
         D = float(cfg.get("D", 0.1))
@@ -708,6 +858,14 @@ class PHVIV(nn.Module):
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
+        force_context_mode = str(arch_cfg.get("force_context_mode", "none"))
+        cnn_kwargs_cfg = arch_cfg.get("cnn_kwargs", {}) or {}
+        channels_cfg_val = cnn_kwargs_cfg.get("channels", arch_cfg.get("context_cnn_channels", 64))
+        if isinstance(channels_cfg_val, (list, tuple)):
+            context_cnn_channels = int(channels_cfg_val[0]) if channels_cfg_val else 64
+        else:
+            context_cnn_channels = int(channels_cfg_val)
+        append_current_state = bool(arch_cfg.get("append_current_state", False))
         residual_kwargs = _default_residual_kwargs()
         residual_kwargs.update(arch_cfg.get("residual_kwargs", {}) or {})
         mlp_kwargs = _default_mlp_kwargs()
@@ -751,6 +909,11 @@ class PHVIV(nn.Module):
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
+            context_len=context_len,
+            force_context_mode=force_context_mode,
+            context_cnn_channels=context_cnn_channels,
+            context_cnn_kwargs=cnn_kwargs_cfg,
+            append_current_state=append_current_state,
         )
         if device is not None:
             model = model.to(device)
@@ -819,27 +982,53 @@ class PHVIV(nn.Module):
         p_scaled = x[..., 1] / self.nn_p_scale
         return torch.stack((q_scaled, p_scaled), dim=-1)
 
-    def u_theta1(self, x):
+    def _encode_context(self, context_z: torch.Tensor) -> torch.Tensor:
+        if context_z is None:
+            raise ValueError("context_z is required when using a context encoder.")
+        if context_z.dim() < 3:
+            raise ValueError(f"context_z must have shape (B, context_len, dim); got {context_z.shape}.")
+        base_feats = self._base_features(context_z)
+        if self.force_context_mode == "flatten":
+            return base_feats.reshape(base_feats.shape[0], -1)
+        if self.force_context_mode == "cnn":
+            if self.context_cnn is None:
+                raise ValueError("context_cnn not initialized.")
+            # (B, T, C) -> (B, C, T)
+            permuted = base_feats.permute(0, 2, 1)
+            return self.context_cnn(permuted)
+        raise ValueError(f"Unsupported force_context_mode '{self.force_context_mode}'.")
+
+    def _force_features(self, x: torch.Tensor, context_z: torch.Tensor | None = None) -> torch.Tensor:
         base_features = self._base_features(x)
-        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        if self.force_context_mode == "none":
+            return self.force_embed(base_features) if self.force_embed is not None else base_features
+        context_features = self._encode_context(context_z)
+        if self.append_current_state:
+            context_features = torch.cat((context_features, base_features.reshape(base_features.shape[0], -1)), dim=1)
+        return context_features
+
+    def u_theta1(self, x, context_z: torch.Tensor | None = None):
+        features = self._force_features(x, context_z=context_z)
         return self.u_net(features) * self.k * self.D
     
-    def u_theta2(self, x):
-        return self.u_theta1(x) + self.drag_force(x)
+    def u_theta2(self, x, context_z: torch.Tensor | None = None):
+        return self.u_theta1(x, context_z=context_z) + self.drag_force(x)
 
-    def learned_force(self, x):
-        return self.u_theta1(x)
+    def learned_force(self, x, context_z: torch.Tensor | None = None):
+        return self.u_theta1(x, context_z=context_z)
     
-    def u_theta(self, x):
-        return self.u_theta2(x) if self.include_physical_drag else self.u_theta1(x)
+    def u_theta(self, x, context_z: torch.Tensor | None = None):
+        return self.u_theta2(x, context_z=context_z) if self.include_physical_drag else self.u_theta1(
+            x, context_z=context_z
+        )
     
-    def f(self, x):
-        u = self.u_theta(x)
+    def f(self, x, context_z: torch.Tensor | None = None):
+        u = self.u_theta(x, context_z=context_z)
         G = self.G.to(x.device).to(x.dtype)                        # (..., 1)
         Gu = torch.einsum('ij,...j->...i', G, u)
         return Gu
 
-    def g(self, x):
+    def g(self, x, context_z: torch.Tensor | None = None):
         gH = self.grad_H(x)                         # (..., 2)
         R = self.R(x)                               # (..., 2, 2)
 
@@ -850,34 +1039,34 @@ class PHVIV(nn.Module):
 
         core = JgH - RgH
 
-        return core + self.f(x)
+        return core + self.f(x, context_z=context_z)
 
-    def step_euler(self, x, dt):
-        return x + dt * self.g(x)
+    def step_euler(self, x, dt, context_z: torch.Tensor | None = None):
+        return x + dt * self.g(x, context_z=context_z)
 
-    def step_rk4(self, x, t, dt):
-        x_next, _ = self.rk4_step(x, t, dt)
+    def step_rk4(self, x, t, dt, context_z: torch.Tensor | None = None):
+        x_next, _ = self.rk4_step(x, t, dt, context_z=context_z)
         return x_next
 
-    def rk4_step(self, x, t, dt):
+    def rk4_step(self, x, t, dt, context_z: torch.Tensor | None = None):
         """
         Perform one Runge-Kutta 4 integration step and return both the next state
         and the averaged force over the step.
         """
-        k1 = self.g(x)
-        force1 = self.u_theta(x)
+        k1 = self.g(x, context_z=context_z)
+        force1 = self.u_theta(x, context_z=context_z)
 
         x2 = x + 0.5 * dt * k1
-        k2 = self.g(x2)
-        force2 = self.u_theta(x2)
+        k2 = self.g(x2, context_z=context_z)
+        force2 = self.u_theta(x2, context_z=context_z)
 
         x3 = x + 0.5 * dt * k2
-        k3 = self.g(x3)
-        force3 = self.u_theta(x3)
+        k3 = self.g(x3, context_z=context_z)
+        force3 = self.u_theta(x3, context_z=context_z)
 
         x4 = x + dt * k3
-        k4 = self.g(x4)
-        force4 = self.u_theta(x4)
+        k4 = self.g(x4, context_z=context_z)
+        force4 = self.u_theta(x4, context_z=context_z)
 
         x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
@@ -923,29 +1112,29 @@ class PHVIV(nn.Module):
         return w_state[0]*Ly + w_state[1]*Lp
 
     
-    def res_loss(self, zi, ti, zin, tin):
-        return self.res_loss_SRK4(zi, ti, zin, tin)
+    def res_loss(self, zi, ti, zin, tin, context_z: torch.Tensor | None = None):
+        return self.res_loss_SRK4(zi, ti, zin, tin, context_z=context_z)
     
-    def avg_force(self, zi, ti, zin, tin):
-        return self.avg_force_SRK4(zi, ti, zin, tin)
+    def avg_force(self, zi, ti, zin, tin, context_z: torch.Tensor | None = None):
+        return self.avg_force_SRK4(zi, ti, zin, tin, context_z=context_z)
     
-    def res_loss_Euler(self, zi, ti, zin, tin):
+    def res_loss_Euler(self, zi, ti, zin, tin, context_z: torch.Tensor | None = None):
         dz = (zin-zi)/self.dt
         z_mean = 0.5*(zin+zi)
-        res = dz - self.g(z_mean)
+        res = dz - self.g(z_mean, context_z=context_z)
         scale = torch.tensor((self.q_scale, self.p_scale), device=res.device, dtype=res.dtype)
         res_scaled = res / scale
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
 
-    def avg_force_Euler(self, zi, ti, zin, tin):
+    def avg_force_Euler(self, zi, ti, zin, tin, context_z: torch.Tensor | None = None):
         z_mean = 0.5*(zin+zi)
-        forces = self.learned_force(z_mean)
+        forces = self.learned_force(z_mean, context_z=context_z)
         loss = torch.mean(torch.linalg.norm(forces, ord=1, dim=1))
         return loss
     
 
-    def res_loss_SRK4(self, zi, ti, zin, tin):
+    def res_loss_SRK4(self, zi, ti, zin, tin, context_z: torch.Tensor | None = None):
         dt = self.dt
         # constants from the scheme
         a = 0.5
@@ -962,16 +1151,16 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin   # (B, d)
 
         # stage evaluations of g
-        g_a_plus  = self.g(z_a_plus)                  # (B, d)
-        g_a_minus = self.g(z_a_minus)                 # (B, d)
+        g_a_plus  = self.g(z_a_plus, context_z=context_z)                  # (B, d)
+        g_a_minus = self.g(z_a_minus, context_z=context_z)                 # (B, d)
 
         # two corrected midpoints
         z_corr_minus = z_mid - b * dt * g_a_plus      # (B, d)
         z_corr_plus  = z_mid + b * dt * g_a_minus     # (B, d)
 
         # final two g-evals
-        g1 = self.g(z_corr_minus)                     # (B, d)
-        g2 = self.g(z_corr_plus)                      # (B, d)
+        g1 = self.g(z_corr_minus, context_z=context_z)                     # (B, d)
+        g2 = self.g(z_corr_plus, context_z=context_z)                      # (B, d)
 
         dz_model = 0.5 * g1 + 0.5 * g2                # (B, d)
 
@@ -988,7 +1177,7 @@ class PHVIV(nn.Module):
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
     
-    def avg_force_SRK4(self, zi, ti, zin, tin):
+    def avg_force_SRK4(self, zi, ti, zin, tin, context_z: torch.Tensor | None = None):
         dt = self.dt
         b = math.sqrt(3.0) / 6.0
 
@@ -997,8 +1186,8 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
         # evaluate learned force at both stages
-        f1 = self.f(z_a_plus)    # assume (B, 1) or (B, 2)
-        f2 = self.f(z_a_minus)
+        f1 = self.f(z_a_plus, context_z=context_z)    # assume (B, 1) or (B, 2)
+        f2 = self.f(z_a_minus, context_z=context_z)
 
         loss = 0.5 * torch.mean(torch.sum(torch.abs(f1), dim=1)) \
             + 0.5 * torch.mean(torch.sum(torch.abs(f2), dim=1))
@@ -1293,6 +1482,7 @@ def build_dataloader_from_series(
     batch_size: int,
     device: torch.device,
     smoothing_cfg: SmoothingConfig | None = None,
+    context_len: int = 20,
     shuffle: bool = True,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
@@ -1310,9 +1500,10 @@ def build_dataloader_from_series(
             smoothing_cfg=smoothing_cfg,
         )
         sequence_tensors.append((y_tensor, vel_tensor, t_tensor))
-        datasets.append(build_dataset(y_tensor, vel_tensor, m_eff, t_tensor))
-        seq_len = y_tensor.shape[0]
-        min_length = seq_len if min_length is None else min(min_length, seq_len)
+        dataset = build_dataset(y_tensor, vel_tensor, m_eff, t_tensor, context_len=context_len)
+        datasets.append(dataset)
+        dataset_len = len(dataset)
+        min_length = dataset_len if min_length is None else min(min_length, dataset_len)
     dataset = combine_datasets(datasets)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
     return loader, sequence_tensors, min_length if min_length is not None else 0
@@ -1399,15 +1590,38 @@ def load_training_series(
     return train_series_raw, eval_tensors
 
 
-def build_dataset(y_data_t: torch.Tensor, vel: torch.Tensor, m_eff: float, t_tensor: torch.Tensor) -> TensorDataset:
-    """Construct consecutive state/time pairs for training."""
+def build_dataset(
+    y_data_t: torch.Tensor,
+    vel: torch.Tensor,
+    m_eff: float,
+    t_tensor: torch.Tensor,
+    context_len: int = 20,
+) -> TensorDataset:
+    """Construct sliding windows of past states/times and the next-state target."""
+    if context_len < 1:
+        raise ValueError("context_len must be at least 1")
     z = torch.stack((y_data_t, vel * m_eff), dim=1)
-    return TensorDataset(
-        z[:-1],
-        t_tensor[:-1].unsqueeze(1),
-        z[1:],
-        t_tensor[1:].unsqueeze(1),
-    )
+    total_steps = z.shape[0]
+    if total_steps <= context_len:
+        raise ValueError(f"Not enough timesteps ({total_steps}) for context_len={context_len}.")
+
+    contexts_z: list[torch.Tensor] = []
+    contexts_t: list[torch.Tensor] = []
+    targets_z: list[torch.Tensor] = []
+    targets_t: list[torch.Tensor] = []
+    for start in range(total_steps - context_len):
+        end = start + context_len
+        contexts_z.append(z[start:end])                  # (context_len, 2)
+        contexts_t.append(t_tensor[start:end])           # (context_len,)
+        targets_z.append(z[end])                         # (2,)
+        targets_t.append(t_tensor[end])                  # ()
+
+    context_batch = torch.stack(contexts_z, dim=0)               # (N, context_len, 2)
+    context_t_batch = torch.stack(contexts_t, dim=0)             # (N, context_len)
+    target_z_batch = torch.stack(targets_z, dim=0)               # (N, 2)
+    target_t_batch = torch.stack(targets_t, dim=0).unsqueeze(1)  # (N, 1)
+
+    return TensorDataset(context_batch, context_t_batch, target_z_batch, target_t_batch)
 
 def build_rollout_dataset(
     y_data_t: torch.Tensor,
@@ -1494,33 +1708,81 @@ def resample_uniform_series(
     resampled_y = np.interp(resampled_t, series_t, series_y)
     return resampled_y, resampled_t
 
-def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: float,
-                  dt: float, t: np.ndarray, D: float, k: float, device: torch.device) -> dict[str, np.ndarray]:
-    """Roll the model forward over the full time grid and return normalised traces."""
-    p0 = vel[0] * m_eff
-    state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
+def rollout_model(
+    model: PHVIV,
+    y0: torch.Tensor,
+    vel: torch.Tensor,
+    m_eff: float,
+    dt: float,
+    t: np.ndarray,
+    D: float,
+    k: float,
+    device: torch.device,
+    start_idx: int = 0,
+) -> dict[str, np.ndarray]:
+    """Roll the model forward over the time grid starting at start_idx."""
+    total_steps = len(t) - start_idx
+    if total_steps <= 0:
+        raise ValueError("start_idx is beyond available time steps.")
+
+    context_len = max(1, int(getattr(model, "context_len", 1)))
+    use_context = getattr(model, "force_context_mode", "none") != "none" and context_len > 1
+
+    z_all = torch.stack((y0, vel * m_eff), dim=1)  # (T, 2)
+    if z_all.shape[0] <= start_idx:
+        raise ValueError("Not enough samples to run rollout from start_idx.")
+
+    if use_context:
+        start_for_ctx = max(0, start_idx - context_len + 1)
+        context_window = z_all[start_for_ctx : start_idx + 1]
+        if context_window.shape[0] < context_len:
+            pad = context_window[0].unsqueeze(0).repeat(context_len - context_window.shape[0], 1)
+            context_window = torch.cat((pad, context_window), dim=0)
+        context_window = context_window.to(device)
+        state = context_window[-1:].clone()  # (1, 2)
+    else:
+        p0 = vel[start_idx] * m_eff
+        state = torch.stack((y0[start_idx], p0), dim=0).unsqueeze(0).to(device)
+
     y_samples: list[float] = []
     p_samples: list[float] = []
     force_total: list[float] = []
     force_drag: list[float] = []
     force_model: list[float] = []
     hamiltonian_model_vals: list[float] = []
+
     with torch.no_grad():
-        for _ in range(len(t)):
+        for step_idx in range(total_steps):
             y_samples.append(float(state[0, 0].detach().cpu()))
             p_samples.append(float(state[0, 1].detach().cpu()))
-            model_force = float(model.learned_force(state).squeeze().detach().cpu())
+            if use_context:
+                ctx = context_window.unsqueeze(0)  # (1, context_len, 2)
+                model_force = float(model.learned_force(state, context_z=ctx).squeeze().detach().cpu())
+                total_force_val = float(model.u_theta(state, context_z=ctx).squeeze().detach().cpu())
+            else:
+                model_force = float(model.learned_force(state).squeeze().detach().cpu())
+                total_force_val = float(model.u_theta(state).squeeze().detach().cpu())
             if model.include_physical_drag:
                 drag_force = float(model.drag_force(state).squeeze().detach().cpu())
             else:
                 drag_force = 0.0
-            total_force = float(model.u_theta(state).squeeze().detach().cpu())
             H_val = float(model.H(state).detach().cpu())
             force_model.append(model_force)
             force_drag.append(drag_force)
-            force_total.append(total_force)
+            force_total.append(total_force_val)
             hamiltonian_model_vals.append(H_val)
-            state = model.step_rk4(state, t, dt)
+
+            # propagate to next state unless at the end
+            if step_idx == total_steps - 1:
+                break
+            if use_context:
+                ctx = context_window.unsqueeze(0)
+                state, _ = model.rk4_step(state, t, dt, context_z=ctx)
+                # update context window with predicted next state
+                context_window = torch.cat((context_window[1:], state.detach()), dim=0)
+            else:
+                state = model.step_rk4(state, t, dt)
+
     y_samples = np.asarray(y_samples)
     p_samples = np.asarray(p_samples)
     y_pred_norm = y_samples / D

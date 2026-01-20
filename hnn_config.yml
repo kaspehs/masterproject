@@ -7,6 +7,7 @@ data:
   middle_time_plot: [15, 17]
   use_generated_train_series: false
   train_series_dir: Data_Gen/generated_series
+  context_len: 20
 
 model:
   rho: 1000.0
@@ -23,23 +24,35 @@ model:
   use_pirate_force: false
   pirate_force_kwargs: {}
   use_fourier_features: false
-  fourier_features: 64
+  fourier_features: 16
   fourier_sigma: 1.0
   use_feature_engineering: false
 
 smoothing:
   use_savgol_smoothing: true
-  window_length: 15
-  polyorder: 4
+  window_length: 7
+  polyorder: 3
 
 architecture:
   force_net_type: residual
+  force_context_mode: cnn  # options: none, flatten, cnn
+  context_cnn_channels: 64
+  cnn_kwargs:
+    channels: [2, 2]
+    kernel_sizes: [5, 5]
+    dilations: [1, 1]
+    paddings: 0  # if null, computed as dilation*(kernel-1)/2
+    strides: [2, 2]
+    pool: none  # global, avg, max, none
+    pool_kernel: 2
+    pool_stride: 2
+  append_current_state: true
   residual_kwargs:
     hidden: 128
     layers: 2
     activation: gelu
   mlp_kwargs:
-    hidden: 100
+    hidden: 128
     layers: 2
     activation: gelu
   pirate_force_kwargs:
@@ -49,23 +62,23 @@ architecture:
     activation: tanh
 
 training:
-  batch_size: 32
-  force_reg: 0.01
+  batch_size: 256
+  force_reg: 0.1
   max_grad_norm: 10000.0
-  lr: 0.001
+  lr: 0.0003
   optimizer: adam
   weight_decay: 1e-5
-  epochs: 2000
+  epochs: 5000
   rollout_every_epoch: 50
   use_lr_scheduler: true
   scheduler:
-    max_lr: 0.001
+    max_lr: 0.0001
     decay_rate: 0.99
-    warmup_steps: 200
-    decay_steps: 200
-    min_lr: 0.0001
-    scheduler_type: exponential
-  use_gradnorm: true
+    warmup_steps: 250
+    decay_steps: 4750
+    min_lr: 0.00001
+    scheduler_type: cosine
+  use_gradnorm: false
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.2
   gradnorm_max_weight: 5.0

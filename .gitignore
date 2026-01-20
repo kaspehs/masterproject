@@ -1,1 +1,4 @@
 /HNNconfigs/*
+/HNNruns/*
+/models/*
+*.pt

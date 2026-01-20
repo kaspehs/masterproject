@@ -27,6 +27,7 @@ def main(config: Config, config_name: str):
     middle_time_plot = data_cfg.middle_time_plot
     use_generated_train_series = data_cfg.use_generated_train_series
     train_series_dir = Path(data_cfg.train_series_dir)
+    context_len = int(getattr(data_cfg, "context_len", 20))
 
     t, y_data, F_data, hamiltonian_data, dt = preprocess_timeseries(
         t,
@@ -59,7 +60,13 @@ def main(config: Config, config_name: str):
 
     model_dict = asdict(model_cfg)
     arch_dict = asdict(config.architecture)
-    model, derived_params = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    model, derived_params = PHVIV.from_config(
+        dt=dt,
+        cfg=model_dict,
+        arch_cfg=arch_dict,
+        device=device,
+        context_len=context_len,
+    )
     D = derived_params["D"]
     k = derived_params["k"]
     m_eff = derived_params["m_eff"]
@@ -82,6 +89,7 @@ def main(config: Config, config_name: str):
         batch_size=batch_size,
         device=device,
         smoothing_cfg=smoothing_cfg,
+        context_len=context_len,
     )
 
     if use_generated_train_series:
@@ -143,16 +151,18 @@ def main(config: Config, config_name: str):
         gradnorm_res_weights: list[float] = []
         gradnorm_force_weights: list[float] = []
 
-        for z_i, t_i, z_next, t_next in train_loader:
-            z_i = z_i.to(device)
-            t_i = t_i.to(device)
+        for z_context, t_context, z_next, t_next in train_loader:
+            z_context = z_context.to(device)
+            t_context = t_context.to(device)
             z_next = z_next.to(device)
             t_next = t_next.to(device)
+            z_i = z_context[:, -1]
+            t_i = t_context[:, -1].unsqueeze(1)
 
             opt.zero_grad()
 
-            res_loss = model.res_loss(z_i, t_i, z_next, t_next)
-            avg_force = model.avg_force(z_i, t_i, z_next, t_next)
+            res_loss = model.res_loss(z_i, t_i, z_next, t_next, context_z=z_context)
+            avg_force = model.avg_force(z_i, t_i, z_next, t_next, context_z=z_context)
             base_force_loss = avg_force
             #base_force_loss = avg_force * force_reg
             if gradnorm_balancer is not None:
