@@ -51,16 +51,13 @@ architecture:
 
 training:
   batch_size: 128
-  force_reg: 0.1
   max_grad_norm: 10000.0
+  epochs: 5000
+
+optim:
   lr: 0.0003
   optimizer: adam
   weight_decay: 0.0
-  epochs: 5000
-  rollout_every_epoch: 50
-  device: auto
-  num_workers: 0
-  log_component_grad_norms: false
   use_lr_scheduler: true
   scheduler:
     max_lr: 0.0003
@@ -69,10 +66,32 @@ training:
     decay_steps: 4750
     min_lr: 0.00003
     scheduler_type: cosine
+
+loss:
+  force_reg: 0.1
   use_gradnorm: false
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.2
   gradnorm_max_weight: 5.0
+
+runtime:
+  device: auto
+  num_workers: 0
+
+precision:
+  use_tf32: true
+  use_amp: true
+  amp_dtype: bf16
+
+compile:
+  use_compile: false
+  compile_mode: default
+
+monitoring:
+  rollout_every_epoch: 50
+  log_every_epochs: 1
+  print_every_epochs: 1
+  log_component_grad_norms: false
 
 logging:
   run_dir_root: HNNruns

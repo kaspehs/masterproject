@@ -41,25 +41,56 @@ def main(config: Config, config_name: str):
     smoothing_cfg = config.smoothing
 
     training_cfg = config.training
+    optim_cfg = config.optim
+    loss_cfg = config.loss
+    runtime_cfg = config.runtime
+    precision_cfg = config.precision
+    compile_cfg = config.compile
+    monitoring_cfg = config.monitoring
+
     batch_size = training_cfg.batch_size
-    force_reg = training_cfg.force_reg
     max_grad_norm = training_cfg.max_grad_norm
-    lr = training_cfg.lr
     epochs = training_cfg.epochs
-    rollout_every_epoch = training_cfg.rollout_every_epoch
-    log_component_grad_norms = bool(getattr(training_cfg, "log_component_grad_norms", False))
-    requested_device = os.getenv("TRAIN_DEVICE", str(getattr(training_cfg, "device", "auto")))
+
+    lr = optim_cfg.lr
+    use_lr_scheduler = optim_cfg.use_lr_scheduler
+    scheduler_cfg = optim_cfg.scheduler
+    optimizer_type = optim_cfg.optimizer.lower()
+    weight_decay = float(optim_cfg.weight_decay)
+
+    force_reg = loss_cfg.force_reg
+    log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
+    rollout_every_epoch = int(monitoring_cfg.rollout_every_epoch)
+    log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
+    print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
+
+    use_tf32 = bool(precision_cfg.use_tf32)
+    use_amp = bool(precision_cfg.use_amp)
+    amp_dtype_str = str(precision_cfg.amp_dtype).strip().lower()
+
+    use_compile = bool(compile_cfg.use_compile)
+    compile_mode = str(compile_cfg.compile_mode).strip()
+
+    requested_device = os.getenv("TRAIN_DEVICE", str(runtime_cfg.device))
     requested_device = str(requested_device).strip().lower()
     if requested_device in {"auto", ""}:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(requested_device)
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA available: {torch.cuda.is_available()}, gpu0: {torch.cuda.get_device_name(0)}")
+        if use_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+            print("TF32 enabled")
     torch.set_num_threads(int(os.getenv("SLURM_CPUS_PER_TASK", "1")))
     non_blocking = device.type == "cuda"
-    num_workers = int(getattr(training_cfg, "num_workers", 0))
+    num_workers = int(runtime_cfg.num_workers)
     pin_memory = device.type == "cuda"
-    use_lr_scheduler = training_cfg.use_lr_scheduler
-    scheduler_cfg = training_cfg.scheduler
+
     max_lr = float(scheduler_cfg.max_lr)
     decay_rate = float(scheduler_cfg.decay_rate)
     scheduler_warmup_steps = int(scheduler_cfg.warmup_steps)
@@ -69,6 +100,12 @@ def main(config: Config, config_name: str):
     model_dict = asdict(model_cfg)
     arch_dict = asdict(config.architecture)
     model, derived_params = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    if use_compile:
+        try:
+            model = torch.compile(model, mode=compile_mode)
+            print(f"torch.compile enabled (mode={compile_mode})")
+        except Exception as exc:
+            print(f"torch.compile failed ({exc}); continuing without compile")
     D = derived_params["D"]
     k = derived_params["k"]
     m_eff = derived_params["m_eff"]
@@ -111,14 +148,12 @@ def main(config: Config, config_name: str):
     y_true_norm = y_data / D
     force_data = F_data
 
-    optimizer_type = training_cfg.optimizer.lower()
-    weight_decay = float(training_cfg.weight_decay)
     if optimizer_type == "adamw":
         opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif optimizer_type == "adam":
         opt = optim.Adam(model.parameters(), lr=lr)
     else:
-        raise ValueError(f"Unsupported optimizer '{training_cfg.optimizer}'. Use 'adam' or 'adamw'.")
+        raise ValueError(f"Unsupported optimizer '{optim_cfg.optimizer}'. Use 'adam' or 'adamw'.")
     scheduler_type = scheduler_cfg.scheduler_type.lower() if hasattr(scheduler_cfg, "scheduler_type") else "cosine"
     if scheduler_type == "cosine":
         lr_scheduler = WarmupCosineLrSchedule(max_lr, min_lr, scheduler_warmup_steps, decay_steps)
@@ -127,15 +162,24 @@ def main(config: Config, config_name: str):
     else:
         raise ValueError(f"Unknown scheduler_type '{scheduler_type}'. Use 'cosine' or 'exponential'.")
     gradnorm_balancer = None
-    if training_cfg.use_gradnorm:
+    if loss_cfg.use_gradnorm:
         gradnorm_balancer = GradNormBalancer(
             model,
             ["residual", "force"],
-            alpha=training_cfg.gradnorm_alpha,
-            eps=training_cfg.gradnorm_eps,
-            min_weight=training_cfg.gradnorm_min_weight,
-            max_weight=training_cfg.gradnorm_max_weight,
+            alpha=loss_cfg.gradnorm_alpha,
+            eps=loss_cfg.gradnorm_eps,
+            min_weight=loss_cfg.gradnorm_min_weight,
+            max_weight=loss_cfg.gradnorm_max_weight,
         )
+
+    amp_enabled = bool(use_amp and device.type == "cuda")
+    if amp_dtype_str in {"fp16", "float16"}:
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
+    if amp_enabled:
+        print(f"AMP enabled (dtype={amp_dtype_str})")
 
     for epoch in range(epochs):
 
@@ -165,27 +209,33 @@ def main(config: Config, config_name: str):
 
             opt.zero_grad()
 
-            res_loss = model.res_loss(z_i, t_i, z_next, t_next)
-            avg_force = model.avg_force(z_i, t_i, z_next, t_next)
-            base_force_loss = avg_force
-            #base_force_loss = avg_force * force_reg
-            if gradnorm_balancer is not None:
-                weights = gradnorm_balancer.update({"residual": res_loss, "force": base_force_loss})
-                res_weight = weights["residual"]
-                force_weight = weights["force"]
-                gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
-                gradnorm_force_weight_sum = gradnorm_force_weight_sum + force_weight
-                gradnorm_weight_count += 1
-            else:
-                res_weight = res_loss.new_tensor(1.0)
-                force_weight = res_loss.new_tensor(1.0)
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                res_loss = model.res_loss(z_i, t_i, z_next, t_next)
+                avg_force = model.avg_force(z_i, t_i, z_next, t_next)
+                base_force_loss = avg_force
+                #base_force_loss = avg_force * force_reg
 
-            weighted_res = res_weight * res_loss
-            force_loss = force_reg * base_force_loss
-            #force_loss = base_force_loss
-            weighted_force = force_weight * force_loss
-            loss = weighted_res + weighted_force
+                if gradnorm_balancer is not None:
+                    weights = gradnorm_balancer.update(
+                        {"residual": res_loss.float(), "force": base_force_loss.float()}
+                    )
+                    res_weight = weights["residual"]
+                    force_weight = weights["force"]
+                    gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
+                    gradnorm_force_weight_sum = gradnorm_force_weight_sum + force_weight
+                    gradnorm_weight_count += 1
+                else:
+                    res_weight = res_loss.new_tensor(1.0)
+                    force_weight = res_loss.new_tensor(1.0)
 
+                weighted_res = res_weight * res_loss
+                force_loss = force_reg * base_force_loss
+                #force_loss = base_force_loss
+                weighted_force = force_weight * force_loss
+                loss = (weighted_res + weighted_force).float()
+
+            if log_component_grad_norms and scaler.is_enabled():
+                raise ValueError("log_component_grad_norms is not supported with AMP fp16 (GradScaler enabled).")
             if log_component_grad_norms:
                 weighted_res.backward(retain_graph=True)
                 res_grad_component_sum = res_grad_component_sum + torch.as_tensor(
@@ -197,20 +247,29 @@ def main(config: Config, config_name: str):
                     compute_model_grad_norm(model), device=device
                 )
                 model.zero_grad(set_to_none=True)
-            loss.backward()
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+            else:
+                loss.backward()
 
             grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm_sum = grad_norm_sum + grad_norm.detach()
             else:
                 grad_norm_sum = grad_norm_sum + torch.tensor(float(grad_norm), device=device)
-            opt.step()
+            if scaler.is_enabled():
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
 
             batch_count += 1
             loss_sum = loss_sum + loss.detach()
-            res_loss_sum = res_loss_sum + res_loss.detach()
-            force_loss_sum = force_loss_sum + force_loss.detach()
-            avg_force_sum = avg_force_sum + avg_force.detach()
+            res_loss_sum = res_loss_sum + res_loss.detach().float()
+            force_loss_sum = force_loss_sum + force_loss.detach().float()
+            avg_force_sum = avg_force_sum + avg_force.detach().float()
 
         denom = float(max(batch_count, 1))
         mean_loss = float((loss_sum / denom).detach().cpu())
@@ -224,7 +283,7 @@ def main(config: Config, config_name: str):
         mean_force_grad_component = float((force_grad_component_sum / denom).detach().cpu())
 
         damping_ratio_value = (
-            float(torch.sigmoid(model.zeta_raw).detach().cpu()) * model.max_damping_ratio
+            float(torch.sigmoid(model.zeta_raw).detach().cpu()) * float(model.max_damping_ratio.detach().cpu())
             if getattr(model, "discover_damping", True)
             else float(model.fixed_damping_ratio)
         )
@@ -249,11 +308,15 @@ def main(config: Config, config_name: str):
             train_metrics["gradnorm_weight_force"] = float(
                 (gradnorm_force_weight_sum / float(gradnorm_weight_count)).detach().cpu()
             )
-        log_training_metrics(writer, epoch, train_metrics)
-        print(
-            f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
-            f"force={mean_force_loss:.4e}"
-        )
+        log_this_epoch = (epoch % log_every_epochs) == 0 or epoch == (epochs - 1)
+        if log_this_epoch:
+            log_training_metrics(writer, epoch, train_metrics)
+        print_this_epoch = (epoch % print_every_epochs) == 0 or epoch == (epochs - 1)
+        if print_this_epoch:
+            print(
+                f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
+                f"force={mean_force_loss:.4e}"
+            )
 
         if (epoch + 1) % rollout_every_epoch == 0:
             val_metrics = log_validation_epoch(

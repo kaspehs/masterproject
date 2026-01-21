@@ -85,24 +85,49 @@ class SchedulerConfig:
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 32
-    force_reg: float = 1e-2
     max_grad_norm: float = 1e4
+    batch_size: int = 32
+    epochs: int = 2000
+
+@dataclass
+class OptimConfig:
     lr: float = 1e-3
     optimizer: str = "adam"
     weight_decay: float = 0.0
-    epochs: int = 2000
-    rollout_every_epoch: int = 50
-    device: str = "auto"
-    num_workers: int = 0
-    log_component_grad_norms: bool = False
     use_lr_scheduler: bool = False
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+@dataclass
+class LossConfig:
+    force_reg: float = 1e-2
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
     gradnorm_eps: float = 1e-8
     gradnorm_min_weight: float = 0.1
     gradnorm_max_weight: float = 10.0
+
+@dataclass
+class RuntimeConfig:
+    device: str = "auto"
+    num_workers: int = 0
+
+@dataclass
+class PrecisionConfig:
+    use_tf32: bool = False
+    use_amp: bool = False
+    amp_dtype: str = "bf16"  # "bf16" (recommended on A100) or "fp16"
+
+@dataclass
+class CompileConfig:
+    use_compile: bool = False
+    compile_mode: str = "default"  # "default" | "reduce-overhead" | "max-autotune"
+
+@dataclass
+class MonitoringConfig:
+    rollout_every_epoch: int = 50
+    log_every_epochs: int = 1
+    print_every_epochs: int = 1
+    log_component_grad_norms: bool = False
 
 @dataclass
 class LoggingConfig:
@@ -115,6 +140,12 @@ class Config:
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
+    compile: CompileConfig = field(default_factory=CompileConfig)
+    monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -130,7 +161,13 @@ def parse_config(raw: dict[str, Any]) -> Config:
     model_cfg = raw.get("model", {}) or {}
     architecture_cfg = dict(raw.get("architecture", {}) or {})
     smoothing_cfg = raw.get("smoothing", {}) or {}
-    training_cfg = raw.get("training", {}) or {}
+    training_cfg = dict(raw.get("training", {}) or {})
+    optim_cfg = dict(raw.get("optim", {}) or {})
+    loss_cfg = dict(raw.get("loss", {}) or {})
+    runtime_cfg = dict(raw.get("runtime", {}) or {})
+    precision_cfg = dict(raw.get("precision", {}) or {})
+    compile_cfg = dict(raw.get("compile", {}) or {})
+    monitoring_cfg = dict(raw.get("monitoring", raw.get("train_logging", {})) or {})
     logging_cfg = raw.get("logging", {}) or {}
 
     legacy_residual: dict[str, Any] = {}
@@ -174,14 +211,53 @@ def parse_config(raw: dict[str, Any]) -> Config:
     pirate_kwargs.update(pirate_overrides)
     architecture_cfg["pirate_force_kwargs"] = pirate_kwargs
 
+    # Backwards compatible mapping: allow legacy keys to live under training:
+    legacy_training = dict(training_cfg)
+    optim_keys = {"lr", "optimizer", "weight_decay", "use_lr_scheduler", "scheduler"}
+    loss_keys = {
+        "force_reg",
+        "use_gradnorm",
+        "gradnorm_alpha",
+        "gradnorm_eps",
+        "gradnorm_min_weight",
+        "gradnorm_max_weight",
+    }
+    runtime_keys = {"device", "num_workers"}
+    precision_keys = {"use_tf32", "use_amp", "amp_dtype"}
+    compile_keys = {"use_compile", "compile_mode"}
+    monitoring_keys = {"rollout_every_epoch", "log_every_epochs", "print_every_epochs", "log_component_grad_norms"}
+
+    for key, value in legacy_training.items():
+        if key in optim_keys and key not in optim_cfg:
+            optim_cfg[key] = value
+        elif key in loss_keys and key not in loss_cfg:
+            loss_cfg[key] = value
+        elif key in runtime_keys and key not in runtime_cfg:
+            runtime_cfg[key] = value
+        elif key in precision_keys and key not in precision_cfg:
+            precision_cfg[key] = value
+        elif key in compile_keys and key not in compile_cfg:
+            compile_cfg[key] = value
+        elif key in monitoring_keys and key not in monitoring_cfg:
+            monitoring_cfg[key] = value
+
+    training_cfg = {k: v for k, v in training_cfg.items() if k in {"batch_size", "max_grad_norm", "epochs"}}
+
     data = DataConfig(**data_cfg)
     model = ModelConfig(**model_cfg)
     architecture = ArchitectureConfig(**architecture_cfg)
     smoothing = SmoothingConfig(**smoothing_cfg)
-    scheduler_dict = training_cfg.get("scheduler", {}) or {}
+    training = TrainingConfig(**training_cfg)
+
+    scheduler_dict = optim_cfg.get("scheduler", {}) or {}
     scheduler = SchedulerConfig(**scheduler_dict)
-    training_fields = {k: v for k, v in training_cfg.items() if k != "scheduler"}
-    training = TrainingConfig(**training_fields, scheduler=scheduler)
+    optim_fields = {k: v for k, v in optim_cfg.items() if k != "scheduler"}
+    optim = OptimConfig(**optim_fields, scheduler=scheduler)
+    loss = LossConfig(**loss_cfg)
+    runtime = RuntimeConfig(**runtime_cfg)
+    precision = PrecisionConfig(**precision_cfg)
+    compile_cfg_obj = CompileConfig(**compile_cfg)
+    monitoring = MonitoringConfig(**monitoring_cfg)
     logging = LoggingConfig(**logging_cfg)
     return Config(
         data=data,
@@ -189,6 +265,12 @@ def parse_config(raw: dict[str, Any]) -> Config:
         architecture=architecture,
         smoothing=smoothing,
         training=training,
+        optim=optim,
+        loss=loss,
+        runtime=runtime,
+        precision=precision,
+        compile=compile_cfg_obj,
+        monitoring=monitoring,
         logging=logging,
     )
 
@@ -561,7 +643,7 @@ class PHVIV(nn.Module):
         self.U = U
         self.rho = rho
         self.D = D
-        self.max_damping_ratio = torch.tensor(max_damping_ratio)
+        self.register_buffer("max_damping_ratio", torch.tensor(float(max_damping_ratio), dtype=torch.float32))
         self.q_scale = q_scale
         self.p_scale = p_scale
         self.discover_damping = bool(discover_damping)
@@ -588,6 +670,14 @@ class PHVIV(nn.Module):
         self.nn_p_scale = p_scale
         self.q_scale = 1.0
         self.p_scale = 1.0
+        self.register_buffer(
+            "res_scale",
+            torch.tensor([float(self.q_scale), float(self.p_scale)], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "sqrt_km",
+            torch.tensor((float(self.k) * float(self.m)) ** 0.5, dtype=torch.float32),
+        )
 
         # NN for instantaneous force u(x)
         pirate_force_kwargs = pirate_force_kwargs or {}
@@ -795,9 +885,9 @@ class PHVIV(nn.Module):
         R = torch.zeros(*x.shape[:-1], 2, 2, device=x.device, dtype=x.dtype)
         if self.discover_damping:
             zeta = torch.sigmoid(self.zeta_raw) * self.max_damping_ratio
-            c_eff = 2.0 * zeta * torch.sqrt(torch.tensor(self.k * self.m, device=x.device, dtype=x.dtype))
+            c_eff = 2.0 * zeta * self.sqrt_km
         else:
-            c_eff = self.fixed_c.to(device=x.device, dtype=x.dtype)
+            c_eff = self.fixed_c
         R[..., 1, 1] = c_eff
         return R
     
@@ -838,22 +928,19 @@ class PHVIV(nn.Module):
     
     def f(self, x):
         u = self.u_theta(x)
-        G = self.G.to(x.device).to(x.dtype)                        # (..., 1)
-        Gu = torch.einsum('ij,...j->...i', G, u)
-        return Gu
+        g_vec = self.G.squeeze(-1)
+        return u * g_vec
 
     def g(self, x):
         gH = self.grad_H(x)                         # (..., 2)
-        R = self.R(x)                               # (..., 2, 2)
-
-        J = self.J.to(x.device).to(x.dtype)
-
-        JgH = torch.einsum('ij,...j->...i', J, gH) #Just  J @ gH, with batch handling
-        RgH = torch.einsum('...ij,...j->...i', R, gH)
-
-        core = JgH - RgH
-
-        return core + self.f(x)
+        JgH = torch.matmul(gH, self.J.T)
+        if self.discover_damping:
+            zeta = torch.sigmoid(self.zeta_raw) * self.max_damping_ratio
+            c_eff = 2.0 * zeta * self.sqrt_km
+        else:
+            c_eff = self.fixed_c
+        damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
+        return (JgH - damping_term) + self.f(x)
 
     def step_euler(self, x, dt):
         return x + dt * self.g(x)
@@ -936,8 +1023,7 @@ class PHVIV(nn.Module):
         dz = (zin-zi)/self.dt
         z_mean = 0.5*(zin+zi)
         res = dz - self.g(z_mean)
-        scale = torch.tensor((self.q_scale, self.p_scale), device=res.device, dtype=res.dtype)
-        res_scaled = res / scale
+        res_scaled = res / self.res_scale
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
 
@@ -982,11 +1068,7 @@ class PHVIV(nn.Module):
         res = dz_fd - dz_model                        # (B, d)
 
         # scale like before, but for time-derivatives
-        res_scale = torch.tensor(
-            (self.q_scale, self.p_scale),
-            device=res.device, dtype=res.dtype
-        )
-        res_scaled = res / res_scale
+        res_scaled = res / self.res_scale
 
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
