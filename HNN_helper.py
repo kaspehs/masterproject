@@ -93,6 +93,9 @@ class TrainingConfig:
     weight_decay: float = 0.0
     epochs: int = 2000
     rollout_every_epoch: int = 50
+    device: str = "auto"
+    num_workers: int = 0
+    log_component_grad_norms: bool = False
     use_lr_scheduler: bool = False
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     use_gradnorm: bool = False
@@ -1294,6 +1297,9 @@ def build_dataloader_from_series(
     device: torch.device,
     smoothing_cfg: SmoothingConfig | None = None,
     shuffle: bool = True,
+    *,
+    num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
         raise ValueError("series_data must contain at least one (y, t, dt) tuple.")
@@ -1314,7 +1320,13 @@ def build_dataloader_from_series(
         seq_len = y_tensor.shape[0]
         min_length = seq_len if min_length is None else min(min_length, seq_len)
     dataset = combine_datasets(datasets)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+    )
     return loader, sequence_tensors, min_length if min_length is not None else 0
 
 
@@ -1345,9 +1357,11 @@ def prepare_sequence_tensors(
         savgol_window=smoothing_cfg.window_length,
         savgol_polyorder=smoothing_cfg.polyorder,
     )
-    y_tensor = torch.from_numpy(y_arr).float().to(device)
-    vel_tensor = torch.from_numpy(vel_np).float().to(device)
-    t_tensor = torch.from_numpy(t_arr).float().to(device)
+    # Keep dataset tensors on CPU and move per-batch in the training loop.
+    # This avoids VRAM blow-ups and enables pinned-memory transfers on CUDA.
+    y_tensor = torch.from_numpy(y_arr).float()
+    vel_tensor = torch.from_numpy(vel_np).float()
+    t_tensor = torch.from_numpy(t_arr).float()
     return y_tensor, vel_tensor, t_tensor
 
 
@@ -1499,36 +1513,37 @@ def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: floa
     """Roll the model forward over the full time grid and return normalised traces."""
     p0 = vel[0] * m_eff
     state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
-    y_samples: list[float] = []
-    p_samples: list[float] = []
-    force_total: list[float] = []
-    force_drag: list[float] = []
-    force_model: list[float] = []
-    hamiltonian_model_vals: list[float] = []
+    y_samples: list[torch.Tensor] = []
+    p_samples: list[torch.Tensor] = []
+    force_total: list[torch.Tensor] = []
+    force_drag: list[torch.Tensor] = []
+    force_model: list[torch.Tensor] = []
+    hamiltonian_model_vals: list[torch.Tensor] = []
     with torch.no_grad():
         for _ in range(len(t)):
-            y_samples.append(float(state[0, 0].detach().cpu()))
-            p_samples.append(float(state[0, 1].detach().cpu()))
-            model_force = float(model.learned_force(state).squeeze().detach().cpu())
+            y_samples.append(state[0, 0].detach())
+            p_samples.append(state[0, 1].detach())
+            model_force = model.learned_force(state).squeeze().detach()
             if model.include_physical_drag:
-                drag_force = float(model.drag_force(state).squeeze().detach().cpu())
+                drag_force = model.drag_force(state).squeeze().detach()
             else:
-                drag_force = 0.0
-            total_force = float(model.u_theta(state).squeeze().detach().cpu())
-            H_val = float(model.H(state).detach().cpu())
+                drag_force = model_force.new_tensor(0.0)
+            total_force = model.u_theta(state).squeeze().detach()
+            H_val = model.H(state).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
             state = model.step_rk4(state, t, dt)
-    y_samples = np.asarray(y_samples)
-    p_samples = np.asarray(p_samples)
-    y_pred_norm = y_samples / D
-    p_pred_norm = (p_samples / m_eff) / (np.sqrt(k / m_eff) * D)
-    force_total_arr = np.asarray(force_total)
-    force_drag_arr = np.asarray(force_drag)
-    force_model_arr = np.asarray(force_model)
-    hamiltonian_model_arr = np.asarray(hamiltonian_model_vals)
+
+    y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
+    p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()
+    y_pred_norm = y_samples_arr / D
+    p_pred_norm = (p_samples_arr / m_eff) / (np.sqrt(k / m_eff) * D)
+    force_total_arr = torch.stack(force_total).detach().cpu().numpy()
+    force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
+    force_model_arr = torch.stack(force_model).detach().cpu().numpy()
+    hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,

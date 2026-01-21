@@ -57,6 +57,9 @@ training:
   weight_decay: 1e-5
   epochs: 2000
   rollout_every_epoch: 50
+  device: auto
+  num_workers: 0
+  log_component_grad_norms: false
   use_lr_scheduler: true
   scheduler:
     max_lr: 0.001

@@ -3,19 +3,22 @@
 #SBATCH --job-name=test_run_1
 #SBATCH --account=nn9352k
 #SBATCH --time=00:05:00
-#SBATCH --partition=preproc
-#SBATCH --ntasks=1 --cpus-per-task=32
-#SBATCH --mem-per-cpu=2G
+#SBATCH --partition=accel
+#SBATCH --qos=devel
+#SBATCH --gpus=1
 #SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
 
 #SBATCH --output=output/%j.txt
 #SBATCH --error=error/%j.txt
 
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export PYTHONUNBUFFERED=1
+export TRAIN_DEVICE=cuda
 
 
 # it is good to have the following lines in any bash script

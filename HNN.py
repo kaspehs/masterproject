@@ -16,9 +16,6 @@ from HNN_helper import *
 from ODE_pinn_helper import LrSchedule, WarmupCosineLrSchedule, WarmupExponentialLrSchedule
 
 def main(config: Config, config_name: str):
-    device = torch.device("cpu")
-    torch.set_num_threads(int(os.getenv("SLURM_CPUS_PER_TASK", "1")))
-
     data_cfg = config.data
     data_path = Path(data_cfg.file)
     data = np.load(data_path)
@@ -50,6 +47,17 @@ def main(config: Config, config_name: str):
     lr = training_cfg.lr
     epochs = training_cfg.epochs
     rollout_every_epoch = training_cfg.rollout_every_epoch
+    log_component_grad_norms = bool(getattr(training_cfg, "log_component_grad_norms", False))
+    requested_device = os.getenv("TRAIN_DEVICE", str(getattr(training_cfg, "device", "auto")))
+    requested_device = str(requested_device).strip().lower()
+    if requested_device in {"auto", ""}:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(requested_device)
+    torch.set_num_threads(int(os.getenv("SLURM_CPUS_PER_TASK", "1")))
+    non_blocking = device.type == "cuda"
+    num_workers = int(getattr(training_cfg, "num_workers", 0))
+    pin_memory = device.type == "cuda"
     use_lr_scheduler = training_cfg.use_lr_scheduler
     scheduler_cfg = training_cfg.scheduler
     max_lr = float(scheduler_cfg.max_lr)
@@ -57,9 +65,6 @@ def main(config: Config, config_name: str):
     scheduler_warmup_steps = int(scheduler_cfg.warmup_steps)
     decay_steps = int(scheduler_cfg.decay_steps)
     min_lr = float(getattr(scheduler_cfg, "min_lr", 0.02 * max_lr))
-
-    device = torch.device("cpu")
-    torch.set_num_threads(int(os.getenv("SLURM_CPUS_PER_TASK", "1")))
 
     model_dict = asdict(model_cfg)
     arch_dict = asdict(config.architecture)
@@ -86,6 +91,8 @@ def main(config: Config, config_name: str):
         batch_size=batch_size,
         device=device,
         smoothing_cfg=smoothing_cfg,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     if use_generated_train_series:
@@ -138,21 +145,23 @@ def main(config: Config, config_name: str):
                 g["lr"] = lr_scheduler.get_lr(epoch)
 
 
-        losses: list[float] = []
-        res_losses: list[float] = []
-        force_losses: list[float] = []
-        grad_norms: list[float] = []
-        avg_forces: list[float] = []
-        res_grad_components: list[float] = []
-        force_grad_components: list[float] = []
-        gradnorm_res_weights: list[float] = []
-        gradnorm_force_weights: list[float] = []
+        batch_count = 0
+        loss_sum = torch.zeros((), device=device)
+        res_loss_sum = torch.zeros((), device=device)
+        force_loss_sum = torch.zeros((), device=device)
+        grad_norm_sum = torch.zeros((), device=device)
+        avg_force_sum = torch.zeros((), device=device)
+        res_grad_component_sum = torch.zeros((), device=device)
+        force_grad_component_sum = torch.zeros((), device=device)
+        gradnorm_res_weight_sum = torch.zeros((), device=device)
+        gradnorm_force_weight_sum = torch.zeros((), device=device)
+        gradnorm_weight_count = 0
 
         for z_i, t_i, z_next, t_next in train_loader:
-            z_i = z_i.to(device)
-            t_i = t_i.to(device)
-            z_next = z_next.to(device)
-            t_next = t_next.to(device)
+            z_i = z_i.to(device, non_blocking=non_blocking)
+            t_i = t_i.to(device, non_blocking=non_blocking)
+            z_next = z_next.to(device, non_blocking=non_blocking)
+            t_next = t_next.to(device, non_blocking=non_blocking)
 
             opt.zero_grad()
 
@@ -164,8 +173,9 @@ def main(config: Config, config_name: str):
                 weights = gradnorm_balancer.update({"residual": res_loss, "force": base_force_loss})
                 res_weight = weights["residual"]
                 force_weight = weights["force"]
-                gradnorm_res_weights.append(float(res_weight.detach().cpu()))
-                gradnorm_force_weights.append(float(force_weight.detach().cpu()))
+                gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
+                gradnorm_force_weight_sum = gradnorm_force_weight_sum + force_weight
+                gradnorm_weight_count += 1
             else:
                 res_weight = res_loss.new_tensor(1.0)
                 force_weight = res_loss.new_tensor(1.0)
@@ -176,32 +186,42 @@ def main(config: Config, config_name: str):
             weighted_force = force_weight * force_loss
             loss = weighted_res + weighted_force
 
-            weighted_res.backward(retain_graph=True)
-            res_grad_components.append(compute_model_grad_norm(model))
-            model.zero_grad(set_to_none=True)
-            weighted_force.backward(retain_graph=True)
-            force_grad_components.append(compute_model_grad_norm(model))
-            model.zero_grad(set_to_none=True)
+            if log_component_grad_norms:
+                weighted_res.backward(retain_graph=True)
+                res_grad_component_sum = res_grad_component_sum + torch.as_tensor(
+                    compute_model_grad_norm(model), device=device
+                )
+                model.zero_grad(set_to_none=True)
+                weighted_force.backward(retain_graph=True)
+                force_grad_component_sum = force_grad_component_sum + torch.as_tensor(
+                    compute_model_grad_norm(model), device=device
+                )
+                model.zero_grad(set_to_none=True)
             loss.backward()
 
             grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            grad_norms.append(float(grad_norm.detach().cpu()))
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm_sum = grad_norm_sum + grad_norm.detach()
+            else:
+                grad_norm_sum = grad_norm_sum + torch.tensor(float(grad_norm), device=device)
             opt.step()
 
-            losses.append(float(loss.detach().cpu()))
-            res_losses.append(float(res_loss.detach().cpu()))
-            force_losses.append(float(force_loss.detach().cpu()))
-            avg_forces.append(float(avg_force.detach().cpu()))
+            batch_count += 1
+            loss_sum = loss_sum + loss.detach()
+            res_loss_sum = res_loss_sum + res_loss.detach()
+            force_loss_sum = force_loss_sum + force_loss.detach()
+            avg_force_sum = avg_force_sum + avg_force.detach()
 
-        mean_loss = float(np.mean(losses)) if losses else 0.0
-        mean_res_loss = float(np.mean(res_losses)) if res_losses else 0.0
-        mean_force_loss = float(np.mean(force_losses)) if force_losses else 0.0
-        mean_grad_norm = float(np.mean(grad_norms)) if grad_norms else 0.0
+        denom = float(max(batch_count, 1))
+        mean_loss = float((loss_sum / denom).detach().cpu())
+        mean_res_loss = float((res_loss_sum / denom).detach().cpu())
+        mean_force_loss = float((force_loss_sum / denom).detach().cpu())
+        mean_grad_norm = float((grad_norm_sum / denom).detach().cpu())
         drag_coeff = float(torch.exp(model.log_Cd).detach().cpu())
-        mean_force = float(np.mean(avg_forces)) if avg_forces else 0.0
+        mean_force = float((avg_force_sum / denom).detach().cpu())
         current_lr = float(opt.param_groups[0]["lr"]) if opt.param_groups else lr
-        mean_res_grad_component = float(np.mean(res_grad_components)) if res_grad_components else 0.0
-        mean_force_grad_component = float(np.mean(force_grad_components)) if force_grad_components else 0.0
+        mean_res_grad_component = float((res_grad_component_sum / denom).detach().cpu())
+        mean_force_grad_component = float((force_grad_component_sum / denom).detach().cpu())
 
         damping_ratio_value = (
             float(torch.sigmoid(model.zeta_raw).detach().cpu()) * model.max_damping_ratio
@@ -218,13 +238,17 @@ def main(config: Config, config_name: str):
             "grad_norm": mean_grad_norm,
             "drag_coefficient": drag_coeff,
             "avg_force": mean_force,
-            "grad_norm_residual_comp": mean_res_grad_component,
-            "grad_norm_force_comp": mean_force_grad_component,
         }
-        if gradnorm_res_weights:
-            train_metrics["gradnorm_weight_residual"] = float(np.mean(gradnorm_res_weights))
-        if gradnorm_force_weights:
-            train_metrics["gradnorm_weight_force"] = float(np.mean(gradnorm_force_weights))
+        if log_component_grad_norms:
+            train_metrics["grad_norm_residual_comp"] = mean_res_grad_component
+            train_metrics["grad_norm_force_comp"] = mean_force_grad_component
+        if gradnorm_weight_count > 0:
+            train_metrics["gradnorm_weight_residual"] = float(
+                (gradnorm_res_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            )
+            train_metrics["gradnorm_weight_force"] = float(
+                (gradnorm_force_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            )
         log_training_metrics(writer, epoch, train_metrics)
         print(
             f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
