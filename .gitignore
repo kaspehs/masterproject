@@ -1,3 +1,6 @@
 /HNNconfigs/*
 /HNNruns/*
 /models/*
+/output/*
+/error/*
+/logs/*
