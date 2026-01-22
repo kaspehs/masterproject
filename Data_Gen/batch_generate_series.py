@@ -66,8 +66,8 @@ def main():
     )
     args = parser.parse_args()
 
-    amplitude_factors = [0.1, 0.3, 0.7, 0.9]
-    fhat_values = [0.05, 0.10, 0.20, 0.25]
+    amplitude_factors = [-1.0, -0.8, -0.4, -0.2, 0.0, 0.2, 0.4, 0.8, 1.0]
+    fhat_values = [-0.25, -0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20, 0.25]
     run_batch(amplitude_factors, fhat_values, args.output_dir, integrator=args.integrator)
 
 

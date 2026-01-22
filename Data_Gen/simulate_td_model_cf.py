@@ -42,11 +42,11 @@ T = 20.0
 dt = 0.0001
 
 def simulate_td_model_cf(
-    A_factor: float = 0.5,
+    A_factor: float = 0.6,
     fhat: float = 0.15,
     dt: float = dt,
     T: float = T,
-    output_path: str | Path | None = "data_test.npz",
+    output_path: str | Path | None = "data.npz",
     plot: bool = False,
     seed: int | None = None,
     verbose: bool = False,
@@ -103,7 +103,7 @@ def simulate_td_model_cf(
     A = A_factor * D
     omega_osc = 2.0 * np.pi * fhat * U / D
 
-    y[0] = A * np.sin(omega_osc * time[0])
+    y[0] = A #* np.sin(omega_osc * time[0])
     dy[0] = omega_osc * A * np.cos(omega_osc * time[0])
     ddy[0] = -omega_osc**2 * A * np.sin(omega_osc * time[0])
 
