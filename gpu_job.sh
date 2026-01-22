@@ -8,7 +8,8 @@
 #SBATCH --gpus=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
 
 #SBATCH --output=output/%j.txt
 #SBATCH --error=error/%j.txt

@@ -75,7 +75,7 @@ loss:
   gradnorm_max_weight: 5.0
 
 runtime:
-  device: auto
+  device: cuda
   num_workers: 0
 
 precision:
@@ -89,8 +89,8 @@ compile:
 
 monitoring:
   rollout_every_epoch: 50
-  log_every_epochs: 1
-  print_every_epochs: 1
+  log_every_epochs: 10
+  print_every_epochs: 10
   log_component_grad_norms: false
 
 logging:
