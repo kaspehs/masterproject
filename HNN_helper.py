@@ -375,9 +375,8 @@ def log_validation_epoch(
                 if np.isfinite(spectral_rel_err):
                     metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
     with torch.no_grad():
-        z_true = torch.stack(
-            (y_data_t, val_vel * m_eff), dim=1
-        )
+        z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
+        z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
         force_on_data = model.u_theta(z_true).squeeze(-1).detach().cpu().numpy()
     min_len_data = min(force_on_data.shape[0], force_target.shape[0])
     if min_len_data > 0:
