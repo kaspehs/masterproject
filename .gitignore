@@ -6,3 +6,4 @@
 /logs/*
 /Data_Gen/legacy_datasets
 /Data_Gen/generated_series
+*.pyc

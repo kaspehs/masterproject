@@ -50,7 +50,7 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 128
+  batch_size: 8096
   max_grad_norm: 10000.0
   epochs: 5000
 
@@ -76,11 +76,11 @@ loss:
 
 runtime:
   device: cuda
-  num_workers: 0
+  num_workers: 4
 
 precision:
-  use_tf32: true
-  use_amp: true
+  use_tf32: false
+  use_amp: false
   amp_dtype: bf16
 
 compile:
