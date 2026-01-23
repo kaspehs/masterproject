@@ -38,4 +38,4 @@ echo "TRAIN_DEVICE=${TRAIN_DEVICE}"
 python -c "import sys, torch; print('python', sys.version); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('torch_cuda', torch.version.cuda); print('gpu_count', torch.cuda.device_count()); print('gpu0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || true
 
-python HNN.py --config HNNrunconfigs/pirate_final.yml
+python train.py --config HNNrunconfigs/pirate_final.yml

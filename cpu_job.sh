@@ -31,4 +31,4 @@ export PS1=\$
 # activate the virtual environment
 source $HOME/ml-env/bin/activate
 
-python HNN.py --config HNNrunconfigs/pirate_final.yml
+python train.py --config HNNrunconfigs/pirate_final.yml

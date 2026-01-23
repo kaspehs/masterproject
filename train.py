@@ -4,16 +4,16 @@ import argparse
 from pathlib import Path
 
 from HNN_helper import load_config, parse_config
-from methods.hnn.trainer import train
+from methods import get_trainer
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train HNN model with YAML configuration.")
+    parser = argparse.ArgumentParser(description="Train models (HNN/PINN) from YAML configuration.")
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("hnn_config.yml"),
-        help="Path to YAML config file (default: hnn_config.yml)",
+        required=True,
+        help="Path to YAML config file.",
     )
     return parser.parse_args()
 
@@ -23,7 +23,8 @@ def main() -> None:
     raw_cfg = load_config(args.config)
     cfg = parse_config(raw_cfg)
     config_name = args.config.stem
-    train(cfg, config_name)
+    trainer = get_trainer(getattr(cfg, "method", "hnn"))
+    trainer(cfg, config_name)
 
 
 if __name__ == "__main__":

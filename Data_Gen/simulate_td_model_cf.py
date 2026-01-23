@@ -7,7 +7,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict
 
-import matplotlib.pyplot as plt
 import numpy as np
 try:
     from utils import vforce_CF
@@ -213,6 +212,8 @@ def simulate_td_model_cf(
 
 
 def _plot_diagnostics(time, y, dy, Fy, Fca, Fcv, Fdy):
+    import matplotlib.pyplot as plt
+
     fig = plt.figure(figsize=(7, 4))
     plt.plot(time, Fy, label="Force (N)")
     plt.plot(time, y * 100, label=r"Displacement $\times 10^2$ (m)")

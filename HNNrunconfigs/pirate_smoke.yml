@@ -7,7 +7,7 @@ data:
   reduce_time: true
   reduction_factor: 100
   middle_time_plot: [15, 17]
-  use_generated_train_series: false
+  use_generated_train_series: true
   train_series_dir: Data_Gen/generated_series
 
 model:
@@ -31,52 +31,53 @@ model:
 
 smoothing:
   use_savgol_smoothing: true
-  window_length: 15
-  polyorder: 4
+  window_length: 7
+  polyorder: 3
 
 architecture:
-  force_net_type: residual
+  force_net_type: pirate
   residual_kwargs:
     hidden: 128
     layers: 2
     activation: gelu
   mlp_kwargs:
-    hidden: 100
+    hidden: 128
     layers: 2
     activation: gelu
   pirate_force_kwargs:
-    fourier_features: 96
+    depth: 1
+    fourier_features: 64
     sigma: 0.5
-    use_rwf: true
-    activation: tanh
+    use_rwf: false
+    activation: gelu
 
 training:
-  batch_size: 32
+  batch_size: 1024
   max_grad_norm: 10000.0
-  epochs: 2000
+  epochs: 50
 
 optim:
-  lr: 0.001
+  lr: 0.0003
   optimizer: adam
-  weight_decay: 1e-5
+  weight_decay: 0.0
   use_lr_scheduler: true
   scheduler:
-    max_lr: 0.001
+    max_lr: 0.0003
     decay_rate: 0.99
-    warmup_steps: 200
-    decay_steps: 200
-    min_lr: 0.0001
-    scheduler_type: exponential
+    warmup_steps: 250
+    decay_steps: 4750
+    min_lr: 0.00003
+    scheduler_type: cosine
 
 loss:
-  force_reg: 0.01
-  use_gradnorm: true
+  force_reg: 0.1
+  use_gradnorm: false
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.2
   gradnorm_max_weight: 5.0
 
 runtime:
-  device: auto
+  device: cpu
   num_workers: 0
 
 precision:
@@ -94,11 +95,11 @@ monitoring:
   print_every_epochs: 1
   log_component_grad_norms: false
 
-hnn: {}
-pinn: {}
-
 logging:
   run_dir_root: HNNruns
 
+hnn: {}
+pinn: {}
+
 #For running all config files
-#ls HNNrunconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}
+#ls HNNconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}

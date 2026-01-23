@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -10,18 +11,40 @@ import numpy as np
 import torch
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from HNN_helper import PHVIV, parse_config
-from Data_Gen.simulate_td_model_cf import simulate_td_model_cf
+
+
+def iter_logged_runs(runs_dir: Path, *, logger_hz: float) -> tuple[list[Path], float]:
+    pattern = f"*log{int(logger_hz):d}Hz.npz"
+    files = sorted(runs_dir.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No logged runs found in {runs_dir} matching '{pattern}'.")
+    return files, float(logger_hz)
 
 
 def load_model(ckpt_path: Path, device: torch.device) -> tuple[PHVIV, dict[str, float]]:
     ckpt = torch.load(ckpt_path, map_location=device)
-    cfg = parse_config(ckpt["config"])
+    cfg_raw = ckpt.get("config", {})
+    if not isinstance(cfg_raw, dict):
+        if hasattr(cfg_raw, "__dict__"):
+            cfg_raw = dict(cfg_raw.__dict__)
+        else:
+            raise TypeError(f"Unsupported config type in checkpoint: {type(cfg_raw)}")
+    cfg = parse_config(cfg_raw)
     dt = float(ckpt.get("dt", 0.01))
     model_dict = asdict(cfg.model)
     arch_dict = asdict(cfg.architecture)
     model, derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
-    model.load_state_dict(ckpt["model_state"])
+    incompatible = model.load_state_dict(ckpt["model_state"], strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"[warn] {ckpt_path.name}: missing_keys={incompatible.missing_keys}, "
+            f"unexpected_keys={incompatible.unexpected_keys}"
+        )
     model.eval()
     return model, derived
 
@@ -69,7 +92,10 @@ def plot_heatmap(
     plt.close(fig)
 
 
-CKPT_PATH = Path("models/pirate_final1_1130-085457.pt")
+CKPT_PATH = Path("models/pirate_smoke_0122-125008.pt")
+LOGGED_RUNS_DIR = Path("Data_Gen/groundtruth_runs_100hz")
+LOGGER_HZ = 100.0
+STEADY_STATE_WINDOW_S = 4.0
 FORCE_CMAP = LinearSegmentedColormap.from_list(
     "force_diverging",
     [
@@ -78,27 +104,6 @@ FORCE_CMAP = LinearSegmentedColormap.from_list(
         (1.0, "red"),
     ],
 )
-SIM_CASES = [
-    (0.1, 0.05),
-    (0.1, 0.10),
-    (0.1, 0.20),
-    (0.1, 0.25),
-    (0.3, 0.05),
-    (0.3, 0.10),
-    (0.3, 0.20),
-    (0.3, 0.25),
-    (0.7, 0.05),
-    (0.7, 0.10),
-    (0.7, 0.20),
-    (0.7, 0.25),
-    (0.9, 0.05),
-    (0.9, 0.10),
-    (0.9, 0.20),
-    (0.9, 0.25),
-]
-SIM_CASES = [(1.0, i) for i in np.arange(0.0, 0.35, 0.0025)]
-SIM_DT = 1e-4
-SIM_T = 10.0
 
 
 def main():
@@ -115,14 +120,19 @@ def main():
     counts = np.zeros_like(QQ)
     squared = np.zeros_like(QQ)
     limit_path = None
-    for amp, freq in SIM_CASES:
-        sim = simulate_td_model_cf(A_factor=amp, fhat=freq, dt=SIM_DT, T=SIM_T, output_path=None, plot=False)
-        q_vals = sim["y"]
-        p_vals = sim["dy"] * derived["m_eff"]
-        f_vals = sim["F_total"]
+
+    runs_dir = LOGGED_RUNS_DIR
+    run_files, _ = iter_logged_runs(runs_dir, logger_hz=LOGGER_HZ)
+    print(f"Using {len(run_files)} logged runs from {runs_dir}")
+
+    for run_path in run_files:
+        with np.load(run_path) as run:
+            q_vals = np.asarray(run["y"])
+            p_vals = np.asarray(run["dy"]) * float(derived["m_eff"])
+            f_vals = np.asarray(run["F_total"])
+            time = np.asarray(run["time"])
         if limit_path is None:
-            time = sim["time"]
-            mask = time >= (time[-1] - 2.0)
+            mask = time >= (time[-1] - float(STEADY_STATE_WINDOW_S))
             if np.any(mask):
                 limit_path = (q_vals[mask], p_vals[mask])
         q_idx = np.digitize(q_vals, q_edges) - 1

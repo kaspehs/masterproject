@@ -1,3 +1,5 @@
+method: hnn
+
 data:
   file: data.npz
   steadystate: false
@@ -95,6 +97,9 @@ monitoring:
 
 logging:
   run_dir_root: HNNruns
+
+hnn: {}
+pinn: {}
 
 #For running all config files
 #ls HNNconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}

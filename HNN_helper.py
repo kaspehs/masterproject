@@ -135,6 +135,7 @@ class LoggingConfig:
 
 @dataclass
 class Config:
+    method: str = "hnn"
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
@@ -147,6 +148,9 @@ class Config:
     compile: CompileConfig = field(default_factory=CompileConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    hnn: dict[str, Any] = field(default_factory=dict)
+    pinn: dict[str, Any] = field(default_factory=dict)
+    vpinn: dict[str, Any] = field(default_factory=dict)
 
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
@@ -157,6 +161,7 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
 
 
 def parse_config(raw: dict[str, Any]) -> Config:
+    method = raw.get("method", "hnn")
     data_cfg = raw.get("data", {}) or {}
     model_cfg = raw.get("model", {}) or {}
     architecture_cfg = dict(raw.get("architecture", {}) or {})
@@ -169,6 +174,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
     compile_cfg = dict(raw.get("compile", {}) or {})
     monitoring_cfg = dict(raw.get("monitoring", raw.get("train_logging", {})) or {})
     logging_cfg = raw.get("logging", {}) or {}
+    hnn_block = dict(raw.get("hnn", {}) or {})
+    pinn_block = dict(raw.get("pinn", {}) or {})
+    vpinn_block = dict(raw.get("vpinn", {}) or {})
 
     legacy_residual: dict[str, Any] = {}
     if "residual_hidden" in architecture_cfg:
@@ -260,6 +268,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
     monitoring = MonitoringConfig(**monitoring_cfg)
     logging = LoggingConfig(**logging_cfg)
     return Config(
+        method=str(method),
         data=data,
         model=model,
         architecture=architecture,
@@ -272,6 +281,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
         compile=compile_cfg_obj,
         monitoring=monitoring,
         logging=logging,
+        hnn=hnn_block,
+        pinn=pinn_block,
+        vpinn=vpinn_block,
     )
 
 
@@ -390,16 +402,6 @@ def log_validation_epoch(
         middle_mask,
         middle_time_plot,
         model.include_physical_drag,
-    )
-    log_hamiltonian_plots(
-        writer,
-        epoch,
-        t,
-        rollout["hamiltonian_model"],
-        zoom_mask,
-        middle_mask,
-        middle_time_plot,
-        hamiltonian_data=hamiltonian_data,
     )
     return metrics
 
