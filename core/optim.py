@@ -5,7 +5,7 @@ from typing import Any, Tuple
 import torch
 import torch.optim as optim
 
-from ODE_pinn_helper import WarmupCosineLrSchedule, WarmupExponentialLrSchedule
+from core.lr_schedules import WarmupCosineLrSchedule, WarmupExponentialLrSchedule
 
 
 def setup_optimizer_and_scheduler(
@@ -39,4 +39,3 @@ def setup_optimizer_and_scheduler(
         raise ValueError(f"Unknown scheduler_type '{scheduler_type}'. Use 'cosine' or 'exponential'.")
 
     return opt, lr_scheduler
-

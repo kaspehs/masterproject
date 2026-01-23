@@ -239,12 +239,25 @@ def _read_timeseries_npz(
             t = np.asarray(data["time"])
             x = np.asarray(data["y"])
             f = np.asarray(data["F_total"])
-            v = np.asarray(data["dy"]) if "dy" in data else None
+            if "dy" in data:
+                v = np.asarray(data["dy"])
+            elif "v" in data:
+                v = np.asarray(data["v"])
+            else:
+                v = None
         else:
             t = np.asarray(data["a"])
             x = np.asarray(data["b"])
             f = np.asarray(data["c"])
-            v = None
+            # Some generators store velocity as "e" (legacy) or "dy".
+            if "dy" in data:
+                v = np.asarray(data["dy"])
+            elif "e" in data:
+                v = np.asarray(data["e"])
+            elif "v" in data:
+                v = np.asarray(data["v"])
+            else:
+                v = None
     if t.ndim != 1:
         raise ValueError(f"{path} must contain 1D time array.")
     if x.ndim not in (1, 2) or f.ndim not in (1, 2):
@@ -637,7 +650,7 @@ def _evaluate_epoch(
     mean_lw = loss_w_sum / denom
     wf_eff = float(wf) if use_force_loss else 0.0
     ww_eff = float(ww) if use_weak_loss else 0.0
-    return {"loss_f": mean_lf, "loss_w": mean_lw, "loss_total": wf_eff * mean_lf + ww_eff * mean_lw}
+    return {"loss_data": mean_lf, "loss_physics": mean_lw, "loss_total": wf_eff * mean_lf + ww_eff * mean_lw}
 
 
 def _log_rollout_validation(
@@ -690,18 +703,18 @@ def _log_rollout_validation(
     if disp_std <= 0.0:
         disp_std = 1.0
     rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
-    writer.add_scalar("val/rollout_rmse_over_std_y", rel_rmse_y, epoch)
+    writer.add_scalar("val/rollout_nrmse_y", rel_rmse_y, epoch)
 
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
         force_std = 1.0
     rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-    writer.add_scalar("val/rollout_rmse_over_std_force_total", rel_rmse_force, epoch)
+    writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t)[:, 0].detach().cpu().numpy()
     rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
-    writer.add_scalar("val/force_mapping_rmse_over_std_on_data", rel_rmse_force_on_data, epoch)
+    writer.add_scalar("val/force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
 
     y_true_norm = x_true / float(D)
     y_pred_norm = x_pred / float(D)
@@ -745,6 +758,7 @@ def train(config: Config, config_name: str) -> None:
     compile_cfg = config.compile
     training_cfg = config.training
     optim_cfg = config.optim
+    monitoring_cfg = config.monitoring
 
     window_M = int(vp.get("window_M", 50))
     stride = int(vp.get("stride", 1))
@@ -770,7 +784,7 @@ def train(config: Config, config_name: str) -> None:
         raise ValueError(
             "vpinn.use_rollout_loss is not supported. "
             "Rollout-based checks are intended for validation only; "
-            "use vpinn.rollout_every_epochs to log rollout validation."
+            "use monitoring.rollout_every_epochs to log rollout validation."
         )
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
@@ -887,11 +901,11 @@ def train(config: Config, config_name: str) -> None:
     use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
     base_lr = float(optim_cfg.lr)
 
-    log_every = int(vp.get("log_every_epochs", 1))
-    print_every = int(vp.get("print_every_epochs", 1))
-    validate_every = int(vp.get("validate_every_epochs", 1))
-    rollout_every = int(vp.get("rollout_every_epochs", 0))
-    rollout_max_trajs = int(vp.get("rollout_max_trajectories", 1))
+    log_every = int(getattr(monitoring_cfg, "log_every_epochs", 1))
+    print_every = int(getattr(monitoring_cfg, "print_every_epochs", 1))
+    validate_every = int(getattr(monitoring_cfg, "validate_every_epochs", 1))
+    rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
+    rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
     middle_time_plot = getattr(config.data, "middle_time_plot", [0.0, 1.0])
     if len(middle_time_plot) != 2:
         middle_time_plot = [0.0, 1.0]
@@ -984,17 +998,14 @@ def train(config: Config, config_name: str) -> None:
         denom = float(max(batches, 1))
         metrics = {
             "loss_total": float((loss_sum / denom).detach().cpu()),
-            "loss_f": float((loss_f_sum / denom).detach().cpu()),
-            "loss_w": float((loss_w_sum / denom).detach().cpu()),
+            "loss_data": float((loss_f_sum / denom).detach().cpu()),
+            "loss_physics": float((loss_w_sum / denom).detach().cpu()),
             "grad_norm": float((grad_norm_sum / denom).detach().cpu()),
             "lr": float(opt.param_groups[0]["lr"]) if opt.param_groups else base_lr,
         }
         if gradnorm_count > 0:
-            metrics["gradnorm_w_force"] = float((gradnorm_force_w_sum / float(gradnorm_count)).detach().cpu())
-            metrics["gradnorm_w_weak"] = float((gradnorm_weak_w_sum / float(gradnorm_count)).detach().cpu())
-            if gradnorm_balancer is not None:
-                metrics["gradnorm_g_force"] = float(gradnorm_balancer.latest_grad_norms["force"].detach().cpu())
-                metrics["gradnorm_g_weak"] = float(gradnorm_balancer.latest_grad_norms["weak"].detach().cpu())
+            metrics["gradnorm_weight_data"] = float((gradnorm_force_w_sum / float(gradnorm_count)).detach().cpu())
+            metrics["gradnorm_weight_physics"] = float((gradnorm_weak_w_sum / float(gradnorm_count)).detach().cpu())
 
         if (epoch % max(1, log_every)) == 0 or epoch == (epochs - 1):
             for k_name, v_value in metrics.items():
@@ -1003,7 +1014,7 @@ def train(config: Config, config_name: str) -> None:
         if (epoch % max(1, print_every)) == 0 or epoch == (epochs - 1):
             print(
                 f"Epoch {epoch}: loss={metrics['loss_total']:.4e}, "
-                f"Lf={metrics['loss_f']:.4e}, Lw={metrics['loss_w']:.4e}, lr={metrics['lr']:.3e}"
+                f"Ldata={metrics['loss_data']:.4e}, Lphys={metrics['loss_physics']:.4e}, lr={metrics['lr']:.3e}"
             )
 
         if val_loader is not None and validate_every > 0 and ((epoch % validate_every) == 0 or epoch == (epochs - 1)):

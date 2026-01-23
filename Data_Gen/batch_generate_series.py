@@ -55,7 +55,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).parent / "generated_series",
+        default=Path(__file__).parent / "generated_series_dy",
         help="Directory to store generated .npz files.",
     )
     parser.add_argument(

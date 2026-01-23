@@ -193,7 +193,7 @@ def simulate_td_model_cf(
     if output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(output_path, a=time, b=y, c=F_total, d=H)
+        np.savez(output_path, a=time, b=y, c=F_total, d=H, e=dy)
 
     if plot:
         _plot_diagnostics(time, y, dy, Fy, Fca, Fcv, Fdy)

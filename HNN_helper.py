@@ -105,6 +105,8 @@ class LossConfig:
     gradnorm_eps: float = 1e-8
     gradnorm_min_weight: float = 0.1
     gradnorm_max_weight: float = 10.0
+    use_force_data_loss: bool = False
+    force_data_weight: float = 1.0
 
 @dataclass
 class RuntimeConfig:
@@ -124,10 +126,13 @@ class CompileConfig:
 
 @dataclass
 class MonitoringConfig:
-    rollout_every_epoch: int = 50
+    rollout_every_epochs: int = 50
+    validate_every_epochs: int = 10
+    rollout_max_trajectories: int = 1
     log_every_epochs: int = 1
     print_every_epochs: int = 1
     log_component_grad_norms: bool = False
+    log_extra_validation_metrics: bool = False
 
 @dataclass
 class LoggingConfig:
@@ -229,11 +234,22 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "gradnorm_eps",
         "gradnorm_min_weight",
         "gradnorm_max_weight",
+        "use_force_data_loss",
+        "force_data_weight",
     }
     runtime_keys = {"device", "num_workers"}
     precision_keys = {"use_tf32", "use_amp", "amp_dtype"}
     compile_keys = {"use_compile", "compile_mode"}
-    monitoring_keys = {"rollout_every_epoch", "log_every_epochs", "print_every_epochs", "log_component_grad_norms"}
+    monitoring_keys = {
+        "rollout_every_epoch",
+        "rollout_every_epochs",
+        "validate_every_epochs",
+        "rollout_max_trajectories",
+        "log_every_epochs",
+        "print_every_epochs",
+        "log_component_grad_norms",
+        "log_extra_validation_metrics",
+    }
 
     for key, value in legacy_training.items():
         if key in optim_keys and key not in optim_cfg:
@@ -265,6 +281,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
     runtime = RuntimeConfig(**runtime_cfg)
     precision = PrecisionConfig(**precision_cfg)
     compile_cfg_obj = CompileConfig(**compile_cfg)
+    # Back-compat key: `rollout_every_epoch` -> `rollout_every_epochs`
+    if "rollout_every_epochs" not in monitoring_cfg and "rollout_every_epoch" in monitoring_cfg:
+        monitoring_cfg["rollout_every_epochs"] = monitoring_cfg.pop("rollout_every_epoch")
     monitoring = MonitoringConfig(**monitoring_cfg)
     logging = LoggingConfig(**logging_cfg)
     return Config(
@@ -316,15 +335,17 @@ def log_validation_epoch(
     device: torch.device,
     middle_time_plot: list[float] | tuple[float, float],
     hamiltonian_data: np.ndarray | None,
+    *,
+    log_extra_metrics: bool = False,
 ) -> dict[str, float]:
     rollout = rollout_model(model, y_data_t, val_vel, m_eff, dt, t, D, k, device)
     metrics: dict[str, float] = {}
     y_pred_raw = rollout["y_norm"] * D
-    disp_range_raw = float(np.ptp(y_data_raw))
-    if disp_range_raw <= 0.0:
-        disp_range_raw = 1.0
-    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_range_raw
-    metrics["rel_rmse_y"] = rel_rmse_disp
+    disp_std_raw = float(np.std(y_data_raw))
+    if disp_std_raw <= 0.0:
+        disp_std_raw = 1.0
+    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
+    metrics["rollout_nrmse_y"] = rel_rmse_disp
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
     force_target = np.asarray(force_data).reshape(-1)
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
@@ -332,30 +353,27 @@ def log_validation_epoch(
         rmse_force = float(
             np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
         )
-        force_range = float(np.ptp(force_target[:min_len]))
-        if force_range <= 0.0:
-            force_range = 1.0
-        metrics["rel_rmse_force_total"] = rmse_force / force_range
-        force_model_aligned = force_total_pred[:min_len]
-        force_true_aligned = force_target[:min_len]
-        damage_true = fatigue_damage(force_true_aligned)
-        damage_model = fatigue_damage(force_model_aligned)
-        damage_rel_err = relative_error(damage_model, damage_true)
-        if np.isfinite(damage_rel_err):
-            metrics["force_fatigue_damage_rel_error"] = damage_rel_err
-    else:
-        force_model_aligned = force_total_pred
-        force_true_aligned = force_target
-    half_idx_disp = len(y_true_norm) // 2
-    y_true_half = y_true_norm[half_idx_disp:]
-    y_model_half = rollout["y_norm"][half_idx_disp:]
-    half_idx_force = force_true_aligned.size // 2
-    force_true_half = force_true_aligned[half_idx_force:]
-    force_model_half = force_model_aligned[half_idx_force:]
-    if force_true_half.size > 0 and force_model_half.size > 0:
-        spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
-        if np.isfinite(spectral_rel_err):
-            metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
+        force_std = float(np.std(force_target[:min_len]))
+        if force_std <= 0.0:
+            force_std = 1.0
+        rel_rmse_force_total = rmse_force / force_std
+        metrics["rollout_nrmse_force_total"] = rel_rmse_force_total
+        if log_extra_metrics:
+            force_model_aligned = force_total_pred[:min_len]
+            force_true_aligned = force_target[:min_len]
+            damage_true = fatigue_damage(force_true_aligned)
+            damage_model = fatigue_damage(force_model_aligned)
+            damage_rel_err = relative_error(damage_model, damage_true)
+            if np.isfinite(damage_rel_err):
+                metrics["force_fatigue_damage_rel_error"] = damage_rel_err
+
+            half_idx_force = force_true_aligned.size // 2
+            force_true_half = force_true_aligned[half_idx_force:]
+            force_model_half = force_model_aligned[half_idx_force:]
+            if force_true_half.size > 0 and force_model_half.size > 0:
+                spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
+                if np.isfinite(spectral_rel_err):
+                    metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
     with torch.no_grad():
         z_true = torch.stack(
             (y_data_t, val_vel * m_eff), dim=1
@@ -366,15 +384,17 @@ def log_validation_epoch(
         force_data_pred = force_on_data[:min_len_data]
         force_data_true = force_target[:min_len_data]
         rmse_force_data = float(np.sqrt(np.mean((force_data_pred - force_data_true) ** 2)))
-        force_range_data = float(np.ptp(force_data_true))
-        if force_range_data <= 0.0:
-            force_range_data = 1.0
-        metrics["rel_rmse_force_on_data"] = rmse_force_data / force_range_data
-        damage_true_data = fatigue_damage(force_data_true)
-        damage_pred_data = fatigue_damage(force_data_pred)
-        damage_rel_data = relative_error(damage_pred_data, damage_true_data)
-        if np.isfinite(damage_rel_data):
-            metrics["force_fatigue_damage_rel_error_on_data"] = damage_rel_data
+        force_std_data = float(np.std(force_data_true))
+        if force_std_data <= 0.0:
+            force_std_data = 1.0
+        rel_rmse_force_on_data = rmse_force_data / force_std_data
+        metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+        if log_extra_metrics:
+            damage_true_data = fatigue_damage(force_data_true)
+            damage_pred_data = fatigue_damage(force_data_pred)
+            damage_rel_data = relative_error(damage_pred_data, damage_true_data)
+            if np.isfinite(damage_rel_data):
+                metrics["force_fatigue_damage_rel_error_on_data"] = damage_rel_data
     for name, value in metrics.items():
         writer.add_scalar(f"val/{name}", value, epoch)
     zoom_mask = create_zoom_mask(t)
@@ -1308,12 +1328,15 @@ def preprocess_timeseries(
     force: np.ndarray,
     hamiltonian: np.ndarray,
     data_cfg: DataConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    velocity: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, float]:
     """
     Apply optional steady-state trimming and uniform decimation to time-series arrays.
     """
     if t.size == 0:
-        return t, y, force, hamiltonian, float("nan")
+        return t, y, force, hamiltonian, velocity, float("nan")
+    if velocity is not None and np.asarray(velocity).shape[0] != t.shape[0]:
+        raise ValueError("Velocity array must have the same length as the time vector.")
     mask = np.ones_like(t, dtype=bool)
     if data_cfg.steadystate:
         mask &= t > float(data_cfg.steadystate_time_threshold)
@@ -1321,14 +1344,17 @@ def preprocess_timeseries(
     y_proc = y[mask]
     f_proc = force[mask]
     h_proc = hamiltonian[mask]
+    v_proc = None if velocity is None else np.asarray(velocity)[mask]
     step = max(1, int(data_cfg.reduction_factor if data_cfg.reduce_time else 1))
     if step > 1:
         t_proc = t_proc[::step]
         y_proc = y_proc[::step]
         f_proc = f_proc[::step]
         h_proc = h_proc[::step]
+        if v_proc is not None:
+            v_proc = v_proc[::step]
     dt_value = float(t_proc[1] - t_proc[0]) if t_proc.size > 1 else float("nan")
-    return t_proc, y_proc, f_proc, h_proc, dt_value
+    return t_proc, y_proc, f_proc, h_proc, v_proc, dt_value
 
 
 def compute_velocity_numpy(
@@ -1375,7 +1401,7 @@ def combine_datasets(datasets: list[TensorDataset | ConcatDataset]) -> TensorDat
 
 
 def build_dataloader_from_series(
-    series_data: list[tuple[np.ndarray, np.ndarray, float]],
+    series_data: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]],
     m_eff: float,
     batch_size: int,
     device: torch.device,
@@ -1386,11 +1412,11 @@ def build_dataloader_from_series(
     pin_memory: bool = False,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
-        raise ValueError("series_data must contain at least one (y, t, dt) tuple.")
+        raise ValueError("series_data must contain at least one (y, t, dt, vel, force) tuple.")
     sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     datasets: list[TensorDataset | ConcatDataset] = []
     min_length: int | None = None
-    for y_np, t_np, dt_value in series_data:
+    for y_np, t_np, dt_value, vel_np, force_np in series_data:
         y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
             y_np,
             t_np,
@@ -1398,9 +1424,16 @@ def build_dataloader_from_series(
             m_eff,
             device,
             smoothing_cfg=smoothing_cfg,
+            vel_np=vel_np,
         )
+        force_tensor: torch.Tensor | None = None
+        if force_np is not None:
+            force_arr = np.asarray(force_np, dtype=float)
+            if force_arr.shape[0] != y_tensor.shape[0]:
+                raise ValueError("Force array must have the same length as displacement.")
+            force_tensor = torch.from_numpy(np.ascontiguousarray(force_arr)).float()
         sequence_tensors.append((y_tensor, vel_tensor, t_tensor))
-        datasets.append(build_dataset(y_tensor, vel_tensor, m_eff, t_tensor))
+        datasets.append(build_dataset(y_tensor, vel_tensor, m_eff, t_tensor, force_tensor=force_tensor))
         seq_len = y_tensor.shape[0]
         min_length = seq_len if min_length is None else min(min_length, seq_len)
     dataset = combine_datasets(datasets)
@@ -1421,6 +1454,7 @@ def prepare_sequence_tensors(
     m_eff: float,
     device: torch.device,
     smoothing_cfg: SmoothingConfig | None = None,
+    vel_np: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     y_arr = np.asarray(y_np, dtype=float)
     t_arr = np.asarray(t_np, dtype=float)
@@ -1434,17 +1468,22 @@ def prepare_sequence_tensors(
         dt_value = 1.0
     if smoothing_cfg is None:
         smoothing_cfg = SmoothingConfig()
-    vel_np = compute_velocity_numpy(
-        y_arr,
-        dt_value,
-        use_savgol=smoothing_cfg.use_savgol_smoothing,
-        savgol_window=smoothing_cfg.window_length,
-        savgol_polyorder=smoothing_cfg.polyorder,
-    )
+    if vel_np is None:
+        vel_arr = compute_velocity_numpy(
+            y_arr,
+            dt_value,
+            use_savgol=smoothing_cfg.use_savgol_smoothing,
+            savgol_window=smoothing_cfg.window_length,
+            savgol_polyorder=smoothing_cfg.polyorder,
+        )
+    else:
+        vel_arr = np.asarray(vel_np, dtype=float)
+        if vel_arr.shape[0] != y_arr.shape[0]:
+            raise ValueError("Provided velocity array must have the same length as displacement.")
     # Keep dataset tensors on CPU and move per-batch in the training loop.
     # This avoids VRAM blow-ups and enables pinned-memory transfers on CUDA.
     y_tensor = torch.from_numpy(y_arr).float()
-    vel_tensor = torch.from_numpy(vel_np).float()
+    vel_tensor = torch.from_numpy(np.ascontiguousarray(vel_arr)).float()
     t_tensor = torch.from_numpy(t_arr).float()
     return y_tensor, vel_tensor, t_tensor
 
@@ -1458,8 +1497,25 @@ def load_training_series(
     m_eff: float,
     device: torch.device,
     smoothing_cfg: SmoothingConfig | None = None,
-) -> tuple[list[tuple[np.ndarray, np.ndarray, float]], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    train_series_raw: list[tuple[np.ndarray, np.ndarray, float]] = []
+    *,
+    velocity_source: str = "compute",
+    eval_velocity: np.ndarray | None = None,
+    velocity_key_candidates: Sequence[str] = ("e", "dy", "v"),
+    require_force: bool = False,
+    eval_force: np.ndarray | None = None,
+    force_key_candidates: Sequence[str] = ("c", "F_total", "force_total", "force"),
+) -> tuple[
+    list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    train_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]] = []
+    vel_source = str(velocity_source).strip().lower()
+    if vel_source not in {"compute", "file", "auto"}:
+        raise ValueError("velocity_source must be one of: compute, file, auto")
+    if vel_source == "file" and eval_velocity is None:
+        raise ValueError("velocity_source is 'file' but no eval_velocity was provided.")
+    if require_force and eval_force is None and not use_generated:
+        raise ValueError("require_force is True but no eval_force was provided for the eval series.")
     if use_generated:
         if not series_dir.exists():
             raise FileNotFoundError(f"Training series directory '{series_dir}' does not exist.")
@@ -1467,24 +1523,64 @@ def load_training_series(
         if not series_files:
             raise FileNotFoundError(f"No '.npz' files found in training series directory '{series_dir}'.")
         for series_file in series_files:
-            series_data = np.load(series_file)
-            series_t = np.asarray(series_data["a"])
-            series_y = np.asarray(series_data["b"])
+            with np.load(series_file) as series_data:
+                series_t = np.asarray(series_data["a"])
+                series_y = np.asarray(series_data["b"])
+                series_vel: np.ndarray | None = None
+                if vel_source in {"file", "auto"}:
+                    for key in velocity_key_candidates:
+                        if key in series_data:
+                            series_vel = np.asarray(series_data[key])
+                            break
+                    if series_vel is None and vel_source == "file":
+                        raise KeyError(
+                            f"Series '{series_file}' is missing velocity. Tried keys: {list(velocity_key_candidates)}"
+                        )
+                series_force: np.ndarray | None = None
+                if require_force:
+                    for key in force_key_candidates:
+                        if key in series_data:
+                            series_force = np.asarray(series_data[key])
+                            break
+                    if series_force is None:
+                        raise KeyError(
+                            f"Series '{series_file}' is missing force data. Tried keys: {list(force_key_candidates)}"
+                        )
             if series_t.ndim != 1 or series_y.ndim != 1:
                 raise ValueError(f"Series '{series_file}' must contain 1D 'a' and 'b' arrays.")
             if series_t.shape[0] != series_y.shape[0]:
                 raise ValueError(f"Series '{series_file}' has mismatched lengths.")
             if series_t.shape[0] < 2:
                 raise ValueError(f"Series '{series_file}' is too short to build training samples.")
+            if series_vel is not None and series_vel.shape[0] != series_t.shape[0]:
+                raise ValueError(f"Series '{series_file}' has mismatched velocity length.")
+            if series_force is not None and series_force.shape[0] != series_t.shape[0]:
+                raise ValueError(f"Series '{series_file}' has mismatched force length.")
             series_dt = float(series_t[1] - series_t[0])
             if not np.allclose(np.diff(series_t), series_dt, rtol=1e-6, atol=1e-9):
                 raise ValueError(f"Series '{series_file}' time vector is not uniform.")
             if not np.isclose(series_dt, dt_eval, rtol=1e-6, atol=1e-9):
-                series_y, series_t = resample_uniform_series(series_t, series_y, dt_eval)
+                series_y, series_t_resampled = resample_uniform_series(series_t, series_y, dt_eval)
+                if series_vel is not None:
+                    series_vel = np.interp(series_t_resampled, series_t, series_vel)
+                if series_force is not None:
+                    series_force = np.interp(series_t_resampled, series_t, series_force)
+                series_t = series_t_resampled
                 series_dt = dt_eval
-            train_series_raw.append((series_y, series_t, series_dt))
+            if series_force is None:
+                train_series_raw.append((series_y, series_t, series_dt, series_vel, None))
+            else:
+                train_series_raw.append((series_y, series_t, series_dt, series_vel, series_force))
     else:
-        train_series_raw.append((y_eval, t_eval, dt_eval))
+        train_series_raw.append(
+            (
+                y_eval,
+                t_eval,
+                dt_eval,
+                eval_velocity if vel_source in {"file", "auto"} else None,
+                np.asarray(eval_force) if require_force else None,
+            )
+        )
 
     eval_tensors = prepare_sequence_tensors(
         y_eval,
@@ -1493,18 +1589,37 @@ def load_training_series(
         m_eff,
         device,
         smoothing_cfg=smoothing_cfg,
+        vel_np=eval_velocity if vel_source in {"file", "auto"} else None,
     )
     return train_series_raw, eval_tensors
 
 
-def build_dataset(y_data_t: torch.Tensor, vel: torch.Tensor, m_eff: float, t_tensor: torch.Tensor) -> TensorDataset:
-    """Construct consecutive state/time pairs for training."""
+def build_dataset(
+    y_data_t: torch.Tensor,
+    vel: torch.Tensor,
+    m_eff: float,
+    t_tensor: torch.Tensor,
+    *,
+    force_tensor: torch.Tensor | None = None,
+) -> TensorDataset:
+    """Construct consecutive state/time pairs for training (optionally with force labels)."""
     z = torch.stack((y_data_t, vel * m_eff), dim=1)
+    if force_tensor is None:
+        return TensorDataset(
+            z[:-1],
+            t_tensor[:-1].unsqueeze(1),
+            z[1:],
+            t_tensor[1:].unsqueeze(1),
+        )
+    if force_tensor.shape[0] != z.shape[0]:
+        raise ValueError("force_tensor must match the sequence length.")
     return TensorDataset(
         z[:-1],
         t_tensor[:-1].unsqueeze(1),
         z[1:],
         t_tensor[1:].unsqueeze(1),
+        force_tensor[:-1].unsqueeze(1),
+        force_tensor[1:].unsqueeze(1),
     )
 
 def build_rollout_dataset(

@@ -70,6 +70,10 @@ optim:
 
 loss:
   force_reg: 0.01
+  # Optional supervised loss on measured force (requires force to be present in the .npz files).
+  # Uses midpoint state z_mid = 0.5*(z_i+z_{i+1}) and midpoint force f_mid = 0.5*(f_i+f_{i+1}).
+  use_force_data_loss: false
+  force_data_weight: 1.0
   use_gradnorm: true
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.2
@@ -89,16 +93,20 @@ compile:
   compile_mode: default
 
 monitoring:
-  rollout_every_epoch: 50
+  rollout_every_epochs: 50
+  validate_every_epochs: 10
+  rollout_max_trajectories: 1
   log_every_epochs: 1
   print_every_epochs: 1
   log_component_grad_norms: false
 
-hnn: {}
+hnn:
+  # How to obtain velocity used to build the state (y, p=m*v) for training/validation.
+  # - compute: compute v from y using finite-diff / optional Savitzky-Golay smoothing
+  # - file: read v from the dataset (.npz must contain e/dy/v)
+  # - auto: use file v if present, otherwise compute
+  velocity_source: compute
 pinn: {}
 
 logging:
   run_dir_root: HNNruns
-
-#For running all config files
-#ls HNNrunconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}

@@ -1,0 +1,118 @@
+method: vpinn
+
+data:
+  # Use the same training-series setup as `HNNrunconfigs/pirate_smoke.yml`.
+  file: data.npz
+  use_generated_train_series: true
+  train_series_dir: Data_Gen/generated_series_dy
+  reduce_time: true
+  reduction_factor: 100
+
+model:
+  rho: 1000.0
+  D: 0.1
+  structural_mass: 16.79
+  Ca: 1.0
+  k: 1218.0
+  damping_c: 1e-4
+
+smoothing:
+  # Only used when vpinn.velocity_source=compute
+  use_savgol_smoothing: true
+  window_length: 7
+  polyorder: 3
+
+architecture:
+  # Used when `vpinn.use_architecture_config: true`
+  force_net_type: residual
+  residual_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  mlp_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  pirate_force_kwargs:
+    depth: 1
+    fourier_features: 64
+    sigma: 0.5
+    use_rwf: false
+    activation: gelu
+
+training:
+  batch_size: 256
+  max_grad_norm: 10000.0
+  epochs: 50
+
+optim:
+  lr: 0.001
+  optimizer: adam
+  weight_decay: 0.0
+  use_lr_scheduler: false
+  scheduler:
+    max_lr: 0.001
+    decay_steps: 1000
+    warmup_steps: 0
+    min_lr: 0.0001
+    scheduler_type: cosine
+
+runtime:
+  device: auto
+  num_workers: 0
+
+precision:
+  use_tf32: false
+  use_amp: false
+  amp_dtype: bf16
+
+compile:
+  use_compile: false
+  compile_mode: default
+
+logging:
+  run_dir_root: VPINNruns
+
+monitoring:
+  # Logging / validation cadence
+  log_every_epochs: 1
+  print_every_epochs: 1
+  validate_every_epochs: 10
+
+  # Rollout validation plots (dynamics check)
+  rollout_every_epochs: 10
+  rollout_max_trajectories: 1
+
+vpinn:
+  # Loss toggles
+  use_force_loss: true
+  use_weak_loss: true
+  use_gradnorm: true
+  gradnorm_alpha: 0.9
+  gradnorm_eps: 1.0e-8
+  gradnorm_min_weight: 0.1
+  gradnorm_max_weight: 10.0
+  gradnorm_update_every_steps: 10
+  window_M: 50
+  stride: 5
+  val_fraction: 0.0
+  split_seed: 0
+  wf: 1.0
+  ww: 1.0
+  include_quadratic_test: false
+
+  # Network architecture
+  # If true, uses the shared `architecture:` block (force_net_type + *_kwargs) like HNN.
+  # If false, uses vpinn.hidden_dim/depth/activation below.
+  use_architecture_config: true
+
+  # Network
+  hidden_dim: 128
+  depth: 2
+  activation: tanh
+
+  # Data interpretation
+  # Generated series contain x and f, but not dy, so we compute v from x.
+  velocity_source: file
+  use_data_file_for_validation: true
+  validation_only_data_file: true

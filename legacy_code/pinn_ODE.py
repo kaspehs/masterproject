@@ -11,7 +11,7 @@ import torch.optim as optim
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from legacy_code.helper_functions import *
-from ODE_pinn_helper import *
+from legacy_code.ODE_pinn_helper import *
 from architectures import BasicMLP, SirenMLP
 from legacy_code.ODE import build_ode_setup, print_ode_summary
 

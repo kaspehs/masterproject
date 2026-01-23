@@ -42,6 +42,8 @@ def _train_one_epoch(
     non_blocking: bool,
     max_grad_norm: float,
     force_reg: float,
+    use_force_data_loss: bool,
+    force_data_weight: float,
     gradnorm_balancer: Optional[GradNormBalancer],
     amp_enabled: bool,
     amp_dtype: torch.dtype,
@@ -52,19 +54,33 @@ def _train_one_epoch(
     loss_sum = torch.zeros((), device=device)
     res_loss_sum = torch.zeros((), device=device)
     force_loss_sum = torch.zeros((), device=device)
+    force_data_loss_sum = torch.zeros((), device=device)
     grad_norm_sum = torch.zeros((), device=device)
     avg_force_sum = torch.zeros((), device=device)
     res_grad_component_sum = torch.zeros((), device=device)
     force_grad_component_sum = torch.zeros((), device=device)
     gradnorm_res_weight_sum = torch.zeros((), device=device)
     gradnorm_force_weight_sum = torch.zeros((), device=device)
+    gradnorm_data_weight_sum = torch.zeros((), device=device) if use_force_data_loss else None
     gradnorm_weight_count = 0
 
-    for z_i, t_i, z_next, t_next in train_loader:
+    for batch in train_loader:
+        if len(batch) == 4:
+            z_i, t_i, z_next, t_next = batch
+            f_i = None
+            f_next = None
+        elif len(batch) == 6:
+            z_i, t_i, z_next, t_next, f_i, f_next = batch
+        else:
+            raise ValueError("Unexpected batch format from dataloader.")
         z_i = z_i.to(device, non_blocking=non_blocking)
         t_i = t_i.to(device, non_blocking=non_blocking)
         z_next = z_next.to(device, non_blocking=non_blocking)
         t_next = t_next.to(device, non_blocking=non_blocking)
+        if f_i is not None:
+            f_i = f_i.to(device, non_blocking=non_blocking)
+        if f_next is not None:
+            f_next = f_next.to(device, non_blocking=non_blocking)
 
         opt.zero_grad()
 
@@ -72,24 +88,44 @@ def _train_one_epoch(
             res_loss = model.res_loss(z_i, t_i, z_next, t_next)
             avg_force = model.avg_force(z_i, t_i, z_next, t_next)
             base_force_loss = avg_force
+            if use_force_data_loss:
+                if f_i is None or f_next is None:
+                    raise ValueError(
+                        "use_force_data_loss is True but the dataloader did not provide force labels."
+                    )
+                z_mid = 0.5 * (z_i + z_next)
+                f_mid = 0.5 * (f_i + f_next)
+                f_pred = model.u_theta(z_mid)
+                data_force_loss = torch.mean((f_pred - f_mid) ** 2)
+            else:
+                data_force_loss = res_loss.new_tensor(0.0)
 
             if gradnorm_balancer is not None:
                 weights = gradnorm_balancer.update(
-                    {"residual": res_loss.float(), "force": base_force_loss.float()}
+                    {
+                        "residual": res_loss.float(),
+                        "force": base_force_loss.float(),
+                        "data": data_force_loss.float() if use_force_data_loss else res_loss.float(),
+                    }
                 )
                 res_weight = weights["residual"]
                 force_weight = weights["force"]
+                data_weight = weights.get("data", res_loss.new_tensor(1.0))
                 gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
                 gradnorm_force_weight_sum = gradnorm_force_weight_sum + force_weight
+                if gradnorm_data_weight_sum is not None:
+                    gradnorm_data_weight_sum = gradnorm_data_weight_sum + data_weight
                 gradnorm_weight_count += 1
             else:
                 res_weight = res_loss.new_tensor(1.0)
                 force_weight = res_loss.new_tensor(1.0)
+                data_weight = res_loss.new_tensor(1.0)
 
             weighted_res = res_weight * res_loss
             force_loss = float(force_reg) * base_force_loss
             weighted_force = force_weight * force_loss
-            loss = (weighted_res + weighted_force).float()
+            weighted_data = data_weight * (float(force_data_weight) * data_force_loss)
+            loss = (weighted_res + weighted_force + weighted_data).float()
 
         if log_component_grad_norms and scaler.is_enabled():
             raise ValueError(
@@ -129,6 +165,7 @@ def _train_one_epoch(
         loss_sum = loss_sum + loss.detach()
         res_loss_sum = res_loss_sum + res_loss.detach().float()
         force_loss_sum = force_loss_sum + force_loss.detach().float()
+        force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
         avg_force_sum = avg_force_sum + avg_force.detach().float()
 
     denom = float(max(batch_count, 1))
@@ -136,6 +173,7 @@ def _train_one_epoch(
         "mean_loss": float((loss_sum / denom).detach().cpu()),
         "mean_res_loss": float((res_loss_sum / denom).detach().cpu()),
         "mean_force_loss": float((force_loss_sum / denom).detach().cpu()),
+        "mean_force_data_loss": float((force_data_loss_sum / denom).detach().cpu()),
         "mean_grad_norm": float((grad_norm_sum / denom).detach().cpu()),
         "mean_force": float((avg_force_sum / denom).detach().cpu()),
         "mean_res_grad_component": float((res_grad_component_sum / denom).detach().cpu()),
@@ -148,6 +186,10 @@ def _train_one_epoch(
         metrics["mean_gradnorm_weight_force"] = float(
             (gradnorm_force_weight_sum / float(gradnorm_weight_count)).detach().cpu()
         )
+        if gradnorm_data_weight_sum is not None:
+            metrics["mean_gradnorm_weight_data"] = float(
+                (gradnorm_data_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            )
     return metrics
 
 
@@ -155,7 +197,7 @@ def _validate_if_needed(
     *,
     writer: SummaryWriter,
     epoch: int,
-    rollout_every_epoch: int,
+    rollout_every_epochs: int,
     model: PHVIV,
     y_data_t: torch.Tensor,
     val_vel: torch.Tensor,
@@ -170,10 +212,11 @@ def _validate_if_needed(
     device: torch.device,
     middle_time_plot,
     hamiltonian_data,
+    log_extra_validation_metrics: bool,
 ) -> None:
-    if rollout_every_epoch <= 0:
+    if rollout_every_epochs <= 0:
         return
-    if (epoch + 1) % int(rollout_every_epoch) != 0:
+    if (epoch + 1) % int(rollout_every_epochs) != 0:
         return
     log_validation_epoch(
         writer,
@@ -192,6 +235,7 @@ def _validate_if_needed(
         device,
         middle_time_plot,
         hamiltonian_data,
+        log_extra_metrics=log_extra_validation_metrics,
     )
 
 
@@ -203,21 +247,29 @@ def train(config: Config, config_name: str) -> None:
     y_data = data["b"]
     F_data = data["c"]
     H_data = data["d"]
+    vel_data = None
+    for key in ("e", "dy", "v"):
+        if key in data:
+            vel_data = data[key]
+            break
 
     middle_time_plot = data_cfg.middle_time_plot
     use_generated_train_series = data_cfg.use_generated_train_series
     train_series_dir = Path(data_cfg.train_series_dir)
 
-    t, y_data, F_data, hamiltonian_data, dt = preprocess_timeseries(
+    t, y_data, F_data, hamiltonian_data, vel_data, dt = preprocess_timeseries(
         t,
         y_data,
         F_data,
         H_data,
         data_cfg,
+        velocity=vel_data,
     )
 
     model_cfg = config.model
     smoothing_cfg = config.smoothing
+    hnn_cfg = dict(config.hnn or {})
+    velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
 
     training_cfg = config.training
     optim_cfg = config.optim
@@ -236,11 +288,14 @@ def train(config: Config, config_name: str) -> None:
     scheduler_cfg = optim_cfg.scheduler
 
     force_reg = float(loss_cfg.force_reg)
+    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
+    force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
 
-    rollout_every_epoch = int(monitoring_cfg.rollout_every_epoch)
+    rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
     log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
+    log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
     print(f"Using device: {device}")
@@ -267,6 +322,10 @@ def train(config: Config, config_name: str) -> None:
         m_eff,
         device,
         smoothing_cfg=smoothing_cfg,
+        velocity_source=velocity_source,
+        eval_velocity=vel_data,
+        require_force=use_force_data_loss,
+        eval_force=F_data,
     )
     eval_y_tensor, eval_vel_tensor, eval_t_tensor = eval_tensors
 
@@ -301,9 +360,12 @@ def train(config: Config, config_name: str) -> None:
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(loss_cfg.use_gradnorm):
+        names = ["residual", "force"]
+        if use_force_data_loss:
+            names.append("data")
         gradnorm_balancer = GradNormBalancer(
             model,
-            ["residual", "force"],
+            names,
             alpha=float(loss_cfg.gradnorm_alpha),
             eps=float(loss_cfg.gradnorm_eps),
             min_weight=float(loss_cfg.gradnorm_min_weight),
@@ -327,6 +389,8 @@ def train(config: Config, config_name: str) -> None:
             non_blocking=non_blocking,
             max_grad_norm=max_grad_norm,
             force_reg=force_reg,
+            use_force_data_loss=use_force_data_loss,
+            force_data_weight=force_data_weight,
             gradnorm_balancer=gradnorm_balancer,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
@@ -337,6 +401,7 @@ def train(config: Config, config_name: str) -> None:
         mean_loss = epoch_metrics["mean_loss"]
         mean_res_loss = epoch_metrics["mean_res_loss"]
         mean_force_loss = epoch_metrics["mean_force_loss"]
+        mean_force_data_loss = epoch_metrics["mean_force_data_loss"]
         mean_grad_norm = epoch_metrics["mean_grad_norm"]
         mean_force = epoch_metrics["mean_force"]
         mean_res_grad_component = epoch_metrics["mean_res_grad_component"]
@@ -352,10 +417,11 @@ def train(config: Config, config_name: str) -> None:
         )
 
         train_metrics: dict[str, float] = {
-            "loss": mean_loss,
-            "residual_loss": mean_res_loss,
-            "force_loss": mean_force_loss,
-            "learning_rate": current_lr,
+            "loss_total": mean_loss,
+            "loss_physics": mean_res_loss,
+            "loss_reg": mean_force_loss,
+            "loss_data": mean_force_data_loss,
+            "lr": current_lr,
             "damping_ratio": damping_ratio_value,
             "grad_norm": mean_grad_norm,
             "drag_coefficient": drag_coeff,
@@ -365,21 +431,29 @@ def train(config: Config, config_name: str) -> None:
             train_metrics["grad_norm_residual_comp"] = mean_res_grad_component
             train_metrics["grad_norm_force_comp"] = mean_force_grad_component
         if "mean_gradnorm_weight_residual" in epoch_metrics:
-            train_metrics["gradnorm_weight_residual"] = float(epoch_metrics["mean_gradnorm_weight_residual"])
+            train_metrics["gradnorm_weight_physics"] = float(epoch_metrics["mean_gradnorm_weight_residual"])
         if "mean_gradnorm_weight_force" in epoch_metrics:
-            train_metrics["gradnorm_weight_force"] = float(epoch_metrics["mean_gradnorm_weight_force"])
+            train_metrics["gradnorm_weight_reg"] = float(epoch_metrics["mean_gradnorm_weight_force"])
+        if "mean_gradnorm_weight_data" in epoch_metrics:
+            train_metrics["gradnorm_weight_data"] = float(epoch_metrics["mean_gradnorm_weight_data"])
 
         log_this_epoch = (epoch % log_every_epochs) == 0 or epoch == (epochs - 1)
         if log_this_epoch:
             log_training_metrics(writer, epoch, train_metrics)
         print_this_epoch = (epoch % print_every_epochs) == 0 or epoch == (epochs - 1)
         if print_this_epoch:
-            print(f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, force={mean_force_loss:.4e}")
+            if use_force_data_loss:
+                print(
+                    f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
+                    f"force={mean_force_loss:.4e}, data={mean_force_data_loss:.4e}"
+                )
+            else:
+                print(f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, force={mean_force_loss:.4e}")
 
         _validate_if_needed(
             writer=writer,
             epoch=epoch,
-            rollout_every_epoch=rollout_every_epoch,
+            rollout_every_epochs=rollout_every_epochs,
             model=model,
             y_data_t=y_data_t,
             val_vel=val_vel,
@@ -394,6 +468,7 @@ def train(config: Config, config_name: str) -> None:
             device=device,
             middle_time_plot=middle_time_plot,
             hamiltonian_data=hamiltonian_data,
+            log_extra_validation_metrics=log_extra_validation_metrics,
         )
 
     models_dir = Path("models")

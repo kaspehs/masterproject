@@ -1,0 +1,107 @@
+method: hnn
+
+data:
+  file: data.npz
+  steadystate: false
+  steadystate_time_threshold: 10.0
+  reduce_time: true
+  reduction_factor: 100
+  middle_time_plot: [15, 17]
+  use_generated_train_series: true
+  train_series_dir: Data_Gen/generated_series
+
+model:
+  rho: 1000.0
+  D: 0.1
+  structural_mass: 16.79
+  Ca: 1.0
+  k: 1218.0
+  U: 0.65
+  damping_c: 1e-4
+  max_damping_ratio: 0.2
+  include_physical_drag: false
+  learn_hamiltonian: false
+  discover_damping: false
+  use_pirate_force: false
+  pirate_force_kwargs: {}
+  use_fourier_features: false
+  fourier_features: 64
+  fourier_sigma: 1.0
+  use_feature_engineering: false
+
+smoothing:
+  use_savgol_smoothing: true
+  window_length: 7
+  polyorder: 3
+
+architecture:
+  force_net_type: pirate
+  residual_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  mlp_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  pirate_force_kwargs:
+    depth: 1
+    fourier_features: 64
+    sigma: 0.5
+    use_rwf: false
+    activation: gelu
+
+training:
+  batch_size: 128
+  max_grad_norm: 10000.0
+  epochs: 5000
+
+optim:
+  lr: 0.0003
+  optimizer: adam
+  weight_decay: 0.0
+  use_lr_scheduler: true
+  scheduler:
+    max_lr: 0.0003
+    decay_rate: 0.99
+    warmup_steps: 250
+    decay_steps: 4750
+    min_lr: 0.00003
+    scheduler_type: cosine
+
+loss:
+  force_reg: 0.1
+  use_gradnorm: false
+  gradnorm_alpha: 0.9
+  gradnorm_min_weight: 0.2
+  gradnorm_max_weight: 5.0
+
+runtime:
+  device: cuda
+  num_workers: 0
+
+precision:
+  use_tf32: true
+  use_amp: true
+  amp_dtype: bf16
+
+compile:
+  use_compile: false
+  compile_mode: default
+
+monitoring:
+  rollout_every_epochs: 50
+  validate_every_epochs: 10
+  rollout_max_trajectories: 1
+  log_every_epochs: 10
+  print_every_epochs: 10
+  log_component_grad_norms: false
+
+logging:
+  run_dir_root: HNNruns
+
+hnn: {}
+pinn: {}
+
+#For running all config files
+#ls HNNconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}
