@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import os
 from pathlib import Path
 import sys
 import json
-from typing import Dict, Tuple
+import tempfile
+from typing import Dict, Optional, Tuple, cast
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+if "MPLCONFIGDIR" not in os.environ:
+    mpl_dir = Path(tempfile.gettempdir()) / f"mplconfig-{os.getpid()}"
+    mpl_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -20,10 +29,12 @@ from HNN_helper import PHVIV, parse_config, compute_velocity_numpy, rollout_mode
 
 
 MODEL_PATH = Path("models/pirate_smoke_0122-125008.pt")
-DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOGGED_RUNS_DIR = Path("Data_Gen/groundtruth_runs_100hz")
 LOGGER_HZ = 100.0
-STEADY_STATE_WINDOW_S: float | None = None  # use full series; set e.g. 2.0 for last 2s
+STEADY_STATE_WINDOW_S: float | None = 10  # use full series; set e.g. 2.0 for last 2s
+EVAL_BATCH_SIZE = 256
+PRINT_PER_RUN = True
 
 # Overlay training cases (A_factor, fhat) on the maps.
 PLOT_TRAINING_POINTS = True
@@ -116,16 +127,18 @@ def _maybe_slice_steady_state(
     force: np.ndarray,
     *,
     window_s: float | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    dy: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     if window_s is None:
-        return time, disp, force
+        return time, disp, force, dy
     if time.size == 0:
-        return time, disp, force
+        return time, disp, force, dy
     t_end = float(time[-1])
     mask = time >= (t_end - float(window_s))
     if not np.any(mask):
-        return time, disp, force
-    return time[mask], disp[mask], force[mask]
+        return time, disp, force, dy
+    dy_sliced = None if dy is None else cast(np.ndarray, dy)[mask]
+    return time[mask], disp[mask], force[mask], dy_sliced
 
 
 def evaluate_run(
@@ -137,6 +150,10 @@ def evaluate_run(
     force_true: np.ndarray,
 ) -> tuple[float, float]:
     dt = float(time[1] - time[0]) if time.size > 1 else 1.0
+    # NOTE: rollout_model only uses the initial velocity value (vel[0]) to
+    # construct the initial momentum. Computing a full velocity time-series is
+    # therefore wasted work during large sweeps. The main() function uses the
+    # faster batched evaluator below; keep this for debugging.
     vel_true = compute_velocity_numpy(disp_true, dt)
     y_tensor = torch.from_numpy(disp_true).float().to(DEVICE)
     vel_tensor = torch.from_numpy(vel_true).float().to(DEVICE)
@@ -165,6 +182,92 @@ def evaluate_run(
     if force_std <= 1e-9:
         force_std = 1.0
     return disp_rmse / disp_std, force_rmse / force_std
+
+
+def _eval_rollout_nrmse_batch(
+    *,
+    model: PHVIV,
+    derived: dict[str, float],
+    dt: float,
+    disp_true: torch.Tensor,  # (B, T)
+    force_true: torch.Tensor,  # (B, T)
+    v0: torch.Tensor,  # (B,)
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Fast batched rollout evaluation.
+
+    Matches the semantics used for rollout evaluation in this script:
+    - Initial state uses (y0, p0=m_eff*v0)
+    - Compare y_pred[k] and F_pred[k]=u_theta(state[k]) to ground truth at sample k
+    - Advance with RK4 using model.step_rk4
+    """
+    if disp_true.ndim != 2 or force_true.ndim != 2:
+        raise ValueError("disp_true and force_true must have shape (B, T)")
+    if disp_true.shape != force_true.shape:
+        raise ValueError("disp_true and force_true must have the same shape")
+    if v0.ndim != 1 or v0.shape[0] != disp_true.shape[0]:
+        raise ValueError("v0 must have shape (B,)")
+
+    B, T = disp_true.shape
+    m_eff = float(derived["m_eff"])
+
+    y0 = disp_true[:, 0]
+    state = torch.stack((y0, v0 * m_eff), dim=1)  # (B, 2)
+
+    sum_sq_y = torch.zeros((B,), device=disp_true.device, dtype=torch.float32)
+    sum_sq_f = torch.zeros((B,), device=disp_true.device, dtype=torch.float32)
+
+    disp_std = torch.std(disp_true.float(), dim=1)
+    force_std = torch.std(force_true.float(), dim=1)
+    disp_std = torch.where(disp_std > 1e-9, disp_std, torch.ones_like(disp_std))
+    force_std = torch.where(force_std > 1e-9, force_std, torch.ones_like(force_std))
+
+    t_dummy = torch.zeros((B,), device=disp_true.device, dtype=disp_true.dtype)
+    dt_t = float(dt)
+
+    with torch.inference_mode():
+        for k in range(int(T)):
+            y_pred = state[:, 0]
+            f_pred = model.u_theta(state).squeeze(-1)
+            dy = (y_pred - disp_true[:, k]).float()
+            df = (f_pred - force_true[:, k]).float()
+            sum_sq_y = sum_sq_y + dy * dy
+            sum_sq_f = sum_sq_f + df * df
+            state = model.step_rk4(state, t_dummy, dt_t)
+
+    rmse_y = torch.sqrt(sum_sq_y / float(max(T, 1)))
+    rmse_f = torch.sqrt(sum_sq_f / float(max(T, 1)))
+    nrmse_y = (rmse_y / disp_std).detach().cpu().numpy()
+    nrmse_f = (rmse_f / force_std).detach().cpu().numpy()
+    return nrmse_y, nrmse_f
+
+
+def _load_run(
+    run_path: Path,
+    *,
+    prefer_dy: bool = True,
+) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    with np.load(run_path) as run:
+        amp = float(np.asarray(run["A_factor"])) if "A_factor" in run else float("nan")
+        fhat = float(np.asarray(run["fhat"])) if "fhat" in run else float("nan")
+        time = np.asarray(run["time"])
+        disp = np.asarray(run["y"])
+        force = np.asarray(run["F_total"])
+        dy: Optional[np.ndarray] = None
+        if prefer_dy and "dy" in run:
+            dy = np.asarray(run["dy"])
+    return amp, fhat, time, disp, force, dy
+
+
+def _print_nrmse_summary(name: str, errors: np.ndarray) -> None:
+    finite = errors[np.isfinite(errors)]
+    if finite.size == 0:
+        print(f"{name}: NRMSE summary: no finite values")
+        return
+    print(
+        f"{name}: NRMSE summary over {finite.size} grid points: "
+        f"mean={float(np.mean(finite)):.4e}, min={float(np.min(finite)):.4e}, max={float(np.max(finite)):.4e}"
+    )
 
 
 def plot_error_field(
@@ -199,7 +302,7 @@ def plot_error_field(
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_title(f"Error map ({name})")
-    fig.colorbar(mesh, ax=ax, label="RMSE / std(ground truth)")
+    fig.colorbar(mesh, ax=ax, label="NRMSE (RMSE / std(ground truth))")
     fig.tight_layout()
     out = Path("figs") / f"phase_error_{name}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -226,6 +329,10 @@ def _auto_limits(errors: np.ndarray, *, q_low: float, q_high: float) -> tuple[fl
 
 
 def main():
+    if DEVICE.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     run_files = _iter_logged_runs(LOGGED_RUNS_DIR, logger_hz=LOGGER_HZ)
     model_dt = _infer_dt_from_run(run_files[0])
     model, derived, _ = load_model(MODEL_PATH, dt=model_dt)
@@ -239,30 +346,70 @@ def main():
     amps_set: set[float] = set()
     fhats_set: set[float] = set()
 
+    # Group runs by (length, dt) so we can evaluate rollouts in batches.
+    buckets: dict[
+        tuple[int, float],
+        list[tuple[float, float, np.ndarray, np.ndarray, np.ndarray, Optional[float]]],
+    ] = {}
     for run_path in run_files:
-        with np.load(run_path) as run:
-            amp = float(np.asarray(run["A_factor"])) if "A_factor" in run else float("nan")
-            fhat = float(np.asarray(run["fhat"])) if "fhat" in run else float("nan")
-            time = np.asarray(run["time"])
-            disp = np.asarray(run["y"])
-            force = np.asarray(run["F_total"])
-
+        amp, fhat, time, disp, force, dy = _load_run(run_path, prefer_dy=True)
         if not np.isfinite(amp) or not np.isfinite(fhat):
             print(f"[warn] Skipping {run_path.name}: missing A_factor/fhat metadata.")
             continue
+        time, disp, force, dy = _maybe_slice_steady_state(
+            time, disp, force, window_s=STEADY_STATE_WINDOW_S, dy=dy
+        )
+        if time.size < 2:
+            print(f"[warn] Skipping {run_path.name}: too few samples.")
+            continue
+        dt = float(time[1] - time[0])
+        dt_key = float(np.round(dt, 12))
+        dy0 = float(dy[0]) if dy is not None and dy.size else None
+        buckets.setdefault((int(time.size), dt_key), []).append((amp, fhat, time, disp, force, dy0))
 
-        time, disp, force = _maybe_slice_steady_state(time, disp, force, window_s=STEADY_STATE_WINDOW_S)
-        disp_rmse, force_rmse = evaluate_run(model, derived, time=time, disp_true=disp, force_true=force)
-        amps_set.add(amp)
-        fhats_set.add(fhat)
-        key = (amp, fhat)
-        prev = accum.get(key)
-        if prev is None:
-            accum[key] = (disp_rmse, force_rmse, 1)
-        else:
-            d_sum, f_sum, n = prev
-            accum[key] = (d_sum + disp_rmse, f_sum + force_rmse, n + 1)
-        print(f"A={amp:.3f}, fhat={fhat:.5f} -> disp={disp_rmse:.3e}, force={force_rmse:.3e}")
+    for (T, dt_key), runs in sorted(buckets.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        for start in range(0, len(runs), int(EVAL_BATCH_SIZE)):
+            batch = runs[start : start + int(EVAL_BATCH_SIZE)]
+            amps_np = np.asarray([b[0] for b in batch], dtype=float)
+            fhats_np = np.asarray([b[1] for b in batch], dtype=float)
+            disp_batch = np.stack([b[3] for b in batch], axis=0).astype(np.float32, copy=False)
+            force_batch = np.stack([b[4] for b in batch], axis=0).astype(np.float32, copy=False)
+
+            v0_list: list[float] = []
+            for _amp, _fhat, t_np, y_np, _f_np, dy0 in batch:
+                if dy0 is not None:
+                    v0_list.append(float(dy0))
+                elif y_np.size >= 2:
+                    v0_list.append(float((y_np[1] - y_np[0]) / float(t_np[1] - t_np[0])))
+                else:
+                    v0_list.append(0.0)
+            v0_np = np.asarray(v0_list, dtype=np.float32)
+
+            disp_true_t = torch.from_numpy(disp_batch).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
+            force_true_t = torch.from_numpy(force_batch).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
+            v0_t = torch.from_numpy(v0_np).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
+
+            disp_nrmse, force_nrmse = _eval_rollout_nrmse_batch(
+                model=model,
+                derived=derived,
+                dt=float(dt_key),
+                disp_true=disp_true_t,
+                force_true=force_true_t,
+                v0=v0_t,
+            )
+
+            for amp, fhat, dn, fn in zip(amps_np, fhats_np, disp_nrmse, force_nrmse):
+                amps_set.add(float(amp))
+                fhats_set.add(float(fhat))
+                key = (float(amp), float(fhat))
+                prev = accum.get(key)
+                if prev is None:
+                    accum[key] = (float(dn), float(fn), 1)
+                else:
+                    d_sum, f_sum, n = prev
+                    accum[key] = (d_sum + float(dn), f_sum + float(fn), n + 1)
+                if PRINT_PER_RUN:
+                    print(f"A={amp:.3f}, fhat={fhat:.5f} -> disp_nrmse={dn:.3e}, force_nrmse={fn:.3e}")
 
     amps = np.array(sorted(amps_set), dtype=float)
     fhats = np.array(sorted(fhats_set), dtype=float)
@@ -277,6 +424,9 @@ def main():
             if n > 0:
                 disp_errors[i, j] = d_sum / n
                 force_errors[i, j] = f_sum / n
+
+    _print_nrmse_summary("displacement", disp_errors)
+    _print_nrmse_summary("force_total", force_errors)
 
     if AUTO_COLOR_LIMITS:
         disp_lims = _auto_limits(disp_errors, q_low=AUTO_LIMIT_Q_LOW, q_high=AUTO_LIMIT_Q_HIGH)
