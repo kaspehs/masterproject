@@ -25,7 +25,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from HNN_helper import PHVIV, Residual, parse_config, rollout_model
+from HNN_helper import PHVIV, Residual, compute_velocity_numpy, parse_config, rollout_model
 from architectures import ODEPirateNet
 
 

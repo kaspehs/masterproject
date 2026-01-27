@@ -8,7 +8,7 @@
 /Data_Gen/legacy_datasets
 /Data_Gen/generated_series
 /Data_Gen/generated_series_dy
-/Data_Gen/groundtruth_runs_100HZ
+/Data_Gen/groundtruth_runs_100hz
 __pycache__/
 *.pyc
 *.png
