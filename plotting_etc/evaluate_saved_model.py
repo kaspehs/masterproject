@@ -102,7 +102,17 @@ def main():
     sample_time = np.arange(0, SIM_T, model_dt)
     dt = float(sample_time[1] - sample_time[0]) if sample_time.size > 1 else SIM_DT
     model, derived = build_model(cfg, dt=dt, device=device)
-    model.load_state_dict(ckpt["model_state"])
+    state = ckpt["model_state"]
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+    incompatible = model.load_state_dict(state, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"[warn] {MODEL_PATH.name}: missing_keys={incompatible.missing_keys}, "
+            f"unexpected_keys={incompatible.unexpected_keys}"
+        )
     model.eval()
 
     smoothing_cfg = cfg.smoothing

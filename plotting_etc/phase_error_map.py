@@ -25,16 +25,46 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from HNN_helper import PHVIV, parse_config, compute_velocity_numpy, rollout_model
+from HNN_helper import PHVIV, Residual, parse_config, rollout_model
+from architectures import ODEPirateNet
 
 
-MODEL_PATH = Path("models/pirate_smoke_0122-125008.pt")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOGGED_RUNS_DIR = Path("Data_Gen/groundtruth_runs_100hz")
-LOGGER_HZ = 100.0
-STEADY_STATE_WINDOW_S: float | None = 10  # use full series; set e.g. 2.0 for last 2s
-EVAL_BATCH_SIZE = 256
-PRINT_PER_RUN = True
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return float(default)
+    return float(value)
+
+
+def _env_optional_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.lower() in {"none", "null"}:
+        return None
+    return float(value)
+
+
+def _resolve_under_root(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return (ROOT_DIR / path).resolve()
+
+
+MODEL_PATH = _resolve_under_root(Path(os.environ.get("PHASE_MODEL_PATH", "models/pirate_smoke_0122-125008.pt")))
+LOGGED_RUNS_DIR = _resolve_under_root(Path(os.environ.get("PHASE_RUNS_DIR", "Data_Gen/groundtruth_runs_100hz")))
+LOGGER_HZ = _env_float("PHASE_LOGGER_HZ", 100.0)
+STEADY_STATE_WINDOW_S: float | None = _env_optional_float("PHASE_STEADY_STATE_WINDOW_S")
+EVAL_BATCH_SIZE = int(os.environ.get("PHASE_EVAL_BATCH_SIZE", "256"))
+PRINT_PER_RUN = os.environ.get("PHASE_PRINT_PER_RUN", "").strip().lower() in {"1", "true", "yes"}
+
+DEVICE = torch.device(
+    os.environ.get("PHASE_DEVICE", "").strip()
+    or ("cuda" if torch.cuda.is_available() else "cpu")
+)
 
 # Overlay training cases (A_factor, fhat) on the maps.
 PLOT_TRAINING_POINTS = True
@@ -69,21 +99,161 @@ def _infer_dt_from_run(run_path: Path) -> float:
         raise ValueError(f"Run {run_path} has too few samples to infer dt.")
     return float(time[1] - time[0])
 
+def _normalize_state_dict_keys(state: dict) -> dict:
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+    return state
 
-def load_model(model_path: Path, *, dt: float) -> tuple[PHVIV, dict[str, float], float]:
+
+def _load_checkpoint(model_path: Path) -> tuple[dict, object, str]:
     ckpt = torch.load(model_path, map_location=DEVICE)
-    cfg = parse_config(ckpt["config"])
-    model_dict = asdict(cfg.model)
-    arch_dict = asdict(cfg.architecture)
-    model, derived = PHVIV.from_config(dt=float(dt), cfg=model_dict, arch_cfg=arch_dict, device=DEVICE)
-    incompatible = model.load_state_dict(ckpt["model_state"], strict=False)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
-        print(
-            f"[warn] {model_path.name}: missing_keys={incompatible.missing_keys}, "
-            f"unexpected_keys={incompatible.unexpected_keys}"
+    cfg = parse_config(ckpt.get("config", {}))
+    method = str(getattr(cfg, "method", ckpt.get("method", "hnn"))).strip().lower()
+    return ckpt, cfg, method
+
+
+class ForceMLP(torch.nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, depth: int, activation: str) -> None:
+        super().__init__()
+        act = str(activation).strip().lower()
+        if act == "tanh":
+            act_cls = torch.nn.Tanh
+        elif act == "relu":
+            act_cls = torch.nn.ReLU
+        elif act == "gelu":
+            act_cls = torch.nn.GELU
+        elif act in {"silu", "swish"}:
+            act_cls = torch.nn.SiLU
+        else:
+            raise ValueError("activation must be one of: tanh, relu, gelu, silu")
+        layers: list[torch.nn.Module] = []
+        in_features = int(input_dim)
+        for _ in range(max(1, int(depth))):
+            layers.append(torch.nn.Linear(in_features, int(hidden_dim)))
+            layers.append(act_cls())
+            in_features = int(hidden_dim)
+        layers.append(torch.nn.Linear(in_features, int(output_dim)))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _build_vpinn_force_model(cfg: object, *, input_dim: int, output_dim: int) -> torch.nn.Module:
+    vp = dict(getattr(cfg, "vpinn", {}) or {})
+    use_arch_cfg = bool(vp.get("use_architecture_config", False))
+    if not use_arch_cfg:
+        return ForceMLP(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=int(vp.get("hidden_dim", 128)),
+            depth=int(vp.get("depth", 3)),
+            activation=str(vp.get("activation", "tanh")),
         )
-    model.eval()
-    return model, derived, float(dt)
+
+    arch = getattr(cfg, "architecture", None)
+    if arch is None:
+        raise ValueError("vpinn.use_architecture_config is True but config has no 'architecture:' block.")
+    net_type = str(getattr(arch, "force_net_type", "residual")).strip().lower()
+    if net_type == "pirate":
+        pirate_kwargs = {}
+        pirate_kwargs.update(getattr(getattr(cfg, "model", None), "pirate_force_kwargs", {}) or {})
+        pirate_kwargs.update(getattr(arch, "pirate_force_kwargs", {}) or {})
+        pirate_kwargs.setdefault("depth", 2)
+        pirate_kwargs.setdefault("fourier_features", 64)
+        pirate_kwargs.setdefault("sigma", 1.0)
+        pirate_kwargs.setdefault("activation", "tanh")
+        return ODEPirateNet(
+            input_size=int(input_dim),
+            output_size=int(output_dim),
+            **pirate_kwargs,
+        )
+    if net_type == "residual":
+        cfg_res = dict(getattr(arch, "residual_kwargs", {}) or {})
+        hidden = int(cfg_res.get("hidden", 128))
+        layers = int(cfg_res.get("layers", 2))
+        activation = str(cfg_res.get("activation", "gelu"))
+        layers_list: list[torch.nn.Module] = [torch.nn.Linear(int(input_dim), hidden)]
+        for _ in range(max(1, layers)):
+            layers_list.append(Residual(hidden, activation=activation))
+        layers_list.append(torch.nn.Linear(hidden, int(output_dim)))
+        return torch.nn.Sequential(*layers_list)
+    if net_type == "mlp":
+        cfg_mlp = dict(getattr(arch, "mlp_kwargs", {}) or {})
+        hidden = int(cfg_mlp.get("hidden", 128))
+        layers = int(cfg_mlp.get("layers", 2))
+        activation = str(cfg_mlp.get("activation", "gelu")).strip().lower()
+        act_mod: torch.nn.Module
+        if activation == "tanh":
+            act_mod = torch.nn.Tanh()
+        elif activation == "relu":
+            act_mod = torch.nn.ReLU()
+        elif activation == "gelu":
+            act_mod = torch.nn.GELU()
+        elif activation in {"silu", "swish"}:
+            act_mod = torch.nn.SiLU()
+        else:
+            raise ValueError("activation must be one of: tanh, relu, gelu, silu")
+        modules: list[torch.nn.Module] = []
+        in_features = int(input_dim)
+        for _ in range(max(1, layers)):
+            modules.append(torch.nn.Linear(in_features, hidden))
+            modules.append(act_mod)
+            in_features = hidden
+        modules.append(torch.nn.Linear(in_features, int(output_dim)))
+        return torch.nn.Sequential(*modules)
+    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate")
+
+
+def _m_eff_from_cfg(cfg: object) -> float:
+    model_cfg = getattr(cfg, "model", None)
+    rho = float(getattr(model_cfg, "rho", 1000.0))
+    D = float(getattr(model_cfg, "D", 0.1))
+    Ca = float(getattr(model_cfg, "Ca", 1.0))
+    structural_mass = float(getattr(model_cfg, "structural_mass", 16.79))
+    m_a = 0.25 * float(np.pi) * D * D * rho * Ca
+    return structural_mass + m_a
+
+
+def load_model(model_path: Path, *, dt: float) -> tuple[object, dict[str, float], float, str]:
+    ckpt, cfg, method = _load_checkpoint(model_path)
+    state = _normalize_state_dict_keys(ckpt["model_state"])
+    if method in {"hnn", "phnn"}:
+        model_dict = asdict(cfg.model)
+        arch_dict = asdict(cfg.architecture)
+        model, derived = PHVIV.from_config(dt=float(dt), cfg=model_dict, arch_cfg=arch_dict, device=DEVICE)
+        incompatible = model.load_state_dict(state, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                f"[warn] {model_path.name}: missing_keys={incompatible.missing_keys}, "
+                f"unexpected_keys={incompatible.unexpected_keys}"
+            )
+        model.eval()
+        return model, derived, float(dt), method
+
+    if method == "vpinn":
+        # VPINN checkpoint stores a pointwise force network; rollout uses the known ODE.
+        model_cfg = getattr(cfg, "model", None)
+        d = 1
+        force_model = _build_vpinn_force_model(cfg, input_dim=2 * d, output_dim=d).to(DEVICE)
+        incompatible = force_model.load_state_dict(state, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                f"[warn] {model_path.name}: missing_keys={incompatible.missing_keys}, "
+                f"unexpected_keys={incompatible.unexpected_keys}"
+            )
+        force_model.eval()
+        derived = {
+            "m_eff": _m_eff_from_cfg(cfg),
+            "k": float(getattr(model_cfg, "k", 1.0)),
+            "c": float(getattr(model_cfg, "damping_c", 0.0)),
+            "D": float(getattr(model_cfg, "D", 1.0)),
+        }
+        return force_model, derived, float(dt), method
+
+    raise ValueError(f"Unsupported method '{method}' in checkpoint/config.")
 
 
 def _load_config_from_checkpoint(model_path: Path):
@@ -242,6 +412,87 @@ def _eval_rollout_nrmse_batch(
     return nrmse_y, nrmse_f
 
 
+def _eval_vpinn_rollout_nrmse_batch(
+    *,
+    force_model: torch.nn.Module,
+    derived: dict[str, float],
+    dt: float,
+    disp_true: torch.Tensor,  # (B, T)
+    force_true: torch.Tensor,  # (B, T)
+    v0: torch.Tensor,  # (B,)
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    VPINN rollout with known dynamics:
+        x' = v
+        v' = (f_theta(x,v) - c v - k x) / m
+    """
+    if disp_true.ndim != 2 or force_true.ndim != 2:
+        raise ValueError("disp_true and force_true must have shape (B, T)")
+    if disp_true.shape != force_true.shape:
+        raise ValueError("disp_true and force_true must have the same shape")
+    if v0.ndim != 1 or v0.shape[0] != disp_true.shape[0]:
+        raise ValueError("v0 must have shape (B,)")
+
+    B, T = disp_true.shape
+    m_eff = float(derived["m_eff"])
+    c = float(derived.get("c", 0.0))
+    k = float(derived.get("k", 0.0))
+    dt_t = float(dt)
+
+    x = disp_true[:, 0]
+    v = v0
+
+    sum_sq_x = torch.zeros((B,), device=disp_true.device, dtype=torch.float32)
+    sum_sq_f = torch.zeros((B,), device=disp_true.device, dtype=torch.float32)
+
+    disp_std = torch.std(disp_true.float(), dim=1)
+    force_std = torch.std(force_true.float(), dim=1)
+    disp_std = torch.where(disp_std > 1e-9, disp_std, torch.ones_like(disp_std))
+    force_std = torch.where(force_std > 1e-9, force_std, torch.ones_like(force_std))
+
+    def f_theta(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+        inp = torch.stack((xi, vi), dim=1)
+        return force_model(inp).squeeze(-1)
+
+    def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+        return (f_theta(xi, vi) - c * vi - k * xi) / m_eff
+
+    with torch.inference_mode():
+        for t_idx in range(int(T)):
+            f0 = f_theta(x, v)
+            dx = (x - disp_true[:, t_idx]).float()
+            df = (f0 - force_true[:, t_idx]).float()
+            sum_sq_x = sum_sq_x + dx * dx
+            sum_sq_f = sum_sq_f + df * df
+
+            k1_x = v
+            k1_v = (f0 - c * v - k * x) / m_eff
+
+            x2 = x + 0.5 * dt_t * k1_x
+            v2 = v + 0.5 * dt_t * k1_v
+            k2_x = v2
+            k2_v = accel(x2, v2)
+
+            x3 = x + 0.5 * dt_t * k2_x
+            v3 = v + 0.5 * dt_t * k2_v
+            k3_x = v3
+            k3_v = accel(x3, v3)
+
+            x4 = x + dt_t * k3_x
+            v4 = v + dt_t * k3_v
+            k4_x = v4
+            k4_v = accel(x4, v4)
+
+            x = x + (dt_t / 6.0) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
+            v = v + (dt_t / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+
+    rmse_x = torch.sqrt(sum_sq_x / float(max(T, 1)))
+    rmse_f = torch.sqrt(sum_sq_f / float(max(T, 1)))
+    nrmse_x = (rmse_x / disp_std).detach().cpu().numpy()
+    nrmse_f = (rmse_f / force_std).detach().cpu().numpy()
+    return nrmse_x, nrmse_f
+
+
 def _load_run(
     run_path: Path,
     *,
@@ -335,7 +586,8 @@ def main():
 
     run_files = _iter_logged_runs(LOGGED_RUNS_DIR, logger_hz=LOGGER_HZ)
     model_dt = _infer_dt_from_run(run_files[0])
-    model, derived, _ = load_model(MODEL_PATH, dt=model_dt)
+    model, derived, _, method = load_model(MODEL_PATH, dt=model_dt)
+    print(f"Loaded checkpoint method='{method}' on device='{DEVICE}'", flush=True)
     if PLOT_TRAINING_POINTS:
         cfg = _load_config_from_checkpoint(MODEL_PATH)
         training_points = _load_training_points_from_config(cfg)
@@ -389,14 +641,26 @@ def main():
             force_true_t = torch.from_numpy(force_batch).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
             v0_t = torch.from_numpy(v0_np).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
 
-            disp_nrmse, force_nrmse = _eval_rollout_nrmse_batch(
-                model=model,
-                derived=derived,
-                dt=float(dt_key),
-                disp_true=disp_true_t,
-                force_true=force_true_t,
-                v0=v0_t,
-            )
+            if method in {"hnn", "phnn"}:
+                disp_nrmse, force_nrmse = _eval_rollout_nrmse_batch(
+                    model=cast(PHVIV, model),
+                    derived=derived,
+                    dt=float(dt_key),
+                    disp_true=disp_true_t,
+                    force_true=force_true_t,
+                    v0=v0_t,
+                )
+            elif method == "vpinn":
+                disp_nrmse, force_nrmse = _eval_vpinn_rollout_nrmse_batch(
+                    force_model=cast(torch.nn.Module, model),
+                    derived=derived,
+                    dt=float(dt_key),
+                    disp_true=disp_true_t,
+                    force_true=force_true_t,
+                    v0=v0_t,
+                )
+            else:
+                raise ValueError(f"Unsupported method '{method}'")
 
             for amp, fhat, dn, fn in zip(amps_np, fhats_np, disp_nrmse, force_nrmse):
                 amps_set.add(float(amp))

@@ -39,7 +39,12 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[PHVIV, dict[str, 
     model_dict = asdict(cfg.model)
     arch_dict = asdict(cfg.architecture)
     model, derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
-    incompatible = model.load_state_dict(ckpt["model_state"], strict=False)
+    state = ckpt["model_state"]
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+    incompatible = model.load_state_dict(state, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(
             f"[warn] {ckpt_path.name}: missing_keys={incompatible.missing_keys}, "

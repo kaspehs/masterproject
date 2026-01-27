@@ -474,9 +474,12 @@ def train(config: Config, config_name: str) -> None:
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / f"{run_name}.pt"
+    state_source = model
+    if hasattr(model, "_orig_mod"):
+        state_source = getattr(model, "_orig_mod")
     torch.save(
         {
-            "model_state": model.state_dict(),
+            "model_state": state_source.state_dict(),
             "config": asdict(config),
             "run_name": run_name,
         },

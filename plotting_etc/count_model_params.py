@@ -33,7 +33,12 @@ def load_model(model_path: Path):
         arch_cfg=dict(cfg.architecture.__dict__),
         device=torch.device("cpu"),
     )
-    incompatible = model.load_state_dict(ckpt["model_state"], strict=False)
+    state = ckpt["model_state"]
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+    incompatible = model.load_state_dict(state, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(
             f"[warn] {model_path.name}: missing_keys={incompatible.missing_keys}, "
