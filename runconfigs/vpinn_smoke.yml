@@ -3,6 +3,7 @@ method: vpinn
 data:
   # Use the same training-series setup as `HNNrunconfigs/pirate_smoke.yml`.
   file: data.npz
+  cut_start_seconds: 0.0
   use_generated_train_series: true
   train_series_dir: Data_Gen/generated_series_dy
   reduce_time: true

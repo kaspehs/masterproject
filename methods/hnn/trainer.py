@@ -326,6 +326,7 @@ def train(config: Config, config_name: str) -> None:
         eval_velocity=vel_data,
         require_force=use_force_data_loss,
         eval_force=F_data,
+        cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
     )
     eval_y_tensor, eval_vel_tensor, eval_t_tensor = eval_tensors
 

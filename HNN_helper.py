@@ -25,6 +25,9 @@ class DataConfig:
     file: str = "data.npz"
     steadystate: bool = False
     steadystate_time_threshold: float = 10.0
+    # Cut away the first N seconds from each time series (relative to the series start).
+    # Applied during both training and validation loading.
+    cut_start_seconds: float = 0.0
     reduce_time: bool = False
     reduction_factor: int = 1
     middle_time_plot: list[float] = field(default_factory=lambda: [15.0, 17.0])
@@ -1330,13 +1333,17 @@ def preprocess_timeseries(
     velocity: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, float]:
     """
-    Apply optional steady-state trimming and uniform decimation to time-series arrays.
+    Apply optional trimming and uniform decimation to time-series arrays.
     """
     if t.size == 0:
         return t, y, force, hamiltonian, velocity, float("nan")
     if velocity is not None and np.asarray(velocity).shape[0] != t.shape[0]:
         raise ValueError("Velocity array must have the same length as the time vector.")
     mask = np.ones_like(t, dtype=bool)
+    cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+    if cut_start_seconds > 0.0:
+        t0 = float(np.asarray(t)[0])
+        mask &= t >= (t0 + cut_start_seconds)
     if data_cfg.steadystate:
         mask &= t > float(data_cfg.steadystate_time_threshold)
     t_proc = t[mask]
@@ -1352,6 +1359,12 @@ def preprocess_timeseries(
         h_proc = h_proc[::step]
         if v_proc is not None:
             v_proc = v_proc[::step]
+    if t_proc.size < 2:
+        raise ValueError(
+            "After trimming/reduction, too few samples remain to infer dt. "
+            f"(cut_start_seconds={cut_start_seconds}, steadystate={bool(data_cfg.steadystate)}, "
+            f"reduce_time={bool(data_cfg.reduce_time)}, reduction_factor={int(data_cfg.reduction_factor)})"
+        )
     dt_value = float(t_proc[1] - t_proc[0]) if t_proc.size > 1 else float("nan")
     return t_proc, y_proc, f_proc, h_proc, v_proc, dt_value
 
@@ -1503,6 +1516,7 @@ def load_training_series(
     require_force: bool = False,
     eval_force: np.ndarray | None = None,
     force_key_candidates: Sequence[str] = ("c", "F_total", "force_total", "force"),
+    cut_start_seconds: float = 0.0,
 ) -> tuple[
     list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1521,6 +1535,7 @@ def load_training_series(
         series_files = sorted(series_dir.glob("*.npz"))
         if not series_files:
             raise FileNotFoundError(f"No '.npz' files found in training series directory '{series_dir}'.")
+        cut_start_seconds = max(0.0, float(cut_start_seconds))
         for series_file in series_files:
             with np.load(series_file) as series_data:
                 series_t = np.asarray(series_data["a"])
@@ -1566,6 +1581,20 @@ def load_training_series(
                     series_force = np.interp(series_t_resampled, series_t, series_force)
                 series_t = series_t_resampled
                 series_dt = dt_eval
+            if cut_start_seconds > 0.0:
+                series_t0 = float(series_t[0])
+                cut_mask = series_t >= (series_t0 + cut_start_seconds)
+                series_t = series_t[cut_mask]
+                series_y = series_y[cut_mask]
+                if series_vel is not None:
+                    series_vel = np.asarray(series_vel)[cut_mask]
+                if series_force is not None:
+                    series_force = np.asarray(series_force)[cut_mask]
+                if series_t.shape[0] < 2:
+                    raise ValueError(
+                        f"Series '{series_file}' became too short after cut_start_seconds={cut_start_seconds}."
+                    )
+                series_dt = float(series_t[1] - series_t[0])
             if series_force is None:
                 train_series_raw.append((series_y, series_t, series_dt, series_vel, None))
             else:

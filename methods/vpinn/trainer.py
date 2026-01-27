@@ -337,6 +337,7 @@ def _load_trajectory(
     smoothing_cfg: Any,
     reduce_time: bool,
     reduction_factor: int,
+    cut_start_seconds: float,
 ) -> tuple[dict[str, Any], float]:
     t, x, f_meas, v_file = _read_timeseries_npz(path)
     t, x, f_meas, v_file = _maybe_reduce_time(
@@ -360,6 +361,18 @@ def _load_trajectory(
             if not np.allclose(t, t_vel, rtol=1e-9, atol=1e-12):
                 raise ValueError(f"{path.name}: resampled v landed on different time grid")
         dt = float(dt_target)
+
+    cut_start_seconds = max(0.0, float(cut_start_seconds))
+    if cut_start_seconds > 0.0:
+        t0 = float(t[0])
+        mask = t >= (t0 + cut_start_seconds)
+        t = t[mask]
+        x = x[mask]
+        f_meas = f_meas[mask]
+        if v_file is not None:
+            v_file = v_file[mask]
+        if t.size < 2:
+            raise ValueError(f"{path.name}: too few samples remain after cut_start_seconds={cut_start_seconds}.")
 
     if velocity_source == "file":
         if v_file is None:
@@ -510,6 +523,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], float]:
 
     trajectories: list[dict[str, Any]] = []
     dt_ref: Optional[float] = None
+    cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
     for path in sources:
         traj, dt = _load_trajectory(
             path=path,
@@ -518,6 +532,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], float]:
             smoothing_cfg=smoothing_cfg,
             reduce_time=False,
             reduction_factor=1,
+            cut_start_seconds=cut_start_seconds,
         )
         if dt_ref is None:
             dt_ref = dt
@@ -809,6 +824,7 @@ def train(config: Config, config_name: str) -> None:
             data_path = (Path.cwd() / data_path).resolve()
         val_reduce_time = bool(getattr(config.data, "reduce_time", False))
         val_reduction_factor = int(getattr(config.data, "reduction_factor", 1))
+        cut_start_seconds = float(getattr(config.data, "cut_start_seconds", 0.0))
         val_traj, val_dt = _load_trajectory(
             path=data_path,
             dt_target=dt,
@@ -816,6 +832,7 @@ def train(config: Config, config_name: str) -> None:
             smoothing_cfg=config.smoothing,
             reduce_time=val_reduce_time,
             reduction_factor=val_reduction_factor,
+            cut_start_seconds=cut_start_seconds,
         )
         if val_dt != dt:
             raise ValueError(f"Validation data dt={val_dt} does not match training dt={dt}.")

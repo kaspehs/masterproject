@@ -4,6 +4,7 @@ data:
   file: data.npz
   steadystate: false
   steadystate_time_threshold: 10.0
+  cut_start_seconds: 0.0
   reduce_time: true
   reduction_factor: 100
   middle_time_plot: [15, 17]
