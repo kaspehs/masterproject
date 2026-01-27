@@ -5,6 +5,7 @@
 /output/*
 /error/*
 /logs/*
+/runconfigs/*
 /Data_Gen/legacy_datasets
 /Data_Gen/generated_series
 /Data_Gen/generated_series_dy
