@@ -97,6 +97,14 @@ monitoring:
   log_every_epochs: 10
   print_every_epochs: 10
   log_component_grad_norms: false
+  cycle_validation_rollout: false
+  async_validation: false
+  async_validation_device: cpu
+  async_validation_num_workers: 0
+  async_validation_num_threads: 4
+  async_validation_max_concurrent: 1
+  async_validation_do_losses: true
+  async_validation_do_rollout: true
 
 logging:
   run_dir_root: HNNruns

@@ -138,6 +138,13 @@ class MonitoringConfig:
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
     cycle_validation_rollout: bool = False
+    async_validation: bool = False
+    async_validation_device: str = "cpu"
+    async_validation_num_workers: int = 0
+    async_validation_num_threads: int = 4
+    async_validation_max_concurrent: int = 1
+    async_validation_do_losses: bool = True
+    async_validation_do_rollout: bool = True
 
 @dataclass
 class LoggingConfig:

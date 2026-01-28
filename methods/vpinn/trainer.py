@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
@@ -221,6 +223,62 @@ def rollout_rk4(
         fs.append(_vpinn_force(model, x, v, ur0))
 
     return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1)
+
+
+def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
+    return [proc for proc in processes if proc.poll() is None]
+
+
+def _launch_async_validation(
+    *,
+    processes: list[subprocess.Popen],
+    max_concurrent: int,
+    checkpoint_path: Path,
+    epoch: int,
+    writer: SummaryWriter,
+    async_device: str,
+    async_num_workers: int,
+    async_num_threads: int,
+    rollout_every_epochs: int,
+    cycle_validation_rollout: bool,
+    do_losses: bool,
+    do_rollout: bool,
+) -> list[subprocess.Popen]:
+    processes = _prune_async_processes(processes)
+    if max_concurrent > 0 and len(processes) >= max_concurrent:
+        return processes
+    script_path = Path(__file__).resolve().parents[2] / "async_validate.py"
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(async_num_threads)
+    env["MKL_NUM_THREADS"] = str(async_num_threads)
+    env["OPENBLAS_NUM_THREADS"] = str(async_num_threads)
+    env["NUMEXPR_NUM_THREADS"] = str(async_num_threads)
+    args = [
+        sys.executable,
+        str(script_path),
+        "--checkpoint",
+        str(checkpoint_path),
+        "--log-dir",
+        str(writer.log_dir),
+        "--epoch",
+        str(epoch + 1),
+        "--device",
+        str(async_device),
+        "--num-threads",
+        str(async_num_threads),
+        "--num-workers",
+        str(async_num_workers),
+        "--rollout-every",
+        str(int(rollout_every_epochs)),
+        "--cycle-rollout",
+        "1" if cycle_validation_rollout else "0",
+        "--do-losses",
+        "1" if do_losses else "0",
+        "--do-rollout",
+        "1" if do_rollout else "0",
+    ]
+    processes.append(subprocess.Popen(args, env=env))
+    return processes
 
 
 def _m_eff_from_model_cfg(model_cfg: Any) -> float:
@@ -972,6 +1030,10 @@ def train(config: Config, config_name: str) -> None:
     alpha = alpha.to(device)
 
     writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
+    async_processes: list[subprocess.Popen] = []
+    async_dir = Path(writer.log_dir) / "async_validation"
+    if async_validation:
+        async_dir.mkdir(parents=True, exist_ok=True)
 
     use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
     base_lr = float(optim_cfg.lr)
@@ -982,6 +1044,13 @@ def train(config: Config, config_name: str) -> None:
     rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
     rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
+    async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
+    async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
+    async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
+    async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
+    async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
+    async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
     middle_time_plot = getattr(config.data, "middle_time_plot", [0.0, 1.0])
     if len(middle_time_plot) != 2:
         middle_time_plot = [0.0, 1.0]
@@ -1094,7 +1163,44 @@ def train(config: Config, config_name: str) -> None:
                 f"Ldata={metrics['loss_data']:.4e}, Lphys={metrics['loss_physics']:.4e}, lr={metrics['lr']:.3e}"
             )
 
-        if val_loader is not None and validate_every > 0 and ((epoch % validate_every) == 0 or epoch == (epochs - 1)):
+        should_validate = (
+            val_loader is not None
+            and validate_every > 0
+            and ((epoch % validate_every) == 0 or epoch == (epochs - 1))
+        )
+        should_rollout = rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == (epochs - 1))
+
+        if async_validation and (should_validate or should_rollout) and (async_do_losses or async_do_rollout):
+            async_processes = _prune_async_processes(async_processes)
+            state_source: nn.Module = model
+            if hasattr(model, "_orig_mod"):
+                state_source = getattr(model, "_orig_mod")
+            ckpt_path = async_dir / f"epoch_{epoch + 1:06d}.pt"
+            torch.save(
+                {
+                    "model_state": state_source.state_dict(),
+                    "config": asdict(config),
+                    "run_name": run_name,
+                    "dt": dt,
+                    "method": "vpinn",
+                },
+                ckpt_path,
+            )
+            async_processes = _launch_async_validation(
+                processes=async_processes,
+                max_concurrent=async_max_concurrent,
+                checkpoint_path=ckpt_path,
+                epoch=epoch,
+                writer=writer,
+                async_device=async_device,
+                async_num_workers=async_num_workers,
+                async_num_threads=async_num_threads,
+                rollout_every_epochs=rollout_every,
+                cycle_validation_rollout=cycle_validation_rollout,
+                do_losses=async_do_losses and should_validate,
+                do_rollout=async_do_rollout and should_rollout,
+            )
+        elif should_validate and not async_validation:
             val_metrics = _evaluate_epoch(
                 model=model,
                 loader=val_loader,
@@ -1117,7 +1223,7 @@ def train(config: Config, config_name: str) -> None:
             for k_name, v_value in val_metrics.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)
 
-        if rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == (epochs - 1)):
+        if should_rollout and not async_validation:
             candidates = val_trajs if val_trajs else train_trajs
             if not candidates:
                 continue

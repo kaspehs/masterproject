@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -329,6 +331,62 @@ def _validate_if_needed(
     )
 
 
+def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
+    return [proc for proc in processes if proc.poll() is None]
+
+
+def _launch_async_validation(
+    *,
+    processes: list[subprocess.Popen],
+    max_concurrent: int,
+    checkpoint_path: Path,
+    epoch: int,
+    writer: SummaryWriter,
+    async_device: str,
+    async_num_workers: int,
+    async_num_threads: int,
+    rollout_every_epochs: int,
+    cycle_validation_rollout: bool,
+    do_losses: bool,
+    do_rollout: bool,
+) -> list[subprocess.Popen]:
+    processes = _prune_async_processes(processes)
+    if max_concurrent > 0 and len(processes) >= max_concurrent:
+        return processes
+    script_path = Path(__file__).resolve().parents[2] / "async_validate.py"
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(async_num_threads)
+    env["MKL_NUM_THREADS"] = str(async_num_threads)
+    env["OPENBLAS_NUM_THREADS"] = str(async_num_threads)
+    env["NUMEXPR_NUM_THREADS"] = str(async_num_threads)
+    args = [
+        sys.executable,
+        str(script_path),
+        "--checkpoint",
+        str(checkpoint_path),
+        "--log-dir",
+        str(writer.log_dir),
+        "--epoch",
+        str(epoch + 1),
+        "--device",
+        str(async_device),
+        "--num-threads",
+        str(async_num_threads),
+        "--num-workers",
+        str(async_num_workers),
+        "--rollout-every",
+        str(int(rollout_every_epochs)),
+        "--cycle-rollout",
+        "1" if cycle_validation_rollout else "0",
+        "--do-losses",
+        "1" if do_losses else "0",
+        "--do-rollout",
+        "1" if do_rollout else "0",
+    ]
+    processes.append(subprocess.Popen(args, env=env))
+    return processes
+
+
 def _evaluate_val_losses(
     *,
     model: PHVIV,
@@ -480,6 +538,13 @@ def train(config: Config, config_name: str) -> None:
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
+    async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
+    async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
+    async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
+    async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
+    async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
+    async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
+    async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
     print(f"Using device: {device}")
@@ -566,6 +631,10 @@ def train(config: Config, config_name: str) -> None:
         y_data_t, val_vel, _t_tensor, val_ur = train_sequences[0]
 
     writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
+    async_processes: list[subprocess.Popen] = []
+    async_dir = Path(writer.log_dir) / "async_validation"
+    if async_validation:
+        async_dir.mkdir(parents=True, exist_ok=True)
 
     y_true_norm = y_data / D
     force_data = F_data
@@ -669,36 +738,70 @@ def train(config: Config, config_name: str) -> None:
             else:
                 print(f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, force={mean_force_loss:.4e}")
 
-        _validate_if_needed(
-            writer=writer,
-            epoch=epoch,
-            rollout_every_epochs=rollout_every_epochs,
-            model=model,
-            y_data_t=y_data_t,
-            val_vel=val_vel,
-            reduced_velocity=val_ur,
-            val_series_raw=val_series_raw,
-            val_sequences=val_sequences,
-            val_loader=val_loader,
-            cycle_validation_rollout=cycle_validation_rollout,
-            m_eff=m_eff,
-            dt=dt,
-            t=t,
-            y_true_norm=y_true_norm,
-            y_data=y_data,
-            force_data=force_data,
-            D=D,
-            k=k,
-            device=device,
-            middle_time_plot=middle_time_plot,
-            hamiltonian_data=hamiltonian_data,
-            log_extra_validation_metrics=log_extra_validation_metrics,
-            force_reg=force_reg,
-            use_force_data_loss=use_force_data_loss,
-            force_data_weight=force_data_weight,
-            amp_enabled=amp_enabled,
-            amp_dtype=amp_dtype,
+        should_validate = rollout_every_epochs > 0 and (
+            (epoch + 1) % int(rollout_every_epochs) == 0 or epoch == (epochs - 1)
         )
+        if async_validation and should_validate and (async_do_losses or async_do_rollout):
+            async_processes = _prune_async_processes(async_processes)
+            state_source = model
+            if hasattr(model, "_orig_mod"):
+                state_source = getattr(model, "_orig_mod")
+            ckpt_path = async_dir / f"epoch_{epoch + 1:06d}.pt"
+            torch.save(
+                {
+                    "model_state": state_source.state_dict(),
+                    "config": asdict(config),
+                    "run_name": run_name,
+                    "dt": dt,
+                    "method": str(config.method),
+                },
+                ckpt_path,
+            )
+            async_processes = _launch_async_validation(
+                processes=async_processes,
+                max_concurrent=async_max_concurrent,
+                checkpoint_path=ckpt_path,
+                epoch=epoch,
+                writer=writer,
+                async_device=async_device,
+                async_num_workers=async_num_workers,
+                async_num_threads=async_num_threads,
+                rollout_every_epochs=rollout_every_epochs,
+                cycle_validation_rollout=cycle_validation_rollout,
+                do_losses=async_do_losses,
+                do_rollout=async_do_rollout,
+            )
+        elif not async_validation:
+            _validate_if_needed(
+                writer=writer,
+                epoch=epoch,
+                rollout_every_epochs=rollout_every_epochs,
+                model=model,
+                y_data_t=y_data_t,
+                val_vel=val_vel,
+                reduced_velocity=val_ur,
+                val_series_raw=val_series_raw,
+                val_sequences=val_sequences,
+                val_loader=val_loader,
+                cycle_validation_rollout=cycle_validation_rollout,
+                m_eff=m_eff,
+                dt=dt,
+                t=t,
+                y_true_norm=y_true_norm,
+                y_data=y_data,
+                force_data=force_data,
+                D=D,
+                k=k,
+                device=device,
+                middle_time_plot=middle_time_plot,
+                hamiltonian_data=hamiltonian_data,
+                log_extra_validation_metrics=log_extra_validation_metrics,
+                force_reg=force_reg,
+                use_force_data_loss=use_force_data_loss,
+                force_data_weight=force_data_weight,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
+            )
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
