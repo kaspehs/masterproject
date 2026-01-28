@@ -53,6 +53,7 @@ class ModelConfig:
     fourier_features: int = 64
     fourier_sigma: float = 1.0
     use_feature_engineering: bool = False
+    use_reduced_velocity: bool = True
     q_scale: float | None = None
     p_scale: float | None = None
 
@@ -136,6 +137,7 @@ class MonitoringConfig:
     print_every_epochs: int = 1
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
+    cycle_validation_rollout: bool = False
 
 @dataclass
 class LoggingConfig:
@@ -327,6 +329,7 @@ def log_validation_epoch(
     model: "PHVIV",
     y_data_t: torch.Tensor,
     val_vel: torch.Tensor,
+    reduced_velocity: torch.Tensor,
     m_eff: float,
     dt: float,
     t: np.ndarray,
@@ -340,8 +343,100 @@ def log_validation_epoch(
     hamiltonian_data: np.ndarray | None,
     *,
     log_extra_metrics: bool = False,
+    log_metrics: bool = True,
 ) -> dict[str, float]:
-    rollout = rollout_model(model, y_data_t, val_vel, m_eff, dt, t, D, k, device)
+    rollout = rollout_model(
+        model,
+        y_data_t,
+        val_vel,
+        reduced_velocity,
+        m_eff,
+        dt,
+        t,
+        D,
+        k,
+        device,
+    )
+    metrics = compute_validation_metrics(
+        model=model,
+        y_data_t=y_data_t,
+        val_vel=val_vel,
+        reduced_velocity=reduced_velocity,
+        m_eff=m_eff,
+        dt=dt,
+        t=t,
+        y_data_raw=y_data_raw,
+        force_data=force_data,
+        D=D,
+        k=k,
+        device=device,
+        log_extra_metrics=log_extra_metrics,
+        rollout=rollout,
+    )
+    if log_metrics:
+        for name, value in metrics.items():
+            writer.add_scalar(f"val/{name}", value, epoch)
+    zoom_mask = create_zoom_mask(t)
+    middle_mask = create_window_mask(t, middle_time_plot)
+    log_displacement_plots(
+        writer,
+        epoch,
+        t,
+        y_true_norm,
+        rollout["y_norm"],
+        rollout["p_norm"],
+        zoom_mask,
+        middle_mask,
+        middle_time_plot,
+        reduced_velocity=float(np.asarray(reduced_velocity).reshape(-1)[0]),
+    )
+    log_force_plots(
+        writer,
+        epoch,
+        t,
+        rollout["force_total"],
+        rollout["force_drag"],
+        rollout["force_model"],
+        force_data,
+        zoom_mask,
+        middle_mask,
+        middle_time_plot,
+        model.include_physical_drag,
+        reduced_velocity=float(np.asarray(reduced_velocity).reshape(-1)[0]),
+    )
+    return metrics
+
+
+def compute_validation_metrics(
+    *,
+    model: "PHVIV",
+    y_data_t: torch.Tensor,
+    val_vel: torch.Tensor,
+    reduced_velocity: torch.Tensor,
+    m_eff: float,
+    dt: float,
+    t: np.ndarray,
+    y_data_raw: np.ndarray,
+    force_data: np.ndarray,
+    D: float,
+    k: float,
+    device: torch.device,
+    log_extra_metrics: bool = False,
+    rollout: dict[str, np.ndarray] | None = None,
+) -> dict[str, float]:
+    if rollout is None:
+        rollout = rollout_model(
+            model,
+            y_data_t,
+            val_vel,
+            reduced_velocity,
+            m_eff,
+            dt,
+            t,
+            D,
+            k,
+            device,
+        )
     metrics: dict[str, float] = {}
     y_pred_raw = rollout["y_norm"] * D
     disp_std_raw = float(np.std(y_data_raw))
@@ -380,7 +475,8 @@ def log_validation_epoch(
     with torch.no_grad():
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
-        force_on_data = model.u_theta(z_true).squeeze(-1).detach().cpu().numpy()
+        rv = reduced_velocity.to(device=device, non_blocking=(device.type == "cuda"))
+        force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
     min_len_data = min(force_on_data.shape[0], force_target.shape[0])
     if min_len_data > 0:
         force_data_pred = force_on_data[:min_len_data]
@@ -397,34 +493,6 @@ def log_validation_epoch(
             damage_rel_data = relative_error(damage_pred_data, damage_true_data)
             if np.isfinite(damage_rel_data):
                 metrics["force_fatigue_damage_rel_error_on_data"] = damage_rel_data
-    for name, value in metrics.items():
-        writer.add_scalar(f"val/{name}", value, epoch)
-    zoom_mask = create_zoom_mask(t)
-    middle_mask = create_window_mask(t, middle_time_plot)
-    log_displacement_plots(
-        writer,
-        epoch,
-        t,
-        y_true_norm,
-        rollout["y_norm"],
-        rollout["p_norm"],
-        zoom_mask,
-        middle_mask,
-        middle_time_plot,
-    )
-    log_force_plots(
-        writer,
-        epoch,
-        t,
-        rollout["force_total"],
-        rollout["force_drag"],
-        rollout["force_model"],
-        force_data,
-        zoom_mask,
-        middle_mask,
-        middle_time_plot,
-        model.include_physical_drag,
-    )
     return metrics
 
 
@@ -656,6 +724,7 @@ class PHVIV(nn.Module):
         fourier_features: int = 64,
         fourier_sigma: float = 1.0,
         use_feature_engineering: bool = False,
+        use_reduced_velocity: bool = True,
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
@@ -674,8 +743,10 @@ class PHVIV(nn.Module):
         self.include_physical_drag = bool(include_physical_drag)
         self.learn_hamiltonian = bool(learn_hamiltonian)
         self.use_feature_engineering = bool(use_feature_engineering)
+        self.use_reduced_velocity = bool(use_reduced_velocity)
         self.engineered_feature_dim = 7
-        self.force_input_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
+        self.base_feature_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
+        self.force_input_dim = self.base_feature_dim + (1 if self.use_reduced_velocity else 0)
 
         residual_cfg = _default_residual_kwargs()
         if residual_kwargs:
@@ -765,7 +836,7 @@ class PHVIV(nn.Module):
             self.u_net = nn.Sequential(*mlp_layers)
 
         if self.learn_hamiltonian:
-            h_in_features = self.force_input_dim
+            h_in_features = self.base_feature_dim
             self.h_net = nn.Sequential(
                 nn.Linear(h_in_features, 100),
                 nn.GELU(),
@@ -823,6 +894,7 @@ class PHVIV(nn.Module):
         fourier_features = int(cfg.get("fourier_features", 64))
         fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
+        use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
         residual_kwargs = _default_residual_kwargs()
@@ -865,6 +937,7 @@ class PHVIV(nn.Module):
             fourier_features=fourier_features,
             fourier_sigma=fourier_sigma,
             use_feature_engineering=use_feature_engineering,
+            use_reduced_velocity=use_reduced_velocity,
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
@@ -936,26 +1009,54 @@ class PHVIV(nn.Module):
         p_scaled = x[..., 1] / self.nn_p_scale
         return torch.stack((q_scaled, p_scaled), dim=-1)
 
-    def u_theta1(self, x):
+    def _prepare_reduced_velocity(self, reduced_velocity: torch.Tensor | np.ndarray | float | None, *, like: torch.Tensor) -> torch.Tensor | None:
+        if reduced_velocity is None:
+            if self.use_reduced_velocity:
+                raise ValueError("reduced_velocity is required for this model.")
+            return None
+        if torch.is_tensor(reduced_velocity):
+            rv = reduced_velocity.to(device=like.device, dtype=like.dtype)
+        else:
+            rv = torch.as_tensor(reduced_velocity, device=like.device, dtype=like.dtype)
+        if rv.ndim == 0:
+            rv = rv.view(1, 1)
+        elif rv.ndim == like.ndim - 1:
+            rv = rv.unsqueeze(-1)
+        if rv.ndim != like.ndim or rv.shape[-1] != 1:
+            raise ValueError("reduced_velocity must be a scalar or have shape (..., 1).")
+        if rv.shape[:-1] != like.shape[:-1]:
+            rv = rv.expand(like.shape[:-1] + (1,))
+        return rv
+
+    def _force_features(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         base_features = self._base_features(x)
+        if self.use_reduced_velocity:
+            rv = self._prepare_reduced_velocity(reduced_velocity, like=base_features)
+            base_features = torch.cat([base_features, rv], dim=-1)
+        return base_features
+
+    def u_theta1(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        base_features = self._force_features(x, reduced_velocity=reduced_velocity)
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
         return self.u_net(features) * self.k * self.D
     
-    def u_theta2(self, x):
-        return self.u_theta1(x) + self.drag_force(x)
+    def u_theta2(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.u_theta1(x, reduced_velocity=reduced_velocity) + self.drag_force(x)
 
-    def learned_force(self, x):
-        return self.u_theta1(x)
+    def learned_force(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.u_theta1(x, reduced_velocity=reduced_velocity)
     
-    def u_theta(self, x):
-        return self.u_theta2(x) if self.include_physical_drag else self.u_theta1(x)
+    def u_theta(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.u_theta2(x, reduced_velocity=reduced_velocity) if self.include_physical_drag else self.u_theta1(
+            x, reduced_velocity=reduced_velocity
+        )
     
-    def f(self, x):
-        u = self.u_theta(x)
+    def f(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        u = self.u_theta(x, reduced_velocity=reduced_velocity)
         g_vec = self.G.squeeze(-1)
         return u * g_vec
 
-    def g(self, x):
+    def g(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         gH = self.grad_H(x)                         # (..., 2)
         JgH = torch.matmul(gH, self.J.T)
         if self.discover_damping:
@@ -964,40 +1065,40 @@ class PHVIV(nn.Module):
         else:
             c_eff = self.fixed_c
         damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
-        return (JgH - damping_term) + self.f(x)
+        return (JgH - damping_term) + self.f(x, reduced_velocity=reduced_velocity)
 
-    def step_euler(self, x, dt):
-        return x + dt * self.g(x)
+    def step_euler(self, x, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return x + dt * self.g(x, reduced_velocity=reduced_velocity)
 
-    def step_rk4(self, x, t, dt):
-        x_next, _ = self.rk4_step(x, t, dt)
+    def step_rk4(self, x, t, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        x_next, _ = self.rk4_step(x, t, dt, reduced_velocity=reduced_velocity)
         return x_next
 
-    def rk4_step(self, x, t, dt):
+    def rk4_step(self, x, t, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         """
         Perform one Runge-Kutta 4 integration step and return both the next state
         and the averaged force over the step.
         """
-        k1 = self.g(x)
-        force1 = self.u_theta(x)
+        k1 = self.g(x, reduced_velocity=reduced_velocity)
+        force1 = self.u_theta(x, reduced_velocity=reduced_velocity)
 
         x2 = x + 0.5 * dt * k1
-        k2 = self.g(x2)
-        force2 = self.u_theta(x2)
+        k2 = self.g(x2, reduced_velocity=reduced_velocity)
+        force2 = self.u_theta(x2, reduced_velocity=reduced_velocity)
 
         x3 = x + 0.5 * dt * k2
-        k3 = self.g(x3)
-        force3 = self.u_theta(x3)
+        k3 = self.g(x3, reduced_velocity=reduced_velocity)
+        force3 = self.u_theta(x3, reduced_velocity=reduced_velocity)
 
         x4 = x + dt * k3
-        k4 = self.g(x4)
-        force4 = self.u_theta(x4)
+        k4 = self.g(x4, reduced_velocity=reduced_velocity)
+        force4 = self.u_theta(x4, reduced_velocity=reduced_velocity)
 
         x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
         return x_next, force_avg
 
-    def rollout(self, z0, t_seq, dt):
+    def rollout(self, z0, t_seq, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         """
         z0: (B, state_dim)    starting state from data
         t_seq: (B, K+1)       absolute times t0..tK
@@ -1015,13 +1116,13 @@ class PHVIV(nn.Module):
         z = z0
         for k in range(K):
             t = t_seq[:, k]
-            z, Fk = self.rk4_step(z, t, dt)
+            z, Fk = self.rk4_step(z, t, dt, reduced_velocity=reduced_velocity)
             Z_pred.append(z)
             F_hist.append(Fk)
 
         Z_pred = torch.stack(Z_pred, dim=1)            # (B,K+1,D)
         if F_hist:
-            initial_force = self.u_theta(z0)
+            initial_force = self.u_theta(z0, reduced_velocity=reduced_velocity)
             F_hist = torch.stack([initial_force] + F_hist, dim=1)
         else:
             F_hist = None
@@ -1037,28 +1138,28 @@ class PHVIV(nn.Module):
         return w_state[0]*Ly + w_state[1]*Lp
 
     
-    def res_loss(self, zi, ti, zin, tin):
-        return self.res_loss_SRK4(zi, ti, zin, tin)
+    def res_loss(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.res_loss_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
     
-    def avg_force(self, zi, ti, zin, tin):
-        return self.avg_force_SRK4(zi, ti, zin, tin)
+    def avg_force(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.avg_force_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
     
-    def res_loss_Euler(self, zi, ti, zin, tin):
+    def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dz = (zin-zi)/self.dt
         z_mean = 0.5*(zin+zi)
-        res = dz - self.g(z_mean)
+        res = dz - self.g(z_mean, reduced_velocity=reduced_velocity)
         res_scaled = res / self.res_scale
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
 
-    def avg_force_Euler(self, zi, ti, zin, tin):
+    def avg_force_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         z_mean = 0.5*(zin+zi)
-        forces = self.learned_force(z_mean)
+        forces = self.learned_force(z_mean, reduced_velocity=reduced_velocity)
         loss = torch.mean(torch.linalg.norm(forces, ord=1, dim=1))
         return loss
     
 
-    def res_loss_SRK4(self, zi, ti, zin, tin):
+    def res_loss_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dt = self.dt
         # constants from the scheme
         a = 0.5
@@ -1075,16 +1176,16 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin   # (B, d)
 
         # stage evaluations of g
-        g_a_plus  = self.g(z_a_plus)                  # (B, d)
-        g_a_minus = self.g(z_a_minus)                 # (B, d)
+        g_a_plus  = self.g(z_a_plus, reduced_velocity=reduced_velocity)                  # (B, d)
+        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)                 # (B, d)
 
         # two corrected midpoints
         z_corr_minus = z_mid - b * dt * g_a_plus      # (B, d)
         z_corr_plus  = z_mid + b * dt * g_a_minus     # (B, d)
 
         # final two g-evals
-        g1 = self.g(z_corr_minus)                     # (B, d)
-        g2 = self.g(z_corr_plus)                      # (B, d)
+        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)                     # (B, d)
+        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)                      # (B, d)
 
         dz_model = 0.5 * g1 + 0.5 * g2                # (B, d)
 
@@ -1097,7 +1198,7 @@ class PHVIV(nn.Module):
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
     
-    def avg_force_SRK4(self, zi, ti, zin, tin):
+    def avg_force_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dt = self.dt
         b = math.sqrt(3.0) / 6.0
 
@@ -1106,8 +1207,8 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
         # evaluate learned force at both stages
-        f1 = self.f(z_a_plus)    # assume (B, 1) or (B, 2)
-        f2 = self.f(z_a_minus)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)    # assume (B, 1) or (B, 2)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
 
         loss = 0.5 * torch.mean(torch.sum(torch.abs(f1), dim=1)) \
             + 0.5 * torch.mean(torch.sum(torch.abs(f2), dim=1))
@@ -1141,16 +1242,18 @@ def log_displacement_plots(
     zoom_mask,
     middle_mask,
     middle_window,
+    reduced_velocity: float | None = None,
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
 
     ax_full.plot(t, y_true_norm, label="y/D (true)")
     ax_full.plot(t, y_pred_norm, label="y/D (pred)")
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("y/D")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Normalized rollout at epoch {epoch+1}")
+    ax_full.set_title(f"Normalized rollout at epoch {epoch+1}{ur_title}")
     ax_full.legend(loc="upper right")
 
     diff_y_norm = y_pred_norm - y_true_norm
@@ -1159,7 +1262,7 @@ def log_displacement_plots(
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("Δy/D")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Difference (pred - true) epoch {epoch+1}")
+    ax_diff.set_title(f"Difference (pred - true) epoch {epoch+1}{ur_title}")
     ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], y_true_norm[zoom_mask], label="y/D (true)")
@@ -1167,7 +1270,7 @@ def log_displacement_plots(
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("y/D")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Normalized rollout (first 1s) epoch {epoch+1}")
+    ax_zoom.set_title(f"Normalized rollout (first 1s) epoch {epoch+1}{ur_title}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
@@ -1176,7 +1279,7 @@ def log_displacement_plots(
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("y/D")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Normalized rollout ({mid_start}-{mid_end}s) epoch {epoch+1}")
+    ax_middle.set_title(f"Normalized rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
@@ -1195,9 +1298,11 @@ def log_force_plots(
     middle_mask,
     middle_window,
     include_physical_drag: bool,
+    reduced_velocity: float | None = None,
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
     total_label = "F_total (model + drag)" if include_physical_drag else "F_total (model)"
     model_label = "F_model (wake)" if include_physical_drag else "F_model"
 
@@ -1209,7 +1314,7 @@ def log_force_plots(
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("Force")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Force rollout at epoch {epoch+1}")
+    ax_full.set_title(f"Force rollout at epoch {epoch+1}{ur_title}")
     ax_full.legend(loc="upper right")
 
     diff_force = force_total - force_data
@@ -1218,7 +1323,7 @@ def log_force_plots(
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("ΔForce")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Force difference (model - data) epoch {epoch+1}")
+    ax_diff.set_title(f"Force difference (model - data) epoch {epoch+1}{ur_title}")
     ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], force_total[zoom_mask], label=total_label, color="tab:purple")
@@ -1229,7 +1334,7 @@ def log_force_plots(
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("Force")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Force rollout (first 1s) epoch {epoch+1}")
+    ax_zoom.set_title(f"Force rollout (first 1s) epoch {epoch+1}{ur_title}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
@@ -1253,7 +1358,7 @@ def log_force_plots(
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("Force")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Force rollout ({mid_start}-{mid_end}s) epoch {epoch+1}")
+    ax_middle.set_title(f"Force rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
@@ -1269,9 +1374,11 @@ def log_hamiltonian_plots(
     middle_mask,
     middle_window,
     hamiltonian_data: np.ndarray | None = None,
+    reduced_velocity: float | None = None,
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
     model_kwargs = {"color": "tab:orange", "label": "H_model"}
     data_kwargs = {"color": "tab:blue", "linestyle": "--", "alpha": 0.8, "label": "H_data"}
 
@@ -1286,7 +1393,7 @@ def log_hamiltonian_plots(
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("Hamiltonian")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Hamiltonian rollout at epoch {epoch+1}")
+    ax_full.set_title(f"Hamiltonian rollout at epoch {epoch+1}{ur_title}")
     ax_full.legend(loc="upper right")
 
     if hamiltonian_data is not None:
@@ -1298,7 +1405,7 @@ def log_hamiltonian_plots(
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("ΔH")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Hamiltonian difference epoch {epoch+1}")
+    ax_diff.set_title(f"Hamiltonian difference epoch {epoch+1}{ur_title}")
     ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], h_model_rel[zoom_mask], **model_kwargs.copy())
@@ -1307,7 +1414,7 @@ def log_hamiltonian_plots(
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("Hamiltonian")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Hamiltonian (first 1s) epoch {epoch+1}")
+    ax_zoom.set_title(f"Hamiltonian (first 1s) epoch {epoch+1}{ur_title}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
@@ -1317,7 +1424,7 @@ def log_hamiltonian_plots(
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("Hamiltonian")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Hamiltonian ({mid_start}-{mid_end}s) epoch {epoch+1}")
+    ax_middle.set_title(f"Hamiltonian ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
@@ -1413,7 +1520,7 @@ def combine_datasets(datasets: list[TensorDataset | ConcatDataset]) -> TensorDat
 
 
 def build_dataloader_from_series(
-    series_data: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]],
+    series_data: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]],
     m_eff: float,
     batch_size: int,
     device: torch.device,
@@ -1422,13 +1529,13 @@ def build_dataloader_from_series(
     *,
     num_workers: int = 0,
     pin_memory: bool = False,
-) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], int]:
+) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
-        raise ValueError("series_data must contain at least one (y, t, dt, vel, force) tuple.")
-    sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        raise ValueError("series_data must contain at least one (y, t, dt, vel, force, U_r) tuple.")
+    sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     datasets: list[TensorDataset | ConcatDataset] = []
     min_length: int | None = None
-    for y_np, t_np, dt_value, vel_np, force_np in series_data:
+    for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
         y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
             y_np,
             t_np,
@@ -1438,14 +1545,31 @@ def build_dataloader_from_series(
             smoothing_cfg=smoothing_cfg,
             vel_np=vel_np,
         )
+        ur_arr = np.asarray(ur_np, dtype=float)
+        if ur_arr.ndim == 0:
+            ur_arr = np.full((y_tensor.shape[0],), float(ur_arr), dtype=float)
+        else:
+            ur_arr = ur_arr.reshape(-1)
+        if ur_arr.shape[0] != y_tensor.shape[0]:
+            raise ValueError("Reduced velocity array must have the same length as displacement.")
+        ur_tensor = torch.from_numpy(np.ascontiguousarray(ur_arr)).float()
         force_tensor: torch.Tensor | None = None
         if force_np is not None:
             force_arr = np.asarray(force_np, dtype=float)
             if force_arr.shape[0] != y_tensor.shape[0]:
                 raise ValueError("Force array must have the same length as displacement.")
             force_tensor = torch.from_numpy(np.ascontiguousarray(force_arr)).float()
-        sequence_tensors.append((y_tensor, vel_tensor, t_tensor))
-        datasets.append(build_dataset(y_tensor, vel_tensor, m_eff, t_tensor, force_tensor=force_tensor))
+        sequence_tensors.append((y_tensor, vel_tensor, t_tensor, ur_tensor))
+        datasets.append(
+            build_dataset(
+                y_tensor,
+                vel_tensor,
+                m_eff,
+                t_tensor,
+                reduced_velocity=ur_tensor,
+                force_tensor=force_tensor,
+            )
+        )
         seq_len = y_tensor.shape[0]
         min_length = seq_len if min_length is None else min(min_length, seq_len)
     dataset = combine_datasets(datasets)
@@ -1500,6 +1624,26 @@ def prepare_sequence_tensors(
     return y_tensor, vel_tensor, t_tensor
 
 
+def _prepare_reduced_velocity_series(
+    ur_raw: np.ndarray | float,
+    length: int,
+    *,
+    name: str,
+) -> np.ndarray:
+    if ur_raw is None:
+        raise ValueError(f"{name} is missing reduced velocity 'U_r'.")
+    ur_arr = np.asarray(ur_raw, dtype=float)
+    if ur_arr.ndim == 0:
+        return np.full((length,), float(ur_arr), dtype=float)
+    ur_flat = ur_arr.reshape(-1)
+    ur_val = float(ur_flat[0])
+    if not np.allclose(ur_flat, ur_val, rtol=1e-6, atol=1e-9):
+        raise ValueError(f"{name} reduced velocity must be constant within a series.")
+    if ur_flat.shape[0] != length:
+        return np.full((length,), ur_val, dtype=float)
+    return np.full((length,), ur_val, dtype=float)
+
+
 def load_training_series(
     y_eval: np.ndarray,
     t_eval: np.ndarray,
@@ -1512,16 +1656,17 @@ def load_training_series(
     *,
     velocity_source: str = "compute",
     eval_velocity: np.ndarray | None = None,
+    eval_reduced_velocity: np.ndarray | float | None = None,
     velocity_key_candidates: Sequence[str] = ("e", "dy", "v"),
     require_force: bool = False,
     eval_force: np.ndarray | None = None,
     force_key_candidates: Sequence[str] = ("c", "F_total", "force_total", "force"),
     cut_start_seconds: float = 0.0,
 ) -> tuple[
-    list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]],
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
-    train_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None]] = []
+    train_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] = []
     vel_source = str(velocity_source).strip().lower()
     if vel_source not in {"compute", "file", "auto"}:
         raise ValueError("velocity_source must be one of: compute, file, auto")
@@ -1560,6 +1705,10 @@ def load_training_series(
                         raise KeyError(
                             f"Series '{series_file}' is missing force data. Tried keys: {list(force_key_candidates)}"
                         )
+                if "U_r" not in series_data:
+                    raise KeyError(f"Series '{series_file}' is missing reduced velocity 'U_r'.")
+                series_ur = _prepare_reduced_velocity_series(series_data["U_r"], series_t.shape[0], name=str(series_file))
+                ur_val = float(np.asarray(series_ur).reshape(-1)[0])
             if series_t.ndim != 1 or series_y.ndim != 1:
                 raise ValueError(f"Series '{series_file}' must contain 1D 'a' and 'b' arrays.")
             if series_t.shape[0] != series_y.shape[0]:
@@ -1579,6 +1728,7 @@ def load_training_series(
                     series_vel = np.interp(series_t_resampled, series_t, series_vel)
                 if series_force is not None:
                     series_force = np.interp(series_t_resampled, series_t, series_force)
+                series_ur = np.full((series_t_resampled.shape[0],), ur_val, dtype=float)
                 series_t = series_t_resampled
                 series_dt = dt_eval
             if cut_start_seconds > 0.0:
@@ -1590,15 +1740,16 @@ def load_training_series(
                     series_vel = np.asarray(series_vel)[cut_mask]
                 if series_force is not None:
                     series_force = np.asarray(series_force)[cut_mask]
+                series_ur = np.full((series_t.shape[0],), ur_val, dtype=float)
                 if series_t.shape[0] < 2:
                     raise ValueError(
                         f"Series '{series_file}' became too short after cut_start_seconds={cut_start_seconds}."
                     )
                 series_dt = float(series_t[1] - series_t[0])
             if series_force is None:
-                train_series_raw.append((series_y, series_t, series_dt, series_vel, None))
+                train_series_raw.append((series_y, series_t, series_dt, series_vel, None, series_ur))
             else:
-                train_series_raw.append((series_y, series_t, series_dt, series_vel, series_force))
+                train_series_raw.append((series_y, series_t, series_dt, series_vel, series_force, series_ur))
     else:
         train_series_raw.append(
             (
@@ -1607,6 +1758,7 @@ def load_training_series(
                 dt_eval,
                 eval_velocity if vel_source in {"file", "auto"} else None,
                 np.asarray(eval_force) if require_force else None,
+                _prepare_reduced_velocity_series(eval_reduced_velocity, t_eval.shape[0], name="eval series"),
             )
         )
 
@@ -1619,7 +1771,9 @@ def load_training_series(
         smoothing_cfg=smoothing_cfg,
         vel_np=eval_velocity if vel_source in {"file", "auto"} else None,
     )
-    return train_series_raw, eval_tensors
+    eval_ur = _prepare_reduced_velocity_series(eval_reduced_velocity, t_eval.shape[0], name="eval series")
+    eval_ur_tensor = torch.from_numpy(np.ascontiguousarray(eval_ur)).float()
+    return train_series_raw, (*eval_tensors, eval_ur_tensor)
 
 
 def build_dataset(
@@ -1628,16 +1782,25 @@ def build_dataset(
     m_eff: float,
     t_tensor: torch.Tensor,
     *,
+    reduced_velocity: torch.Tensor,
     force_tensor: torch.Tensor | None = None,
 ) -> TensorDataset:
     """Construct consecutive state/time pairs for training (optionally with force labels)."""
     z = torch.stack((y_data_t, vel * m_eff), dim=1)
+    ur = reduced_velocity
+    if ur.ndim == 1:
+        ur = ur.unsqueeze(1)
+    if ur.ndim != 2 or ur.shape[1] != 1:
+        raise ValueError("Reduced velocity tensor must have shape (T,) or (T, 1).")
+    if ur.shape[0] != z.shape[0]:
+        raise ValueError("Reduced velocity tensor must match the sequence length.")
     if force_tensor is None:
         return TensorDataset(
             z[:-1],
             t_tensor[:-1].unsqueeze(1),
             z[1:],
             t_tensor[1:].unsqueeze(1),
+            ur[:-1],
         )
     if force_tensor.shape[0] != z.shape[0]:
         raise ValueError("force_tensor must match the sequence length.")
@@ -1646,6 +1809,7 @@ def build_dataset(
         t_tensor[:-1].unsqueeze(1),
         z[1:],
         t_tensor[1:].unsqueeze(1),
+        ur[:-1],
         force_tensor[:-1].unsqueeze(1),
         force_tensor[1:].unsqueeze(1),
     )
@@ -1735,11 +1899,27 @@ def resample_uniform_series(
     resampled_y = np.interp(resampled_t, series_t, series_y)
     return resampled_y, resampled_t
 
-def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: float,
-                  dt: float, t: np.ndarray, D: float, k: float, device: torch.device) -> dict[str, np.ndarray]:
+def rollout_model(
+    model: PHVIV,
+    y0: torch.Tensor,
+    vel: torch.Tensor,
+    reduced_velocity: torch.Tensor | np.ndarray | float,
+    m_eff: float,
+    dt: float,
+    t: np.ndarray,
+    D: float,
+    k: float,
+    device: torch.device,
+) -> dict[str, np.ndarray]:
     """Roll the model forward over the full time grid and return normalised traces."""
     p0 = vel[0] * m_eff
     state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
+    rv_val = reduced_velocity
+    if torch.is_tensor(rv_val):
+        rv_val = float(rv_val.reshape(-1)[0].detach().cpu())
+    else:
+        rv_val = float(np.asarray(rv_val).reshape(-1)[0])
+    rv_tensor = torch.tensor(rv_val, device=device)
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
     force_total: list[torch.Tensor] = []
@@ -1750,18 +1930,18 @@ def rollout_model(model: PHVIV, y0: torch.Tensor, vel: torch.Tensor, m_eff: floa
         for _ in range(len(t)):
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
-            model_force = model.learned_force(state).squeeze().detach()
+            model_force = model.learned_force(state, reduced_velocity=rv_tensor).squeeze().detach()
             if model.include_physical_drag:
                 drag_force = model.drag_force(state).squeeze().detach()
             else:
                 drag_force = model_force.new_tensor(0.0)
-            total_force = model.u_theta(state).squeeze().detach()
+            total_force = model.u_theta(state, reduced_velocity=rv_tensor).squeeze().detach()
             H_val = model.H(state).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
-            state = model.step_rk4(state, t, dt)
+            state = model.step_rk4(state, t, dt, reduced_velocity=rv_tensor)
 
     y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
     p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()

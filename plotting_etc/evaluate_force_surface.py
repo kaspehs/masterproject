@@ -54,12 +54,18 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[PHVIV, dict[str, 
     return model, derived
 
 
-def evaluate_force_surface(model: PHVIV, q_values: np.ndarray, p_values: np.ndarray, device: torch.device):
+def evaluate_force_surface(
+    model: PHVIV,
+    q_values: np.ndarray,
+    p_values: np.ndarray,
+    reduced_velocity: float,
+    device: torch.device,
+):
     QQ, PP = np.meshgrid(q_values, p_values, indexing="ij")
     grid = np.stack([QQ, PP], axis=-1)
     with torch.no_grad():
         inputs = torch.from_numpy(grid.reshape(-1, 2)).float().to(device)
-        forces = model.u_theta(inputs).cpu().numpy().reshape(QQ.shape)
+        forces = model.u_theta(inputs, reduced_velocity=reduced_velocity).cpu().numpy().reshape(QQ.shape)
     return QQ, PP, forces
 
 
@@ -117,18 +123,22 @@ def main():
     q_range = np.linspace(-derived["D"], derived["D"], 100)
     p_scale = np.sqrt(derived["k"] * derived["m_eff"]) * derived["D"]
     p_range = np.linspace(-p_scale, p_scale, 100)
-    QQ, PP, forces = evaluate_force_surface(model, q_range, p_range, device)
     save_path = Path("figs") / f"force_heatmap_{CKPT_PATH.stem}.png"
     q_edges = np.linspace(q_range.min(), q_range.max(), q_range.size + 1)
     p_edges = np.linspace(p_range.min(), p_range.max(), p_range.size + 1)
-    sums = np.zeros_like(QQ)
-    counts = np.zeros_like(QQ)
-    squared = np.zeros_like(QQ)
-    limit_path = None
 
     runs_dir = LOGGED_RUNS_DIR
     run_files, _ = iter_logged_runs(runs_dir, logger_hz=LOGGER_HZ)
     print(f"Using {len(run_files)} logged runs from {runs_dir}")
+    with np.load(run_files[0]) as run:
+        if "U_r" not in run:
+            raise KeyError(f"{run_files[0].name} is missing reduced velocity 'U_r'.")
+        ur_val = float(np.asarray(run["U_r"]).reshape(-1)[0])
+    QQ, PP, forces = evaluate_force_surface(model, q_range, p_range, ur_val, device)
+    sums = np.zeros_like(QQ)
+    counts = np.zeros_like(QQ)
+    squared = np.zeros_like(QQ)
+    limit_path = None
 
     for run_path in run_files:
         with np.load(run_path) as run:

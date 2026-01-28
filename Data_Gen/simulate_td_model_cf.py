@@ -45,6 +45,7 @@ def simulate_td_model_cf(
     fhat: float = 0.15,
     dt: float = dt,
     T: float = T,
+    U: float = U,
     output_path: str | Path | None = "data.npz",
     plot: bool = False,
     seed: int | None = None,
@@ -59,6 +60,7 @@ def simulate_td_model_cf(
         fhat: normalized frequency used for the initial harmonic displacement.
         dt: timestep size.
         T: total simulation time.
+        U: flow speed used to set reduced velocity.
         output_path: where to store the npz file; set to None to skip saving.
         plot: whether to show diagnostic plots.
         seed: optional RNG seed for the initial vortex shedding phase.
@@ -83,6 +85,8 @@ def simulate_td_model_cf(
         raise ValueError("integrator must be either 'euler' or 'rk4'.")
 
     rng = np.random.default_rng(seed)
+
+    U_r = 2 * np.pi * U / D * np.sqrt((M + D**2 * np.pi / 4.0 * rho) / K)
 
     N = int(np.ceil(T / dt))
     time = np.zeros(N)
@@ -136,7 +140,6 @@ def simulate_td_model_cf(
         return y_next, v_next
 
     if verbose:
-        U_r = 2 * np.pi * U / D * np.sqrt((M + D**2 * np.pi / 4.0 * rho) / K)
         print(f"Reduced velocity: {U_r:.3f}, damping C={C:.3e}")
 
     for i in range(N - 1):
@@ -193,7 +196,7 @@ def simulate_td_model_cf(
     if output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(output_path, a=time, b=y, c=F_total, d=H, e=dy)
+        np.savez(output_path, a=time, b=y, c=F_total, d=H, e=dy, U_r=U_r)
 
     if plot:
         _plot_diagnostics(time, y, dy, Fy, Fca, Fcv, Fdy)
@@ -208,6 +211,7 @@ def simulate_td_model_cf(
         "Fcv": Fcv,
         "Fdy": Fdy,
         "H": H,
+        "U_r": U_r,
     }
 
 

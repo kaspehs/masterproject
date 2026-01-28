@@ -32,6 +32,7 @@ def evaluate_series(
     t: np.ndarray,
     disp: np.ndarray,
     force: np.ndarray,
+    reduced_velocity: float,
     smoothing_cfg,
     device: torch.device,
 ) -> dict[str, float]:
@@ -49,6 +50,7 @@ def evaluate_series(
         model,
         y_tensor,
         vel_tensor,
+        reduced_velocity,
         derived["m_eff"],
         dt,
         t,
@@ -91,7 +93,12 @@ def simulate_series(a_factor: float, fhat: float, dt: float, T: float, integrato
         verbose=False,
         integrator=integrator,
     )
-    return sim["time"][::reduction_factor], sim["y"][::reduction_factor], sim["F_total"][::reduction_factor]
+    return (
+        sim["time"][::reduction_factor],
+        sim["y"][::reduction_factor],
+        sim["F_total"][::reduction_factor],
+        float(sim["U_r"]),
+    )
 
 
 def main():
@@ -118,8 +125,8 @@ def main():
     smoothing_cfg = cfg.smoothing
     results = []
     for amplitude, freq in CASES:
-        t, disp, force = simulate_series(amplitude, freq, SIM_DT, SIM_T, SIM_INTEGRATOR)
-        metrics = evaluate_series(model, derived, t, disp, force, smoothing_cfg, device)
+        t, disp, force, ur_val = simulate_series(amplitude, freq, SIM_DT, SIM_T, SIM_INTEGRATOR)
+        metrics = evaluate_series(model, derived, t, disp, force, ur_val, smoothing_cfg, device)
         entry = {
             "amplitude": amplitude,
             "frequency": freq,

@@ -5,7 +5,7 @@ data:
   file: data.npz
   cut_start_seconds: 0.0
   use_generated_train_series: true
-  train_series_dir: Data_Gen/generated_series_dy
+  train_series_dir: Data_Gen/generated_series_Ur
   reduce_time: true
   reduction_factor: 100
 
@@ -25,7 +25,7 @@ smoothing:
 
 architecture:
   # Used when `vpinn.use_architecture_config: true`
-  force_net_type: residual
+  force_net_type: mlp
   residual_kwargs:
     hidden: 128
     layers: 2
@@ -42,19 +42,19 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 256
+  batch_size: 1024
   max_grad_norm: 10000.0
-  epochs: 50
+  epochs: 100
 
 optim:
   lr: 0.001
   optimizer: adam
   weight_decay: 0.0
-  use_lr_scheduler: false
+  use_lr_scheduler: true
   scheduler:
     max_lr: 0.001
-    decay_steps: 1000
-    warmup_steps: 0
+    decay_steps: 90
+    warmup_steps: 10
     min_lr: 0.0001
     scheduler_type: cosine
 
@@ -72,7 +72,7 @@ compile:
   compile_mode: default
 
 logging:
-  run_dir_root: VPINNruns
+  run_dir_root: logs
 
 monitoring:
   # Logging / validation cadence
@@ -83,6 +83,7 @@ monitoring:
   # Rollout validation plots (dynamics check)
   rollout_every_epochs: 10
   rollout_max_trajectories: 1
+  cycle_validation_rollout: true
 
 vpinn:
   # Loss toggles
@@ -114,6 +115,6 @@ vpinn:
 
   # Data interpretation
   # Generated series contain x and f, but not dy, so we compute v from x.
-  velocity_source: file
+  velocity_source: compute
   use_data_file_for_validation: true
   validation_only_data_file: true

@@ -25,6 +25,7 @@ from HNN_helper import (
     GradNormBalancer,
     PHVIV,
     build_dataloader_from_series,
+    compute_validation_metrics,
     compute_model_grad_norm,
     load_training_series,
     log_training_metrics,
@@ -65,18 +66,19 @@ def _train_one_epoch(
     gradnorm_weight_count = 0
 
     for batch in train_loader:
-        if len(batch) == 4:
-            z_i, t_i, z_next, t_next = batch
+        if len(batch) == 5:
+            z_i, t_i, z_next, t_next, ur_i = batch
             f_i = None
             f_next = None
-        elif len(batch) == 6:
-            z_i, t_i, z_next, t_next, f_i, f_next = batch
+        elif len(batch) == 7:
+            z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
         else:
             raise ValueError("Unexpected batch format from dataloader.")
         z_i = z_i.to(device, non_blocking=non_blocking)
         t_i = t_i.to(device, non_blocking=non_blocking)
         z_next = z_next.to(device, non_blocking=non_blocking)
         t_next = t_next.to(device, non_blocking=non_blocking)
+        ur_i = ur_i.to(device, non_blocking=non_blocking)
         if f_i is not None:
             f_i = f_i.to(device, non_blocking=non_blocking)
         if f_next is not None:
@@ -85,8 +87,8 @@ def _train_one_epoch(
         opt.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-            res_loss = model.res_loss(z_i, t_i, z_next, t_next)
-            avg_force = model.avg_force(z_i, t_i, z_next, t_next)
+            res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+            avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
             base_force_loss = avg_force
             if use_force_data_loss:
                 if f_i is None or f_next is None:
@@ -95,7 +97,7 @@ def _train_one_epoch(
                     )
                 z_mid = 0.5 * (z_i + z_next)
                 f_mid = 0.5 * (f_i + f_next)
-                f_pred = model.u_theta(z_mid)
+                f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
                 data_force_loss = torch.mean((f_pred - f_mid) ** 2)
             else:
                 data_force_loss = res_loss.new_tensor(0.0)
@@ -201,6 +203,11 @@ def _validate_if_needed(
     model: PHVIV,
     y_data_t: torch.Tensor,
     val_vel: torch.Tensor,
+    reduced_velocity: torch.Tensor,
+    val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] | None,
+    val_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None,
+    val_loader: Any | None,
+    cycle_validation_rollout: bool,
     m_eff: float,
     dt: float,
     t: np.ndarray,
@@ -213,10 +220,92 @@ def _validate_if_needed(
     middle_time_plot,
     hamiltonian_data,
     log_extra_validation_metrics: bool,
+    force_reg: float,
+    use_force_data_loss: bool,
+    force_data_weight: float,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> None:
     if rollout_every_epochs <= 0:
         return
     if (epoch + 1) % int(rollout_every_epochs) != 0:
+        return
+    if val_loader is not None:
+        val_loss_metrics = _evaluate_val_losses(
+            model=model,
+            loader=val_loader,
+            device=device,
+            non_blocking=(device.type == "cuda"),
+            force_reg=force_reg,
+            use_force_data_loss=use_force_data_loss,
+            force_data_weight=force_data_weight,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
+        for name, value in val_loss_metrics.items():
+            writer.add_scalar(f"val/{name}", value, epoch + 1)
+
+    if val_series_raw is not None and val_sequences is not None:
+        metrics_sum: dict[str, float] = {}
+        count = 0
+        for series_raw, sequence in zip(val_series_raw, val_sequences):
+            y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
+            y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
+            if force_np is None:
+                continue
+            metrics = compute_validation_metrics(
+                model=model,
+                y_data_t=y_tensor,
+                val_vel=vel_tensor,
+                reduced_velocity=ur_tensor,
+                m_eff=m_eff,
+                dt=dt_value,
+                t=t_np,
+                y_data_raw=y_np,
+                force_data=force_np,
+                D=D,
+                k=k,
+                device=device,
+                log_extra_metrics=log_extra_validation_metrics,
+            )
+            for name, value in metrics.items():
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+            count += 1
+        if count > 0:
+            for name, total in metrics_sum.items():
+                writer.add_scalar(f"val/{name}", total / float(count), epoch + 1)
+        if cycle_validation_rollout:
+            step = max(0, (epoch + 1) // max(1, int(rollout_every_epochs)) - 1)
+            rollout_idx = step % len(val_series_raw)
+        else:
+            rollout_idx = 0
+        series_raw = val_series_raw[rollout_idx]
+        sequence = val_sequences[rollout_idx]
+        y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
+        y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
+        if force_np is None:
+            return
+        log_validation_epoch(
+            writer,
+            epoch + 1,
+            model,
+            y_tensor,
+            vel_tensor,
+            ur_tensor,
+            m_eff,
+            dt_value,
+            t_np,
+            y_np / D,
+            y_np,
+            force_np,
+            D,
+            k,
+            device,
+            middle_time_plot,
+            hamiltonian_data,
+            log_extra_metrics=log_extra_validation_metrics,
+            log_metrics=False,
+        )
         return
     log_validation_epoch(
         writer,
@@ -224,6 +313,7 @@ def _validate_if_needed(
         model,
         y_data_t,
         val_vel,
+        reduced_velocity,
         m_eff,
         dt,
         t,
@@ -239,23 +329,116 @@ def _validate_if_needed(
     )
 
 
+def _evaluate_val_losses(
+    *,
+    model: PHVIV,
+    loader: Any,
+    device: torch.device,
+    non_blocking: bool,
+    force_reg: float,
+    use_force_data_loss: bool,
+    force_data_weight: float,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+) -> dict[str, float]:
+    was_training = model.training
+    model.eval()
+    loss_sum = torch.zeros((), device=device)
+    res_sum = torch.zeros((), device=device)
+    force_sum = torch.zeros((), device=device)
+    data_sum = torch.zeros((), device=device)
+    batches = 0
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 5:
+                z_i, t_i, z_next, t_next, ur_i = batch
+                f_i = None
+                f_next = None
+            elif len(batch) == 7:
+                z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+            else:
+                raise ValueError("Unexpected batch format from dataloader.")
+            z_i = z_i.to(device, non_blocking=non_blocking)
+            t_i = t_i.to(device, non_blocking=non_blocking)
+            z_next = z_next.to(device, non_blocking=non_blocking)
+            t_next = t_next.to(device, non_blocking=non_blocking)
+            ur_i = ur_i.to(device, non_blocking=non_blocking)
+            if f_i is not None:
+                f_i = f_i.to(device, non_blocking=non_blocking)
+            if f_next is not None:
+                f_next = f_next.to(device, non_blocking=non_blocking)
+
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                force_loss = float(force_reg) * avg_force
+                if use_force_data_loss:
+                    if f_i is None or f_next is None:
+                        raise ValueError(
+                            "use_force_data_loss is True but the dataloader did not provide force labels."
+                        )
+                    z_mid = 0.5 * (z_i + z_next)
+                    f_mid = 0.5 * (f_i + f_next)
+                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                    data_force_loss = torch.mean((f_pred - f_mid) ** 2)
+                else:
+                    data_force_loss = res_loss.new_tensor(0.0)
+                total = res_loss + force_loss + float(force_data_weight) * data_force_loss
+
+            loss_sum = loss_sum + total.detach().float()
+            res_sum = res_sum + res_loss.detach().float()
+            force_sum = force_sum + force_loss.detach().float()
+            data_sum = data_sum + data_force_loss.detach().float()
+            batches += 1
+
+    if was_training:
+        model.train()
+    denom = float(max(batches, 1))
+    return {
+        "loss_total": float((loss_sum / denom).detach().cpu()),
+        "loss_physics": float((res_sum / denom).detach().cpu()),
+        "loss_reg": float((force_sum / denom).detach().cpu()),
+        "loss_data": float((data_sum / denom).detach().cpu()),
+    }
+
+
 def train(config: Config, config_name: str) -> None:
     data_cfg = config.data
-    data_path = Path(data_cfg.file)
+    middle_time_plot = data_cfg.middle_time_plot
+    use_generated_train_series = data_cfg.use_generated_train_series
+    train_series_root = Path(data_cfg.train_series_dir)
+    train_series_dir = train_series_root
+
+    if use_generated_train_series:
+        train_dir = train_series_root / "train"
+        val_dir = train_series_root / "val"
+        if not val_dir.exists():
+            raise FileNotFoundError(
+                f"Expected validation data in '{val_dir}'. data.npz is no longer used for validation."
+            )
+        if not train_dir.exists():
+            raise FileNotFoundError(f"Expected training data in '{train_dir}'.")
+        val_files = sorted(val_dir.glob("*.npz"))
+        if not val_files:
+            raise FileNotFoundError(f"No '.npz' files found in validation directory '{val_dir}'.")
+        data_path = val_files[0]
+        train_series_dir = train_dir
+    else:
+        data_path = Path(data_cfg.file)
+
     data = np.load(data_path)
     t = data["a"]
     y_data = data["b"]
     F_data = data["c"]
     H_data = data["d"]
+    if "U_r" not in data:
+        raise KeyError(f"{data_path} is missing reduced velocity 'U_r'.")
+    reduced_velocity = data["U_r"]
     vel_data = None
     for key in ("e", "dy", "v"):
         if key in data:
             vel_data = data[key]
             break
-
-    middle_time_plot = data_cfg.middle_time_plot
-    use_generated_train_series = data_cfg.use_generated_train_series
-    train_series_dir = Path(data_cfg.train_series_dir)
 
     t, y_data, F_data, hamiltonian_data, vel_data, dt = preprocess_timeseries(
         t,
@@ -292,6 +475,7 @@ def train(config: Config, config_name: str) -> None:
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
 
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
+    cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
     log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
@@ -324,11 +508,12 @@ def train(config: Config, config_name: str) -> None:
         smoothing_cfg=smoothing_cfg,
         velocity_source=velocity_source,
         eval_velocity=vel_data,
+        eval_reduced_velocity=reduced_velocity,
         require_force=use_force_data_loss,
         eval_force=F_data,
         cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
     )
-    eval_y_tensor, eval_vel_tensor, eval_t_tensor = eval_tensors
+    eval_y_tensor, eval_vel_tensor, eval_t_tensor, eval_ur_tensor = eval_tensors
 
     pin_memory = device.type == "cuda"
     num_workers = int(runtime_cfg.num_workers)
@@ -342,10 +527,43 @@ def train(config: Config, config_name: str) -> None:
         pin_memory=pin_memory,
     )
 
+    val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] | None = None
+    val_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
+    val_loader: Any | None = None
     if use_generated_train_series:
-        y_data_t, val_vel, _t_tensor = eval_y_tensor, eval_vel_tensor, eval_t_tensor
+        val_dir = train_series_root / "val"
+        if val_dir.exists():
+            val_series_raw, _ = load_training_series(
+                y_data,
+                t,
+                dt,
+                True,
+                val_dir,
+                m_eff,
+                device,
+                smoothing_cfg=smoothing_cfg,
+                velocity_source=velocity_source,
+                eval_velocity=vel_data,
+                eval_reduced_velocity=reduced_velocity,
+                require_force=True,
+                eval_force=F_data,
+                cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
+            )
+            val_loader, val_sequences, _ = build_dataloader_from_series(
+                val_series_raw,
+                m_eff=m_eff,
+                batch_size=batch_size,
+                device=device,
+                smoothing_cfg=smoothing_cfg,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+
+    if use_generated_train_series:
+        y_data_t, val_vel, _t_tensor, val_ur = eval_y_tensor, eval_vel_tensor, eval_t_tensor, eval_ur_tensor
     else:
-        y_data_t, val_vel, _t_tensor = train_sequences[0]
+        y_data_t, val_vel, _t_tensor, val_ur = train_sequences[0]
 
     writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
 
@@ -458,6 +676,11 @@ def train(config: Config, config_name: str) -> None:
             model=model,
             y_data_t=y_data_t,
             val_vel=val_vel,
+            reduced_velocity=val_ur,
+            val_series_raw=val_series_raw,
+            val_sequences=val_sequences,
+            val_loader=val_loader,
+            cycle_validation_rollout=cycle_validation_rollout,
             m_eff=m_eff,
             dt=dt,
             t=t,
@@ -470,6 +693,11 @@ def train(config: Config, config_name: str) -> None:
             middle_time_plot=middle_time_plot,
             hamiltonian_data=hamiltonian_data,
             log_extra_validation_metrics=log_extra_validation_metrics,
+            force_reg=force_reg,
+            use_force_data_loss=use_force_data_loss,
+            force_data_weight=force_data_weight,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
 
     models_dir = Path("models")

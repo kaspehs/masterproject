@@ -149,8 +149,8 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
     raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate")
 
 
-def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    return model(torch.cat([x, v], dim=-1))
+def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor, ur: torch.Tensor) -> torch.Tensor:
+    return model(torch.cat([x, v, ur], dim=-1))
 
 
 def rollout_rk4(
@@ -158,6 +158,7 @@ def rollout_rk4(
     model: nn.Module,
     x0: torch.Tensor,
     v0: torch.Tensor,
+    ur0: torch.Tensor,
     steps: int,
     dt: float,
     m: torch.Tensor,
@@ -183,14 +184,14 @@ def rollout_rk4(
     v = v0
     xs = [x]
     vs = [v]
-    fs = [_vpinn_force(model, x, v)]
+    fs = [_vpinn_force(model, x, v, ur0)]
 
     dt_t = x0.new_tensor(float(dt))
     half = x0.new_tensor(0.5)
     sixth = x0.new_tensor(1.0 / 6.0)
 
     def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
-        fi = _vpinn_force(model, xi, vi)
+        fi = _vpinn_force(model, xi, vi, ur0)
         return (fi - c * vi - k * xi) / m
 
     for _ in range(int(steps)):
@@ -217,7 +218,7 @@ def rollout_rk4(
 
         xs.append(x)
         vs.append(v)
-        fs.append(_vpinn_force(model, x, v))
+        fs.append(_vpinn_force(model, x, v, ur0))
 
     return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1)
 
@@ -233,8 +234,9 @@ def _m_eff_from_model_cfg(model_cfg: Any) -> float:
 
 def _read_timeseries_npz(
     path: Path,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], float]:
     with np.load(path) as data:
+        ur_raw = data["U_r"] if "U_r" in data else None
         if "time" in data:
             t = np.asarray(data["time"])
             x = np.asarray(data["y"])
@@ -283,7 +285,19 @@ def _read_timeseries_npz(
             v = v[:, None]
         if v.shape != x.shape:
             raise ValueError(f"{path} has mismatched shapes (x={x.shape}, dy={v.shape}).")
-    return t, x, f, v
+    if ur_raw is None:
+        raise ValueError(f"{path} is missing reduced velocity 'U_r'.")
+    ur_arr = np.asarray(ur_raw, dtype=float)
+    if ur_arr.ndim == 0:
+        ur_val = float(ur_arr)
+    else:
+        ur_flat = ur_arr.reshape(-1)
+        if ur_flat.shape[0] != t.size:
+            raise ValueError(f"{path} reduced velocity length must match time series length.")
+        ur_val = float(ur_flat[0])
+        if not np.allclose(ur_flat, ur_val, rtol=1e-6, atol=1e-9):
+            raise ValueError(f"{path} reduced velocity must be constant within a series.")
+    return t, x, f, v, ur_val
 
 
 def _infer_dt_target_from_data_cfg(data_cfg: Any) -> Optional[float]:
@@ -339,7 +353,7 @@ def _load_trajectory(
     reduction_factor: int,
     cut_start_seconds: float,
 ) -> tuple[dict[str, Any], float]:
-    t, x, f_meas, v_file = _read_timeseries_npz(path)
+    t, x, f_meas, v_file, ur_val = _read_timeseries_npz(path)
     t, x, f_meas, v_file = _maybe_reduce_time(
         t,
         x,
@@ -395,12 +409,14 @@ def _load_trajectory(
     else:
         raise ValueError("vpinn.velocity_source must be 'compute' or 'file'.")
 
+    ur_series = np.full((t.shape[0], 1), float(ur_val), dtype=np.float32)
     traj = {
         "name": path.name,
         "t": torch.from_numpy(t.astype(np.float32)),
         "x": torch.from_numpy(x.astype(np.float32)),
         "v": torch.from_numpy(np.asarray(v, dtype=np.float32)),
         "f": torch.from_numpy(f_meas.astype(np.float32)),
+        "ur": torch.from_numpy(ur_series),
     }
     return traj, dt
 
@@ -445,7 +461,7 @@ def _split_by_trajectory(
     return train, val
 
 
-class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
         trajectories: list[dict[str, Any]],
@@ -484,17 +500,18 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __len__(self) -> int:  # type: ignore[override]
         return int(self._traj_ids.shape[0])
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # type: ignore[override]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # type: ignore[override]
         traj = self.trajectories[int(self._traj_ids[idx])]
         start = int(self._starts[idx])
         end = start + self.M1
         x = traj["x"][start:end]
         v = traj["v"][start:end]
         f = traj["f"][start:end]
-        return x, v, f
+        ur = traj["ur"][start:end]
+        return x, v, f, ur
 
 
-def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], float]:
+def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
     data_cfg = config.data
     smoothing_cfg = config.smoothing
     vp = dict(config.vpinn or {})
@@ -511,17 +528,34 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], float]:
             series_dir = (Path.cwd() / series_dir).resolve()
         if not series_dir.exists():
             raise FileNotFoundError(f"Training series directory '{series_dir}' does not exist.")
-        files = sorted(series_dir.glob("*.npz"))
-        if not files:
-            raise FileNotFoundError(f"No '.npz' files found in '{series_dir}'.")
-        sources: list[Path] = list(files)
+        train_dir = series_dir / "train"
+        val_dir = series_dir / "val"
+        if train_dir.exists() or val_dir.exists():
+            if not train_dir.exists() or not val_dir.exists():
+                raise FileNotFoundError(f"Expected both train/ and val/ under '{series_dir}'.")
+            train_files = sorted(train_dir.glob("*.npz"))
+            val_files = sorted(val_dir.glob("*.npz"))
+            if not train_files:
+                raise FileNotFoundError(f"No '.npz' files found in '{train_dir}'.")
+            if not val_files:
+                raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
+            sources: list[Path] = list(train_files)
+            val_sources: list[Path] = list(val_files)
+        else:
+            files = sorted(series_dir.glob("*.npz"))
+            if not files:
+                raise FileNotFoundError(f"No '.npz' files found in '{series_dir}'.")
+            sources = list(files)
+            val_sources = []
     else:
         data_path = Path(data_cfg.file)
         if not data_path.is_absolute():
             data_path = (Path.cwd() / data_path).resolve()
         sources = [data_path]
+        val_sources = []
 
     trajectories: list[dict[str, Any]] = []
+    val_trajectories: list[dict[str, Any]] = []
     dt_ref: Optional[float] = None
     cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
     for path in sources:
@@ -539,10 +573,25 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], float]:
         elif not np.isclose(dt, float(dt_ref), rtol=1e-9, atol=1e-12):
             raise ValueError(f"{path} has dt={dt} but expected dt={dt_ref}.")
         trajectories.append(traj)
+    for path in val_sources:
+        traj, dt = _load_trajectory(
+            path=path,
+            dt_target=dt_target,
+            velocity_source=velocity_source,
+            smoothing_cfg=smoothing_cfg,
+            reduce_time=False,
+            reduction_factor=1,
+            cut_start_seconds=cut_start_seconds,
+        )
+        if dt_ref is None:
+            dt_ref = dt
+        elif not np.isclose(dt, float(dt_ref), rtol=1e-9, atol=1e-12):
+            raise ValueError(f"{path} has dt={dt} but expected dt={dt_ref}.")
+        val_trajectories.append(traj)
 
     if dt_ref is None:
         raise ValueError("No trajectories loaded.")
-    return trajectories, float(dt_ref)
+    return trajectories, val_trajectories, float(dt_ref)
 
 
 def _test_functions(M: int, dt: float, *, include_quadratic: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -629,13 +678,14 @@ def _evaluate_epoch(
     loss_w_sum = 0.0
     count = 0
     with torch.no_grad():
-        for x_win, v_win, f_meas in loader:
+        for x_win, v_win, f_meas, ur_win in loader:
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
+            ur_win = ur_win.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
-            inp = torch.cat([x_win, v_win], dim=-1)
+            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
 
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                 flat = inp.reshape(B * M1, -1)
@@ -685,6 +735,7 @@ def _log_rollout_validation(
     x_true_t = traj["x"].to(device)
     v_true_t = traj["v"].to(device)
     f_true_t = traj["f"].to(device)
+    ur_true_t = traj["ur"].to(device)
     t_np = traj["t"].detach().cpu().numpy()
     if x_true_t.ndim != 2:
         return
@@ -702,6 +753,7 @@ def _log_rollout_validation(
         model=model,
         x0=x_true_t[0:1, :],
         v0=v_true_t[0:1, :],
+        ur0=ur_true_t[0:1, :],
         steps=steps,
         dt=dt,
         m=m,
@@ -727,7 +779,7 @@ def _log_rollout_validation(
     writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
 
     with torch.no_grad():
-        f_on_data = _vpinn_force(model, x_true_t, v_true_t)[:, 0].detach().cpu().numpy()
+        f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
     rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
     writer.add_scalar("val/force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
 
@@ -740,6 +792,7 @@ def _log_rollout_validation(
     zoom_mask = create_zoom_mask(t_np)
     middle_mask = create_window_mask(t_np, middle_time_plot)
     middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
+    ur_val = float(ur_true_t[0, 0].detach().cpu().item())
     log_displacement_plots(
         writer,
         epoch,
@@ -750,6 +803,7 @@ def _log_rollout_validation(
         zoom_mask,
         middle_mask,
         middle_window,
+        reduced_velocity=ur_val,
     )
     log_force_plots(
         writer,
@@ -763,6 +817,7 @@ def _log_rollout_validation(
         middle_mask,
         middle_window,
         include_physical_drag=False,
+        reduced_velocity=ur_val,
     )
 
 
@@ -808,16 +863,19 @@ def train(config: Config, config_name: str) -> None:
     set_num_threads_from_slurm(default=1)
     non_blocking = device.type == "cuda"
 
-    trajectories, dt = _prepare_trajectories(config)
+    train_trajs, val_trajs, dt = _prepare_trajectories(config)
     validation_only_data_file = bool(vp.get("validation_only_data_file", False))
+    use_data_file_for_validation = bool(vp.get("use_data_file_for_validation", False))
+    if val_trajs:
+        validation_only_data_file = False
+        use_data_file_for_validation = False
     if validation_only_data_file:
-        train_trajs, val_trajs = trajectories, []
+        val_trajs = []
     else:
-        train_trajs, val_trajs = _split_by_trajectory(trajectories, val_fraction=val_fraction, seed=split_seed)
+        if not val_trajs:
+            train_trajs, val_trajs = _split_by_trajectory(train_trajs, val_fraction=val_fraction, seed=split_seed)
     if not train_trajs:
         raise ValueError("Empty training split. Reduce vpinn.val_fraction or provide more trajectories.")
-
-    use_data_file_for_validation = bool(vp.get("use_data_file_for_validation", False))
     if use_data_file_for_validation:
         data_path = Path(config.data.file)
         if not data_path.is_absolute():
@@ -876,7 +934,7 @@ def train(config: Config, config_name: str) -> None:
     c = _as_diag_param(vp.get("c", getattr(config.model, "damping_c", 1e-4)), d, device, "c")
     k = _as_diag_param(vp.get("k", getattr(config.model, "k", 1218.0)), d, device, "k")
 
-    input_dim = 2 * d
+    input_dim = 2 * d + 1
     output_dim = d
     model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim)
     model = model.to(device)
@@ -923,6 +981,7 @@ def train(config: Config, config_name: str) -> None:
     validate_every = int(getattr(monitoring_cfg, "validate_every_epochs", 1))
     rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
     rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
+    cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
     middle_time_plot = getattr(config.data, "middle_time_plot", [0.0, 1.0])
     if len(middle_time_plot) != 2:
         middle_time_plot = [0.0, 1.0]
@@ -943,13 +1002,14 @@ def train(config: Config, config_name: str) -> None:
         gradnorm_count = 0
         batches = 0
 
-        for step, (x_win, v_win, f_meas) in enumerate(train_loader):
+        for step, (x_win, v_win, f_meas, ur_win) in enumerate(train_loader):
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
+            ur_win = ur_win.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
-            inp = torch.cat([x_win, v_win], dim=-1)
+            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
 
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
@@ -1059,7 +1119,14 @@ def train(config: Config, config_name: str) -> None:
 
         if rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == (epochs - 1)):
             candidates = val_trajs if val_trajs else train_trajs
-            for traj in candidates[: max(1, rollout_max_trajs)]:
+            if not candidates:
+                continue
+            if cycle_validation_rollout:
+                step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
+                rollout_idx = step % len(candidates)
+            else:
+                rollout_idx = 0
+            for traj in candidates[rollout_idx : rollout_idx + 1]:
                 _log_rollout_validation(
                     writer=writer,
                     epoch=epoch,

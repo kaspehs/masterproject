@@ -102,6 +102,7 @@ def simulate_logged(
         verbose=False,
         integrator=integrator,
     )
+    U_r = float(sim.get("U_r", float("nan")))
 
     time = np.asarray(sim["time"])
     mask = np.ones_like(time, dtype=bool)
@@ -126,6 +127,7 @@ def simulate_logged(
             "integrator": str(integrator),
             "start_time": None if start_time is None else float(start_time),
             "end_time": None if end_time is None else float(end_time),
+            "U_r": U_r,
         },
         "data": logged,
     }
@@ -149,6 +151,7 @@ def save_logged(out_dir: Path, payload: dict[str, Any]) -> Path:
         **data,
         A_factor=np.array(meta["A_factor"], dtype=float),
         fhat=np.array(meta["fhat"], dtype=float),
+        U_r=np.array(meta.get("U_r", float("nan")), dtype=float),
         dt_sim=np.array(meta["dt_sim"], dtype=float),
         dt_logger=np.array(meta["dt_logger"], dtype=float),
         logger_hz=np.array(meta["logger_hz"], dtype=float),

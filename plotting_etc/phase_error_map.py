@@ -237,7 +237,7 @@ def load_model(model_path: Path, *, dt: float) -> tuple[object, dict[str, float]
         # VPINN checkpoint stores a pointwise force network; rollout uses the known ODE.
         model_cfg = getattr(cfg, "model", None)
         d = 1
-        force_model = _build_vpinn_force_model(cfg, input_dim=2 * d, output_dim=d).to(DEVICE)
+        force_model = _build_vpinn_force_model(cfg, input_dim=2 * d + 1, output_dim=d).to(DEVICE)
         incompatible = force_model.load_state_dict(state, strict=False)
         if incompatible.missing_keys or incompatible.unexpected_keys:
             print(
@@ -318,6 +318,7 @@ def evaluate_run(
     time: np.ndarray,
     disp_true: np.ndarray,
     force_true: np.ndarray,
+    reduced_velocity: float,
 ) -> tuple[float, float]:
     dt = float(time[1] - time[0]) if time.size > 1 else 1.0
     # NOTE: rollout_model only uses the initial velocity value (vel[0]) to
@@ -331,6 +332,7 @@ def evaluate_run(
         model,
         y_tensor,
         vel_tensor,
+        reduced_velocity,
         derived["m_eff"],
         dt,
         time,
@@ -362,6 +364,7 @@ def _eval_rollout_nrmse_batch(
     disp_true: torch.Tensor,  # (B, T)
     force_true: torch.Tensor,  # (B, T)
     v0: torch.Tensor,  # (B,)
+    reduced_velocity: torch.Tensor,  # (B,) or (B,1)
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Fast batched rollout evaluation.
@@ -377,6 +380,12 @@ def _eval_rollout_nrmse_batch(
         raise ValueError("disp_true and force_true must have the same shape")
     if v0.ndim != 1 or v0.shape[0] != disp_true.shape[0]:
         raise ValueError("v0 must have shape (B,)")
+    if reduced_velocity.ndim == 2 and reduced_velocity.shape[1] == 1:
+        ur = reduced_velocity.squeeze(1)
+    else:
+        ur = reduced_velocity
+    if ur.ndim != 1 or ur.shape[0] != disp_true.shape[0]:
+        raise ValueError("reduced_velocity must have shape (B,) or (B,1)")
 
     B, T = disp_true.shape
     m_eff = float(derived["m_eff"])
@@ -398,12 +407,12 @@ def _eval_rollout_nrmse_batch(
     with torch.inference_mode():
         for k in range(int(T)):
             y_pred = state[:, 0]
-            f_pred = model.u_theta(state).squeeze(-1)
+            f_pred = model.u_theta(state, reduced_velocity=ur).squeeze(-1)
             dy = (y_pred - disp_true[:, k]).float()
             df = (f_pred - force_true[:, k]).float()
             sum_sq_y = sum_sq_y + dy * dy
             sum_sq_f = sum_sq_f + df * df
-            state = model.step_rk4(state, t_dummy, dt_t)
+            state = model.step_rk4(state, t_dummy, dt_t, reduced_velocity=ur)
 
     rmse_y = torch.sqrt(sum_sq_y / float(max(T, 1)))
     rmse_f = torch.sqrt(sum_sq_f / float(max(T, 1)))
@@ -420,6 +429,7 @@ def _eval_vpinn_rollout_nrmse_batch(
     disp_true: torch.Tensor,  # (B, T)
     force_true: torch.Tensor,  # (B, T)
     v0: torch.Tensor,  # (B,)
+    reduced_velocity: torch.Tensor,  # (B,) or (B,1)
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     VPINN rollout with known dynamics:
@@ -432,6 +442,12 @@ def _eval_vpinn_rollout_nrmse_batch(
         raise ValueError("disp_true and force_true must have the same shape")
     if v0.ndim != 1 or v0.shape[0] != disp_true.shape[0]:
         raise ValueError("v0 must have shape (B,)")
+    if reduced_velocity.ndim == 2 and reduced_velocity.shape[1] == 1:
+        ur = reduced_velocity.squeeze(1)
+    else:
+        ur = reduced_velocity
+    if ur.ndim != 1 or ur.shape[0] != disp_true.shape[0]:
+        raise ValueError("reduced_velocity must have shape (B,) or (B,1)")
 
     B, T = disp_true.shape
     m_eff = float(derived["m_eff"])
@@ -451,7 +467,7 @@ def _eval_vpinn_rollout_nrmse_batch(
     force_std = torch.where(force_std > 1e-9, force_std, torch.ones_like(force_std))
 
     def f_theta(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
-        inp = torch.stack((xi, vi), dim=1)
+        inp = torch.stack((xi, vi, ur), dim=1)
         return force_model(inp).squeeze(-1)
 
     def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
@@ -497,7 +513,7 @@ def _load_run(
     run_path: Path,
     *,
     prefer_dy: bool = True,
-) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], float]:
     with np.load(run_path) as run:
         amp = float(np.asarray(run["A_factor"])) if "A_factor" in run else float("nan")
         fhat = float(np.asarray(run["fhat"])) if "fhat" in run else float("nan")
@@ -507,7 +523,10 @@ def _load_run(
         dy: Optional[np.ndarray] = None
         if prefer_dy and "dy" in run:
             dy = np.asarray(run["dy"])
-    return amp, fhat, time, disp, force, dy
+        if "U_r" not in run:
+            raise KeyError(f"{run_path.name} is missing reduced velocity 'U_r'.")
+        ur_val = float(np.asarray(run["U_r"]).reshape(-1)[0])
+    return amp, fhat, time, disp, force, dy, ur_val
 
 
 def _print_nrmse_summary(name: str, errors: np.ndarray) -> None:
@@ -601,10 +620,10 @@ def main():
     # Group runs by (length, dt) so we can evaluate rollouts in batches.
     buckets: dict[
         tuple[int, float],
-        list[tuple[float, float, np.ndarray, np.ndarray, np.ndarray, Optional[float]]],
+        list[tuple[float, float, np.ndarray, np.ndarray, np.ndarray, Optional[float], float]],
     ] = {}
     for run_path in run_files:
-        amp, fhat, time, disp, force, dy = _load_run(run_path, prefer_dy=True)
+        amp, fhat, time, disp, force, dy, ur_val = _load_run(run_path, prefer_dy=True)
         if not np.isfinite(amp) or not np.isfinite(fhat):
             print(f"[warn] Skipping {run_path.name}: missing A_factor/fhat metadata.")
             continue
@@ -617,7 +636,7 @@ def main():
         dt = float(time[1] - time[0])
         dt_key = float(np.round(dt, 12))
         dy0 = float(dy[0]) if dy is not None and dy.size else None
-        buckets.setdefault((int(time.size), dt_key), []).append((amp, fhat, time, disp, force, dy0))
+        buckets.setdefault((int(time.size), dt_key), []).append((amp, fhat, time, disp, force, dy0, ur_val))
 
     for (T, dt_key), runs in sorted(buckets.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         for start in range(0, len(runs), int(EVAL_BATCH_SIZE)):
@@ -626,9 +645,10 @@ def main():
             fhats_np = np.asarray([b[1] for b in batch], dtype=float)
             disp_batch = np.stack([b[3] for b in batch], axis=0).astype(np.float32, copy=False)
             force_batch = np.stack([b[4] for b in batch], axis=0).astype(np.float32, copy=False)
+            ur_np = np.asarray([b[6] for b in batch], dtype=np.float32)
 
             v0_list: list[float] = []
-            for _amp, _fhat, t_np, y_np, _f_np, dy0 in batch:
+            for _amp, _fhat, t_np, y_np, _f_np, dy0, _ur in batch:
                 if dy0 is not None:
                     v0_list.append(float(dy0))
                 elif y_np.size >= 2:
@@ -640,6 +660,7 @@ def main():
             disp_true_t = torch.from_numpy(disp_batch).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
             force_true_t = torch.from_numpy(force_batch).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
             v0_t = torch.from_numpy(v0_np).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
+            ur_t = torch.from_numpy(ur_np).to(DEVICE, non_blocking=(DEVICE.type == "cuda"))
 
             if method in {"hnn", "phnn"}:
                 disp_nrmse, force_nrmse = _eval_rollout_nrmse_batch(
@@ -649,6 +670,7 @@ def main():
                     disp_true=disp_true_t,
                     force_true=force_true_t,
                     v0=v0_t,
+                    reduced_velocity=ur_t,
                 )
             elif method == "vpinn":
                 disp_nrmse, force_nrmse = _eval_vpinn_rollout_nrmse_batch(
@@ -658,6 +680,7 @@ def main():
                     disp_true=disp_true_t,
                     force_true=force_true_t,
                     v0=v0_t,
+                    reduced_velocity=ur_t,
                 )
             else:
                 raise ValueError(f"Unsupported method '{method}'")
