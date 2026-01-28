@@ -1029,15 +1029,6 @@ def train(config: Config, config_name: str) -> None:
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
-    writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
-    async_processes: list[subprocess.Popen] = []
-    async_dir = Path(writer.log_dir) / "async_validation"
-    if async_validation:
-        async_dir.mkdir(parents=True, exist_ok=True)
-
-    use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
-    base_lr = float(optim_cfg.lr)
-
     log_every = int(getattr(monitoring_cfg, "log_every_epochs", 1))
     print_every = int(getattr(monitoring_cfg, "print_every_epochs", 1))
     validate_every = int(getattr(monitoring_cfg, "validate_every_epochs", 1))
@@ -1051,6 +1042,15 @@ def train(config: Config, config_name: str) -> None:
     async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
     async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
     async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
+
+    writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
+    async_processes: list[subprocess.Popen] = []
+    async_dir = Path(writer.log_dir) / "async_validation"
+    if async_validation:
+        async_dir.mkdir(parents=True, exist_ok=True)
+
+    use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
+    base_lr = float(optim_cfg.lr)
     middle_time_plot = getattr(config.data, "middle_time_plot", [0.0, 1.0])
     if len(middle_time_plot) != 2:
         middle_time_plot = [0.0, 1.0]
