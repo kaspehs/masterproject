@@ -84,6 +84,7 @@ monitoring:
   rollout_every_epochs: 10
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
+  final_rollout_all_validation: false
   async_validation: false
   async_validation_device: cpu
   async_validation_num_workers: 0

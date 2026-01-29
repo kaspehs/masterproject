@@ -138,6 +138,7 @@ class MonitoringConfig:
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
     cycle_validation_rollout: bool = False
+    final_rollout_all_validation: bool = False
     async_validation: bool = False
     async_validation_device: str = "cpu"
     async_validation_num_workers: int = 0
@@ -353,6 +354,9 @@ def log_validation_epoch(
     *,
     log_extra_metrics: bool = False,
     log_metrics: bool = True,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    title_suffix: str = "",
 ) -> dict[str, float]:
     rollout = rollout_model(
         model,
@@ -398,6 +402,9 @@ def log_validation_epoch(
         middle_mask,
         middle_time_plot,
         reduced_velocity=float(np.asarray(reduced_velocity).reshape(-1)[0]),
+        tag_prefix=tag_prefix,
+        step=step,
+        title_suffix=title_suffix,
     )
     log_force_plots(
         writer,
@@ -412,6 +419,9 @@ def log_validation_epoch(
         middle_time_plot,
         model.include_physical_drag,
         reduced_velocity=float(np.asarray(reduced_velocity).reshape(-1)[0]),
+        tag_prefix=tag_prefix,
+        step=step,
+        title_suffix=title_suffix,
     )
     return metrics
 
@@ -1252,6 +1262,10 @@ def log_displacement_plots(
     middle_mask,
     middle_window,
     reduced_velocity: float | None = None,
+    *,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    title_suffix: str = "",
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
@@ -1262,7 +1276,7 @@ def log_displacement_plots(
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("y/D")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Normalized rollout at epoch {epoch+1}{ur_title}")
+    ax_full.set_title(f"Normalized rollout at epoch {epoch+1}{ur_title}{title_suffix}")
     ax_full.legend(loc="upper right")
 
     diff_y_norm = y_pred_norm - y_true_norm
@@ -1271,7 +1285,7 @@ def log_displacement_plots(
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("Δy/D")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Difference (pred - true) epoch {epoch+1}{ur_title}")
+    ax_diff.set_title(f"Difference (pred - true) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], y_true_norm[zoom_mask], label="y/D (true)")
@@ -1279,7 +1293,7 @@ def log_displacement_plots(
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("y/D")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Normalized rollout (first 1s) epoch {epoch+1}{ur_title}")
+    ax_zoom.set_title(f"Normalized rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
@@ -1288,11 +1302,11 @@ def log_displacement_plots(
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("y/D")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Normalized rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}")
+    ax_middle.set_title(f"Normalized rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
-    writer.add_figure("val/rollout_displacement", fig, epoch + 1)
+    writer.add_figure(f"{tag_prefix}_displacement", fig, epoch + 1 if step is None else step)
     plt.close(fig)
 
 def log_force_plots(
@@ -1308,6 +1322,10 @@ def log_force_plots(
     middle_window,
     include_physical_drag: bool,
     reduced_velocity: float | None = None,
+    *,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    title_suffix: str = "",
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
@@ -1323,7 +1341,7 @@ def log_force_plots(
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("Force")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Force rollout at epoch {epoch+1}{ur_title}")
+    ax_full.set_title(f"Force rollout at epoch {epoch+1}{ur_title}{title_suffix}")
     ax_full.legend(loc="upper right")
 
     diff_force = force_total - force_data
@@ -1332,7 +1350,7 @@ def log_force_plots(
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("ΔForce")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Force difference (model - data) epoch {epoch+1}{ur_title}")
+    ax_diff.set_title(f"Force difference (model - data) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], force_total[zoom_mask], label=total_label, color="tab:purple")
@@ -1343,7 +1361,7 @@ def log_force_plots(
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("Force")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Force rollout (first 1s) epoch {epoch+1}{ur_title}")
+    ax_zoom.set_title(f"Force rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
@@ -1367,11 +1385,11 @@ def log_force_plots(
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("Force")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Force rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}")
+    ax_middle.set_title(f"Force rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
-    writer.add_figure("val/rollout_force", fig, epoch + 1)
+    writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
     plt.close(fig)
 
 def log_hamiltonian_plots(
@@ -1384,6 +1402,10 @@ def log_hamiltonian_plots(
     middle_window,
     hamiltonian_data: np.ndarray | None = None,
     reduced_velocity: float | None = None,
+    *,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    title_suffix: str = "",
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
@@ -1402,7 +1424,7 @@ def log_hamiltonian_plots(
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("Hamiltonian")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Hamiltonian rollout at epoch {epoch+1}{ur_title}")
+    ax_full.set_title(f"Hamiltonian rollout at epoch {epoch+1}{ur_title}{title_suffix}")
     ax_full.legend(loc="upper right")
 
     if hamiltonian_data is not None:
@@ -1414,7 +1436,7 @@ def log_hamiltonian_plots(
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("ΔH")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Hamiltonian difference epoch {epoch+1}{ur_title}")
+    ax_diff.set_title(f"Hamiltonian difference epoch {epoch+1}{ur_title}{title_suffix}")
     ax_diff.legend(loc="upper right")
 
     ax_zoom.plot(t[zoom_mask], h_model_rel[zoom_mask], **model_kwargs.copy())
@@ -1423,7 +1445,7 @@ def log_hamiltonian_plots(
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("Hamiltonian")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Hamiltonian (first 1s) epoch {epoch+1}{ur_title}")
+    ax_zoom.set_title(f"Hamiltonian (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
@@ -1433,11 +1455,11 @@ def log_hamiltonian_plots(
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("Hamiltonian")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Hamiltonian ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}")
+    ax_middle.set_title(f"Hamiltonian ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
-    writer.add_figure("val/rollout_hamiltonian", fig, epoch + 1)
+    writer.add_figure(f"{tag_prefix}_hamiltonian", fig, epoch + 1 if step is None else step)
     plt.close(fig)
 
 def preprocess_timeseries(

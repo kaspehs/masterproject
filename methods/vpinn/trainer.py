@@ -745,7 +745,7 @@ def _evaluate_epoch(
             B, M1, d = x_win.shape
             inp = torch.cat([x_win, v_win, ur_win], dim=-1)
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
                 loss_f = F.mse_loss(f_pred, f_meas)
@@ -789,23 +789,27 @@ def _log_rollout_validation(
     D: float,
     middle_time_plot: Sequence[float],
     device: torch.device,
-) -> None:
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    log_metrics: bool = True,
+    title_suffix: str = "",
+) -> dict[str, float]:
     x_true_t = traj["x"].to(device)
     v_true_t = traj["v"].to(device)
     f_true_t = traj["f"].to(device)
     ur_true_t = traj["ur"].to(device)
     t_np = traj["t"].detach().cpu().numpy()
     if x_true_t.ndim != 2:
-        return
+        return {}
     d = int(x_true_t.shape[-1])
     if d < 1:
-        return
+        return {}
     if d > 1:
         print("vpinn rollout validation: d>1 detected; logging only the first DOF.")
 
     steps = int(x_true_t.shape[0] - 1)
     if steps < 1:
-        return
+        return {}
 
     x_seq, v_seq, f_seq = rollout_rk4(
         model=model,
@@ -828,18 +832,24 @@ def _log_rollout_validation(
     if disp_std <= 0.0:
         disp_std = 1.0
     rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
-    writer.add_scalar("val/rollout_nrmse_y", rel_rmse_y, epoch)
+    metrics: dict[str, float] = {"rollout_nrmse_y": rel_rmse_y}
+    if log_metrics:
+        writer.add_scalar("val/rollout_nrmse_y", rel_rmse_y, epoch)
 
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
         force_std = 1.0
     rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-    writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
+    metrics["rollout_nrmse_force_total"] = rel_rmse_force
+    if log_metrics:
+        writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
     rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
-    writer.add_scalar("val/force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
+    metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+    if log_metrics:
+        writer.add_scalar("val/force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
 
     y_true_norm = x_true / float(D)
     y_pred_norm = x_pred / float(D)
@@ -862,6 +872,9 @@ def _log_rollout_validation(
         middle_mask,
         middle_window,
         reduced_velocity=ur_val,
+        tag_prefix=tag_prefix,
+        step=step,
+        title_suffix=title_suffix,
     )
     log_force_plots(
         writer,
@@ -876,7 +889,11 @@ def _log_rollout_validation(
         middle_window,
         include_physical_drag=False,
         reduced_velocity=ur_val,
+        tag_prefix=tag_prefix,
+        step=step,
+        title_suffix=title_suffix,
     )
+    return metrics
 
 
 def train(config: Config, config_name: str) -> None:
@@ -1035,6 +1052,7 @@ def train(config: Config, config_name: str) -> None:
     rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
     rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
@@ -1086,7 +1104,7 @@ def train(config: Config, config_name: str) -> None:
             inp = torch.cat([x_win, v_win, ur_win], dim=-1)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
                 loss_f = F.mse_loss(f_pred, f_meas)
@@ -1252,6 +1270,47 @@ def train(config: Config, config_name: str) -> None:
                     middle_time_plot=middle_time_plot,
                     device=device,
                 )
+
+    if final_rollout_all_validation and val_trajs:
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
+        used = 0
+        for idx, traj in enumerate(val_trajs):
+            metrics = _log_rollout_validation(
+                writer=writer,
+                epoch=max(0, epochs - 1),
+                model=model,
+                traj=traj,
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                D=D_val,
+                middle_time_plot=middle_time_plot,
+                device=device,
+                tag_prefix="val/final_rollout",
+                step=idx,
+                log_metrics=False,
+                title_suffix=f" [final {idx+1}/{len(val_trajs)}]",
+            )
+            if metrics:
+                used += 1
+            for name, value in metrics.items():
+                if not np.isfinite(value):
+                    continue
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        avg_metrics = {
+            name: metrics_sum[name] / float(metrics_count[name])
+            for name in metrics_sum
+            if metrics_count.get(name, 0) > 0
+        }
+        if avg_metrics and used > 0:
+            summary_lines = [f"Final rollout over {used} validation trajectories:"]
+            for name in sorted(avg_metrics):
+                summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
+                writer.add_scalar(f"val/final_rollout_avg/{name}", avg_metrics[name], epochs)
+            writer.add_text("val/final_rollout_summary", "\n".join(summary_lines), epochs)
 
     writer.add_text("vpinn/config_vpinn", json.dumps(vp, indent=2, sort_keys=True), 0)
 

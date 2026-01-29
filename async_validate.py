@@ -195,7 +195,7 @@ def _run_hnn_validation(
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
             amp_enabled=amp_enabled,
-            amp_dtype=str(cfg.precision.amp_dtype),
+            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
         )
         for name, value in loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
@@ -354,7 +354,7 @@ def _run_vpinn_validation(
             wdot=wdot,
             alpha=alpha,
             amp_enabled=amp_enabled,
-            amp_dtype=str(cfg.precision.amp_dtype),
+            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
         )
         for name, value in val_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
@@ -386,7 +386,7 @@ def _evaluate_val_losses(
     use_force_data_loss: bool,
     force_data_weight: float,
     amp_enabled: bool,
-    amp_dtype: str,
+    amp_dtype: torch.dtype,
 ) -> dict[str, float]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
@@ -415,7 +415,7 @@ def _evaluate_val_losses(
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=_amp_dtype(amp_dtype)):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 force_loss = float(force_reg) * avg_force

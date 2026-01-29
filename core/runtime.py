@@ -37,11 +37,11 @@ def maybe_compile_model(model: torch.nn.Module, enabled: bool, mode: str) -> tor
 
 def setup_amp(
     device: torch.device, *, use_amp: bool, amp_dtype: str
-) -> Tuple[bool, torch.dtype, torch.cuda.amp.GradScaler]:
+) -> Tuple[bool, torch.dtype, torch.amp.GradScaler]:
     enabled = bool(use_amp and device.type == "cuda")
     dtype_key = str(amp_dtype).strip().lower()
     chosen_dtype = torch.float16 if dtype_key in {"fp16", "float16"} else torch.bfloat16
-    scaler = torch.cuda.amp.GradScaler(enabled=enabled and chosen_dtype == torch.float16)
+    scaler = torch.amp.GradScaler("cuda", enabled=enabled and chosen_dtype == torch.float16)
     if enabled:
         print(f"AMP enabled (dtype={dtype_key})")
     return enabled, chosen_dtype, scaler
@@ -51,4 +51,3 @@ def set_num_threads_from_slurm(*, default: int = 1) -> int:
     threads = int(os.getenv("SLURM_CPUS_PER_TASK", str(default)))
     torch.set_num_threads(threads)
     return threads
-

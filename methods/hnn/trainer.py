@@ -51,7 +51,7 @@ def _train_one_epoch(
     gradnorm_balancer: Optional[GradNormBalancer],
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     log_component_grad_norms: bool,
 ) -> dict[str, float]:
     batch_count = 0
@@ -89,7 +89,7 @@ def _train_one_epoch(
 
         opt.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
             avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
             base_force_loss = avg_force
@@ -332,6 +332,69 @@ def _validate_if_needed(
     )
 
 
+def _log_final_rollouts_all(
+    *,
+    writer: SummaryWriter,
+    epoch: int,
+    model: PHVIV,
+    val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]],
+    val_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    m_eff: float,
+    D: float,
+    k: float,
+    device: torch.device,
+    middle_time_plot,
+    log_extra_validation_metrics: bool,
+) -> tuple[dict[str, float], int]:
+    total = min(len(val_series_raw), len(val_sequences))
+    if total <= 0:
+        return {}, 0
+    metrics_sum: dict[str, float] = {}
+    metrics_count: dict[str, int] = {}
+    used = 0
+    for idx in range(total):
+        y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[idx]
+        if force_np is None:
+            continue
+        y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[idx]
+        metrics = log_validation_epoch(
+            writer,
+            epoch,
+            model,
+            y_tensor,
+            vel_tensor,
+            ur_tensor,
+            m_eff,
+            dt_value,
+            t_np,
+            y_np / D,
+            y_np,
+            force_np,
+            D,
+            k,
+            device,
+            middle_time_plot,
+            None,
+            log_extra_metrics=log_extra_validation_metrics,
+            log_metrics=False,
+            tag_prefix="val/final_rollout",
+            step=idx,
+            title_suffix=f" [final {idx+1}/{total}]",
+        )
+        for name, value in metrics.items():
+            if not np.isfinite(value):
+                continue
+            metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+            metrics_count[name] = metrics_count.get(name, 0) + 1
+        used += 1
+    averaged = {
+        name: metrics_sum[name] / float(metrics_count[name])
+        for name in metrics_sum
+        if metrics_count.get(name, 0) > 0
+    }
+    return averaged, used
+
+
 def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
     return [proc for proc in processes if proc.poll() is None]
 
@@ -427,7 +490,7 @@ def _evaluate_val_losses(
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 force_loss = float(force_reg) * avg_force
@@ -539,6 +602,7 @@ def train(config: Config, config_name: str) -> None:
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
+    final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
@@ -811,6 +875,27 @@ def train(config: Config, config_name: str) -> None:
             )
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
+
+    if final_rollout_all_validation and val_series_raw is not None and val_sequences is not None:
+        avg_metrics, used = _log_final_rollouts_all(
+            writer=writer,
+            epoch=max(0, epochs - 1),
+            model=model,
+            val_series_raw=val_series_raw,
+            val_sequences=val_sequences,
+            m_eff=m_eff,
+            D=D,
+            k=k,
+            device=device,
+            middle_time_plot=middle_time_plot,
+            log_extra_validation_metrics=log_extra_validation_metrics,
+        )
+        if used > 0 and avg_metrics:
+            summary_lines = [f"Final rollout over {used} validation trajectories:"]
+            for name in sorted(avg_metrics):
+                summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
+                writer.add_scalar(f"val/final_rollout_avg/{name}", avg_metrics[name], epochs)
+            writer.add_text("val/final_rollout_summary", "\n".join(summary_lines), epochs)
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
