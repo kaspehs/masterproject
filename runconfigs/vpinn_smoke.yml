@@ -25,7 +25,7 @@ smoothing:
 
 architecture:
   # Used when `vpinn.use_architecture_config: true`
-  force_net_type: mlp
+  force_net_type: pirate
   residual_kwargs:
     hidden: 128
     layers: 2
@@ -42,7 +42,7 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 1024
+  batch_size: 8096
   max_grad_norm: 10000.0
   epochs: 100
 
@@ -59,8 +59,8 @@ optim:
     scheduler_type: cosine
 
 runtime:
-  device: auto
-  num_workers: 0
+  device: cuda
+  num_workers: 4
 
 precision:
   use_tf32: false
@@ -73,23 +73,26 @@ compile:
 
 logging:
   run_dir_root: logs
+  run_name: vpinn_test
+  append_timestamp: true
+
 
 monitoring:
   # Logging / validation cadence
-  log_every_epochs: 1
-  print_every_epochs: 1
+  log_every_epochs: 10
+  print_every_epochs: 10
   validate_every_epochs: 10
 
   # Rollout validation plots (dynamics check)
   rollout_every_epochs: 10
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
-  final_rollout_all_validation: false
-  async_validation: false
+  final_rollout_all_validation: true
+  async_validation: true
   async_validation_device: cpu
-  async_validation_num_workers: 0
-  async_validation_num_threads: 4
-  async_validation_max_concurrent: 1
+  async_validation_num_workers: 3
+  async_validation_num_threads: 1
+  async_validation_max_concurrent: 3
   async_validation_do_losses: true
   async_validation_do_rollout: true
 

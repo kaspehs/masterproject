@@ -2,14 +2,14 @@
 
 #SBATCH --job-name=test_run_1
 #SBATCH --account=nn9352k
-#SBATCH --time=00:05:00
+#SBATCH --time=00:15:00
 #SBATCH --partition=accel
 #SBATCH --qos=devel
 #SBATCH --gpus=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=4G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=8G
 
 #SBATCH --output=output/%j.txt
 #SBATCH --error=error/%j.txt
@@ -38,4 +38,4 @@ echo "TRAIN_DEVICE=${TRAIN_DEVICE}"
 python -c "import sys, torch; print('python', sys.version); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('torch_cuda', torch.version.cuda); print('gpu_count', torch.cuda.device_count()); print('gpu0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || true
 
-python train.py --config HNNrunconfigs/pirate_final.yml
+python train.py --config runconfigs/vpinn_smoke.yml
