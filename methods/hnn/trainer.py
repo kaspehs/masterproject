@@ -32,6 +32,7 @@ from HNN_helper import (
     compute_validation_metrics,
     compute_model_grad_norm,
     load_training_series,
+    log_final_rollout_errors_vs_ur,
     log_training_metrics,
     log_validation_epoch,
     preprocess_timeseries,
@@ -346,18 +347,33 @@ def _log_final_rollouts_all(
     device: torch.device,
     middle_time_plot,
     log_extra_validation_metrics: bool,
-) -> tuple[dict[str, float], int]:
+) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
-        return {}, 0
+        return {}, 0, [], []
+    selected_indices: list[int] = []
+    seen_ur: set[float] = set()
+    for idx in range(total):
+        ur_np = val_series_raw[idx][5]
+        ur_val = float(np.asarray(ur_np).reshape(-1)[0])
+        ur_key = round(ur_val, 6)
+        if ur_key in seen_ur:
+            continue
+        seen_ur.add(ur_key)
+        selected_indices.append(idx)
+    if not selected_indices:
+        return {}, 0, [], []
     metrics_sum: dict[str, float] = {}
     metrics_count: dict[str, int] = {}
     used = 0
-    for idx in range(total):
+    ur_values: list[float] = []
+    metrics_list: list[dict[str, float]] = []
+    for step_idx, idx in enumerate(selected_indices):
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[idx]
         if force_np is None:
             continue
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[idx]
+        ur_val = float(np.asarray(ur_tensor.detach().cpu()).reshape(-1)[0])
         metrics = log_validation_epoch(
             writer,
             epoch,
@@ -378,10 +394,13 @@ def _log_final_rollouts_all(
             None,
             log_extra_metrics=log_extra_validation_metrics,
             log_metrics=False,
-            tag_prefix="val/final_rollout",
-            step=idx,
-            title_suffix=f" [final {idx+1}/{total}]",
+            tag_prefix="final_val/rollout",
+            step=step_idx,
+            title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
         )
+        if metrics:
+            ur_values.append(ur_val)
+            metrics_list.append(metrics)
         for name, value in metrics.items():
             if not np.isfinite(value):
                 continue
@@ -393,7 +412,7 @@ def _log_final_rollouts_all(
         for name in metrics_sum
         if metrics_count.get(name, 0) > 0
     }
-    return averaged, used
+    return averaged, used, ur_values, metrics_list
 
 
 def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
@@ -880,7 +899,7 @@ def train(config: Config, config_name: str) -> None:
     if final_rollout_all_validation and val_series_raw is not None and val_sequences is not None:
         print("Final validation rollout (all trajectories) started.")
         final_start = time.perf_counter()
-        avg_metrics, used = _log_final_rollouts_all(
+        avg_metrics, used, ur_values, metrics_list = _log_final_rollouts_all(
             writer=writer,
             epoch=max(0, epochs - 1),
             model=model,
@@ -894,11 +913,13 @@ def train(config: Config, config_name: str) -> None:
             log_extra_validation_metrics=log_extra_validation_metrics,
         )
         if used > 0 and avg_metrics:
-            summary_lines = [f"Final rollout over {used} validation trajectories:"]
+            summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
-                writer.add_scalar(f"val/final_rollout_avg/{name}", avg_metrics[name], epochs)
-            writer.add_text("val/final_rollout_summary", "\n".join(summary_lines), epochs)
+                writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
+            writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
+        if ur_values and metrics_list:
+            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 

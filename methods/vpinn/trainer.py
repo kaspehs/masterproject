@@ -33,6 +33,7 @@ from HNN_helper import (
     compute_velocity_numpy,
     create_window_mask,
     create_zoom_mask,
+    log_final_rollout_errors_vs_ur,
     log_displacement_plots,
     log_force_plots,
     resample_uniform_series,
@@ -1278,7 +1279,18 @@ def train(config: Config, config_name: str) -> None:
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         used = 0
-        for idx, traj in enumerate(val_trajs):
+        ur_values: list[float] = []
+        metrics_list: list[dict[str, float]] = []
+        selected_trajs: list[dict[str, Any]] = []
+        seen_ur: set[float] = set()
+        for traj in val_trajs:
+            ur_val = float(traj["ur"][0, 0].detach().cpu().item())
+            ur_key = round(ur_val, 6)
+            if ur_key in seen_ur:
+                continue
+            seen_ur.add(ur_key)
+            selected_trajs.append(traj)
+        for idx, traj in enumerate(selected_trajs):
             metrics = _log_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
@@ -1291,13 +1303,15 @@ def train(config: Config, config_name: str) -> None:
                 D=D_val,
                 middle_time_plot=middle_time_plot,
                 device=device,
-                tag_prefix="val/final_rollout",
+                tag_prefix="final_val/rollout",
                 step=idx,
                 log_metrics=False,
-                title_suffix=f" [final {idx+1}/{len(val_trajs)}]",
+                title_suffix=f" [final {idx+1}/{len(selected_trajs)}]",
             )
             if metrics:
                 used += 1
+                ur_values.append(float(traj["ur"][0, 0].detach().cpu().item()))
+                metrics_list.append(metrics)
             for name, value in metrics.items():
                 if not np.isfinite(value):
                     continue
@@ -1309,11 +1323,13 @@ def train(config: Config, config_name: str) -> None:
             if metrics_count.get(name, 0) > 0
         }
         if avg_metrics and used > 0:
-            summary_lines = [f"Final rollout over {used} validation trajectories:"]
+            summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
-                writer.add_scalar(f"val/final_rollout_avg/{name}", avg_metrics[name], epochs)
-            writer.add_text("val/final_rollout_summary", "\n".join(summary_lines), epochs)
+                writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
+            writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
+        if ur_values and metrics_list:
+            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
