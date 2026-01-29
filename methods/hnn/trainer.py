@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import subprocess
 import sys
 from dataclasses import asdict
@@ -877,6 +878,8 @@ def train(config: Config, config_name: str) -> None:
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
 
     if final_rollout_all_validation and val_series_raw is not None and val_sequences is not None:
+        print("Final validation rollout (all trajectories) started.")
+        final_start = time.perf_counter()
         avg_metrics, used = _log_final_rollouts_all(
             writer=writer,
             epoch=max(0, epochs - 1),
@@ -896,6 +899,8 @@ def train(config: Config, config_name: str) -> None:
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"val/final_rollout_avg/{name}", avg_metrics[name], epochs)
             writer.add_text("val/final_rollout_summary", "\n".join(summary_lines), epochs)
+        elapsed = time.perf_counter() - final_start
+        print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 import subprocess
 import sys
 from dataclasses import asdict
@@ -1272,6 +1273,8 @@ def train(config: Config, config_name: str) -> None:
                 )
 
     if final_rollout_all_validation and val_trajs:
+        print("Final validation rollout (all trajectories) started.")
+        final_start = time.perf_counter()
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         used = 0
@@ -1311,6 +1314,8 @@ def train(config: Config, config_name: str) -> None:
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"val/final_rollout_avg/{name}", avg_metrics[name], epochs)
             writer.add_text("val/final_rollout_summary", "\n".join(summary_lines), epochs)
+        elapsed = time.perf_counter() - final_start
+        print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
     writer.add_text("vpinn/config_vpinn", json.dumps(vp, indent=2, sort_keys=True), 0)
 
