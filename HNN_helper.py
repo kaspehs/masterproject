@@ -149,6 +149,8 @@ class MonitoringConfig:
 @dataclass
 class LoggingConfig:
     run_dir_root: str = "HNNruns"
+    run_name: str | None = None
+    append_timestamp: bool = True
 
 @dataclass
 class Config:

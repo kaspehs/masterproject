@@ -1043,7 +1043,12 @@ def train(config: Config, config_name: str) -> None:
     async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
     async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
 
-    writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
+    writer, run_name = setup_writer(
+        config.logging.run_dir_root,
+        config_name,
+        run_name_override=getattr(config.logging, "run_name", None),
+        append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
+    )
     async_processes: list[subprocess.Popen] = []
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:

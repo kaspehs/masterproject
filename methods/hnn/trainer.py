@@ -631,7 +631,12 @@ def train(config: Config, config_name: str) -> None:
     else:
         y_data_t, val_vel, _t_tensor, val_ur = train_sequences[0]
 
-    writer, run_name = setup_writer(config.logging.run_dir_root, config_name)
+    writer, run_name = setup_writer(
+        config.logging.run_dir_root,
+        config_name,
+        run_name_override=getattr(config.logging, "run_name", None),
+        append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
+    )
     async_processes: list[subprocess.Popen] = []
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
