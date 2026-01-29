@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="${SLURM_SUBMIT_DIR:-$SCRIPT_DIR}"
 cd "$WORKDIR"
 mkdir -p output error
-REQ_FILE="${REQ_FILE:-$SCRIPT_DIR/requirements_olivia.txt}"
+REQ_FILE="${REQ_FILE:-$WORKDIR/requirements_olivia.txt}"
 ENV_PREFIX="${ENV_PREFIX:-$HOME/olivia-env}"
 
 export http_proxy="${http_proxy:-http://10.63.2.48:3128/}"

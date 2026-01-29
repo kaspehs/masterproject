@@ -43,7 +43,7 @@ module load NRIS/CPU
 
 ENV_PREFIX="${ENV_PREFIX:-$HOME/olivia-env}"
 if [ ! -x "$ENV_PREFIX/bin/python" ]; then
-  echo "Missing containerized env at $ENV_PREFIX. Create it with hpc-container-wrapper (conda-containerize new --prefix ...)." >&2
+  echo "Missing containerized env at $ENV_PREFIX. Create it with hpc-container-wrapper (pip-containerize new --prefix ...)." >&2
   exit 1
 fi
 export PATH="$ENV_PREFIX/bin:$PATH"
@@ -61,4 +61,14 @@ export PHASE_STEADY_STATE_WINDOW_S=None
 export PHASE_EVAL_BATCH_SIZE=512
 export PHASE_PRINT_PER_RUN=0
 
-srun python -u plotting_etc/phase_error_map.py
+PROFILE="${PROFILE:-0}"
+APR_MODULE="${APR_MODULE:-Arm-PerfReports/20.0.3}"
+
+if [ "$PROFILE" -eq 1 ]; then
+  module load "$APR_MODULE"
+  echo "set sysroot /" > gdbfile
+  export ALLINEA_DEBUGGER_USER_FILE=gdbfile
+  perf-report srun python -u plotting_etc/phase_error_map.py
+else
+  srun python -u plotting_etc/phase_error_map.py
+fi
