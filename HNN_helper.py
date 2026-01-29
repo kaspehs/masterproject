@@ -1462,6 +1462,62 @@ def log_hamiltonian_plots(
     writer.add_figure(f"{tag_prefix}_hamiltonian", fig, epoch + 1 if step is None else step)
     plt.close(fig)
 
+
+def log_final_rollout_errors_vs_ur(
+    writer: SummaryWriter,
+    ur_values: Sequence[float],
+    metrics_list: Sequence[dict[str, float]],
+    epoch: int,
+    *,
+    tag: str = "final_val/errors_vs_ur",
+) -> None:
+    pairs = []
+    for ur_val, metrics in zip(ur_values, metrics_list):
+        if not metrics:
+            continue
+        pairs.append((float(ur_val), metrics))
+    if not pairs:
+        return
+    pairs.sort(key=lambda item: item[0])
+    x_all = [p[0] for p in pairs]
+    metrics_all = [p[1] for p in pairs]
+
+    series = [
+        ("rollout_nrmse_y", "NRMSE disp"),
+        ("rollout_nrmse_force_total", "NRMSE force total"),
+        ("force_mapping_nrmse_on_data", "NRMSE force on data"),
+    ]
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    plotted = False
+    for key, label in series:
+        xs: list[float] = []
+        ys: list[float] = []
+        for x_val, metrics in zip(x_all, metrics_all):
+            if key not in metrics:
+                continue
+            y_val = float(metrics[key])
+            if not np.isfinite(y_val):
+                continue
+            xs.append(x_val)
+            ys.append(y_val)
+        if xs:
+            ax.plot(xs, ys, marker="o", label=label)
+            plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return
+
+    ax.set_xlabel("Reduced velocity (U_r)")
+    ax.set_ylabel("Error")
+    ax.set_title("Final rollout errors vs U_r")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
 def preprocess_timeseries(
     t: np.ndarray,
     y: np.ndarray,
