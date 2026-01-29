@@ -3,7 +3,7 @@ method: vpinn
 data:
   # Use the same training-series setup as `HNNrunconfigs/pirate_smoke.yml`.
   file: data.npz
-  cut_start_seconds: 0.0
+  cut_start_seconds: 2.0
   use_generated_train_series: true
   train_series_dir: Data_Gen/generated_series_Ur
   reduce_time: true
@@ -44,7 +44,7 @@ architecture:
 training:
   batch_size: 8096
   max_grad_norm: 10000.0
-  epochs: 100
+  epochs: 500
 
 optim:
   lr: 0.001
@@ -53,8 +53,8 @@ optim:
   use_lr_scheduler: true
   scheduler:
     max_lr: 0.001
-    decay_steps: 90
-    warmup_steps: 10
+    decay_steps: 475
+    warmup_steps: 25
     min_lr: 0.0001
     scheduler_type: cosine
 
@@ -73,18 +73,18 @@ compile:
 
 logging:
   run_dir_root: logs
-  run_name: vpinn_test
+  run_name: vpinn_test_2s
   append_timestamp: true
 
 
 monitoring:
   # Logging / validation cadence
   log_every_epochs: 10
-  print_every_epochs: 10
-  validate_every_epochs: 10
+  print_every_epochs: 50
+  validate_every_epochs: 20
 
   # Rollout validation plots (dynamics check)
-  rollout_every_epochs: 10
+  rollout_every_epochs: 20
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
   final_rollout_all_validation: true

@@ -5,7 +5,6 @@
 /output/*
 /error/*
 /logs/*
-/runconfigs/*
 /Data_Gen/legacy_datasets
 /Data_Gen/const_Ur
 /Data_Gen/generated_series
@@ -16,5 +15,4 @@ __pycache__/
 *.pyc
 *.npz
 *.png
-*.yml
 *.sh
