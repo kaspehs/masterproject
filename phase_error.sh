@@ -2,7 +2,7 @@
 #SBATCH --job-name=phase_error_map
 #SBATCH --account=nn9352k
 #SBATCH --time=00:10:00
-#SBATCH --partition=preproc
+#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
@@ -38,9 +38,15 @@ mkdir -p "$SLURM_TMPDIR"
 export MPLCONFIGDIR="$HOME/.cache/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 
-module load Python/3.10.8-GCCcore-12.2.0
-export PS1=\$
-source "$HOME/ml-env/bin/activate"
+# Olivia: load a stack, then use a containerized Python env (hpc-container-wrapper)
+module load NRIS/CPU
+
+ENV_PREFIX="${ENV_PREFIX:-$HOME/olivia-env}"
+if [ ! -x "$ENV_PREFIX/bin/python" ]; then
+  echo "Missing containerized env at $ENV_PREFIX. Create it with hpc-container-wrapper (conda-containerize new --prefix ...)." >&2
+  exit 1
+fi
+export PATH="$ENV_PREFIX/bin:$PATH"
 
 # Copy heavy I/O inputs to node-local storage
 mkdir -p "$SLURM_TMPDIR/groundtruth_runs_100hz" "$SLURM_TMPDIR/models"
@@ -55,4 +61,4 @@ export PHASE_STEADY_STATE_WINDOW_S=None
 export PHASE_EVAL_BATCH_SIZE=512
 export PHASE_PRINT_PER_RUN=0
 
-python -u plotting_etc/phase_error_map.py
+srun python -u plotting_etc/phase_error_map.py

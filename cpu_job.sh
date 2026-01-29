@@ -3,8 +3,9 @@
 #SBATCH --job-name=test_run_1
 #SBATCH --account=nn9352k
 #SBATCH --time=00:05:00
-#SBATCH --partition=preproc
-#SBATCH --ntasks=1 --cpus-per-task=32
+#SBATCH --partition=normal
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=2G
 #SBATCH --nodes=1
 
@@ -23,12 +24,17 @@ export TRAIN_DEVICE=cpu
 set -o errexit  # make bash exit on any error
 set -o nounset  # treat unset variables as errors
 
-module load Python/3.10.8-GCCcore-12.2.0
+cd "$SLURM_SUBMIT_DIR"
+mkdir -p output error
 
-# Set the ${PS1} (needed in the source of the virtual environment for some Python versions)
-export PS1=\$
+# Olivia: load a stack, then use a containerized Python env (hpc-container-wrapper)
+module load NRIS/CPU
 
-# activate the virtual environment
-source $HOME/ml-env/bin/activate
+ENV_PREFIX="${ENV_PREFIX:-$HOME/olivia-env}"
+if [ ! -x "$ENV_PREFIX/bin/python" ]; then
+  echo "Missing containerized env at $ENV_PREFIX. Create it with hpc-container-wrapper (conda-containerize new --prefix ...)." >&2
+  exit 1
+fi
+export PATH="$ENV_PREFIX/bin:$PATH"
 
-python train.py --config HNNrunconfigs/pirate_final.yml
+srun python train.py --config HNNrunconfigs/pirate_final.yml

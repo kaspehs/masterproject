@@ -3,7 +3,7 @@
 #SBATCH --job-name=test_run_1
 #SBATCH --account=nn9352k
 #SBATCH --time=00:30:00
-#SBATCH --partition=accel
+#SBATCH --partition=accelerator
 #SBATCH --gpus=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -25,16 +25,24 @@ export TRAIN_DEVICE=cuda
 set -o errexit  # make bash exit on any error
 set -o nounset  # treat unset variables as errors
 
-module load Python/3.10.8-GCCcore-12.2.0
+cd "$SLURM_SUBMIT_DIR"
+mkdir -p output error
 
-# Set the ${PS1} (needed in the source of the virtual environment for some Python versions)
-export PS1=\$
+# Olivia: load GPU stack and run inside an ARM64 PyTorch container
+module load NRIS/GPU
 
-# activate the virtual environment
-source $HOME/ml-env/bin/activate
+if ! command -v apptainer >/dev/null 2>&1; then
+  module load apptainer || true
+fi
+
+CONTAINER="${CONTAINER:-/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif}"
+if [ ! -f "$CONTAINER" ]; then
+  echo "Missing container at $CONTAINER. Set CONTAINER to your .sif path." >&2
+  exit 1
+fi
 
 echo "TRAIN_DEVICE=${TRAIN_DEVICE}"
-python -c "import sys, torch; print('python', sys.version); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('torch_cuda', torch.version.cuda); print('gpu_count', torch.cuda.device_count()); print('gpu0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
+apptainer exec --nv "$CONTAINER" python -c "import sys, torch; print('python', sys.version); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('torch_cuda', torch.version.cuda); print('gpu_count', torch.cuda.device_count()); print('gpu0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || true
 
-python train.py --config runconfigs/phnn_smoke.yml
+srun apptainer exec --nv "$CONTAINER" python train.py --config runconfigs/phnn_smoke.yml

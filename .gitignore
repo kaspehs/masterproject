@@ -15,4 +15,3 @@ __pycache__/
 *.pyc
 *.npz
 *.png
-*.sh
