@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -746,6 +747,7 @@ def train(config: Config, config_name: str) -> None:
             state_source = model
             if hasattr(model, "_orig_mod"):
                 state_source = getattr(model, "_orig_mod")
+            async_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = async_dir / f"epoch_{epoch + 1:06d}.pt"
             torch.save(
                 {
@@ -802,6 +804,8 @@ def train(config: Config, config_name: str) -> None:
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
             )
+
+    writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)

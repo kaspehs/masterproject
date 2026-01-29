@@ -1175,6 +1175,7 @@ def train(config: Config, config_name: str) -> None:
             state_source: nn.Module = model
             if hasattr(model, "_orig_mod"):
                 state_source = getattr(model, "_orig_mod")
+            async_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = async_dir / f"epoch_{epoch + 1:06d}.pt"
             torch.save(
                 {
