@@ -1,22 +1,26 @@
 #!/bin/bash
 
-#SBATCH --job-name=test_run_1
+#SBATCH --job-name=gpu_test
 #SBATCH --account=nn9352k
-#SBATCH --time=00:30:00
 #SBATCH --partition=accel
-#SBATCH --gpus=1
+#SBATCH --qos=devel
+#SBATCH --time=00:05:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=16G
+#SBATCH --gres=gpu:1
 
 #SBATCH --output=output/%j.txt
 #SBATCH --error=error/%j.txt
 
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+THREADS_PER_PROC=1
+
+export OMP_NUM_THREADS="$THREADS_PER_PROC"
+export MKL_NUM_THREADS="$THREADS_PER_PROC"
+export OPENBLAS_NUM_THREADS="$THREADS_PER_PROC"
+export NUMEXPR_NUM_THREADS="$THREADS_PER_PROC"
+
 export PYTHONUNBUFFERED=1
 export TRAIN_DEVICE=cuda
 

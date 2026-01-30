@@ -2,6 +2,7 @@
 #SBATCH --job-name=gpu_env_check
 #SBATCH --account=nn9352k
 #SBATCH --partition=accel
+#SBATCH --qos=devel
 #SBATCH --time=00:10:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
