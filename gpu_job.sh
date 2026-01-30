@@ -30,7 +30,7 @@ set -o errexit  # make bash exit on any error
 set -o nounset  # treat unset variables as errors
 
 cd "$SLURM_SUBMIT_DIR"
-mkdir -p output error
+mkdir -p output error gpu_usage
 
 # Olivia: load GPU stack and run inside an ARM64 PyTorch container
 module load NRIS/GPU
@@ -48,5 +48,13 @@ fi
 echo "TRAIN_DEVICE=${TRAIN_DEVICE}"
 apptainer exec --nv "$CONTAINER" python -c "import sys, torch; print('python', sys.version); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('torch_cuda', torch.version.cuda); print('gpu_count', torch.cuda.device_count()); print('gpu0', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || true
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  GPU_LOG="${GPU_LOG:-$SLURM_SUBMIT_DIR/gpu_usage/gpu_usage_${SLURM_JOB_ID}.csv}"
+  nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu \
+    --format=csv -l 10 > "$GPU_LOG" &
+  GPU_MON_PID=$!
+  trap "kill $GPU_MON_PID" EXIT
+fi
 
 srun apptainer exec --nv "$CONTAINER" python train.py --config runconfigs/phnn_smoke.yml
