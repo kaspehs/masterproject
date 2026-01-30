@@ -57,7 +57,6 @@ METRICS = {
         ("val/rel_rmse_y", "NRMSEy", 1e-3, 1e-1),
         ("val/rel_rmse_force_total", "NRMSEf", 1e-2, 2e-2),
         ("val/force_spectral_rel_error_second_half", "Relative Spectral Error", None, None),
-        ("val/force_fatigue_damage_rel_error", "Relative Fatigue Error", None, None),
     ],
     "Training": [
         ("train/residual_loss", "Residual Loss", 1e-3, 1e0),

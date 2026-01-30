@@ -4,5 +4,4 @@ matplotlib
 scikit-learn
 pyyaml
 tensorboard
-rainflow
 torch

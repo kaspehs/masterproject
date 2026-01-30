@@ -11,8 +11,6 @@ import torch.nn as nn
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
-from rainflow import count_cycles as _rainflow_count_cycles
-
 try:
     from scipy.signal import savgol_filter
 except ImportError:
@@ -478,12 +476,6 @@ def compute_validation_metrics(
         if log_extra_metrics:
             force_model_aligned = force_total_pred[:min_len]
             force_true_aligned = force_target[:min_len]
-            damage_true = fatigue_damage(force_true_aligned)
-            damage_model = fatigue_damage(force_model_aligned)
-            damage_rel_err = relative_error(damage_model, damage_true)
-            if np.isfinite(damage_rel_err):
-                metrics["force_fatigue_damage_rel_error"] = damage_rel_err
-
             half_idx_force = force_true_aligned.size // 2
             force_true_half = force_true_aligned[half_idx_force:]
             force_model_half = force_model_aligned[half_idx_force:]
@@ -506,12 +498,6 @@ def compute_validation_metrics(
             force_std_data = 1.0
         rel_rmse_force_on_data = rmse_force_data / force_std_data
         metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
-        if log_extra_metrics:
-            damage_true_data = fatigue_damage(force_data_true)
-            damage_pred_data = fatigue_damage(force_data_pred)
-            damage_rel_data = relative_error(damage_pred_data, damage_true_data)
-            if np.isfinite(damage_rel_data):
-                metrics["force_fatigue_damage_rel_error_on_data"] = damage_rel_data
     return metrics
 
 
@@ -697,24 +683,6 @@ def spectral_relative_error(
         return float("nan")
     return float(np.linalg.norm(model_fft - true_fft) / (denom + eps))
 
-
-def fatigue_damage(signal: np.ndarray, exponent: float = 3.0) -> float:
-    """Return cumulative fatigue damage using rainflow counting and range^exponent."""
-    signal = np.asarray(signal, dtype=float)
-    if signal.size < 3 or not np.all(np.isfinite(signal)):
-        return float("nan")
-    cycles = _rainflow_count_cycles(signal)
-    damage = 0.0
-    for cycle in cycles:
-        if len(cycle) == 3:
-            rng, mean, count = cycle
-        else:
-            rng, count = cycle
-        rng = abs(float(rng))
-        cnt = float(count)
-        if rng > 0.0 and cnt > 0.0:
-            damage += (rng ** exponent) * cnt
-    return float(damage)
 
 class PHVIV(nn.Module):
     """

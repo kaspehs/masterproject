@@ -3,7 +3,7 @@
 #SBATCH --job-name=test_run_1
 #SBATCH --account=nn9352k
 #SBATCH --time=00:30:00
-#SBATCH --partition=accelerator
+#SBATCH --partition=accel
 #SBATCH --gpus=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
