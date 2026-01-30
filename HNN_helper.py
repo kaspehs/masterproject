@@ -1584,6 +1584,8 @@ def build_dataloader_from_series(
     *,
     num_workers: int = 0,
     pin_memory: bool = False,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
         raise ValueError("series_data must contain at least one (y, t, dt, vel, force, U_r) tuple.")
@@ -1628,13 +1630,17 @@ def build_dataloader_from_series(
         seq_len = y_tensor.shape[0]
         min_length = seq_len if min_length is None else min(min_length, seq_len)
     dataset = combine_datasets(datasets)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=int(num_workers),
-        pin_memory=bool(pin_memory),
-    )
+    loader_kwargs: dict[str, object] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+    }
+    if int(num_workers) > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+    loader = DataLoader(**loader_kwargs)
     return loader, sequence_tensors, min_length if min_length is not None else 0
 
 
