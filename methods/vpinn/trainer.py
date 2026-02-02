@@ -1102,9 +1102,6 @@ def _log_rollout_validation(
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
     rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
-    metrics["rollout_force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
-    if log_metrics:
-        writer.add_scalar("val/rollout_force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
 
     y_true_norm = x_true / float(D)
     y_pred_norm = x_pred / float(D)

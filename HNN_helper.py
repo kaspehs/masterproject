@@ -1555,6 +1555,31 @@ def log_final_rollout_errors_vs_ur(
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
 
+    # Also log average force-mapping error vs reduced velocity (grouped by U_r).
+    force_key = "force_mapping_nrmse_on_data"
+    grouped: dict[float, list[float]] = {}
+    for ur_val, metrics in pairs:
+        if force_key not in metrics:
+            continue
+        y_val = float(metrics[force_key])
+        if not np.isfinite(y_val) or y_val <= 0.0:
+            continue
+        grouped.setdefault(float(ur_val), []).append(y_val)
+    if grouped:
+        xs = sorted(grouped.keys())
+        ys = [float(np.mean(grouped[x])) for x in xs]
+        fig2, ax2 = plt.subplots(1, 1, figsize=(6, 4))
+        ax2.plot(xs, ys, marker="o", label="Avg NRMSE force on data")
+        ax2.set_xlabel("Reduced velocity (U_r)")
+        ax2.set_ylabel("Error")
+        ax2.set_yscale("log")
+        ax2.set_title("Avg force-mapping error vs U_r")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best")
+        plt.tight_layout()
+        writer.add_figure("final_val/force_mapping_avg_vs_ur", fig2, epoch)
+        plt.close(fig2)
+
 def preprocess_timeseries(
     t: np.ndarray,
     y: np.ndarray,
