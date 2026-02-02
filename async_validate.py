@@ -32,6 +32,7 @@ from HNN_helper import (
     preprocess_timeseries,
 )
 from methods.vpinn.trainer import (
+    _apply_per_traj_scale,
     _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
     WindowDataset,
@@ -93,6 +94,10 @@ def _run_hnn_validation(
     data_cfg = cfg.data
     hnn_cfg = dict(cfg.hnn or {})
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
+    per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
+    per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
+    if per_traj_norm not in {"none", "force_rms"}:
+        raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
 
     if bool(getattr(data_cfg, "use_generated_train_series", False)):
@@ -184,6 +189,8 @@ def _run_hnn_validation(
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
+        per_traj_norm=per_traj_norm,
+        per_traj_norm_eps=per_traj_norm_eps,
     )
 
     if do_losses:
@@ -198,6 +205,7 @@ def _run_hnn_validation(
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
+            per_traj_norm_eps=per_traj_norm_eps,
         )
         for name, value in loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
@@ -370,7 +378,38 @@ def _run_vpinn_validation(
     _load_state(model, ckpt["model_state"])
     model.eval()
 
-    val_dataset = WindowDataset(val_trajs, window_intervals=int(vp.get("window_M", 50)), stride=int(vp.get("stride", 1)))
+    w, wdot, alpha = _test_functions(int(vp.get("window_M", 50)), dt, num_poly=num_poly, num_sine=num_sine)
+    w = w.to(device)
+    wdot = wdot.to(device)
+    alpha = alpha.to(device)
+
+    per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
+    per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
+    if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
+        raise ValueError("vpinn.per_traj_norm must be one of: none, force_rms, residual_rms.")
+    if per_traj_norm != "none":
+        _apply_per_traj_scale(
+            val_trajs,
+            mode=per_traj_norm,
+            dt=dt,
+            m=m,
+            c=c,
+            k=k,
+            w=w,
+            wdot=wdot,
+            alpha=alpha,
+            window_M=int(vp.get("window_M", 50)),
+            stride=int(vp.get("stride", 1)),
+            eps=per_traj_norm_eps,
+        )
+
+    return_scale = per_traj_norm != "none"
+    val_dataset = WindowDataset(
+        val_trajs,
+        window_intervals=int(vp.get("window_M", 50)),
+        stride=int(vp.get("stride", 1)),
+        return_scale=return_scale,
+    )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=int(cfg.training.batch_size),
@@ -379,11 +418,6 @@ def _run_vpinn_validation(
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
-
-    w, wdot, alpha = _test_functions(int(vp.get("window_M", 50)), dt, num_poly=num_poly, num_sine=num_sine)
-    w = w.to(device)
-    wdot = wdot.to(device)
-    alpha = alpha.to(device)
 
     if do_losses:
         amp_enabled = bool(cfg.precision.use_amp) and device.type == "cuda"
@@ -405,6 +439,7 @@ def _run_vpinn_validation(
             alpha=alpha,
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
+            per_traj_norm_eps=per_traj_norm_eps,
         )
         for name, value in val_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
@@ -440,6 +475,7 @@ def _evaluate_val_losses(
     force_data_weight: float,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    per_traj_norm_eps: float,
 ) -> dict[str, float]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
@@ -454,8 +490,16 @@ def _evaluate_val_losses(
                 z_i, t_i, z_next, t_next, ur_i = batch
                 f_i = None
                 f_next = None
+                scale = None
+            elif len(batch) == 6:
+                z_i, t_i, z_next, t_next, ur_i, scale = batch
+                f_i = None
+                f_next = None
             elif len(batch) == 7:
                 z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+                scale = None
+            elif len(batch) == 8:
+                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
             z_i = z_i.to(device, non_blocking=non_blocking)
@@ -467,10 +511,19 @@ def _evaluate_val_losses(
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
+            if scale is not None:
+                scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                if scale is None:
+                    res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                else:
+                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    denom = scale * scale + float(per_traj_norm_eps)
+                    res_loss = torch.mean(per_res / denom)
+                    avg_force = torch.mean(per_force / denom)
                 force_loss = float(force_reg) * avg_force
                 if use_force_data_loss:
                     if f_i is None or f_next is None:
@@ -480,7 +533,10 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
-                    data_force_loss = torch.mean((f_pred - f_mid) ** 2)
+                    per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
+                    if scale is not None:
+                        per_data = per_data / (scale * scale + float(per_traj_norm_eps))
+                    data_force_loss = torch.mean(per_data)
                 else:
                     data_force_loss = res_loss.new_tensor(0.0)
                 total = res_loss + force_loss + float(force_data_weight) * data_force_loss

@@ -634,6 +634,7 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         *,
         window_intervals: int,
         stride: int,
+        return_scale: bool = False,
     ) -> None:
         if window_intervals < 1:
             raise ValueError("vpinn.window_M must be >= 1")
@@ -643,6 +644,7 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         self.M = int(window_intervals)
         self.M1 = self.M + 1
         self.stride = int(stride)
+        self._return_scale = bool(return_scale)
 
         traj_ids: list[np.ndarray] = []
         starts: list[np.ndarray] = []
@@ -674,6 +676,9 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         v = traj["v"][start:end]
         f = traj["f"][start:end]
         ur = traj["ur"][start:end]
+        if self._return_scale:
+            scale = float(traj.get("scale", 1.0))
+            return x, v, f, ur, torch.tensor(scale, dtype=torch.float32)
         return x, v, f, ur
 
 
@@ -844,6 +849,107 @@ def _weak_residual(
     return boundary + trap
 
 
+def _per_traj_force_rms(traj: dict[str, Any]) -> float:
+    f = torch.as_tensor(traj["f"], dtype=torch.float32)
+    rms = torch.sqrt(torch.mean(f.pow(2)))
+    val = float(rms.detach().cpu())
+    return val if np.isfinite(val) and val > 0.0 else 1.0
+
+
+def _per_traj_residual_rms(
+    traj: dict[str, Any],
+    *,
+    dt: float,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    wdot: torch.Tensor,
+    alpha: torch.Tensor,
+    window_M: int,
+    stride: int,
+    eps: float,
+) -> float:
+    x = torch.as_tensor(traj["x"], dtype=torch.float32)
+    v = torch.as_tensor(traj["v"], dtype=torch.float32)
+    f = torch.as_tensor(traj["f"], dtype=torch.float32)
+    length = int(x.shape[0])
+    M1 = int(window_M) + 1
+    if length < M1:
+        return 1.0
+    loss_sum = 0.0
+    count = 0
+    for start in range(0, length - M1 + 1, int(stride)):
+        end = start + M1
+        x_win = x[start:end].unsqueeze(0)
+        v_win = v[start:end].unsqueeze(0)
+        f_win = f[start:end].unsqueeze(0)
+        R = _weak_residual(
+            x=x_win,
+            v=v_win,
+            f_pred=f_win,
+            m=m,
+            c=c,
+            k=k,
+            dt=dt,
+            w=w,
+            wdot=wdot,
+            alpha=alpha,
+        )
+        loss_w = torch.mean(R.pow(2))
+        loss_sum += float(loss_w.detach().cpu())
+        count += 1
+    mean_loss = loss_sum / float(max(count, 1))
+    scale = math.sqrt(max(mean_loss, float(eps)))
+    return scale if np.isfinite(scale) and scale > 0.0 else 1.0
+
+
+def _apply_per_traj_scale(
+    trajectories: list[dict[str, Any]],
+    *,
+    mode: str,
+    dt: float,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    wdot: torch.Tensor,
+    alpha: torch.Tensor,
+    window_M: int,
+    stride: int,
+    eps: float,
+) -> None:
+    if not trajectories:
+        return
+    mode = str(mode).strip().lower()
+    m_cpu = m.detach().cpu()
+    c_cpu = c.detach().cpu()
+    k_cpu = k.detach().cpu()
+    w_cpu = w.detach().cpu()
+    wdot_cpu = wdot.detach().cpu()
+    alpha_cpu = alpha.detach().cpu()
+    for traj in trajectories:
+        if mode == "force_rms":
+            scale = _per_traj_force_rms(traj)
+        elif mode == "residual_rms":
+            scale = _per_traj_residual_rms(
+                traj,
+                dt=dt,
+                m=m_cpu,
+                c=c_cpu,
+                k=k_cpu,
+                w=w_cpu,
+                wdot=wdot_cpu,
+                alpha=alpha_cpu,
+                window_M=window_M,
+                stride=stride,
+                eps=eps,
+            )
+        else:
+            scale = 1.0
+        traj["scale"] = float(scale)
+
+
 def _evaluate_epoch(
     *,
     model: nn.Module,
@@ -863,17 +969,27 @@ def _evaluate_epoch(
     alpha: torch.Tensor,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    per_traj_norm_eps: float = 0.0,
 ) -> dict[str, float]:
     model.eval()
     loss_f_sum = 0.0
     loss_w_sum = 0.0
     count = 0
     with torch.no_grad():
-        for x_win, v_win, f_meas, ur_win in loader:
+        for batch in loader:
+            if len(batch) == 4:
+                x_win, v_win, f_meas, ur_win = batch
+                scale = None
+            elif len(batch) == 5:
+                x_win, v_win, f_meas, ur_win, scale = batch
+            else:
+                raise ValueError("Unexpected batch format from dataloader.")
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
+            if scale is not None:
+                scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             B, M1, d = x_win.shape
             inp = torch.cat([x_win, v_win, ur_win], dim=-1)
@@ -881,7 +997,10 @@ def _evaluate_epoch(
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
-                loss_f = F.mse_loss(f_pred, f_meas)
+                per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
+                if scale is not None:
+                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
+                loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
                     R = _weak_residual(
                         x=x_win,
@@ -895,7 +1014,10 @@ def _evaluate_epoch(
                         wdot=wdot,
                         alpha=alpha,
                     )
-                    loss_w = torch.mean(R.pow(2))
+                    per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
+                    if scale is not None:
+                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
+                    loss_w = torch.mean(per_loss_w)
                 else:
                     loss_w = loss_f.new_tensor(0.0)
             loss_f_sum += float(loss_f.detach().cpu())
@@ -1048,6 +1170,10 @@ def train(config: Config, config_name: str) -> None:
     use_weak_loss = bool(vp.get("use_weak_loss", True))
     num_poly = int(vp.get("num_poly_test", 2))
     num_sine = int(vp.get("num_sine_test", 0))
+    per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
+    per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
+    if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
+        raise ValueError("vpinn.per_traj_norm must be one of: none, force_rms, residual_rms.")
     if not (use_force_loss or use_weak_loss):
         raise ValueError("vpinn must enable at least one of: use_force_loss, use_weak_loss.")
 
@@ -1108,35 +1234,9 @@ def train(config: Config, config_name: str) -> None:
         # Put `data.npz` first so rollout validation uses it by default.
         val_trajs = [val_traj] + list(val_trajs)
 
-    train_dataset = WindowDataset(train_trajs, window_intervals=window_M, stride=stride)
-    val_dataset = WindowDataset(val_trajs, window_intervals=window_M, stride=stride) if val_trajs else None
-    if len(train_dataset) == 0:
-        raise ValueError("No windows available for training. Reduce vpinn.window_M or check data lengths.")
-
     batch_size = int(training_cfg.batch_size)
     epochs = int(training_cfg.epochs)
     max_grad_norm = float(training_cfg.max_grad_norm)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=int(runtime_cfg.num_workers),
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
-    val_loader = (
-        DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=int(runtime_cfg.num_workers),
-            pin_memory=(device.type == "cuda"),
-            drop_last=False,
-        )
-        if val_dataset is not None and len(val_dataset) > 0
-        else None
-    )
 
     d = int(train_trajs[0]["x"].shape[-1])
     m = _as_diag_param(vp.get("m", _m_eff_from_model_cfg(config.model)), d, device, "m")
@@ -1205,6 +1305,73 @@ def train(config: Config, config_name: str) -> None:
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
+    if per_traj_norm != "none":
+        _apply_per_traj_scale(
+            train_trajs,
+            mode=per_traj_norm,
+            dt=dt,
+            m=m,
+            c=c,
+            k=k,
+            w=w,
+            wdot=wdot,
+            alpha=alpha,
+            window_M=window_M,
+            stride=stride,
+            eps=per_traj_norm_eps,
+        )
+        if val_trajs:
+            _apply_per_traj_scale(
+                val_trajs,
+                mode=per_traj_norm,
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                w=w,
+                wdot=wdot,
+                alpha=alpha,
+                window_M=window_M,
+                stride=stride,
+                eps=per_traj_norm_eps,
+            )
+
+    return_scale = per_traj_norm != "none"
+    train_dataset = WindowDataset(
+        train_trajs,
+        window_intervals=window_M,
+        stride=stride,
+        return_scale=return_scale,
+    )
+    val_dataset = (
+        WindowDataset(val_trajs, window_intervals=window_M, stride=stride, return_scale=return_scale)
+        if val_trajs
+        else None
+    )
+    if len(train_dataset) == 0:
+        raise ValueError("No windows available for training. Reduce vpinn.window_M or check data lengths.")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=int(runtime_cfg.num_workers),
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    val_loader = (
+        DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=int(runtime_cfg.num_workers),
+            pin_memory=(device.type == "cuda"),
+            drop_last=False,
+        )
+        if val_dataset is not None and len(val_dataset) > 0
+        else None
+    )
+
     log_every = int(getattr(monitoring_cfg, "log_every_epochs", 1))
     print_every = int(getattr(monitoring_cfg, "print_every_epochs", 1))
     validate_every = int(getattr(monitoring_cfg, "validate_every_epochs", 1))
@@ -1253,11 +1420,20 @@ def train(config: Config, config_name: str) -> None:
         gradnorm_count = 0
         batches = 0
 
-        for step, (x_win, v_win, f_meas, ur_win) in enumerate(train_loader):
+        for step, batch in enumerate(train_loader):
+            if len(batch) == 4:
+                x_win, v_win, f_meas, ur_win = batch
+                scale = None
+            elif len(batch) == 5:
+                x_win, v_win, f_meas, ur_win, scale = batch
+            else:
+                raise ValueError("Unexpected batch format from dataloader.")
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
+            if scale is not None:
+                scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             B, M1, d = x_win.shape
             inp = torch.cat([x_win, v_win, ur_win], dim=-1)
@@ -1266,7 +1442,10 @@ def train(config: Config, config_name: str) -> None:
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
-                loss_f = F.mse_loss(f_pred, f_meas)
+                per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
+                if scale is not None:
+                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
+                loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
                     R = _weak_residual(
                         x=x_win,
@@ -1280,7 +1459,10 @@ def train(config: Config, config_name: str) -> None:
                         wdot=wdot,
                         alpha=alpha,
                     )
-                    loss_w = torch.mean(R.pow(2))
+                    per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
+                    if scale is not None:
+                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
+                    loss_w = torch.mean(per_loss_w)
                 else:
                     loss_w = loss_f.new_tensor(0.0)
 
@@ -1402,6 +1584,7 @@ def train(config: Config, config_name: str) -> None:
                 alpha=alpha,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
+                per_traj_norm_eps=per_traj_norm_eps,
             )
             for k_name, v_value in val_metrics.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)

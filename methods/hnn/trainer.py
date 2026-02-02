@@ -55,6 +55,7 @@ def _train_one_epoch(
     amp_dtype: torch.dtype,
     scaler: torch.amp.GradScaler,
     log_component_grad_norms: bool,
+    per_traj_norm_eps: float,
 ) -> dict[str, float]:
     batch_count = 0
     loss_sum = torch.zeros((), device=device)
@@ -75,8 +76,16 @@ def _train_one_epoch(
             z_i, t_i, z_next, t_next, ur_i = batch
             f_i = None
             f_next = None
+            scale = None
+        elif len(batch) == 6:
+            z_i, t_i, z_next, t_next, ur_i, scale = batch
+            f_i = None
+            f_next = None
         elif len(batch) == 7:
             z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+            scale = None
+        elif len(batch) == 8:
+            z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
         else:
             raise ValueError("Unexpected batch format from dataloader.")
         z_i = z_i.to(device, non_blocking=non_blocking)
@@ -88,12 +97,21 @@ def _train_one_epoch(
             f_i = f_i.to(device, non_blocking=non_blocking)
         if f_next is not None:
             f_next = f_next.to(device, non_blocking=non_blocking)
+        if scale is not None:
+            scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
         opt.zero_grad()
 
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-            res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-            avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+            if scale is None:
+                res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+            else:
+                per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                denom = scale * scale + float(per_traj_norm_eps)
+                res_loss = torch.mean(per_res / denom)
+                avg_force = torch.mean(per_force / denom)
             base_force_loss = avg_force
             if use_force_data_loss:
                 if f_i is None or f_next is None:
@@ -103,7 +121,10 @@ def _train_one_epoch(
                 z_mid = 0.5 * (z_i + z_next)
                 f_mid = 0.5 * (f_i + f_next)
                 f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
-                data_force_loss = torch.mean((f_pred - f_mid) ** 2)
+                per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
+                if scale is not None:
+                    per_data = per_data / (scale * scale + float(per_traj_norm_eps))
+                data_force_loss = torch.mean(per_data)
             else:
                 data_force_loss = res_loss.new_tensor(0.0)
 
@@ -230,6 +251,7 @@ def _validate_if_needed(
     force_data_weight: float,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    per_traj_norm_eps: float,
 ) -> None:
     if rollout_every_epochs <= 0:
         return
@@ -246,6 +268,7 @@ def _validate_if_needed(
             force_data_weight=force_data_weight,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
+            per_traj_norm_eps=per_traj_norm_eps,
         )
         for name, value in val_loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch + 1)
@@ -482,6 +505,7 @@ def _evaluate_val_losses(
     force_data_weight: float,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    per_traj_norm_eps: float,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -496,8 +520,16 @@ def _evaluate_val_losses(
                 z_i, t_i, z_next, t_next, ur_i = batch
                 f_i = None
                 f_next = None
+                scale = None
+            elif len(batch) == 6:
+                z_i, t_i, z_next, t_next, ur_i, scale = batch
+                f_i = None
+                f_next = None
             elif len(batch) == 7:
                 z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+                scale = None
+            elif len(batch) == 8:
+                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
             z_i = z_i.to(device, non_blocking=non_blocking)
@@ -509,10 +541,19 @@ def _evaluate_val_losses(
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
+            if scale is not None:
+                scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                if scale is None:
+                    res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                else:
+                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    denom = scale * scale + float(per_traj_norm_eps)
+                    res_loss = torch.mean(per_res / denom)
+                    avg_force = torch.mean(per_force / denom)
                 force_loss = float(force_reg) * avg_force
                 if use_force_data_loss:
                     if f_i is None or f_next is None:
@@ -522,7 +563,10 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
-                    data_force_loss = torch.mean((f_pred - f_mid) ** 2)
+                    per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
+                    if scale is not None:
+                        per_data = per_data / (scale * scale + float(per_traj_norm_eps))
+                    data_force_loss = torch.mean(per_data)
                 else:
                     data_force_loss = res_loss.new_tensor(0.0)
                 total = res_loss + force_loss + float(force_data_weight) * data_force_loss
@@ -594,6 +638,10 @@ def train(config: Config, config_name: str) -> None:
     model_cfg = config.model
     smoothing_cfg = config.smoothing
     hnn_cfg = dict(config.hnn or {})
+    per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
+    per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
+    if per_traj_norm not in {"none", "force_rms"}:
+        raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
 
     training_cfg = config.training
@@ -675,6 +723,8 @@ def train(config: Config, config_name: str) -> None:
         smoothing_cfg=smoothing_cfg,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        per_traj_norm=per_traj_norm,
+        per_traj_norm_eps=per_traj_norm_eps,
     )
 
     val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] | None = None
@@ -708,6 +758,8 @@ def train(config: Config, config_name: str) -> None:
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
+                per_traj_norm=per_traj_norm,
+                per_traj_norm_eps=per_traj_norm_eps,
             )
 
     if use_generated_train_series:
@@ -774,6 +826,7 @@ def train(config: Config, config_name: str) -> None:
             amp_dtype=amp_dtype,
             scaler=scaler,
             log_component_grad_norms=log_component_grad_norms,
+            per_traj_norm_eps=per_traj_norm_eps,
         )
 
         mean_loss = epoch_metrics["mean_loss"]
@@ -892,6 +945,7 @@ def train(config: Config, config_name: str) -> None:
                 force_data_weight=force_data_weight,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
+                per_traj_norm_eps=per_traj_norm_eps,
             )
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)

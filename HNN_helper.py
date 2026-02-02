@@ -1142,6 +1142,26 @@ class PHVIV(nn.Module):
     
     def avg_force(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         return self.avg_force_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+
+    def res_loss_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        return self.res_loss_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+
+    def avg_force_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        return self.avg_force_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
     
     def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dz = (zin-zi)/self.dt
@@ -1196,6 +1216,32 @@ class PHVIV(nn.Module):
 
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
+
+    def res_loss_SRK4_per_sample(
+        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+    ) -> torch.Tensor:
+        dt = self.dt
+        a = 0.5
+        b = math.sqrt(3.0) / 6.0
+
+        dz_fd = (zin - zi) / dt
+        z_mid = 0.5 * (zi + zin)
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+
+        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity)
+        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)
+
+        z_corr_minus = z_mid - b * dt * g_a_plus
+        z_corr_plus = z_mid + b * dt * g_a_minus
+
+        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)
+        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)
+
+        dz_model = 0.5 * g1 + 0.5 * g2
+        res = dz_fd - dz_model
+        res_scaled = res / self.res_scale
+        return torch.sum(res_scaled**2, dim=1)
     
     def avg_force_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dt = self.dt
@@ -1212,6 +1258,16 @@ class PHVIV(nn.Module):
         loss = 0.5 * torch.mean(torch.sum(torch.abs(f1), dim=1)) \
             + 0.5 * torch.mean(torch.sum(torch.abs(f2), dim=1))
         return loss
+
+    def avg_force_SRK4_per_sample(
+        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+    ) -> torch.Tensor:
+        b = math.sqrt(3.0) / 6.0
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        return 0.5 * torch.sum(torch.abs(f1), dim=1) + 0.5 * torch.sum(torch.abs(f2), dim=1)
     
     def feature_engineering(self, z):
         q_scaled = z[..., 0] / self.nn_q_scale
@@ -1477,7 +1533,7 @@ def log_final_rollout_errors_vs_ur(
             if key not in metrics:
                 continue
             y_val = float(metrics[key])
-            if not np.isfinite(y_val):
+            if not np.isfinite(y_val) or y_val <= 0.0:
                 continue
             xs.append(x_val)
             ys.append(y_val)
@@ -1491,6 +1547,7 @@ def log_final_rollout_errors_vs_ur(
 
     ax.set_xlabel("Reduced velocity (U_r)")
     ax.set_ylabel("Error")
+    ax.set_yscale("log")
     ax.set_title("Final rollout errors vs U_r")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")
@@ -1598,12 +1655,17 @@ def build_dataloader_from_series(
     pin_memory: bool = False,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
+    per_traj_norm: str = "none",
+    per_traj_norm_eps: float = 1e-8,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
         raise ValueError("series_data must contain at least one (y, t, dt, vel, force, U_r) tuple.")
     sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     datasets: list[TensorDataset | ConcatDataset] = []
     min_length: int | None = None
+    per_traj_norm = str(per_traj_norm).strip().lower()
+    if per_traj_norm not in {"none", "force_rms"}:
+        raise ValueError("per_traj_norm must be one of: none, force_rms.")
     for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
         y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
             y_np,
@@ -1628,6 +1690,16 @@ def build_dataloader_from_series(
             if force_arr.shape[0] != y_tensor.shape[0]:
                 raise ValueError("Force array must have the same length as displacement.")
             force_tensor = torch.from_numpy(np.ascontiguousarray(force_arr)).float()
+        traj_scale: float | None = None
+        if per_traj_norm == "force_rms":
+            if force_np is None:
+                traj_scale = 1.0
+            else:
+                force_arr = np.asarray(force_np, dtype=float)
+                rms = float(np.sqrt(np.mean(force_arr**2)))
+                if not np.isfinite(rms) or rms <= 0.0:
+                    rms = 1.0
+                traj_scale = rms
         sequence_tensors.append((y_tensor, vel_tensor, t_tensor, ur_tensor))
         datasets.append(
             build_dataset(
@@ -1637,6 +1709,7 @@ def build_dataloader_from_series(
                 t_tensor,
                 reduced_velocity=ur_tensor,
                 force_tensor=force_tensor,
+                traj_scale=traj_scale,
             )
         )
         seq_len = y_tensor.shape[0]
@@ -1857,6 +1930,7 @@ def build_dataset(
     *,
     reduced_velocity: torch.Tensor,
     force_tensor: torch.Tensor | None = None,
+    traj_scale: float | None = None,
 ) -> TensorDataset:
     """Construct consecutive state/time pairs for training (optionally with force labels)."""
     z = torch.stack((y_data_t, vel * m_eff), dim=1)
@@ -1867,16 +1941,38 @@ def build_dataset(
         raise ValueError("Reduced velocity tensor must have shape (T,) or (T, 1).")
     if ur.shape[0] != z.shape[0]:
         raise ValueError("Reduced velocity tensor must match the sequence length.")
+    scale_tensor: torch.Tensor | None = None
+    if traj_scale is not None:
+        scale_tensor = torch.full((z.shape[0] - 1,), float(traj_scale), dtype=torch.float32)
     if force_tensor is None:
+        if scale_tensor is None:
+            return TensorDataset(
+                z[:-1],
+                t_tensor[:-1].unsqueeze(1),
+                z[1:],
+                t_tensor[1:].unsqueeze(1),
+                ur[:-1],
+            )
         return TensorDataset(
             z[:-1],
             t_tensor[:-1].unsqueeze(1),
             z[1:],
             t_tensor[1:].unsqueeze(1),
             ur[:-1],
+            scale_tensor,
         )
     if force_tensor.shape[0] != z.shape[0]:
         raise ValueError("force_tensor must match the sequence length.")
+    if scale_tensor is None:
+        return TensorDataset(
+            z[:-1],
+            t_tensor[:-1].unsqueeze(1),
+            z[1:],
+            t_tensor[1:].unsqueeze(1),
+            ur[:-1],
+            force_tensor[:-1].unsqueeze(1),
+            force_tensor[1:].unsqueeze(1),
+        )
     return TensorDataset(
         z[:-1],
         t_tensor[:-1].unsqueeze(1),
@@ -1885,6 +1981,7 @@ def build_dataset(
         ur[:-1],
         force_tensor[:-1].unsqueeze(1),
         force_tensor[1:].unsqueeze(1),
+        scale_tensor,
     )
 
 def build_rollout_dataset(
