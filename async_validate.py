@@ -271,6 +271,8 @@ def _run_vpinn_validation(
     data_cfg = cfg.data
     vp = dict(cfg.vpinn or {})
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
+    num_poly = int(vp.get("num_poly_test", 2))
+    num_sine = int(vp.get("num_sine_test", 0))
 
     if bool(getattr(data_cfg, "use_generated_train_series", False)):
         val_dir = Path(data_cfg.train_series_dir) / "val"
@@ -351,7 +353,7 @@ def _run_vpinn_validation(
         drop_last=False,
     )
 
-    w, wdot, alpha = _test_functions(int(vp.get("window_M", 50)), dt, include_quadratic=bool(vp.get("include_quadratic_test", False)))
+    w, wdot, alpha = _test_functions(int(vp.get("window_M", 50)), dt, num_poly=num_poly, num_sine=num_sine)
     w = w.to(device)
     wdot = wdot.to(device)
     alpha = alpha.to(device)

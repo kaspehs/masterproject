@@ -725,15 +725,40 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
     return trajectories, val_trajectories, float(dt_ref)
 
 
-def _test_functions(M: int, dt: float, *, include_quadratic: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _test_functions(
+    M: int,
+    dt: float,
+    *,
+    num_poly: int,
+    num_sine: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M1 = int(M) + 1
     tau = torch.linspace(0.0, 1.0, M1, dtype=torch.float32)
     T = float(M) * float(dt)
-    w_list = [torch.ones_like(tau), tau]
-    wdot_list = [torch.zeros_like(tau), torch.full_like(tau, 1.0 / float(T))]
-    if include_quadratic:
-        w_list.append(tau**2)
-        wdot_list.append(2.0 * tau / float(T))
+    w_list: list[torch.Tensor] = []
+    wdot_list: list[torch.Tensor] = []
+
+    num_poly = int(num_poly)
+    num_sine = int(num_sine)
+    if num_poly < 0 or num_sine < 0:
+        raise ValueError("num_poly and num_sine must be >= 0.")
+
+    if num_poly > 0:
+        for degree in range(num_poly):
+            w_list.append(tau**degree)
+            if degree == 0:
+                wdot_list.append(torch.zeros_like(tau))
+            else:
+                wdot_list.append(float(degree) * tau ** (degree - 1) / float(T))
+
+    if num_sine > 0:
+        for k in range(1, num_sine + 1):
+            phase = float(k) * math.pi * tau
+            w_list.append(torch.sin(phase))
+            wdot_list.append((float(k) * math.pi / float(T)) * torch.cos(phase))
+
+    if not w_list:
+        raise ValueError("At least one test function is required (num_poly + num_sine must be > 0).")
     w = torch.stack(w_list, dim=0)  # (L, M1)
     wdot = torch.stack(wdot_list, dim=0)  # (L, M1)
     alpha = torch.ones((M1,), dtype=torch.float32)
@@ -986,7 +1011,8 @@ def train(config: Config, config_name: str) -> None:
     ww = float(vp.get("ww", 1.0))
     use_force_loss = bool(vp.get("use_force_loss", True))
     use_weak_loss = bool(vp.get("use_weak_loss", True))
-    include_quadratic = bool(vp.get("include_quadratic_test", False))
+    num_poly = int(vp.get("num_poly_test", 2))
+    num_sine = int(vp.get("num_sine_test", 0))
     if not (use_force_loss or use_weak_loss):
         raise ValueError("vpinn must enable at least one of: use_force_loss, use_weak_loss.")
 
@@ -1139,7 +1165,7 @@ def train(config: Config, config_name: str) -> None:
         device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype)
     )
 
-    w, wdot, alpha = _test_functions(window_M, dt, include_quadratic=include_quadratic)
+    w, wdot, alpha = _test_functions(window_M, dt, num_poly=num_poly, num_sine=num_sine)
     w = w.to(device)
     wdot = wdot.to(device)
     alpha = alpha.to(device)

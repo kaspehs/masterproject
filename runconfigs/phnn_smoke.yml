@@ -29,6 +29,7 @@ model:
   fourier_features: 64
   fourier_sigma: 1.0
   use_feature_engineering: false
+  ur_scale: 10.0
 
 smoothing:
   use_savgol_smoothing: true
