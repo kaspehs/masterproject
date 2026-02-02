@@ -111,7 +111,7 @@ monitoring:
 
 logging:
   run_dir_root: logs
-  run_name: phnn_pirate2_steadystate_velfile
+  run_name: null
   append_timestamp: true
 
 hnn: # file or compute

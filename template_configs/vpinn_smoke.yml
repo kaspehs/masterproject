@@ -72,7 +72,7 @@ compile:
 
 logging:
   run_dir_root: logs
-  run_name: vpinn_test_2s
+  run_name: null
   append_timestamp: true
 
 
@@ -118,7 +118,7 @@ vpinn:
 
   # Per-trajectory normalization: divide each window loss by a per-trajectory RMS scale.
   # Options: none | force_rms | residual_rms
-  per_traj_norm: none
+  per_traj_norm: force_rms
   per_traj_norm_eps: 1e-8
 
   # Network architecture
