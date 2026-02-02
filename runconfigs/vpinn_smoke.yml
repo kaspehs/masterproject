@@ -35,16 +35,16 @@ architecture:
     layers: 2
     activation: gelu
   pirate_force_kwargs:
-    depth: 1
+    depth: 2
     fourier_features: 64
     sigma: 0.5
     use_rwf: false
     activation: gelu
 
 training:
-  batch_size: 8096
+  batch_size: 8192
   max_grad_norm: 10000.0
-  epochs: 500
+  epochs: 1000
 
 optim:
   lr: 0.001
@@ -90,9 +90,9 @@ monitoring:
   final_rollout_all_validation: true
   async_validation: true
   async_validation_device: cpu
-  async_validation_num_workers: 3
+  async_validation_num_workers: 0
   async_validation_num_threads: 1
-  async_validation_max_concurrent: 3
+  async_validation_max_concurrent: 6
   async_validation_do_losses: true
   async_validation_do_rollout: true
 

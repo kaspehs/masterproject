@@ -4,7 +4,7 @@ data:
   file: data.npz
   steadystate: false
   steadystate_time_threshold: 10.0
-  cut_start_seconds: 2.0
+  cut_start_seconds: 0.0
   reduce_time: true
   reduction_factor: 100
   middle_time_plot: [15, 17]
@@ -46,7 +46,7 @@ architecture:
     layers: 2
     activation: gelu
   pirate_force_kwargs:
-    depth: 1
+    depth: 2
     fourier_features: 64
     sigma: 0.5
     use_rwf: false
@@ -56,6 +56,7 @@ training:
   batch_size: 8192
   max_grad_norm: 10000.0
   epochs: 1000
+
 optim:
   lr: 0.001
   optimizer: adam
@@ -70,7 +71,7 @@ optim:
     scheduler_type: cosine
 
 loss:
-  force_reg: 0.001
+  force_reg: 0.01
   use_force_data_loss: false
   force_data_weight: 1.0
   use_gradnorm: false
@@ -79,8 +80,8 @@ loss:
   gradnorm_max_weight: 5.0
 
 runtime:
-  device: cpu
-  num_workers: 0
+  device: cuda
+  num_workers: 4
 
 precision:
   use_tf32: false
@@ -100,7 +101,7 @@ monitoring:
   log_every_epochs: 10
   print_every_epochs: 50
   log_component_grad_norms: false
-  async_validation: false
+  async_validation: true
   async_validation_device: cpu
   async_validation_num_workers: 0
   async_validation_num_threads: 1
@@ -110,7 +111,7 @@ monitoring:
 
 logging:
   run_dir_root: logs
-  run_name: phnn_pirate_smallreg
+  run_name: phnn_pirate2_alldata
   append_timestamp: true
 
 hnn: # file or compute
