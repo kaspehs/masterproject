@@ -53,25 +53,24 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 8096
+  batch_size: 8192
   max_grad_norm: 10000.0
-  epochs: 500
-
+  epochs: 1000
 optim:
-  lr: 0.0003
+  lr: 0.001
   optimizer: adam
   weight_decay: 0.0
   use_lr_scheduler: true
   scheduler:
-    max_lr: 0.0003
+    max_lr: 0.001
     decay_rate: 0.99
-    warmup_steps: 25
-    decay_steps: 475
-    min_lr: 0.00003
+    warmup_steps: 50
+    decay_steps: 950
+    min_lr: 0.0001
     scheduler_type: cosine
 
 loss:
-  force_reg: 0.1
+  force_reg: 0.001
   use_force_data_loss: false
   force_data_weight: 1.0
   use_gradnorm: false
@@ -90,7 +89,7 @@ precision:
 
 compile:
   use_compile: false
-  compile_mode: default
+  compile_mode: reduce-overhead
 
 monitoring:
   rollout_every_epochs: 20
@@ -103,15 +102,15 @@ monitoring:
   log_component_grad_norms: false
   async_validation: true
   async_validation_device: cpu
-  async_validation_num_workers: 3
+  async_validation_num_workers: 0
   async_validation_num_threads: 1
-  async_validation_max_concurrent: 3
+  async_validation_max_concurrent: 6
   async_validation_do_losses: true
   async_validation_do_rollout: true
 
 logging:
   run_dir_root: logs
-  run_name: phnn_test_2s
+  run_name: phnn_pirate_smallreg
   append_timestamp: true
 
 hnn: # file or compute
