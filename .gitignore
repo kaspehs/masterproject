@@ -4,6 +4,7 @@
 /models/*
 /output/*
 /error/*
+/gpu_usage
 /logs/*
 /Data_Gen/legacy_datasets
 /Data_Gen/const_Ur
