@@ -82,6 +82,8 @@ class SchedulerConfig:
     max_lr: float = 5e-4
     decay_rate: float = 0.9
     warmup_steps: int = 1000
+    # If set, overrides warmup_steps with a fraction of total epochs (e.g., 0.05 for 5%).
+    warmup_fraction: float | None = None
     decay_steps: int = 1000
     min_lr: float = 1e-5
     scheduler_type: str = "cosine"  # or "exponential"

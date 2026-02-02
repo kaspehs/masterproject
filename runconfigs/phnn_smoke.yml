@@ -66,8 +66,7 @@ optim:
   scheduler:
     max_lr: 0.0003
     decay_rate: 0.99
-    warmup_steps: 25
-    decay_steps: 475
+    warmup_fraction: 0.05
     min_lr: 0.00003
     scheduler_type: cosine
 

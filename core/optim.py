@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Tuple
 
+import math
+
 import torch
 import torch.optim as optim
 
@@ -26,7 +28,17 @@ def setup_optimizer_and_scheduler(
         raise ValueError(f"Unsupported optimizer '{optim_cfg.optimizer}'. Use 'adam' or 'adamw'.")
 
     max_lr = float(scheduler_cfg.max_lr)
-    scheduler_warmup_steps = int(scheduler_cfg.warmup_steps)
+    warmup_fraction = getattr(scheduler_cfg, "warmup_fraction", None)
+    if warmup_fraction is not None:
+        warmup_fraction = float(warmup_fraction)
+        if warmup_fraction < 0.0 or warmup_fraction > 1.0:
+            raise ValueError("scheduler.warmup_fraction must be between 0 and 1.")
+        if warmup_fraction == 0.0:
+            scheduler_warmup_steps = 0
+        else:
+            scheduler_warmup_steps = int(max(1, math.ceil(float(epochs) * warmup_fraction)))
+    else:
+        scheduler_warmup_steps = int(scheduler_cfg.warmup_steps)
     decay_steps = int(scheduler_cfg.decay_steps)
     min_lr = float(getattr(scheduler_cfg, "min_lr", 0.02 * max_lr))
 

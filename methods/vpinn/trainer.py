@@ -228,6 +228,41 @@ def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor, ur: torch.T
     return model(torch.cat([x, v, ur], dim=-1))
 
 
+def _force_mapping_nrmse_over_trajs(
+    *,
+    model: nn.Module,
+    val_trajs: Sequence[dict[str, Any]],
+    device: torch.device,
+) -> Optional[float]:
+    if not val_trajs:
+        return None
+    model.eval()
+    values: list[torch.Tensor] = []
+    with torch.no_grad():
+        for traj in val_trajs:
+            x_true = traj["x"].to(device)
+            v_true = traj["v"].to(device)
+            f_true = traj["f"].to(device)
+            ur_true = traj["ur"].to(device)
+            if x_true.ndim != 2:
+                continue
+            f_pred = _vpinn_force(model, x_true, v_true, ur_true)
+            if f_pred.ndim == 1:
+                f_pred = f_pred.unsqueeze(-1)
+            if f_true.ndim == 1:
+                f_true = f_true.unsqueeze(-1)
+            f_pred0 = f_pred[..., 0]
+            f_true0 = f_true[..., 0]
+            force_std = torch.std(f_true0)
+            if force_std <= 0.0:
+                force_std = f_true0.new_tensor(1.0)
+            nrmse = torch.sqrt(torch.mean((f_pred0 - f_true0) ** 2)) / force_std
+            values.append(nrmse.detach())
+    if not values:
+        return None
+    return float(torch.mean(torch.stack(values)).detach().cpu())
+
+
 def rollout_rk4(
     *,
     model: nn.Module,
@@ -945,9 +980,9 @@ def _log_rollout_validation(
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
     rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
-    metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+    metrics["rollout_force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
     if log_metrics:
-        writer.add_scalar("val/force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
+        writer.add_scalar("val/rollout_force_mapping_nrmse_on_data", rel_rmse_force_on_data, epoch)
 
     y_true_norm = x_true / float(D)
     y_pred_norm = x_pred / float(D)
@@ -1370,6 +1405,9 @@ def train(config: Config, config_name: str) -> None:
             )
             for k_name, v_value in val_metrics.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)
+            force_map = _force_mapping_nrmse_over_trajs(model=model, val_trajs=val_trajs or [], device=device)
+            if force_map is not None:
+                writer.add_scalar("val/force_mapping_nrmse_on_data", force_map, epoch)
 
         if should_rollout and not async_validation:
             candidates = val_trajs if val_trajs else train_trajs

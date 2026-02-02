@@ -32,6 +32,7 @@ from HNN_helper import (
     preprocess_timeseries,
 )
 from methods.vpinn.trainer import (
+    _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
     WindowDataset,
     _as_diag_param,
@@ -253,6 +254,32 @@ def _run_hnn_validation(
             log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
             log_metrics=False,
         )
+    else:
+        force_map_sum = 0.0
+        count = 0
+        for series_raw, sequence in zip(val_series_raw, val_sequences):
+            _y_np, _t_np, _dt_value, _vel_np, force_np, _ur_np = series_raw
+            if force_np is None:
+                continue
+            y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
+            z_true = torch.stack((y_tensor, vel_tensor * m_eff), dim=1).to(device=device)
+            rv = ur_tensor.to(device=device)
+            with torch.no_grad():
+                force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
+            force_target = np.asarray(force_np).reshape(-1)
+            min_len = min(force_on_data.shape[0], force_target.shape[0])
+            if min_len <= 0:
+                continue
+            force_pred = force_on_data[:min_len]
+            force_true = force_target[:min_len]
+            rmse = float(np.sqrt(np.mean((force_pred - force_true) ** 2)))
+            force_std = float(np.std(force_true))
+            if force_std <= 0.0:
+                force_std = 1.0
+            force_map_sum += rmse / force_std
+            count += 1
+        if count > 0:
+            writer.add_scalar("val/force_mapping_nrmse_on_data", force_map_sum / float(count), epoch)
 
 
 def _run_vpinn_validation(
@@ -381,6 +408,9 @@ def _run_vpinn_validation(
         )
         for name, value in val_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
+        force_map = _force_mapping_nrmse_over_trajs(model=model, val_trajs=val_trajs, device=device)
+        if force_map is not None:
+            writer.add_scalar("val/force_mapping_nrmse_on_data", force_map, epoch)
 
     if do_rollout:
         rollout_idx = _rollout_index(epoch, rollout_every, len(val_trajs), cycle_rollout)
