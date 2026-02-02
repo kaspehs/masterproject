@@ -32,6 +32,9 @@ set -o nounset  # treat unset variables as errors
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p output error gpu_usage
 
+# Config file path (option 3: pass as first arg to sbatch)
+CONFIG_PATH="${1:-runconfigs/phnn_smoke.yml}"
+
 # Olivia: load GPU stack and run inside an ARM64 PyTorch container
 module load NRIS/GPU
 
@@ -57,4 +60,4 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   trap "kill $GPU_MON_PID" EXIT
 fi
 
-srun apptainer exec --nv "$CONTAINER" python train.py --config runconfigs/phnn_smoke.yml
+srun apptainer exec --nv "$CONTAINER" python train.py --config "$CONFIG_PATH"
