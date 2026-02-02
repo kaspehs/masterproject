@@ -54,6 +54,7 @@ class ModelConfig:
     use_reduced_velocity: bool = True
     q_scale: float | None = None
     p_scale: float | None = None
+    ur_scale: float | None = None
 
 def _default_residual_kwargs() -> dict[str, Any]:
     return {"hidden": 128, "layers": 2, "activation": "gelu"}
@@ -712,6 +713,7 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_feature_engineering: bool = False,
         use_reduced_velocity: bool = True,
+        ur_scale: float | None = None,
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
@@ -731,6 +733,10 @@ class PHVIV(nn.Module):
         self.learn_hamiltonian = bool(learn_hamiltonian)
         self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
+        ur_scale_val = 1.0 if ur_scale is None else float(ur_scale)
+        if not np.isfinite(ur_scale_val) or ur_scale_val == 0.0:
+            raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
+        self.register_buffer("ur_scale", torch.tensor(ur_scale_val, dtype=torch.float32))
         self.engineered_feature_dim = 7
         self.base_feature_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
         self.force_input_dim = self.base_feature_dim + (1 if self.use_reduced_velocity else 0)
@@ -882,6 +888,8 @@ class PHVIV(nn.Module):
         fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
+        ur_scale_val = cfg.get("ur_scale")
+        ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
         residual_kwargs = _default_residual_kwargs()
@@ -925,6 +933,7 @@ class PHVIV(nn.Module):
             fourier_sigma=fourier_sigma,
             use_feature_engineering=use_feature_engineering,
             use_reduced_velocity=use_reduced_velocity,
+            ur_scale=ur_scale,
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
@@ -1005,6 +1014,7 @@ class PHVIV(nn.Module):
             rv = reduced_velocity.to(device=like.device, dtype=like.dtype)
         else:
             rv = torch.as_tensor(reduced_velocity, device=like.device, dtype=like.dtype)
+        rv = rv / self.ur_scale.to(device=rv.device, dtype=rv.dtype)
         if rv.ndim == 0:
             rv = rv.view(1, 1)
         elif rv.ndim == like.ndim - 1:
