@@ -43,6 +43,9 @@ def setup_optimizer_and_scheduler(
     min_lr = float(getattr(scheduler_cfg, "min_lr", 0.02 * max_lr))
 
     scheduler_type = scheduler_cfg.scheduler_type.lower() if hasattr(scheduler_cfg, "scheduler_type") else "cosine"
+    if warmup_fraction is not None:
+        decay_steps = max(1, int(epochs) - int(scheduler_warmup_steps))
+
     if scheduler_type == "cosine":
         lr_scheduler = WarmupCosineLrSchedule(max_lr, min_lr, scheduler_warmup_steps, decay_steps)
     elif scheduler_type == "exponential":
