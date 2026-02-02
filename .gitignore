@@ -5,6 +5,7 @@
 /output/*
 /error/*
 /gpu_usage
+/runconfigs
 /logs/*
 /Data_Gen/legacy_datasets
 /Data_Gen/const_Ur
