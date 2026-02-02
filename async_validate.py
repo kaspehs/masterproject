@@ -32,6 +32,7 @@ from HNN_helper import (
     preprocess_timeseries,
 )
 from methods.vpinn.trainer import (
+    ScaledForceWrapper,
     WindowDataset,
     _as_diag_param,
     _build_force_model,
@@ -316,7 +317,27 @@ def _run_vpinn_validation(
 
     input_dim = 2 * d + 1
     output_dim = d
-    model = _build_force_model(cfg, input_dim=input_dim, output_dim=output_dim).to(device)
+    base_model = _build_force_model(cfg, input_dim=input_dim, output_dim=output_dim).to(device)
+    # Keep validation backward-compatible with older checkpoints/configs:
+    # scaling must be explicitly enabled, otherwise state_dict keys won't match.
+    use_input_scaling = bool(vp.get("use_input_scaling", False))
+    if use_input_scaling:
+        D_val = float(getattr(cfg.model, "D", 1.0))
+        x_scale = D_val if np.isfinite(D_val) and D_val != 0.0 else 1.0
+        omega = torch.sqrt(torch.clamp(k / m, min=1e-12))
+        v_scale = omega * float(x_scale)
+        ur_scale = float(vp.get("ur_scale", 10.0))
+        f_scale = k * float(x_scale)
+        model = ScaledForceWrapper(
+            base_model,
+            d=d,
+            x_scale=x_scale,
+            v_scale=v_scale,
+            ur_scale=ur_scale,
+            f_scale=f_scale,
+        )
+    else:
+        model = base_model
     _load_state(model, ckpt["model_state"])
     model.eval()
 
