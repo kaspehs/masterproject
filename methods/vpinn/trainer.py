@@ -78,6 +78,77 @@ class ForceMLP(nn.Module):
         return self.net(x)
 
 
+class ScaledForceWrapper(nn.Module):
+    """
+    Wrap a force network so VPINN sees well-conditioned inputs and produces forces
+    in physical units.
+
+    The VPINN force model takes s = [x, v, U_r] and returns f. Here we apply:
+      x_tilde = x / x_scale
+      v_tilde = v / v_scale
+      U_tilde = U_r / ur_scale
+      f       = f_scale * f_net([x_tilde, v_tilde, U_tilde])
+    """
+
+    def __init__(
+        self,
+        base: nn.Module,
+        *,
+        d: int,
+        x_scale: float,
+        v_scale: torch.Tensor,
+        ur_scale: float,
+        f_scale: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.base = base
+        self.d = int(d)
+        if self.d < 1:
+            raise ValueError("ScaledForceWrapper requires d >= 1")
+
+        # Place scaling buffers on the same device as the wrapped model so forward()
+        # never mixes CPU/GPU tensors.
+        try:
+            base_device = next(base.parameters()).device
+        except StopIteration:
+            base_device = v_scale.device
+
+        x_scale = float(x_scale)
+        if not np.isfinite(x_scale) or x_scale == 0.0:
+            raise ValueError(f"x_scale must be finite and non-zero, got {x_scale}")
+        ur_scale = float(ur_scale)
+        if not np.isfinite(ur_scale) or ur_scale == 0.0:
+            raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale}")
+
+        self.register_buffer("x_scale", torch.tensor(x_scale, dtype=torch.float32, device=base_device))
+        self.register_buffer("ur_scale", torch.tensor(ur_scale, dtype=torch.float32, device=base_device))
+        self.register_buffer("v_scale", torch.as_tensor(v_scale, dtype=torch.float32).to(base_device).reshape(-1))
+        self.register_buffer("f_scale", torch.as_tensor(f_scale, dtype=torch.float32).to(base_device).reshape(-1))
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        d = self.d
+        if int(s.shape[-1]) != int(2 * d + 1):
+            raise ValueError(f"Expected input dim {2*d+1} ([x,v,U_r]) but got {int(s.shape[-1])}.")
+        x = s[..., :d]
+        v = s[..., d : 2 * d]
+        ur = s[..., 2 * d :]
+        if self.v_scale.numel() == 1:
+            v_scale = self.v_scale
+        else:
+            v_scale = self.v_scale.view(*([1] * (v.ndim - 1)), -1)
+        if self.f_scale.numel() == 1:
+            f_scale = self.f_scale
+        else:
+            f_scale = self.f_scale.view(*([1] * (v.ndim - 1)), -1)
+
+        x_tilde = x / self.x_scale
+        v_tilde = v / v_scale
+        ur_tilde = ur / self.ur_scale
+        s_tilde = torch.cat([x_tilde, v_tilde, ur_tilde], dim=-1)
+        f_tilde = self.base(s_tilde)
+        return f_tilde * f_scale
+
+
 def _activation_from_string(name: str) -> nn.Module:
     key = str(name).strip().lower()
     if key == "tanh":
@@ -1015,6 +1086,31 @@ def train(config: Config, config_name: str) -> None:
     output_dim = d
     model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim)
     model = model.to(device)
+
+    use_input_scaling = bool(vp.get("use_input_scaling", False))
+    if use_input_scaling:
+        D_val = float(getattr(config.model, "D", 1.0))
+        x_scale = D_val if np.isfinite(D_val) and D_val != 0.0 else 1.0
+        # Typical velocity scale: omega * D, with omega = sqrt(k/m).
+        omega = torch.sqrt(torch.clamp(k / m, min=1e-12))
+        v_scale = omega * float(x_scale)
+        # Reduce velocity is dimensionless; scale it to O(1) for the force network.
+        ur_scale = float(vp.get("ur_scale", 10.0))
+        # Typical force scale: k * D.
+        f_scale = k * float(x_scale)
+        model = ScaledForceWrapper(
+            model,
+            d=d,
+            x_scale=x_scale,
+            v_scale=v_scale,
+            ur_scale=ur_scale,
+            f_scale=f_scale,
+        )
+        print(
+            f"VPINN scaling enabled: x/D (D={x_scale:g}), v/(sqrt(k/m)D), U_r/{ur_scale:g}, "
+            f"f_scale=kD."
+        )
+
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
     gradnorm_balancer: Optional[GradNormBalancer] = None

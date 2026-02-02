@@ -79,8 +79,8 @@ loss:
   gradnorm_max_weight: 5.0
 
 runtime:
-  device: cuda
-  num_workers: 4
+  device: cpu
+  num_workers: 0
 
 precision:
   use_tf32: false
@@ -100,7 +100,7 @@ monitoring:
   log_every_epochs: 10
   print_every_epochs: 50
   log_component_grad_norms: false
-  async_validation: true
+  async_validation: false
   async_validation_device: cpu
   async_validation_num_workers: 0
   async_validation_num_threads: 1

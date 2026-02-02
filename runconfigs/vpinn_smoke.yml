@@ -129,3 +129,7 @@ vpinn:
   velocity_source: compute
   use_data_file_for_validation: true
   validation_only_data_file: true
+
+  # Input/output scaling (recommended): x/D, v/(sqrt(k/m)D), U_r/ur_scale, and f_scale=kD.
+  use_input_scaling: true
+  ur_scale: 10.0
