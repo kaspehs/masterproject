@@ -27,6 +27,9 @@ set -o nounset  # treat unset variables as errors
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p output error
 
+# Config file path (option 3: pass as first arg to sbatch)
+CONFIG_PATH="${1:-HNNrunconfigs/pirate_final.yml}"
+
 # Olivia: load a stack, then use a containerized Python env (hpc-container-wrapper)
 module load NRIS/CPU
 
@@ -44,7 +47,7 @@ if [ "$PROFILE" -eq 1 ]; then
   module load "$APR_MODULE"
   echo "set sysroot /" > gdbfile
   export ALLINEA_DEBUGGER_USER_FILE=gdbfile
-  perf-report srun python train.py --config HNNrunconfigs/pirate_final.yml
+  perf-report srun python train.py --config "$CONFIG_PATH"
 else
-  srun python train.py --config HNNrunconfigs/pirate_final.yml
+  srun python train.py --config "$CONFIG_PATH"
 fi
