@@ -34,6 +34,7 @@ from HNN_helper import (
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
     _force_mapping_nrmse_over_trajs,
+    _load_metadata_map,
     ScaledForceWrapper,
     WindowDataset,
     _as_diag_param,
@@ -306,6 +307,9 @@ def _run_vpinn_validation(
     data_cfg = cfg.data
     vp = dict(cfg.vpinn or {})
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
+    force_representation = str(vp.get("force_representation", "force")).strip().lower()
+    if force_representation not in {"force", "coefficient"}:
+        raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
     num_poly = int(vp.get("num_poly_test", 2))
     num_sine = int(vp.get("num_sine_test", 0))
 
@@ -328,6 +332,14 @@ def _run_vpinn_validation(
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)
     dt_target = None if dt_target is None else float(dt_target)
 
+    f0_lookup = None
+    if force_representation == "coefficient":
+        if bool(getattr(data_cfg, "use_generated_train_series", False)):
+            meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
+        else:
+            meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
+        f0_lookup = _load_metadata_map(meta_path)
+
     for path in sources:
         traj, dt = _load_trajectory(
             path=path,
@@ -337,6 +349,10 @@ def _run_vpinn_validation(
             reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
             reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
             cut_start_seconds=cut_start_seconds,
+            force_representation=force_representation,
+            f0_lookup=f0_lookup,
+            rho=float(getattr(cfg.model, "rho", 1000.0)),
+            D=float(getattr(cfg.model, "D", 0.1)),
         )
         if dt_ref is None:
             dt_ref = dt
@@ -364,7 +380,7 @@ def _run_vpinn_validation(
         omega = torch.sqrt(torch.clamp(k / m, min=1e-12))
         v_scale = omega * float(x_scale)
         ur_scale = float(vp.get("ur_scale", 10.0))
-        f_scale = k * float(x_scale)
+        f_scale = 1.0 if force_representation == "coefficient" else k * float(x_scale)
         model = ScaledForceWrapper(
             base_model,
             d=d,
@@ -440,12 +456,15 @@ def _run_vpinn_validation(
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
             per_traj_norm_eps=per_traj_norm_eps,
+            expect_scale=return_scale,
+            expect_f0=(force_representation == "coefficient"),
         )
         for name, value in val_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
         force_map = _force_mapping_nrmse_over_trajs(model=model, val_trajs=val_trajs, device=device)
         if force_map is not None:
-            writer.add_scalar("val/force_mapping_nrmse_on_data", force_map, epoch)
+            for k_name, v_value in force_map.items():
+                writer.add_scalar(f"val/{k_name}", v_value, epoch)
 
     if do_rollout:
         rollout_idx = _rollout_index(epoch, rollout_every, len(val_trajs), cycle_rollout)

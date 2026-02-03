@@ -233,17 +233,21 @@ def _force_mapping_nrmse_over_trajs(
     model: nn.Module,
     val_trajs: Sequence[dict[str, Any]],
     device: torch.device,
-) -> Optional[float]:
+) -> Optional[dict[str, float]]:
     if not val_trajs:
         return None
     model.eval()
-    values: list[torch.Tensor] = []
+    values_force: list[torch.Tensor] = []
+    values_coeff: list[torch.Tensor] = []
     with torch.no_grad():
         for traj in val_trajs:
             x_true = traj["x"].to(device)
             v_true = traj["v"].to(device)
             f_true = traj["f"].to(device)
             ur_true = traj["ur"].to(device)
+            f0_true = traj.get("f0", None)
+            if f0_true is not None:
+                f0_true = f0_true.to(device)
             if x_true.ndim != 2:
                 continue
             f_pred = _vpinn_force(model, x_true, v_true, ur_true)
@@ -253,14 +257,37 @@ def _force_mapping_nrmse_over_trajs(
                 f_true = f_true.unsqueeze(-1)
             f_pred0 = f_pred[..., 0]
             f_true0 = f_true[..., 0]
-            force_std = torch.std(f_true0)
-            if force_std <= 0.0:
-                force_std = f_true0.new_tensor(1.0)
-            nrmse = torch.sqrt(torch.mean((f_pred0 - f_true0) ** 2)) / force_std
-            values.append(nrmse.detach())
-    if not values:
+
+            if f0_true is not None:
+                f0_vec = f0_true[..., 0]
+                f_pred_force = f_pred0 * f0_vec
+                f_true_force = f_true0 * f0_vec
+                force_std = torch.std(f_true_force)
+                if force_std <= 0.0:
+                    force_std = f_true_force.new_tensor(1.0)
+                nrmse_force = torch.sqrt(torch.mean((f_pred_force - f_true_force) ** 2)) / force_std
+                values_force.append(nrmse_force.detach())
+
+                coeff_std = torch.std(f_true0)
+                if coeff_std <= 0.0:
+                    coeff_std = f_true0.new_tensor(1.0)
+                nrmse_coeff = torch.sqrt(torch.mean((f_pred0 - f_true0) ** 2)) / coeff_std
+                values_coeff.append(nrmse_coeff.detach())
+            else:
+                force_std = torch.std(f_true0)
+                if force_std <= 0.0:
+                    force_std = f_true0.new_tensor(1.0)
+                nrmse_force = torch.sqrt(torch.mean((f_pred0 - f_true0) ** 2)) / force_std
+                values_force.append(nrmse_force.detach())
+
+    if not values_force:
         return None
-    return float(torch.mean(torch.stack(values)).detach().cpu())
+    out: dict[str, float] = {
+        "force_mapping_nrmse_on_data": float(torch.mean(torch.stack(values_force)).detach().cpu())
+    }
+    if values_coeff:
+        out["force_mapping_nrmse_on_data_coeff"] = float(torch.mean(torch.stack(values_coeff)).detach().cpu())
+    return out
 
 
 def rollout_rk4(
@@ -274,6 +301,7 @@ def rollout_rk4(
     m: torch.Tensor,
     c: torch.Tensor,
     k: torch.Tensor,
+    f0: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Differentiable RK4 rollout of:
@@ -301,7 +329,8 @@ def rollout_rk4(
     sixth = x0.new_tensor(1.0 / 6.0)
 
     def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
-        fi = _vpinn_force(model, xi, vi, ur0)
+        ci = _vpinn_force(model, xi, vi, ur0)
+        fi = ci if f0 is None else ci * f0
         return (fi - c * vi - k * xi) / m
 
     for _ in range(int(steps)):
@@ -466,6 +495,28 @@ def _read_timeseries_npz(
     return t, x, f, v, ur_val
 
 
+def _load_metadata_map(meta_path: Path) -> dict[str, float]:
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Metadata file '{meta_path}' not found.")
+    with meta_path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise ValueError(f"Metadata file '{meta_path}' must contain a list.")
+    mapping: dict[str, float] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        file_name = item.get("file")
+        if not file_name:
+            continue
+        if "U" not in item:
+            raise KeyError(f"Metadata entry for '{file_name}' is missing 'U'.")
+        mapping[str(file_name)] = float(item["U"])
+    if not mapping:
+        raise ValueError(f"No valid entries found in metadata file '{meta_path}'.")
+    return mapping
+
+
 def _infer_dt_target_from_data_cfg(data_cfg: Any) -> Optional[float]:
     data_path = Path(getattr(data_cfg, "file", ""))
     if not data_path:
@@ -518,6 +569,10 @@ def _load_trajectory(
     reduce_time: bool,
     reduction_factor: int,
     cut_start_seconds: float,
+    force_representation: str,
+    f0_lookup: Optional[dict[str, float]],
+    rho: float,
+    D: float,
 ) -> tuple[dict[str, Any], float]:
     t, x, f_meas, v_file, ur_val = _read_timeseries_npz(path)
     t, x, f_meas, v_file = _maybe_reduce_time(
@@ -575,6 +630,21 @@ def _load_trajectory(
     else:
         raise ValueError("vpinn.velocity_source must be 'compute' or 'file'.")
 
+    force_representation = str(force_representation).strip().lower()
+    if force_representation not in {"force", "coefficient"}:
+        raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
+    f0_val = None
+    if force_representation == "coefficient":
+        if f0_lookup is None:
+            raise ValueError("Missing metadata lookup for force coefficient conversion.")
+        if path.name not in f0_lookup:
+            raise KeyError(f"Metadata missing U for '{path.name}'.")
+        U_val = float(f0_lookup[path.name])
+        f0_val = 0.5 * float(rho) * float(D) * float(U_val) ** 2
+        if not np.isfinite(f0_val) or f0_val <= 0.0:
+            raise ValueError(f"Invalid F0 for '{path.name}': {f0_val}")
+        f_meas = f_meas / float(f0_val)
+
     ur_series = np.full((t.shape[0], 1), float(ur_val), dtype=np.float32)
     traj = {
         "name": path.name,
@@ -584,6 +654,9 @@ def _load_trajectory(
         "f": torch.from_numpy(f_meas.astype(np.float32)),
         "ur": torch.from_numpy(ur_series),
     }
+    if f0_val is not None:
+        f0_series = np.full((t.shape[0], 1), float(f0_val), dtype=np.float32)
+        traj["f0"] = torch.from_numpy(f0_series)
     return traj, dt
 
 
@@ -645,6 +718,7 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         self.M1 = self.M + 1
         self.stride = int(stride)
         self._return_scale = bool(return_scale)
+        self._return_f0 = any("f0" in traj for traj in self.trajectories)
 
         traj_ids: list[np.ndarray] = []
         starts: list[np.ndarray] = []
@@ -676,10 +750,14 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         v = traj["v"][start:end]
         f = traj["f"][start:end]
         ur = traj["ur"][start:end]
+        items: list[torch.Tensor] = [x, v, f, ur]
         if self._return_scale:
             scale = float(traj.get("scale", 1.0))
-            return x, v, f, ur, torch.tensor(scale, dtype=torch.float32)
-        return x, v, f, ur
+            items.append(torch.tensor(scale, dtype=torch.float32))
+        if self._return_f0:
+            f0 = traj["f0"][start:end]
+            items.append(f0)
+        return tuple(items)  # type: ignore[return-value]
 
 
 def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
@@ -688,10 +766,21 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
     vp = dict(config.vpinn or {})
 
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
+    force_representation = str(vp.get("force_representation", "force")).strip().lower()
+    if force_representation not in {"force", "coefficient"}:
+        raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
     dt_target = vp.get("dt_target", None)
     if dt_target is None:
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)
     dt_target = None if dt_target is None else float(dt_target)
+
+    f0_lookup: Optional[dict[str, float]] = None
+    if force_representation == "coefficient":
+        if data_cfg.use_generated_train_series:
+            meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
+        else:
+            meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
+        f0_lookup = _load_metadata_map(meta_path)
 
     if data_cfg.use_generated_train_series:
         series_dir = Path(data_cfg.train_series_dir)
@@ -738,6 +827,10 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             reduce_time=False,
             reduction_factor=1,
             cut_start_seconds=cut_start_seconds,
+            force_representation=force_representation,
+            f0_lookup=f0_lookup,
+            rho=float(getattr(config.model, "rho", 1000.0)),
+            D=float(getattr(config.model, "D", 0.1)),
         )
         if dt_ref is None:
             dt_ref = dt
@@ -753,6 +846,10 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             reduce_time=False,
             reduction_factor=1,
             cut_start_seconds=cut_start_seconds,
+            force_representation=force_representation,
+            f0_lookup=f0_lookup,
+            rho=float(getattr(config.model, "rho", 1000.0)),
+            D=float(getattr(config.model, "D", 0.1)),
         )
         if dt_ref is None:
             dt_ref = dt
@@ -828,12 +925,22 @@ def _weak_residual(
     w: torch.Tensor,
     wdot: torch.Tensor,
     alpha: torch.Tensor,
+    f0: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = m.view(1, 1, -1)
     c = c.view(1, 1, -1)
     k = k.view(1, 1, -1)
-    mv = m * v
-    cv_kx_minus_f = c * v + k * x - f_pred
+    if f0 is not None:
+        f0 = f0.to(device=x.device, dtype=x.dtype)
+        if f0.ndim == 2:
+            f0 = f0.unsqueeze(-1)
+        if f0.ndim != 3:
+            raise ValueError("f0 must have shape (B, M1, 1) or (B, M1).")
+        mv = (m * v) / f0
+        cv_kx_minus_f = (c * v + k * x) / f0 - f_pred
+    else:
+        mv = m * v
+        cv_kx_minus_f = c * v + k * x - f_pred
     vM = v[:, -1, :].unsqueeze(1)
     v0 = v[:, 0, :].unsqueeze(1)
     wM = w[:, -1].view(1, -1, 1)
@@ -873,6 +980,9 @@ def _per_traj_residual_rms(
     x = torch.as_tensor(traj["x"], dtype=torch.float32)
     v = torch.as_tensor(traj["v"], dtype=torch.float32)
     f = torch.as_tensor(traj["f"], dtype=torch.float32)
+    f0 = None
+    if "f0" in traj:
+        f0 = torch.as_tensor(traj["f0"], dtype=torch.float32)
     length = int(x.shape[0])
     M1 = int(window_M) + 1
     if length < M1:
@@ -884,6 +994,9 @@ def _per_traj_residual_rms(
         x_win = x[start:end].unsqueeze(0)
         v_win = v[start:end].unsqueeze(0)
         f_win = f[start:end].unsqueeze(0)
+        f0_win = None
+        if f0 is not None:
+            f0_win = f0[start:end].unsqueeze(0)
         R = _weak_residual(
             x=x_win,
             v=v_win,
@@ -895,6 +1008,7 @@ def _per_traj_residual_rms(
             w=w,
             wdot=wdot,
             alpha=alpha,
+            f0=f0_win,
         )
         loss_w = torch.mean(R.pow(2))
         loss_sum += float(loss_w.detach().cpu())
@@ -970,6 +1084,8 @@ def _evaluate_epoch(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float = 0.0,
+    expect_scale: bool = False,
+    expect_f0: bool = False,
 ) -> dict[str, float]:
     model.eval()
     loss_f_sum = 0.0
@@ -980,8 +1096,19 @@ def _evaluate_epoch(
             if len(batch) == 4:
                 x_win, v_win, f_meas, ur_win = batch
                 scale = None
+                f0 = None
             elif len(batch) == 5:
-                x_win, v_win, f_meas, ur_win, scale = batch
+                x_win, v_win, f_meas, ur_win, extra = batch
+                if expect_scale and not expect_f0:
+                    scale = extra
+                    f0 = None
+                elif expect_f0 and not expect_scale:
+                    scale = None
+                    f0 = extra
+                else:
+                    raise ValueError("Unexpected batch format (missing scale or f0).")
+            elif len(batch) == 6:
+                x_win, v_win, f_meas, ur_win, scale, f0 = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
             x_win = x_win.to(device, non_blocking=non_blocking)
@@ -990,6 +1117,8 @@ def _evaluate_epoch(
             ur_win = ur_win.to(device, non_blocking=non_blocking)
             if scale is not None:
                 scale = scale.to(device, non_blocking=non_blocking).view(-1)
+            if f0 is not None:
+                f0 = f0.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
             inp = torch.cat([x_win, v_win, ur_win], dim=-1)
@@ -1002,10 +1131,11 @@ def _evaluate_epoch(
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
+                    f_pred_force = f_pred if f0 is None else f_pred * f0
                     R = _weak_residual(
                         x=x_win,
                         v=v_win,
-                        f_pred=f_pred,
+                        f_pred=f_pred_force,
                         m=m,
                         c=c,
                         k=k,
@@ -1013,6 +1143,7 @@ def _evaluate_epoch(
                         w=w,
                         wdot=wdot,
                         alpha=alpha,
+                        f0=f0,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
                     if scale is not None:
@@ -1053,6 +1184,9 @@ def _log_rollout_validation(
     v_true_t = traj["v"].to(device)
     f_true_t = traj["f"].to(device)
     ur_true_t = traj["ur"].to(device)
+    f0_true_t = traj.get("f0", None)
+    if f0_true_t is not None:
+        f0_true_t = f0_true_t.to(device)
     t_np = traj["t"].detach().cpu().numpy()
     if x_true_t.ndim != 2:
         return {}
@@ -1076,6 +1210,7 @@ def _log_rollout_validation(
         m=m,
         c=c,
         k=k,
+        f0=(f0_true_t[0:1, :] if f0_true_t is not None else None),
     )
     x_pred = x_seq[0, :, 0].detach().cpu().numpy()
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
@@ -1094,15 +1229,51 @@ def _log_rollout_validation(
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
         force_std = 1.0
-    rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-    metrics["rollout_nrmse_force_total"] = rel_rmse_force
-    if log_metrics:
-        writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
+    if f0_true_t is not None:
+        f0_np = f0_true_t[:, 0].detach().cpu().numpy()
+        f_true_force = f_true * f0_np
+        f_pred_force = f_pred * f0_np
+        force_std = float(np.std(f_true_force))
+        if force_std <= 0.0:
+            force_std = 1.0
+        rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
+        metrics["rollout_nrmse_force_total"] = rel_rmse_force
+        if log_metrics:
+            writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
+
+        coeff_std = float(np.std(f_true))
+        if coeff_std <= 0.0:
+            coeff_std = 1.0
+        rel_rmse_coeff = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / coeff_std
+        metrics["rollout_nrmse_force_total_coeff"] = rel_rmse_coeff
+        if log_metrics:
+            writer.add_scalar("val/rollout_nrmse_force_total_coeff", rel_rmse_coeff, epoch)
+    else:
+        rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
+        metrics["rollout_nrmse_force_total"] = rel_rmse_force
+        if log_metrics:
+            writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
-    rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
-    metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+    if f0_true_t is not None:
+        f0_np = f0_true_t[:, 0].detach().cpu().numpy()
+        f_on_data_force = f_on_data * f0_np
+        f_true_force = f_true * f0_np
+        force_std = float(np.std(f_true_force))
+        if force_std <= 0.0:
+            force_std = 1.0
+        rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data_force - f_true_force) ** 2))) / force_std
+        metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+
+        coeff_std = float(np.std(f_true))
+        if coeff_std <= 0.0:
+            coeff_std = 1.0
+        rel_rmse_coeff_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / coeff_std
+        metrics["force_mapping_nrmse_on_data_coeff"] = rel_rmse_coeff_on_data
+    else:
+        rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
+        metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
 
     y_true_norm = x_true / float(D)
     y_pred_norm = x_pred / float(D)
@@ -1168,6 +1339,17 @@ def train(config: Config, config_name: str) -> None:
     use_weak_loss = bool(vp.get("use_weak_loss", True))
     num_poly = int(vp.get("num_poly_test", 2))
     num_sine = int(vp.get("num_sine_test", 0))
+    force_representation = str(vp.get("force_representation", "force")).strip().lower()
+    if force_representation not in {"force", "coefficient"}:
+        raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
+    use_force_coeff = force_representation == "coefficient"
+    f0_lookup: Optional[dict[str, float]] = None
+    if use_force_coeff:
+        if bool(getattr(config.data, "use_generated_train_series", False)):
+            meta_path = Path(config.data.train_series_dir) / "metadata.json"
+        else:
+            meta_path = Path(config.data.file).resolve().parent / "metadata.json"
+        f0_lookup = _load_metadata_map(meta_path)
     per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
     if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
@@ -1224,6 +1406,10 @@ def train(config: Config, config_name: str) -> None:
             reduce_time=val_reduce_time,
             reduction_factor=val_reduction_factor,
             cut_start_seconds=cut_start_seconds,
+            force_representation=force_representation,
+            f0_lookup=f0_lookup,
+            rho=float(getattr(config.model, "rho", 1000.0)),
+            D=float(getattr(config.model, "D", 0.1)),
         )
         if val_dt != dt:
             raise ValueError(f"Validation data dt={val_dt} does not match training dt={dt}.")
@@ -1255,8 +1441,8 @@ def train(config: Config, config_name: str) -> None:
         v_scale = omega * float(x_scale)
         # Reduce velocity is dimensionless; scale it to O(1) for the force network.
         ur_scale = float(vp.get("ur_scale", 10.0))
-        # Typical force scale: k * D.
-        f_scale = k * float(x_scale)
+        # Typical force scale: k * D (unless output is force coefficient).
+        f_scale = 1.0 if use_force_coeff else k * float(x_scale)
         model = ScaledForceWrapper(
             model,
             d=d,
@@ -1418,12 +1604,25 @@ def train(config: Config, config_name: str) -> None:
         gradnorm_count = 0
         batches = 0
 
+        expect_scale = per_traj_norm != "none"
+        expect_f0 = use_force_coeff
         for step, batch in enumerate(train_loader):
             if len(batch) == 4:
                 x_win, v_win, f_meas, ur_win = batch
                 scale = None
+                f0 = None
             elif len(batch) == 5:
-                x_win, v_win, f_meas, ur_win, scale = batch
+                x_win, v_win, f_meas, ur_win, extra = batch
+                if expect_scale and not expect_f0:
+                    scale = extra
+                    f0 = None
+                elif expect_f0 and not expect_scale:
+                    scale = None
+                    f0 = extra
+                else:
+                    raise ValueError("Unexpected batch format (missing scale or f0).")
+            elif len(batch) == 6:
+                x_win, v_win, f_meas, ur_win, scale, f0 = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
             x_win = x_win.to(device, non_blocking=non_blocking)
@@ -1432,6 +1631,8 @@ def train(config: Config, config_name: str) -> None:
             ur_win = ur_win.to(device, non_blocking=non_blocking)
             if scale is not None:
                 scale = scale.to(device, non_blocking=non_blocking).view(-1)
+            if f0 is not None:
+                f0 = f0.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
             inp = torch.cat([x_win, v_win, ur_win], dim=-1)
@@ -1445,10 +1646,11 @@ def train(config: Config, config_name: str) -> None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
+                    f_pred_force = f_pred if f0 is None else f_pred * f0
                     R = _weak_residual(
                         x=x_win,
                         v=v_win,
-                        f_pred=f_pred,
+                        f_pred=f_pred_force,
                         m=m,
                         c=c,
                         k=k,
@@ -1456,6 +1658,7 @@ def train(config: Config, config_name: str) -> None:
                         w=w,
                         wdot=wdot,
                         alpha=alpha,
+                        f0=f0,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
                     if scale is not None:
@@ -1583,12 +1786,15 @@ def train(config: Config, config_name: str) -> None:
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 per_traj_norm_eps=per_traj_norm_eps,
+                expect_scale=return_scale,
+                expect_f0=use_force_coeff,
             )
             for k_name, v_value in val_metrics.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)
             force_map = _force_mapping_nrmse_over_trajs(model=model, val_trajs=val_trajs or [], device=device)
             if force_map is not None:
-                writer.add_scalar("val/force_mapping_nrmse_on_data", force_map, epoch)
+                for k_name, v_value in force_map.items():
+                    writer.add_scalar(f"val/{k_name}", v_value, epoch)
 
         if should_rollout and not async_validation:
             candidates = val_trajs if val_trajs else train_trajs
