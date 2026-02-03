@@ -941,11 +941,11 @@ def _weak_residual(
     else:
         mv = m * v
         cv_kx_minus_f = c * v + k * x - f_pred
-    vM = v[:, -1, :].unsqueeze(1)
-    v0 = v[:, 0, :].unsqueeze(1)
+    mvM = mv[:, -1, :].unsqueeze(1)
+    mv0 = mv[:, 0, :].unsqueeze(1)
     wM = w[:, -1].view(1, -1, 1)
     w0 = w[:, 0].view(1, -1, 1)
-    boundary = (m * vM) * wM - (m * v0) * w0
+    boundary = mvM * wM - mv0 * w0
 
     ww = w.unsqueeze(0).unsqueeze(-1)  # (1, L, M1, 1)
     wwdot = wdot.unsqueeze(0).unsqueeze(-1)  # (1, L, M1, 1)
@@ -1131,11 +1131,10 @@ def _evaluate_epoch(
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
-                    f_pred_force = f_pred if f0 is None else f_pred * f0
                     R = _weak_residual(
                         x=x_win,
                         v=v_win,
-                        f_pred=f_pred_force,
+                        f_pred=f_pred,
                         m=m,
                         c=c,
                         k=k,
@@ -1646,11 +1645,10 @@ def train(config: Config, config_name: str) -> None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
-                    f_pred_force = f_pred if f0 is None else f_pred * f0
                     R = _weak_residual(
                         x=x_win,
                         v=v_win,
-                        f_pred=f_pred_force,
+                        f_pred=f_pred,
                         m=m,
                         c=c,
                         k=k,
