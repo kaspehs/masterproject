@@ -5,6 +5,8 @@ data:
   steadystate: false
   steadystate_time_threshold: 10.0
   cut_start_seconds: 5.0
+  cut_start_seconds_train: 5.0
+  cut_start_seconds_val: 5.0
   reduce_time: true
   reduction_factor: 100
   middle_time_plot: [15, 17]

@@ -817,7 +817,16 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
     trajectories: list[dict[str, Any]] = []
     val_trajectories: list[dict[str, Any]] = []
     dt_ref: Optional[float] = None
-    cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+    train_cut_start_seconds = float(
+        data_cfg.cut_start_seconds_train
+        if getattr(data_cfg, "cut_start_seconds_train", None) is not None
+        else getattr(data_cfg, "cut_start_seconds", 0.0)
+    )
+    val_cut_start_seconds = float(
+        data_cfg.cut_start_seconds_val
+        if getattr(data_cfg, "cut_start_seconds_val", None) is not None
+        else getattr(data_cfg, "cut_start_seconds", 0.0)
+    )
     for path in sources:
         traj, dt = _load_trajectory(
             path=path,
@@ -826,7 +835,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             smoothing_cfg=smoothing_cfg,
             reduce_time=False,
             reduction_factor=1,
-            cut_start_seconds=cut_start_seconds,
+            cut_start_seconds=train_cut_start_seconds,
             force_representation=force_representation,
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
@@ -845,7 +854,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             smoothing_cfg=smoothing_cfg,
             reduce_time=False,
             reduction_factor=1,
-            cut_start_seconds=cut_start_seconds,
+            cut_start_seconds=val_cut_start_seconds,
             force_representation=force_representation,
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
@@ -1396,7 +1405,11 @@ def train(config: Config, config_name: str) -> None:
             data_path = (Path.cwd() / data_path).resolve()
         val_reduce_time = bool(getattr(config.data, "reduce_time", False))
         val_reduction_factor = int(getattr(config.data, "reduction_factor", 1))
-        cut_start_seconds = float(getattr(config.data, "cut_start_seconds", 0.0))
+        cut_start_seconds = float(
+            config.data.cut_start_seconds_val
+            if getattr(config.data, "cut_start_seconds_val", None) is not None
+            else getattr(config.data, "cut_start_seconds", 0.0)
+        )
         val_traj, val_dt = _load_trajectory(
             path=data_path,
             dt_target=dt,

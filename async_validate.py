@@ -30,6 +30,7 @@ from HNN_helper import (
     log_validation_epoch,
     parse_config,
     preprocess_timeseries,
+    resolve_cut_start_seconds,
 )
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
@@ -126,6 +127,7 @@ def _run_hnn_validation(
                 vel_data = np.asarray(data[key])
                 break
 
+    val_cut = resolve_cut_start_seconds(data_cfg, "val")
     t, y_data, F_data, hamiltonian_data, vel_data, dt = preprocess_timeseries(
         t,
         y_data,
@@ -133,6 +135,7 @@ def _run_hnn_validation(
         H_data,
         data_cfg,
         velocity=vel_data,
+        cut_start_seconds=val_cut,
     )
 
     model_dict = asdict(cfg.model)
@@ -161,7 +164,7 @@ def _run_hnn_validation(
             eval_reduced_velocity=reduced_velocity,
             require_force=True,
             eval_force=F_data,
-            cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
+            cut_start_seconds=val_cut,
         )
     else:
         val_series_raw, _ = load_training_series(
@@ -178,7 +181,7 @@ def _run_hnn_validation(
             eval_reduced_velocity=reduced_velocity,
             require_force=True,
             eval_force=F_data,
-            cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
+            cut_start_seconds=val_cut,
         )
 
     val_loader, val_sequences, _ = build_dataloader_from_series(
@@ -327,7 +330,11 @@ def _run_vpinn_validation(
 
     val_trajs: list[dict[str, Any]] = []
     dt_ref: Optional[float] = None
-    cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+    cut_start_seconds = float(
+        data_cfg.cut_start_seconds_val
+        if getattr(data_cfg, "cut_start_seconds_val", None) is not None
+        else getattr(data_cfg, "cut_start_seconds", 0.0)
+    )
     dt_target = vp.get("dt_target", None)
     if dt_target is None:
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)

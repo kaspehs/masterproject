@@ -36,6 +36,7 @@ from HNN_helper import (
     log_training_metrics,
     log_validation_epoch,
     preprocess_timeseries,
+    resolve_cut_start_seconds,
 )
 
 
@@ -642,6 +643,7 @@ def train(config: Config, config_name: str) -> None:
             vel_data = data[key]
             break
 
+    train_cut = resolve_cut_start_seconds(data_cfg, "train")
     t, y_data, F_data, hamiltonian_data, vel_data, dt = preprocess_timeseries(
         t,
         y_data,
@@ -649,6 +651,7 @@ def train(config: Config, config_name: str) -> None:
         H_data,
         data_cfg,
         velocity=vel_data,
+        cut_start_seconds=train_cut,
     )
 
     model_cfg = config.model
@@ -726,7 +729,7 @@ def train(config: Config, config_name: str) -> None:
         eval_reduced_velocity=reduced_velocity,
         require_force=use_force_data_loss,
         eval_force=F_data,
-        cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
+        cut_start_seconds=train_cut,
     )
     eval_y_tensor, eval_vel_tensor, eval_t_tensor, eval_ur_tensor = eval_tensors
 
@@ -750,6 +753,7 @@ def train(config: Config, config_name: str) -> None:
     if use_generated_train_series:
         val_dir = train_series_root / "val"
         if val_dir.exists():
+            val_cut = resolve_cut_start_seconds(data_cfg, "val")
             val_series_raw, _ = load_training_series(
                 y_data,
                 t,
@@ -764,7 +768,7 @@ def train(config: Config, config_name: str) -> None:
                 eval_reduced_velocity=reduced_velocity,
                 require_force=True,
                 eval_force=F_data,
-                cut_start_seconds=float(getattr(data_cfg, "cut_start_seconds", 0.0)),
+                cut_start_seconds=val_cut,
             )
             val_loader, val_sequences, _ = build_dataloader_from_series(
                 val_series_raw,

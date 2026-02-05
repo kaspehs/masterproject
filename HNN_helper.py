@@ -26,6 +26,9 @@ class DataConfig:
     # Cut away the first N seconds from each time series (relative to the series start).
     # Applied during both training and validation loading.
     cut_start_seconds: float = 0.0
+    # Optional overrides for training/validation splits (fallback to cut_start_seconds when unset).
+    cut_start_seconds_train: float | None = None
+    cut_start_seconds_val: float | None = None
     reduce_time: bool = False
     reduction_factor: int = 1
     middle_time_plot: list[float] = field(default_factory=lambda: [15.0, 17.0])
@@ -1676,6 +1679,8 @@ def preprocess_timeseries(
     hamiltonian: np.ndarray,
     data_cfg: DataConfig,
     velocity: np.ndarray | None = None,
+    *,
+    cut_start_seconds: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, float]:
     """
     Apply optional trimming and uniform decimation to time-series arrays.
@@ -1685,7 +1690,9 @@ def preprocess_timeseries(
     if velocity is not None and np.asarray(velocity).shape[0] != t.shape[0]:
         raise ValueError("Velocity array must have the same length as the time vector.")
     mask = np.ones_like(t, dtype=bool)
-    cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+    if cut_start_seconds is None:
+        cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+    cut_start_seconds = float(cut_start_seconds)
     if cut_start_seconds > 0.0:
         t0 = float(np.asarray(t)[0])
         mask &= t >= (t0 + cut_start_seconds)
@@ -1712,6 +1719,20 @@ def preprocess_timeseries(
         )
     dt_value = float(t_proc[1] - t_proc[0]) if t_proc.size > 1 else float("nan")
     return t_proc, y_proc, f_proc, h_proc, v_proc, dt_value
+
+
+def resolve_cut_start_seconds(data_cfg: DataConfig, split: str) -> float:
+    split = str(split).strip().lower()
+    default_cut = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+    if split == "train":
+        override = getattr(data_cfg, "cut_start_seconds_train", None)
+    elif split == "val":
+        override = getattr(data_cfg, "cut_start_seconds_val", None)
+    else:
+        override = None
+    if override is None:
+        return default_cut
+    return float(override)
 
 
 def compute_velocity_numpy(
