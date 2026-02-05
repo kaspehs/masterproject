@@ -56,6 +56,7 @@ def _train_one_epoch(
     scaler: torch.amp.GradScaler,
     log_component_grad_norms: bool,
     per_traj_norm_eps: float,
+    force_reg_on_coeff: bool,
 ) -> dict[str, float]:
     batch_count = 0
     loss_sum = torch.zeros((), device=device)
@@ -105,10 +106,16 @@ def _train_one_epoch(
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             if scale is None:
                 res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                if force_reg_on_coeff:
+                    avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                else:
+                    avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
             else:
                 per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                if force_reg_on_coeff:
+                    per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                else:
+                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 denom = scale * scale + float(per_traj_norm_eps)
                 res_loss = torch.mean(per_res / denom)
                 avg_force = torch.mean(per_force / denom)
@@ -252,6 +259,7 @@ def _validate_if_needed(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float,
+    force_reg_on_coeff: bool,
 ) -> None:
     if rollout_every_epochs <= 0:
         return
@@ -269,6 +277,7 @@ def _validate_if_needed(
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             per_traj_norm_eps=per_traj_norm_eps,
+            force_reg_on_coeff=force_reg_on_coeff,
         )
         for name, value in val_loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch + 1)
@@ -506,6 +515,7 @@ def _evaluate_val_losses(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float,
+    force_reg_on_coeff: bool,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -547,10 +557,16 @@ def _evaluate_val_losses(
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 if scale is None:
                     res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    if force_reg_on_coeff:
+                        avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    else:
+                        avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 else:
                     per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    if force_reg_on_coeff:
+                        per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    else:
+                        per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                     denom = scale * scale + float(per_traj_norm_eps)
                     res_loss = torch.mean(per_res / denom)
                     avg_force = torch.mean(per_force / denom)
@@ -661,6 +677,7 @@ def train(config: Config, config_name: str) -> None:
     scheduler_cfg = optim_cfg.scheduler
 
     force_reg = float(loss_cfg.force_reg)
+    force_reg_on_coeff = bool(getattr(loss_cfg, "force_reg_on_coeff", False))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
 
@@ -827,6 +844,7 @@ def train(config: Config, config_name: str) -> None:
             scaler=scaler,
             log_component_grad_norms=log_component_grad_norms,
             per_traj_norm_eps=per_traj_norm_eps,
+            force_reg_on_coeff=force_reg_on_coeff,
         )
 
         mean_loss = epoch_metrics["mean_loss"]
@@ -946,6 +964,7 @@ def train(config: Config, config_name: str) -> None:
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 per_traj_norm_eps=per_traj_norm_eps,
+                force_reg_on_coeff=force_reg_on_coeff,
             )
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)

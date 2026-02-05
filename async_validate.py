@@ -202,6 +202,7 @@ def _run_hnn_validation(
             device=device,
             non_blocking=(device.type == "cuda"),
             force_reg=float(loss_cfg.force_reg),
+            force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
             amp_enabled=amp_enabled,
@@ -495,6 +496,7 @@ def _evaluate_val_losses(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float,
+    force_reg_on_coeff: bool,
 ) -> dict[str, float]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
@@ -536,10 +538,16 @@ def _evaluate_val_losses(
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 if scale is None:
                     res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    if force_reg_on_coeff:
+                        avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    else:
+                        avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                 else:
                     per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    if force_reg_on_coeff:
+                        per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    else:
+                        per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
                     denom = scale * scale + float(per_traj_norm_eps)
                     res_loss = torch.mean(per_res / denom)
                     avg_force = torch.mean(per_force / denom)

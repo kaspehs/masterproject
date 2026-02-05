@@ -105,6 +105,7 @@ class OptimConfig:
 @dataclass
 class LossConfig:
     force_reg: float = 1e-2
+    force_reg_on_coeff: bool = False
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
     gradnorm_eps: float = 1e-8
@@ -245,6 +246,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
     optim_keys = {"lr", "optimizer", "weight_decay", "use_lr_scheduler", "scheduler"}
     loss_keys = {
         "force_reg",
+        "force_reg_on_coeff",
         "use_gradnorm",
         "gradnorm_alpha",
         "gradnorm_eps",
@@ -1027,6 +1029,48 @@ class PHVIV(nn.Module):
             rv = rv.expand(like.shape[:-1] + (1,))
         return rv
 
+    def _prepare_reduced_velocity_raw(
+        self,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None,
+        *,
+        like: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if reduced_velocity is None:
+            if self.use_reduced_velocity:
+                raise ValueError("reduced_velocity is required for force coefficient regularization.")
+            return None
+        if torch.is_tensor(reduced_velocity):
+            rv = reduced_velocity.to(device=like.device, dtype=like.dtype)
+        else:
+            rv = torch.as_tensor(reduced_velocity, device=like.device, dtype=like.dtype)
+        if rv.ndim == 0:
+            rv = rv.view(1, 1)
+        elif rv.ndim == like.ndim - 1:
+            rv = rv.unsqueeze(-1)
+        if rv.ndim != like.ndim or rv.shape[-1] != 1:
+            raise ValueError("reduced_velocity must be a scalar or have shape (..., 1).")
+        if rv.shape[:-1] != like.shape[:-1]:
+            rv = rv.expand(like.shape[:-1] + (1,))
+        return rv
+
+    def _force_scale_from_reduced_velocity(
+        self,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None,
+        *,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
+        if rv_raw is None:
+            f0 = 0.5 * float(self.rho) * float(self.D) * float(self.U) ** 2
+            return like.new_full(like.shape[:-1] + (1,), float(f0))
+        omega_n = torch.sqrt(
+            torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
+        )
+        f_n = omega_n / (2.0 * math.pi)
+        U = rv_raw * f_n * float(self.D)
+        f0 = 0.5 * float(self.rho) * float(self.D) * (U ** 2)
+        return torch.clamp(f0, min=1e-12)
+
     def _force_features(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         base_features = self._base_features(x)
         if self.use_reduced_velocity:
@@ -1162,6 +1206,19 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     ) -> torch.Tensor:
         return self.avg_force_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+
+    def avg_force_coeff(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.avg_force_coeff_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+
+    def avg_force_coeff_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        return self.avg_force_coeff_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
     
     def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dz = (zin-zi)/self.dt
@@ -1268,6 +1325,38 @@ class PHVIV(nn.Module):
         f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
         f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
         return 0.5 * torch.sum(torch.abs(f1), dim=1) + 0.5 * torch.sum(torch.abs(f2), dim=1)
+
+    def avg_force_coeff_SRK4(
+        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+    ):
+        dt = self.dt
+        b = math.sqrt(3.0) / 6.0
+
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1)
+
+        f1c = f1 / f0
+        f2c = f2 / f0
+        loss = 0.5 * torch.mean(torch.sum(torch.abs(f1c), dim=1)) \
+            + 0.5 * torch.mean(torch.sum(torch.abs(f2c), dim=1))
+        return loss
+
+    def avg_force_coeff_SRK4_per_sample(
+        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+    ) -> torch.Tensor:
+        b = math.sqrt(3.0) / 6.0
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1)
+        f1c = f1 / f0
+        f2c = f2 / f0
+        return 0.5 * torch.sum(torch.abs(f1c), dim=1) + 0.5 * torch.sum(torch.abs(f2c), dim=1)
     
     def feature_engineering(self, z):
         q_scaled = z[..., 0] / self.nn_q_scale

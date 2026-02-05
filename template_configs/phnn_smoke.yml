@@ -72,6 +72,7 @@ optim:
 
 loss:
   force_reg: 0.01
+  force_reg_on_coeff: true
   use_force_data_loss: false
   force_data_weight: 1.0
   use_gradnorm: false

@@ -71,6 +71,7 @@ optim:
 
 loss:
   force_reg: 0.01
+  force_reg_on_coeff: true
   # Optional supervised loss on measured force (requires force to be present in the .npz files).
   # Uses midpoint state z_mid = 0.5*(z_i+z_{i+1}) and midpoint force f_mid = 0.5*(f_i+f_{i+1}).
   use_force_data_loss: false
