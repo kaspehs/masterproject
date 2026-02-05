@@ -1347,6 +1347,9 @@ def train(config: Config, config_name: str) -> None:
     use_weak_loss = bool(vp.get("use_weak_loss", True))
     num_poly = int(vp.get("num_poly_test", 2))
     num_sine = int(vp.get("num_sine_test", 0))
+    rollout_force_weight = float(vp.get("rollout_force_weight", 0.0))
+    rollout_force_steps = int(vp.get("rollout_force_steps", 0))
+    rollout_force_every = int(vp.get("rollout_force_every", 1))
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
@@ -1372,13 +1375,6 @@ def train(config: Config, config_name: str) -> None:
     gradnorm_max_weight = float(vp.get("gradnorm_max_weight", 10.0))
     gradnorm_update_every_steps = int(vp.get("gradnorm_update_every_steps", 1))
     gradnorm_update_every_steps = max(1, gradnorm_update_every_steps)
-
-    if bool(vp.get("use_rollout_loss", False)):
-        raise ValueError(
-            "vpinn.use_rollout_loss is not supported. "
-            "Rollout-based checks are intended for validation only; "
-            "use monitoring.rollout_every_epochs to log rollout validation."
-        )
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
     print(f"Using device: {device}")
@@ -1473,17 +1469,27 @@ def train(config: Config, config_name: str) -> None:
     gradnorm_balancer: Optional[GradNormBalancer] = None
     gradnorm_last_force = None
     gradnorm_last_weak = None
-    if use_gradnorm and use_force_loss and use_weak_loss:
-        gradnorm_balancer = GradNormBalancer(
-            model,
-            ["force", "weak"],
-            alpha=gradnorm_alpha,
-            eps=gradnorm_eps,
-            min_weight=gradnorm_min_weight,
-            max_weight=gradnorm_max_weight,
-        )
-    elif use_gradnorm and not (use_force_loss and use_weak_loss):
-        print("vpinn.use_gradnorm is True but only one loss is enabled; skipping GradNorm.")
+    gradnorm_last_rollout = None
+    use_rollout_loss = rollout_force_weight > 0.0 and rollout_force_steps > 0
+    if use_gradnorm:
+        gradnorm_names: list[str] = []
+        if use_force_loss:
+            gradnorm_names.append("force")
+        if use_weak_loss:
+            gradnorm_names.append("weak")
+        if use_rollout_loss:
+            gradnorm_names.append("rollout")
+        if len(gradnorm_names) >= 2:
+            gradnorm_balancer = GradNormBalancer(
+                model,
+                gradnorm_names,
+                alpha=gradnorm_alpha,
+                eps=gradnorm_eps,
+                min_weight=gradnorm_min_weight,
+                max_weight=gradnorm_max_weight,
+            )
+        else:
+            print("vpinn.use_gradnorm is True but fewer than two losses are enabled; skipping GradNorm.")
 
     opt, lr_scheduler = setup_optimizer_and_scheduler(
         model,
@@ -1609,10 +1615,13 @@ def train(config: Config, config_name: str) -> None:
 
         loss_f_sum = torch.zeros((), device=device)
         loss_w_sum = torch.zeros((), device=device)
+        loss_roll_sum = torch.zeros((), device=device)
         loss_sum = torch.zeros((), device=device)
+        roll_count = 0
         grad_norm_sum = torch.zeros((), device=device)
         gradnorm_force_w_sum = torch.zeros((), device=device)
         gradnorm_weak_w_sum = torch.zeros((), device=device)
+        gradnorm_rollout_w_sum = torch.zeros((), device=device)
         gradnorm_count = 0
         batches = 0
 
@@ -1678,23 +1687,74 @@ def train(config: Config, config_name: str) -> None:
                 else:
                     loss_w = loss_f.new_tensor(0.0)
 
+                loss_roll = loss_f.new_tensor(0.0)
+                roll_computed = False
+                if rollout_force_weight > 0.0 and rollout_force_steps > 0:
+                    if (step % max(1, int(rollout_force_every))) == 0:
+                        steps_k = min(int(rollout_force_steps), int(M1) - 1)
+                        if steps_k > 0:
+                            f0_step = f0[:, 0, :] if f0 is not None else None
+                            _x_seq, _v_seq, f_seq = rollout_rk4(
+                                model=model,
+                                x0=x_win[:, 0, :],
+                                v0=v_win[:, 0, :],
+                                ur0=ur_win[:, 0, :],
+                                steps=steps_k,
+                                dt=dt,
+                                m=m,
+                                c=c,
+                                k=k,
+                                f0=f0_step,
+                            )
+                            f_roll = f_seq[:, : steps_k + 1, :]
+                            f_true = f_meas[:, : steps_k + 1, :]
+                            per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
+                            if scale is not None:
+                                per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
+                            loss_roll = torch.mean(per_roll)
+                            roll_computed = True
+
                 wf_eff = float(wf) if use_force_loss else 0.0
                 ww_eff = float(ww) if use_weak_loss else 0.0
                 if gradnorm_balancer is not None:
-                    do_update = (step % gradnorm_update_every_steps) == 0 or gradnorm_last_force is None
+                    need_init = gradnorm_last_force is None and use_force_loss
+                    need_init = need_init or (gradnorm_last_weak is None and use_weak_loss)
+                    need_init = need_init or (gradnorm_last_rollout is None and use_rollout_loss)
+                    do_update = (step % gradnorm_update_every_steps) == 0 or need_init
+                    if use_rollout_loss and not roll_computed:
+                        do_update = False
                     if do_update:
-                        weights = gradnorm_balancer.update({"force": loss_f.float(), "weak": loss_w.float()})
-                        gradnorm_last_force = weights["force"]
-                        gradnorm_last_weak = weights["weak"]
-                    w_force = gradnorm_last_force
-                    w_weak = gradnorm_last_weak
-                    assert w_force is not None and w_weak is not None
-                    gradnorm_force_w_sum = gradnorm_force_w_sum + w_force.detach()
-                    gradnorm_weak_w_sum = gradnorm_weak_w_sum + w_weak.detach()
+                        losses: dict[str, torch.Tensor] = {}
+                        if use_force_loss:
+                            losses["force"] = loss_f.float()
+                        if use_weak_loss:
+                            losses["weak"] = loss_w.float()
+                        if use_rollout_loss:
+                            losses["rollout"] = loss_roll.float()
+                        weights = gradnorm_balancer.update(losses)
+                        if "force" in weights:
+                            gradnorm_last_force = weights["force"]
+                        if "weak" in weights:
+                            gradnorm_last_weak = weights["weak"]
+                        if "rollout" in weights:
+                            gradnorm_last_rollout = weights["rollout"]
+                    w_force = gradnorm_last_force if use_force_loss else loss_f.new_tensor(1.0)
+                    w_weak = gradnorm_last_weak if use_weak_loss else loss_f.new_tensor(1.0)
+                    w_roll = gradnorm_last_rollout if use_rollout_loss else loss_f.new_tensor(1.0)
+                    if use_force_loss and w_force is not None:
+                        gradnorm_force_w_sum = gradnorm_force_w_sum + w_force.detach()
+                    if use_weak_loss and w_weak is not None:
+                        gradnorm_weak_w_sum = gradnorm_weak_w_sum + w_weak.detach()
+                    if use_rollout_loss and w_roll is not None:
+                        gradnorm_rollout_w_sum = gradnorm_rollout_w_sum + w_roll.detach()
                     gradnorm_count += 1
-                    loss = wf_eff * w_force * loss_f + ww_eff * w_weak * loss_w
+                    loss = (
+                        wf_eff * w_force * loss_f
+                        + ww_eff * w_weak * loss_w
+                        + float(rollout_force_weight) * w_roll * loss_roll
+                    )
                 else:
-                    loss = wf_eff * loss_f + ww_eff * loss_w
+                    loss = wf_eff * loss_f + ww_eff * loss_w + float(rollout_force_weight) * loss_roll
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -1712,6 +1772,9 @@ def train(config: Config, config_name: str) -> None:
             loss_sum = loss_sum + loss.detach()
             loss_f_sum = loss_f_sum + loss_f.detach()
             loss_w_sum = loss_w_sum + loss_w.detach()
+            if rollout_force_weight > 0.0 and rollout_force_steps > 0 and (step % max(1, int(rollout_force_every))) == 0:
+                loss_roll_sum = loss_roll_sum + loss_roll.detach()
+                roll_count += 1
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm_sum = grad_norm_sum + grad_norm.detach()
             else:
@@ -1725,9 +1788,17 @@ def train(config: Config, config_name: str) -> None:
             "grad_norm": float((grad_norm_sum / denom).detach().cpu()),
             "lr": float(opt.param_groups[0]["lr"]) if opt.param_groups else base_lr,
         }
+        if roll_count > 0:
+            metrics["loss_rollout_force"] = float((loss_roll_sum / float(roll_count)).detach().cpu())
         if gradnorm_count > 0:
-            metrics["gradnorm_weight_data"] = float((gradnorm_force_w_sum / float(gradnorm_count)).detach().cpu())
-            metrics["gradnorm_weight_physics"] = float((gradnorm_weak_w_sum / float(gradnorm_count)).detach().cpu())
+            if use_force_loss:
+                metrics["gradnorm_weight_data"] = float((gradnorm_force_w_sum / float(gradnorm_count)).detach().cpu())
+            if use_weak_loss:
+                metrics["gradnorm_weight_physics"] = float((gradnorm_weak_w_sum / float(gradnorm_count)).detach().cpu())
+            if use_rollout_loss:
+                metrics["gradnorm_weight_rollout"] = float(
+                    (gradnorm_rollout_w_sum / float(gradnorm_count)).detach().cpu()
+                )
 
         if (epoch % max(1, log_every)) == 0 or epoch == (epochs - 1):
             for k_name, v_value in metrics.items():
