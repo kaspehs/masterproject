@@ -82,10 +82,10 @@ monitoring:
   # Logging / validation cadence
   log_every_epochs: 10
   print_every_epochs: 50
-  validate_every_epochs: 20
+  validate_every_epochs: 1
 
   # Rollout validation plots (dynamics check)
-  rollout_every_epochs: 20
+  rollout_every_epochs: 1
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
   final_rollout_all_validation: true

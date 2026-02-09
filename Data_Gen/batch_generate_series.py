@@ -102,7 +102,7 @@ def default_reduced_velocity() -> float:
 
 
 def main():
-    output_dir = Path(__file__).parent / "generated_series_Ur_long"
+    output_dir = Path(__file__).parent / "generated_series_Ur_60"
     integrator = "rk4"
     train_fraction = 0.7
     val_fraction = 0.15

@@ -80,10 +80,10 @@ monitoring:
   # Logging / validation cadence
   log_every_epochs: 1
   print_every_epochs: 1
-  validate_every_epochs: 10
+  validate_every_epochs: 1
 
   # Rollout validation plots (dynamics check)
-  rollout_every_epochs: 10
+  rollout_every_epochs: 1
   rollout_max_trajectories: 1
 
 vpinn:

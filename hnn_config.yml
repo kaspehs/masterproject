@@ -97,8 +97,8 @@ compile:
   compile_mode: default
 
 monitoring:
-  rollout_every_epochs: 50
-  validate_every_epochs: 10
+  rollout_every_epochs: 1
+  validate_every_epochs: 1
   rollout_max_trajectories: 1
   log_every_epochs: 1
   print_every_epochs: 1

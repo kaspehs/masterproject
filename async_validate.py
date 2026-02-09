@@ -27,6 +27,7 @@ from HNN_helper import (
     build_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
+    log_loss_vs_ur,
     log_validation_epoch,
     parse_config,
     preprocess_timeseries,
@@ -46,6 +47,8 @@ from methods.vpinn.trainer import (
     _m_eff_from_model_cfg,
     _test_functions,
     _log_rollout_validation,
+    rollout_rk4,
+    _weak_residual,
 )
 
 
@@ -214,7 +217,28 @@ def _run_hnn_validation(
         )
         for name, value in loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
+        loss_by_ur = _per_ur_loss_map_hnn(
+            model=model,
+            loader=val_loader,
+            device=device,
+            non_blocking=(device.type == "cuda"),
+            force_reg=float(loss_cfg.force_reg),
+            force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
+            use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
+            amp_enabled=amp_enabled,
+            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
+            per_traj_norm_eps=per_traj_norm_eps,
+        )
+        log_loss_vs_ur(
+            writer,
+            epoch,
+            loss_by_ur,
+            tag="val/loss_vs_ur",
+            title="Validation loss vs U_r",
+        )
 
+    rollout_by_ur: dict[float, list[float]] = {}
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
@@ -238,10 +262,22 @@ def _run_hnn_validation(
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+            if "rollout_nrmse_force_total" in metrics:
+                ur_val = float(np.asarray(_ur_np).reshape(-1)[0])
+                rollout_by_ur.setdefault(ur_val, []).append(float(metrics["rollout_nrmse_force_total"]))
             count += 1
         if count > 0:
             for name, total in metrics_sum.items():
                 writer.add_scalar(f"val/{name}", total / float(count), epoch)
+        if rollout_by_ur:
+            rollout_mean = {float(np.round(k, 6)): float(np.mean(v)) for k, v in rollout_by_ur.items()}
+            log_loss_vs_ur(
+                writer,
+                epoch,
+                {"rollout_nrmse_force_total": rollout_mean},
+                tag="val/rollout_vs_ur",
+                title="Rollout NRMSE force vs U_r",
+            )
 
         rollout_idx = _rollout_index(epoch, rollout_every, len(val_series_raw), cycle_rollout)
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[rollout_idx]
@@ -473,6 +509,34 @@ def _run_vpinn_validation(
         if force_map is not None:
             for k_name, v_value in force_map.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)
+        loss_by_ur = _per_ur_loss_map_vpinn(
+            model=model,
+            loader=val_loader,
+            device=device,
+            non_blocking=(device.type == "cuda"),
+            dt=dt,
+            m=m,
+            c=c,
+            k=k,
+            w=w,
+            wdot=wdot,
+            alpha=alpha,
+            use_force_loss=bool(vp.get("use_force_loss", True)),
+            use_weak_loss=bool(vp.get("use_weak_loss", True)),
+            rollout_force_steps=int(vp.get("rollout_force_steps", 0)),
+            expect_scale=return_scale,
+            expect_f0=(force_representation == "coefficient"),
+            amp_enabled=amp_enabled,
+            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
+            per_traj_norm_eps=per_traj_norm_eps,
+        )
+        log_loss_vs_ur(
+            writer,
+            epoch,
+            loss_by_ur,
+            tag="val/loss_vs_ur",
+            title="Validation loss vs U_r",
+        )
 
     if do_rollout:
         rollout_idx = _rollout_index(epoch, rollout_every, len(val_trajs), cycle_rollout)
@@ -590,6 +654,110 @@ def _evaluate_val_losses(
     }
 
 
+def _per_ur_loss_map_hnn(
+    *,
+    model: PHVIV,
+    loader: Any,
+    device: torch.device,
+    non_blocking: bool,
+    force_reg: float,
+    force_reg_on_coeff: bool,
+    use_force_data_loss: bool,
+    force_data_weight: float,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    per_traj_norm_eps: float,
+) -> dict[str, dict[float, float]]:
+    model.eval()
+    amp_enabled = bool(amp_enabled) and device.type == "cuda"
+    buckets: dict[str, dict[float, list[float]]] = {
+        "loss_physics": {},
+        "loss_reg": {},
+        "loss_data": {},
+    }
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 5:
+                z_i, t_i, z_next, t_next, ur_i = batch
+                f_i = None
+                f_next = None
+                scale = None
+            elif len(batch) == 6:
+                z_i, t_i, z_next, t_next, ur_i, scale = batch
+                f_i = None
+                f_next = None
+            elif len(batch) == 7:
+                z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+                scale = None
+            elif len(batch) == 8:
+                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
+            else:
+                raise ValueError("Unexpected batch format from dataloader.")
+            z_i = z_i.to(device, non_blocking=non_blocking)
+            t_i = t_i.to(device, non_blocking=non_blocking)
+            z_next = z_next.to(device, non_blocking=non_blocking)
+            t_next = t_next.to(device, non_blocking=non_blocking)
+            ur_i = ur_i.to(device, non_blocking=non_blocking)
+            if f_i is not None:
+                f_i = f_i.to(device, non_blocking=non_blocking)
+            if f_next is not None:
+                f_next = f_next.to(device, non_blocking=non_blocking)
+            if scale is not None:
+                scale = scale.to(device, non_blocking=non_blocking).view(-1)
+
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                if scale is None:
+                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    if force_reg_on_coeff:
+                        per_force = model.avg_force_coeff_per_sample(
+                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                        )
+                    else:
+                        per_force = model.avg_force_per_sample(
+                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                        )
+                else:
+                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    if force_reg_on_coeff:
+                        per_force = model.avg_force_coeff_per_sample(
+                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                        )
+                    else:
+                        per_force = model.avg_force_per_sample(
+                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                        )
+                    denom = scale * scale + float(per_traj_norm_eps)
+                    per_res = per_res / denom
+                    per_force = per_force / denom
+                per_reg = float(force_reg) * per_force
+
+                if use_force_data_loss and f_i is not None and f_next is not None:
+                    z_mid = 0.5 * (z_i + z_next)
+                    f_mid = 0.5 * (f_i + f_next)
+                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                    per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
+                    if scale is not None:
+                        per_data = per_data / (scale * scale + float(per_traj_norm_eps))
+                    per_data = float(force_data_weight) * per_data
+                else:
+                    per_data = per_res.new_zeros(per_res.shape)
+
+            ur_vals = ur_i.detach().cpu().view(-1).numpy()
+            per_res_vals = per_res.detach().cpu().view(-1).numpy()
+            per_reg_vals = per_reg.detach().cpu().view(-1).numpy()
+            per_data_vals = per_data.detach().cpu().view(-1).numpy()
+            for u, res_v, reg_v, data_v in zip(ur_vals, per_res_vals, per_reg_vals, per_data_vals):
+                key = float(np.round(u, 6))
+                buckets["loss_physics"].setdefault(key, []).append(float(res_v))
+                buckets["loss_reg"].setdefault(key, []).append(float(reg_v))
+                buckets["loss_data"].setdefault(key, []).append(float(data_v))
+
+    out: dict[str, dict[float, float]] = {}
+    for name, by_ur in buckets.items():
+        out[name] = {ur: float(np.mean(vals)) for ur, vals in by_ur.items()}
+    return out
+
+
 def _amp_dtype(name: str) -> torch.dtype:
     key = str(name).lower()
     if key == "fp16":
@@ -597,6 +765,140 @@ def _amp_dtype(name: str) -> torch.dtype:
     if key == "bf16":
         return torch.bfloat16
     return torch.bfloat16
+
+
+def _per_ur_loss_map_vpinn(
+    *,
+    model: torch.nn.Module,
+    loader: Any,
+    device: torch.device,
+    non_blocking: bool,
+    dt: float,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    wdot: torch.Tensor,
+    alpha: torch.Tensor,
+    use_force_loss: bool,
+    use_weak_loss: bool,
+    rollout_force_steps: int,
+    expect_scale: bool,
+    expect_f0: bool,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    per_traj_norm_eps: float,
+) -> dict[str, dict[float, float]]:
+    model.eval()
+    amp_enabled = bool(amp_enabled) and device.type == "cuda"
+    buckets: dict[str, dict[float, list[float]]] = {
+        "loss_data": {},
+        "loss_physics": {},
+    }
+    if rollout_force_steps > 0:
+        buckets["loss_rollout_force"] = {}
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 4:
+                x_win, v_win, f_meas, ur_win = batch
+                scale = None
+                f0 = None
+            elif len(batch) == 5:
+                x_win, v_win, f_meas, ur_win, extra = batch
+                if expect_scale and not expect_f0:
+                    scale = extra
+                    f0 = None
+                elif expect_f0 and not expect_scale:
+                    scale = None
+                    f0 = extra
+                else:
+                    raise ValueError("Unexpected batch format (missing scale or f0).")
+            elif len(batch) == 6:
+                x_win, v_win, f_meas, ur_win, scale, f0 = batch
+            else:
+                raise ValueError("Unexpected batch format from dataloader.")
+
+            x_win = x_win.to(device, non_blocking=non_blocking)
+            v_win = v_win.to(device, non_blocking=non_blocking)
+            f_meas = f_meas.to(device, non_blocking=non_blocking)
+            ur_win = ur_win.to(device, non_blocking=non_blocking)
+            if scale is not None:
+                scale = scale.to(device, non_blocking=non_blocking).view(-1)
+            if f0 is not None:
+                f0 = f0.to(device, non_blocking=non_blocking)
+
+            B, M1, d = x_win.shape
+            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
+
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                flat = inp.reshape(B * M1, -1)
+                f_pred = model(flat).reshape(B, M1, d)
+                per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
+                if scale is not None:
+                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
+                per_loss_w = per_loss_f.new_zeros(per_loss_f.shape)
+                if use_weak_loss:
+                    R = _weak_residual(
+                        x=x_win,
+                        v=v_win,
+                        f_pred=f_pred,
+                        m=m,
+                        c=c,
+                        k=k,
+                        dt=dt,
+                        w=w,
+                        wdot=wdot,
+                        alpha=alpha,
+                        f0=f0,
+                    )
+                    per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
+                    if scale is not None:
+                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
+
+                per_roll = None
+                if rollout_force_steps > 0:
+                    steps_k = min(int(rollout_force_steps), int(M1) - 1)
+                    if steps_k > 0:
+                        f0_step = f0[:, 0, :] if f0 is not None else None
+                        _x_seq, _v_seq, f_seq = rollout_rk4(
+                            model=model,
+                            x0=x_win[:, 0, :],
+                            v0=v_win[:, 0, :],
+                            ur0=ur_win[:, 0, :],
+                            steps=steps_k,
+                            dt=dt,
+                            m=m,
+                            c=c,
+                            k=k,
+                            f0=f0_step,
+                        )
+                        f_roll = f_seq[:, : steps_k + 1, :]
+                        f_true = f_meas[:, : steps_k + 1, :]
+                        per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
+                        if scale is not None:
+                            per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
+
+            ur_vals = ur_win[:, 0, 0].detach().cpu().numpy()
+            per_loss_f_vals = per_loss_f.detach().cpu().numpy()
+            per_loss_w_vals = per_loss_w.detach().cpu().numpy()
+            for i, u in enumerate(ur_vals):
+                key = float(np.round(u, 6))
+                if use_force_loss:
+                    buckets["loss_data"].setdefault(key, []).append(float(per_loss_f_vals[i]))
+                if use_weak_loss:
+                    buckets["loss_physics"].setdefault(key, []).append(float(per_loss_w_vals[i]))
+            if per_roll is not None:
+                per_roll_vals = per_roll.detach().cpu().numpy()
+                for i, u in enumerate(ur_vals):
+                    key = float(np.round(u, 6))
+                    buckets["loss_rollout_force"].setdefault(key, []).append(float(per_roll_vals[i]))
+
+    out: dict[str, dict[float, float]] = {}
+    for name, by_ur in buckets.items():
+        if not by_ur:
+            continue
+        out[name] = {ur: float(np.mean(vals)) for ur, vals in by_ur.items()}
+    return out
 
 
 def main() -> None:

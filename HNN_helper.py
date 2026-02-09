@@ -1591,6 +1591,32 @@ def log_hamiltonian_plots(
     plt.close(fig)
 
 
+def log_loss_vs_ur(
+    writer,
+    epoch: int,
+    losses_by_ur: dict[str, dict[float, float]],
+    *,
+    tag: str = "val/loss_vs_ur",
+    title: str = "Loss vs reduced velocity",
+):
+    if not losses_by_ur:
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    for name, ur_map in losses_by_ur.items():
+        if not ur_map:
+            continue
+        xs = sorted(ur_map.keys())
+        ys = [ur_map[x] for x in xs]
+        ax.plot(xs, ys, marker="o", label=name)
+    ax.set_xlabel("Reduced velocity (U_r)")
+    ax.set_ylabel("Loss")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
 def log_final_rollout_errors_vs_ur(
     writer: SummaryWriter,
     ur_values: Sequence[float],

@@ -1,13 +1,32 @@
-"""Visualize generated TD-model time series with smoothing and phase portrait."""
+"""Visualize generated TD-model time series (phase portrait only by default)."""
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import savgol_filter
+
+
+CONFIG = {
+    # Data selection
+    "series_dir": Path(__file__).parent / "generated_series_Ur_60",
+    # If series_dir has train/val/test subfolders, select which to include.
+    "splits": ["train", "val", "test"],
+    # Optional time trim (seconds from series start)
+    "cut_start_seconds": 10.0,
+    # Reduced velocity filtering (use one of: list or range; None disables)
+    "ur_include": [2.0],  # e.g. [2.0, 4.0, 6.0]
+    "ur_range": None,    # e.g. (2.0, 6.0)
+    "ur_tol": 1e-3,
+    # Plotting
+    "plot_timeseries": False,
+    "plot_phase": True,
+    "columns": 4,
+    "save_timeseries": None,  # e.g. Path("figs/series.png")
+    "save_phase": None,       # e.g. Path("figs/phase.png")
+}
 
 
 def _savgol_smooth(signal: np.ndarray, window: int, poly: int) -> np.ndarray:
@@ -22,74 +41,105 @@ def _savgol_smooth(signal: np.ndarray, window: int, poly: int) -> np.ndarray:
     return savgol_filter(signal, window_length=window, polyorder=poly)
 
 
-def _savgol_velocity(signal: np.ndarray, dt: float, window: int, poly: int) -> np.ndarray:
-    n = signal.size
-    if n < 3 or dt <= 0.0:
-        return np.zeros_like(signal)
-    window = min(window, n - (1 - n % 2))
-    if window % 2 == 0:
-        window -= 1
-    if window >= 3 and poly < window:
-        try:
-            return savgol_filter(
-                signal,
-                window_length=window,
-                polyorder=poly,
-                deriv=1,
-                delta=dt,
-                mode="interp",
-            )
-        except ValueError:
-            pass
-    vel = np.zeros_like(signal)
-    vel[0] = (signal[1] - signal[0]) / dt if n >= 2 else 0.0
-    vel[-1] = (signal[-1] - signal[-2]) / dt if n >= 2 else 0.0
-    if n > 2:
-        vel[1:-1] = (signal[2:] - signal[:-2]) / (2.0 * dt)
-    return vel
+def _load_velocity(arr: np.lib.npyio.NpzFile) -> np.ndarray:
+    for key in ("dy", "v", "e"):
+        if key in arr:
+            return np.asarray(arr[key]).reshape(-1)
+    raise KeyError("No ground-truth velocity found (expected 'dy', 'v', or 'e').")
 
 
-def load_series(series_dir: Path, window: int, poly: int, val_file: Path | None = None):
-    files = sorted(series_dir.glob("*.npz"))
+def _extract_ur(arr: np.lib.npyio.NpzFile, fallback: float | None = None) -> float | None:
+    if "U_r" in arr:
+        ur = np.asarray(arr["U_r"], dtype=float)
+        if ur.ndim == 0:
+            return float(ur)
+        ur_flat = ur.reshape(-1)
+        if ur_flat.size > 0:
+            return float(ur_flat[0])
+    return fallback
+
+
+def _ur_allowed(ur: float | None, *, ur_include, ur_range, ur_tol: float) -> bool:
+    if ur is None:
+        return False
+    if ur_include is not None:
+        return any(abs(float(ur) - float(u)) <= float(ur_tol) for u in ur_include)
+    if ur_range is not None:
+        lo, hi = ur_range
+        return float(lo) <= float(ur) <= float(hi)
+    return True
+
+
+def _apply_cut(t: np.ndarray, *arrays: np.ndarray, cut_start_seconds: float):
+    if cut_start_seconds <= 0.0:
+        return (t, *arrays)
+    t0 = float(t[0])
+    mask = t >= (t0 + float(cut_start_seconds))
+    t2 = t[mask]
+    out = [arr[mask] for arr in arrays]
+    return (t2, *out)
+
+
+def _collect_series_files(series_dir: Path, splits: list[str]) -> list[Path]:
+    split_dirs = []
+    for name in splits:
+        d = series_dir / name
+        if d.exists() and d.is_dir():
+            split_dirs.append(d)
+    if split_dirs:
+        files: list[Path] = []
+        for d in split_dirs:
+            files.extend(sorted(d.glob("*.npz")))
+        return files
+    return sorted(series_dir.glob("*.npz"))
+
+
+def load_series(
+    series_dir: Path,
+    window: int,
+    poly: int,
+    *,
+    cut_start_seconds: float = 0.0,
+    ur_include=None,
+    ur_range=None,
+    ur_tol: float = 1e-3,
+    splits: list[str] | None = None,
+):
+    splits = splits or []
+    files = _collect_series_files(series_dir, splits)
     if not files:
         raise FileNotFoundError(f"No .npz files found in {series_dir}")
     data: list[dict[str, object]] = []
     for f in files:
         arr = np.load(f)
+        ur_val = _extract_ur(arr)
+        if not _ur_allowed(ur_val, ur_include=ur_include, ur_range=ur_range, ur_tol=ur_tol):
+            continue
         time = np.asarray(arr["a"])
         disp = np.asarray(arr["b"])
         force = np.asarray(arr["c"])
-        dt = float(time[1] - time[0]) if time.size > 1 else 1.0
+        if time.shape[0] != disp.shape[0] or time.shape[0] != force.shape[0]:
+            raise ValueError(f"{f.name}: time/disp/force length mismatch.")
+        vel = _load_velocity(arr)
+        if vel.size < disp.size:
+            raise ValueError("Velocity shorter than displacement.")
+        vel = vel[: disp.size]
+        time, disp, force, vel = _apply_cut(time, disp, force, vel, cut_start_seconds=cut_start_seconds)
+        if time.shape[0] != disp.shape[0] or time.shape[0] != force.shape[0] or time.shape[0] != vel.shape[0]:
+            raise ValueError(f"{f.name}: length mismatch after cut.")
         disp_smooth = _savgol_smooth(disp, window, poly)
-        vel_smooth = _savgol_velocity(disp, dt, window, poly)
+        vel_smooth = vel
         data.append(
             {
                 "path": f,
+                "split": f.parent.name if f.parent != series_dir else "series",
                 "time": time,
                 "disp": disp,
                 "force": force,
                 "disp_smooth": disp_smooth,
                 "vel_smooth": vel_smooth,
+                "ur": ur_val,
                 "is_validation": False,
-            }
-        )
-    if val_file is not None and val_file.exists():
-        arr = np.load(val_file)
-        time = np.asarray(arr["a"])
-        disp = np.asarray(arr["b"])
-        force = np.asarray(arr["c"]) if "c" in arr else np.zeros_like(disp)
-        dt = float(time[1] - time[0]) if time.size > 1 else 1.0
-        disp_smooth = _savgol_smooth(disp, window, poly)
-        vel_smooth = _savgol_velocity(disp, dt, window, poly)
-        data.append(
-            {
-                "path": val_file,
-                "time": time,
-                "disp": disp,
-                "force": force,
-                "disp_smooth": disp_smooth,
-                "vel_smooth": vel_smooth,
-                "is_validation": True,
             }
         )
     return data
@@ -124,24 +174,24 @@ def plot_series(series_data, columns: int = 4, save_path: Path | None = None):
     plt.close(fig)
 
 
-def plot_phase(series_data, save_path: Path | None = None):
+def _ur_color_key(ur: float | None, ur_tol: float) -> float | None:
+    if ur is None:
+        return None
+    tol = float(ur_tol) if float(ur_tol) > 0.0 else 1e-6
+    return float(np.round(float(ur) / tol) * tol)
+
+
+def plot_phase(series_data, save_path: Path | None = None, *, ur_tol: float = 1e-3):
     fig, ax = plt.subplots(figsize=(6, 6))
-    non_val = [entry for entry in series_data if not entry.get("is_validation")]
-    colors = plt.cm.tab20(np.linspace(0, 1, len(non_val))) if non_val else []
-    for entry, color in zip(non_val, colors):
+    ur_keys = [_ur_color_key(entry["ur"], ur_tol) for entry in series_data]
+    unique_keys = sorted({k for k in ur_keys if k is not None})
+    colors = plt.cm.viridis(np.linspace(0, 1, max(len(unique_keys), 1)))
+    color_map = {key: colors[i] for i, key in enumerate(unique_keys)}
+    default_color = (0.4, 0.4, 0.4, 0.7)
+    for entry, key in zip(series_data, ur_keys):
+        color = color_map.get(key, default_color)
         ax.plot(entry["disp_smooth"], entry["vel_smooth"], color=color, alpha=0.7, label=entry["path"].stem)
         ax.scatter(entry["disp_smooth"][0], entry["vel_smooth"][0], color=color, s=30)
-    val_entries = [entry for entry in series_data if entry.get("is_validation")]
-    for entry in val_entries:
-        ax.plot(
-            entry["disp_smooth"],
-            entry["vel_smooth"],
-            color="black",
-            linewidth=2,
-            alpha=0.9,
-            label=f"Validation ({entry['path'].stem})",
-        )
-        ax.scatter(entry["disp_smooth"][0], entry["vel_smooth"][0], color="black", s=50)
     ax.set_xlabel("Displacement")
     ax.set_ylabel("Velocity")
     ax.set_title("Phase Portrait")
@@ -158,24 +208,20 @@ def plot_phase(series_data, save_path: Path | None = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot generated TD-model time series.")
-    parser.add_argument("--series-dir", type=Path, default=Path(__file__).parent / "generated_series")
-    parser.add_argument("--columns", type=int, default=4)
-    parser.add_argument("--save", type=Path, default=None, help="Output path for time-series plot.")
-    parser.add_argument("--phase-save", type=Path, default=None, help="Output path for phase plot.")
-    parser.add_argument("--savgol-window", type=int, default=15)
-    parser.add_argument("--savgol-poly", type=int, default=4)
-    parser.add_argument("--validation-file", type=Path, default=Path("data.npz"))
-    args = parser.parse_args()
-
     series = load_series(
-        args.series_dir,
-        window=args.savgol_window,
-        poly=args.savgol_poly,
-        val_file=args.validation_file,
+        CONFIG["series_dir"],
+        window=1,
+        poly=1,
+        cut_start_seconds=float(CONFIG["cut_start_seconds"]),
+        ur_include=CONFIG["ur_include"],
+        ur_range=CONFIG["ur_range"],
+        ur_tol=float(CONFIG["ur_tol"]),
+        splits=list(CONFIG["splits"]),
     )
-    plot_series(series, columns=args.columns, save_path=args.save)
-    plot_phase(series, save_path=args.phase_save)
+    if bool(CONFIG["plot_timeseries"]):
+        plot_series(series, columns=int(CONFIG["columns"]), save_path=CONFIG["save_timeseries"])
+    if bool(CONFIG["plot_phase"]):
+        plot_phase(series, save_path=CONFIG["save_phase"], ur_tol=float(CONFIG["ur_tol"]))
 
 
 if __name__ == "__main__":

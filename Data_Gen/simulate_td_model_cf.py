@@ -37,7 +37,7 @@ fhat0 = 0.144        # centre of synchronization
 fhat_min = 0.08
 fhat_max = 0.206
 
-T = 40.0
+T = 60.0
 dt = 0.0001
 
 def simulate_td_model_cf(
