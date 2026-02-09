@@ -46,6 +46,7 @@ class ModelConfig:
     damping_c: float = 1e-4
     max_damping_ratio: float = 0.2
     include_physical_drag: bool = False
+    force_output: str = "force"  # "force" or "coefficient"
     learn_hamiltonian: bool = False
     discover_damping: bool = False
     use_pirate_force: bool = False
@@ -712,6 +713,7 @@ class PHVIV(nn.Module):
         discover_damping: bool = False,
         damping_c: float | None = None,
         include_physical_drag: bool = True,
+        force_output: str = "force",
         learn_hamiltonian: bool = False,
         use_pirate_force: bool = False,
         pirate_force_kwargs: dict | None = None,
@@ -737,6 +739,10 @@ class PHVIV(nn.Module):
         self.p_scale = p_scale
         self.discover_damping = bool(discover_damping)
         self.include_physical_drag = bool(include_physical_drag)
+        force_output = str(force_output).strip().lower()
+        if force_output not in {"force", "coefficient"}:
+            raise ValueError("force_output must be one of: force, coefficient")
+        self.force_output = force_output
         self.learn_hamiltonian = bool(learn_hamiltonian)
         self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
@@ -887,6 +893,7 @@ class PHVIV(nn.Module):
         max_damping_ratio = float(cfg.get("max_damping_ratio", 0.2))
         discover_damping = bool(cfg.get("discover_damping", False))
         include_physical_drag = bool(cfg.get("include_physical_drag", False))
+        force_output = str(cfg.get("force_output", "force")).strip().lower()
         learn_hamiltonian = bool(cfg.get("learn_hamiltonian", False))
         use_pirate_force = bool(cfg.get("use_pirate_force", False))
         pirate_force_kwargs = cfg.get("pirate_force_kwargs", {}) or {}
@@ -932,6 +939,7 @@ class PHVIV(nn.Module):
             discover_damping=discover_damping,
             damping_c=damping_c,
             include_physical_drag=include_physical_drag,
+            force_output=force_output,
             learn_hamiltonian=learn_hamiltonian,
             use_pirate_force=use_pirate_force,
             pirate_force_kwargs=combined_pirate_kwargs,
@@ -1081,18 +1089,47 @@ class PHVIV(nn.Module):
             base_features = torch.cat([base_features, rv], dim=-1)
         return base_features
 
-    def u_theta1(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def _force_net_raw(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         base_features = self._force_features(x, reduced_velocity=reduced_velocity)
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
-        return self.u_net(features) * self.k * self.D
+        return self.u_net(features)
+
+    def learned_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
+        if self.force_output == "coefficient":
+            return raw
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
+        return raw * self.k * self.D / f0
+
+    def learned_force(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
+            return raw * f0
+        return raw * self.k * self.D
+
+    def drag_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        drag = self.drag_force(x)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=drag)
+        return drag / f0
+
+    def u_theta_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        coeff = self.learned_force_coeff(x, reduced_velocity=reduced_velocity)
+        if self.include_physical_drag:
+            coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
+        return coeff
+
+    def u_theta1(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        return self.learned_force(x, reduced_velocity=reduced_velocity)
     
     def u_theta2(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         return self.u_theta1(x, reduced_velocity=reduced_velocity) + self.drag_force(x)
-
-    def learned_force(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        return self.u_theta1(x, reduced_velocity=reduced_velocity)
     
     def u_theta(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        if self.force_output == "coefficient":
+            coeff = self.u_theta_coeff(x, reduced_velocity=reduced_velocity)
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff)
+            return coeff * f0
         return self.u_theta2(x, reduced_velocity=reduced_velocity) if self.include_physical_drag else self.u_theta1(
             x, reduced_velocity=reduced_velocity
         )
@@ -1228,6 +1265,10 @@ class PHVIV(nn.Module):
         z_mean = 0.5*(zin+zi)
         res = dz - self.g(z_mean, reduced_velocity=reduced_velocity)
         res_scaled = res / self.res_scale
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            res_scaled = res_scaled.clone()
+            res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
 
@@ -1273,6 +1314,10 @@ class PHVIV(nn.Module):
 
         # scale like before, but for time-derivatives
         res_scaled = res / self.res_scale
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            res_scaled = res_scaled.clone()
+            res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
 
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
@@ -1301,6 +1346,10 @@ class PHVIV(nn.Module):
         dz_model = 0.5 * g1 + 0.5 * g2
         res = dz_fd - dz_model
         res_scaled = res / self.res_scale
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            res_scaled = res_scaled.clone()
+            res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
         return torch.sum(res_scaled**2, dim=1)
     
     def avg_force_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):

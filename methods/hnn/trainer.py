@@ -74,6 +74,7 @@ def _train_one_epoch(
     gradnorm_data_weight_sum = torch.zeros((), device=device) if use_force_data_loss else None
     gradnorm_weight_count = 0
 
+    force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     for batch in train_loader:
         if len(batch) == 5:
             z_i, t_i, z_next, t_next, ur_i = batch
@@ -129,7 +130,12 @@ def _train_one_epoch(
                     )
                 z_mid = 0.5 * (z_i + z_next)
                 f_mid = 0.5 * (f_i + f_next)
-                f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                if force_output_coeff:
+                    f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                    f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                    f_mid = f_mid / f0
+                else:
+                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
                 per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                 if scale is not None:
                     per_data = per_data / (scale * scale + float(per_traj_norm_eps))
@@ -541,6 +547,7 @@ def _evaluate_val_losses(
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
+    force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     loss_sum = torch.zeros((), device=device)
     res_sum = torch.zeros((), device=device)
     force_sum = torch.zeros((), device=device)
@@ -600,7 +607,12 @@ def _evaluate_val_losses(
                         )
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
-                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                    if force_output_coeff:
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_mid = f_mid / f0
+                    else:
+                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     if scale is not None:
                         per_data = per_data / (scale * scale + float(per_traj_norm_eps))
@@ -642,6 +654,7 @@ def _per_ur_loss_map_hnn(
 ) -> dict[str, dict[float, float]]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
+    force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     buckets: dict[str, dict[float, list[float]]] = {
         "loss_physics": {},
         "loss_reg": {},
@@ -694,7 +707,12 @@ def _per_ur_loss_map_hnn(
                 if use_force_data_loss and f_i is not None and f_next is not None:
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
-                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                    if force_output_coeff:
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_mid = f_mid / f0
+                    else:
+                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     if scale is not None:
                         per_data = per_data / (scale * scale + float(per_traj_norm_eps))
