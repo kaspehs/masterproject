@@ -1611,6 +1611,7 @@ def log_loss_vs_ur(
     ax.set_xlabel("Reduced velocity (U_r)")
     ax.set_ylabel("Loss")
     ax.set_title(title)
+    ax.set_yscale("log")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")
     fig.tight_layout()
