@@ -164,18 +164,23 @@ def _train_one_epoch(
                 force_weight = res_loss.new_tensor(1.0)
                 data_weight = res_loss.new_tensor(1.0)
 
-            weighted_res = res_weight * res_loss
+            # GradNorm balances raw branch losses first; user multipliers are applied after.
+            # This makes force_reg behave as a post-GradNorm scaling of the force branch.
+            gradnorm_weighted_res = res_weight * res_loss
+            gradnorm_weighted_force = force_weight * base_force_loss
+            gradnorm_weighted_data = data_weight * data_force_loss
+
             force_loss = float(force_reg) * base_force_loss
-            weighted_force = force_weight * force_loss
-            weighted_data = data_weight * (float(force_data_weight) * data_force_loss)
-            loss = (weighted_res + weighted_force + weighted_data).float()
+            weighted_force = float(force_reg) * gradnorm_weighted_force
+            weighted_data = float(force_data_weight) * gradnorm_weighted_data
+            loss = (gradnorm_weighted_res + weighted_force + weighted_data).float()
 
         if log_component_grad_norms and scaler.is_enabled():
             raise ValueError(
                 "monitoring.log_component_grad_norms is not supported with AMP fp16 (GradScaler enabled)."
             )
         if log_component_grad_norms:
-            weighted_res.backward(retain_graph=True)
+            gradnorm_weighted_res.backward(retain_graph=True)
             res_grad_component_sum = res_grad_component_sum + torch.as_tensor(
                 compute_model_grad_norm(model), device=device
             )
@@ -207,7 +212,8 @@ def _train_one_epoch(
         batch_count += 1
         loss_sum = loss_sum + loss.detach()
         res_loss_sum = res_loss_sum + res_loss.detach().float()
-        force_loss_sum = force_loss_sum + force_loss.detach().float()
+        # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
+        force_loss_sum = force_loss_sum + base_force_loss.detach().float()
         force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
         avg_force_sum = avg_force_sum + avg_force.detach().float()
 
@@ -623,7 +629,8 @@ def _evaluate_val_losses(
 
             loss_sum = loss_sum + total.detach().float()
             res_sum = res_sum + res_loss.detach().float()
-            force_sum = force_sum + force_loss.detach().float()
+            # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
+            force_sum = force_sum + avg_force.detach().float()
             data_sum = data_sum + data_force_loss.detach().float()
             batches += 1
 
@@ -702,8 +709,6 @@ def _per_ur_loss_map_hnn(
                     denom = scale * scale + float(per_traj_norm_eps)
                     per_res = per_res / denom
                     per_force = per_force / denom
-                per_reg = float(force_reg) * per_force
-
                 if use_force_data_loss and f_i is not None and f_next is not None:
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
@@ -722,7 +727,7 @@ def _per_ur_loss_map_hnn(
 
             ur_vals = ur_i.detach().cpu().view(-1).numpy()
             per_res_vals = per_res.detach().cpu().view(-1).numpy()
-            per_reg_vals = per_reg.detach().cpu().view(-1).numpy()
+            per_reg_vals = per_force.detach().cpu().view(-1).numpy()
             per_data_vals = per_data.detach().cpu().view(-1).numpy()
             for u, res_v, reg_v, data_v in zip(ur_vals, per_res_vals, per_reg_vals, per_data_vals):
                 key = float(np.round(u, 6))

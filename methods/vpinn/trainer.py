@@ -6,6 +6,7 @@ import os
 import time
 import subprocess
 import sys
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
@@ -602,7 +603,14 @@ def _maybe_reduce_time(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     if not enabled:
         return t, x, f, v
-    rf = max(1, int(reduction_factor))
+    rf_requested = max(1, int(reduction_factor))
+    # Keep at least two samples after decimation whenever possible.
+    rf = min(rf_requested, max(1, int(t.size) - 1))
+    if rf < rf_requested:
+        warnings.warn(
+            "Reduction factor was too large for the current trajectory; "
+            f"using step={rf} instead of {rf_requested} to keep at least two samples."
+        )
     t2 = t[::rf]
     x2 = x[::rf]
     f2 = f[::rf]

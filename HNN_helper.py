@@ -1,4 +1,5 @@
 import math
+import warnings
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1779,7 +1780,15 @@ def preprocess_timeseries(
     f_proc = force[mask]
     h_proc = hamiltonian[mask]
     v_proc = None if velocity is None else np.asarray(velocity)[mask]
-    step = max(1, int(data_cfg.reduction_factor if data_cfg.reduce_time else 1))
+    step_requested = max(1, int(data_cfg.reduction_factor if data_cfg.reduce_time else 1))
+    # Keep at least two samples after decimation whenever trimming left >=2 samples.
+    # This prevents brittle failures for aggressive reduction on short trimmed series.
+    step = min(step_requested, max(1, int(t_proc.size) - 1))
+    if step < step_requested:
+        warnings.warn(
+            "Reduction factor was too large for the trimmed series; "
+            f"using step={step} instead of {step_requested} to keep at least two samples."
+        )
     if step > 1:
         t_proc = t_proc[::step]
         y_proc = y_proc[::step]
