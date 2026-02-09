@@ -140,6 +140,11 @@ vpinn:
   # Data interpretation
   # Generated series contain x and f, but not dy, so we compute v from x.
   velocity_source: compute
+  # Optional training-only U_r filtering when using generated series.
+  # Validation loading is unchanged.
+  train_include_ur: null
+  train_exclude_ur: []
+  train_ur_filter_tol: 1e-6
   use_data_file_for_validation: true
   validation_only_data_file: true
 

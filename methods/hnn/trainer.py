@@ -736,6 +736,17 @@ def _per_ur_loss_map_hnn(
     return out
 
 
+def _as_float_list(values: Any, *, key: str) -> list[float] | None:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return []
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{key} must contain only finite numeric values.")
+    return [float(v) for v in arr.tolist()]
+
+
 def train(config: Config, config_name: str) -> None:
     data_cfg = config.data
     middle_time_plot = data_cfg.middle_time_plot
@@ -793,6 +804,16 @@ def train(config: Config, config_name: str) -> None:
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
+    train_include_ur = _as_float_list(hnn_cfg.get("train_include_ur"), key="hnn.train_include_ur")
+    train_exclude_ur = _as_float_list(hnn_cfg.get("train_exclude_ur"), key="hnn.train_exclude_ur")
+    train_ur_filter_tol = float(hnn_cfg.get("train_ur_filter_tol", 1e-6))
+    if train_ur_filter_tol < 0.0:
+        raise ValueError("hnn.train_ur_filter_tol must be non-negative.")
+    if use_generated_train_series and (train_include_ur is not None or train_exclude_ur is not None):
+        print(
+            "Applying training U_r filter: "
+            f"include={train_include_ur}, exclude={train_exclude_ur}, tol={train_ur_filter_tol:g}"
+        )
 
     training_cfg = config.training
     optim_cfg = config.optim
@@ -861,6 +882,9 @@ def train(config: Config, config_name: str) -> None:
         require_force=use_force_data_loss,
         eval_force=F_data,
         cut_start_seconds=train_cut,
+        include_reduced_velocity=train_include_ur,
+        exclude_reduced_velocity=train_exclude_ur,
+        ur_filter_tol=train_ur_filter_tol,
     )
     eval_y_tensor, eval_vel_tensor, eval_t_tensor, eval_ur_tensor = eval_tensors
 

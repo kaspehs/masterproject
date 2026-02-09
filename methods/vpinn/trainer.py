@@ -518,6 +518,57 @@ def _load_metadata_map(meta_path: Path) -> dict[str, float]:
     return mapping
 
 
+def _normalize_ur_filter(values: Any, *, key: str) -> np.ndarray | None:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return np.empty((0,), dtype=float)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{key} must contain only finite numeric values.")
+    return arr
+
+
+def _ur_in_filter(ur_value: float, ur_filter: np.ndarray, *, tol: float) -> bool:
+    if ur_filter.size == 0:
+        return False
+    return bool(np.any(np.isclose(float(ur_value), ur_filter, rtol=0.0, atol=float(tol))))
+
+
+def _read_reduced_velocity_from_npz(path: Path) -> float:
+    with np.load(path) as data:
+        if "U_r" not in data:
+            raise ValueError(f"{path} is missing reduced velocity 'U_r'.")
+        ur_arr = np.asarray(data["U_r"], dtype=float)
+    if ur_arr.ndim == 0:
+        return float(ur_arr)
+    ur_flat = ur_arr.reshape(-1)
+    if ur_flat.size == 0:
+        raise ValueError(f"{path} has an empty reduced velocity array.")
+    ur_val = float(ur_flat[0])
+    if not np.allclose(ur_flat, ur_val, rtol=1e-6, atol=1e-9):
+        raise ValueError(f"{path} reduced velocity must be constant within a series.")
+    return ur_val
+
+
+def _filter_paths_by_ur(
+    paths: Sequence[Path],
+    *,
+    include_ur: np.ndarray | None,
+    exclude_ur: np.ndarray | None,
+    tol: float,
+) -> list[Path]:
+    filtered: list[Path] = []
+    for path in paths:
+        ur_val = _read_reduced_velocity_from_npz(path)
+        if include_ur is not None and include_ur.size > 0 and not _ur_in_filter(ur_val, include_ur, tol=tol):
+            continue
+        if exclude_ur is not None and exclude_ur.size > 0 and _ur_in_filter(ur_val, exclude_ur, tol=tol):
+            continue
+        filtered.append(path)
+    return filtered
+
+
 def _infer_dt_target_from_data_cfg(data_cfg: Any) -> Optional[float]:
     data_path = Path(getattr(data_cfg, "file", ""))
     if not data_path:
@@ -774,6 +825,11 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
     if dt_target is None:
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)
     dt_target = None if dt_target is None else float(dt_target)
+    train_include_ur = _normalize_ur_filter(vp.get("train_include_ur"), key="vpinn.train_include_ur")
+    train_exclude_ur = _normalize_ur_filter(vp.get("train_exclude_ur"), key="vpinn.train_exclude_ur")
+    train_ur_filter_tol = float(vp.get("train_ur_filter_tol", 1e-6))
+    if train_ur_filter_tol < 0.0:
+        raise ValueError("vpinn.train_ur_filter_tol must be non-negative.")
 
     f0_lookup: Optional[dict[str, float]] = None
     if force_representation == "coefficient":
@@ -814,6 +870,30 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             data_path = (Path.cwd() / data_path).resolve()
         sources = [data_path]
         val_sources = []
+
+    if data_cfg.use_generated_train_series:
+        has_include = train_include_ur is not None and train_include_ur.size > 0
+        has_exclude = train_exclude_ur is not None and train_exclude_ur.size > 0
+        if has_include or has_exclude:
+            print(
+                "Applying VPINN training U_r filter: "
+                f"include={None if train_include_ur is None else train_include_ur.tolist()}, "
+                f"exclude={None if train_exclude_ur is None else train_exclude_ur.tolist()}, "
+                f"tol={train_ur_filter_tol:g}"
+            )
+        sources = _filter_paths_by_ur(
+            sources,
+            include_ur=train_include_ur,
+            exclude_ur=train_exclude_ur,
+            tol=train_ur_filter_tol,
+        )
+        if not sources:
+            raise ValueError(
+                "No VPINN training series left after U_r filtering. "
+                f"include={vp.get('train_include_ur')}, "
+                f"exclude={vp.get('train_exclude_ur')}, "
+                f"series_dir='{getattr(data_cfg, 'train_series_dir', '')}'."
+            )
 
     trajectories: list[dict[str, Any]] = []
     val_trajectories: list[dict[str, Any]] = []

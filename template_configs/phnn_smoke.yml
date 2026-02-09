@@ -120,6 +120,11 @@ logging:
 
 hnn: # file or compute
   velocity_source: file
+  # Optional training-only U_r filtering when using generated series.
+  # Validation loading is unchanged.
+  train_include_ur: null
+  train_exclude_ur: []
+  train_ur_filter_tol: 1e-6
   # Per-trajectory normalization (PHNN): scale losses by per-trajectory RMS force.
   # Options: none | force_rms
   per_traj_norm: none

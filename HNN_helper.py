@@ -2001,6 +2001,32 @@ def _prepare_reduced_velocity_series(
     return np.full((length,), ur_val, dtype=float)
 
 
+def _normalize_ur_filter(
+    values: Sequence[float] | np.ndarray | float | None,
+    *,
+    name: str,
+) -> np.ndarray | None:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return np.empty((0,), dtype=float)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values.")
+    return arr
+
+
+def _ur_in_filter(
+    ur_value: float,
+    ur_filter: np.ndarray,
+    *,
+    tol: float,
+) -> bool:
+    if ur_filter.size == 0:
+        return False
+    return bool(np.any(np.isclose(float(ur_value), ur_filter, rtol=0.0, atol=float(tol))))
+
+
 def load_training_series(
     y_eval: np.ndarray,
     t_eval: np.ndarray,
@@ -2019,6 +2045,9 @@ def load_training_series(
     eval_force: np.ndarray | None = None,
     force_key_candidates: Sequence[str] = ("c", "F_total", "force_total", "force"),
     cut_start_seconds: float = 0.0,
+    include_reduced_velocity: Sequence[float] | np.ndarray | float | None = None,
+    exclude_reduced_velocity: Sequence[float] | np.ndarray | float | None = None,
+    ur_filter_tol: float = 1e-6,
 ) -> tuple[
     list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -2037,6 +2066,11 @@ def load_training_series(
         series_files = sorted(series_dir.glob("*.npz"))
         if not series_files:
             raise FileNotFoundError(f"No '.npz' files found in training series directory '{series_dir}'.")
+        include_ur = _normalize_ur_filter(include_reduced_velocity, name="include_reduced_velocity")
+        exclude_ur = _normalize_ur_filter(exclude_reduced_velocity, name="exclude_reduced_velocity")
+        tol = float(ur_filter_tol)
+        if tol < 0.0:
+            raise ValueError("ur_filter_tol must be non-negative.")
         cut_start_seconds = max(0.0, float(cut_start_seconds))
         for series_file in series_files:
             with np.load(series_file) as series_data:
@@ -2066,6 +2100,10 @@ def load_training_series(
                     raise KeyError(f"Series '{series_file}' is missing reduced velocity 'U_r'.")
                 series_ur = _prepare_reduced_velocity_series(series_data["U_r"], series_t.shape[0], name=str(series_file))
                 ur_val = float(np.asarray(series_ur).reshape(-1)[0])
+            if include_ur is not None and include_ur.size > 0 and not _ur_in_filter(ur_val, include_ur, tol=tol):
+                continue
+            if exclude_ur is not None and exclude_ur.size > 0 and _ur_in_filter(ur_val, exclude_ur, tol=tol):
+                continue
             if series_t.ndim != 1 or series_y.ndim != 1:
                 raise ValueError(f"Series '{series_file}' must contain 1D 'a' and 'b' arrays.")
             if series_t.shape[0] != series_y.shape[0]:
@@ -2107,6 +2145,13 @@ def load_training_series(
                 train_series_raw.append((series_y, series_t, series_dt, series_vel, None, series_ur))
             else:
                 train_series_raw.append((series_y, series_t, series_dt, series_vel, series_force, series_ur))
+        if not train_series_raw:
+            raise ValueError(
+                "No training series left after U_r filtering. "
+                f"include_reduced_velocity={include_reduced_velocity}, "
+                f"exclude_reduced_velocity={exclude_reduced_velocity}, "
+                f"series_dir='{series_dir}'."
+            )
     else:
         train_series_raw.append(
             (
