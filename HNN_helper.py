@@ -400,6 +400,11 @@ def log_validation_epoch(
         log_extra_metrics=log_extra_metrics,
         rollout=rollout,
     )
+    if torch.is_tensor(reduced_velocity):
+        reduced_velocity_scalar = float(reduced_velocity.reshape(-1)[0].detach().cpu())
+    else:
+        reduced_velocity_scalar = float(np.asarray(reduced_velocity).reshape(-1)[0])
+
     if log_metrics:
         for name, value in metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
@@ -415,24 +420,27 @@ def log_validation_epoch(
         zoom_mask,
         middle_mask,
         middle_time_plot,
-        reduced_velocity=float(np.asarray(reduced_velocity).reshape(-1)[0]),
+        reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
         step=step,
         title_suffix=title_suffix,
     )
+    with torch.no_grad():
+        rv_tensor = torch.tensor([[reduced_velocity_scalar]], dtype=torch.float32)
+        like = torch.ones((1, 1), dtype=torch.float32)
+        force_scale = float(model._force_scale_from_reduced_velocity(rv_tensor, like=like).reshape(-1)[0].detach().cpu())
+    if not np.isfinite(force_scale) or force_scale <= 0.0:
+        force_scale = 1.0
     log_force_plots(
         writer,
         epoch,
         t,
-        rollout["force_total"],
-        rollout["force_drag"],
-        rollout["force_model"],
-        force_data,
+        np.asarray(rollout["force_total"]) / force_scale,
+        np.asarray(force_data) / force_scale,
         zoom_mask,
         middle_mask,
         middle_time_plot,
-        model.include_physical_drag,
-        reduced_velocity=float(np.asarray(reduced_velocity).reshape(-1)[0]),
+        reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
         step=step,
         title_suffix=title_suffix,
@@ -1497,14 +1505,11 @@ def log_force_plots(
     writer,
     epoch,
     t,
-    force_total,
-    force_drag,
-    force_model,
-    force_data,
+    force_coeff_pred,
+    force_coeff_true,
     zoom_mask,
     middle_mask,
     middle_window,
-    include_physical_drag: bool,
     reduced_velocity: float | None = None,
     *,
     tag_prefix: str = "val/rollout",
@@ -1514,62 +1519,38 @@ def log_force_plots(
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_middle = axes
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
-    total_label = "F_total (model + drag)" if include_physical_drag else "F_total (model)"
-    model_label = "F_model (wake)" if include_physical_drag else "F_model"
-
-    ax_full.plot(t, force_total, label=total_label, color="tab:purple")
-    if include_physical_drag:
-        ax_full.plot(t, force_drag, label="F_drag", color="tab:red", linestyle="--")
-    ax_full.plot(t, force_model, label=model_label, color="tab:green", linestyle=":")
-    ax_full.plot(t, force_data, label="F_data", color="tab:blue", alpha=0.7)
+    ax_full.plot(t, force_coeff_true, label="C_F (true)", color="tab:blue", alpha=0.7)
+    ax_full.plot(t, force_coeff_pred, label="C_F (pred)", color="tab:purple")
     ax_full.set_xlabel("time")
-    ax_full.set_ylabel("Force")
+    ax_full.set_ylabel("C_F")
     ax_full.grid(True, alpha=0.3)
-    ax_full.set_title(f"Force rollout at epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_full.set_title(f"Force coefficient rollout at epoch {epoch+1}{ur_title}{title_suffix}")
     ax_full.legend(loc="upper right")
 
-    diff_force = force_total - force_data
-    ax_diff.plot(t, diff_force, label="ΔF_total", color="tab:orange")
+    diff_force = force_coeff_pred - force_coeff_true
+    ax_diff.plot(t, diff_force, label="ΔC_F", color="tab:orange")
     ax_diff.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
     ax_diff.set_xlabel("time")
-    ax_diff.set_ylabel("ΔForce")
+    ax_diff.set_ylabel("ΔC_F")
     ax_diff.grid(True, alpha=0.3)
-    ax_diff.set_title(f"Force difference (model - data) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_diff.set_title(f"Force coefficient difference (pred - true) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_diff.legend(loc="upper right")
 
-    ax_zoom.plot(t[zoom_mask], force_total[zoom_mask], label=total_label, color="tab:purple")
-    if include_physical_drag:
-        ax_zoom.plot(t[zoom_mask], force_drag[zoom_mask], label="F_drag", color="tab:red", linestyle="--")
-    ax_zoom.plot(t[zoom_mask], force_model[zoom_mask], label=model_label, color="tab:green", linestyle=":")
-    ax_zoom.plot(t[zoom_mask], force_data[zoom_mask], label="F_data", color="tab:blue", alpha=0.7)
+    ax_zoom.plot(t[zoom_mask], force_coeff_true[zoom_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
+    ax_zoom.plot(t[zoom_mask], force_coeff_pred[zoom_mask], label="C_F (pred)", color="tab:purple")
     ax_zoom.set_xlabel("time")
-    ax_zoom.set_ylabel("Force")
+    ax_zoom.set_ylabel("C_F")
     ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Force rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_zoom.set_title(f"Force coefficient rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_zoom.legend(loc="upper right")
 
     mid_start, mid_end = middle_window
-    ax_middle.plot(t[middle_mask], force_total[middle_mask], label=total_label, color="tab:purple")
-    if include_physical_drag:
-        ax_middle.plot(
-            t[middle_mask],
-            force_drag[middle_mask],
-            label="F_drag",
-            color="tab:red",
-            linestyle="--",
-        )
-    ax_middle.plot(
-        t[middle_mask],
-        force_model[middle_mask],
-        label=model_label,
-        color="tab:green",
-        linestyle=":",
-    )
-    ax_middle.plot(t[middle_mask], force_data[middle_mask], label="F_data", color="tab:blue", alpha=0.7)
+    ax_middle.plot(t[middle_mask], force_coeff_true[middle_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
+    ax_middle.plot(t[middle_mask], force_coeff_pred[middle_mask], label="C_F (pred)", color="tab:purple")
     ax_middle.set_xlabel("time")
-    ax_middle.set_ylabel("Force")
+    ax_middle.set_ylabel("C_F")
     ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Force rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_middle.set_title(f"Force coefficient rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
