@@ -34,6 +34,7 @@ from HNN_helper import (
     parse_config,
     preprocess_timeseries,
     resolve_cut_start_seconds,
+    resolve_middle_time_plot,
 )
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
@@ -552,7 +553,7 @@ def _run_vpinn_validation(
             c=c,
             k=k,
             D=float(getattr(cfg.model, "D", 1.0)),
-            middle_time_plot=getattr(data_cfg, "middle_time_plot", [0.0, 1.0]),
+            middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
             device=device,
         )
 

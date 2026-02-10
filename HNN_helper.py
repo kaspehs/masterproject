@@ -1836,6 +1836,39 @@ def resolve_cut_start_seconds(data_cfg: DataConfig, split: str) -> float:
     return float(override)
 
 
+def resolve_middle_time_plot(
+    data_cfg: DataConfig | Any,
+    method_cfg: dict[str, Any] | None = None,
+    *,
+    method_name: str = "method",
+    default_window: tuple[float, float] = (15.0, 17.0),
+) -> list[float]:
+    """Resolve rollout middle-window from method-specific config, then data config."""
+    candidate = None
+    if method_cfg is not None:
+        candidate = method_cfg.get("middle_time_plot", None)
+    if candidate is None:
+        candidate = getattr(data_cfg, "middle_time_plot", None)
+    if candidate is None:
+        candidate = list(default_window)
+    values = np.asarray(candidate, dtype=float).reshape(-1)
+    if values.size != 2:
+        raise ValueError(
+            f"{method_name}.middle_time_plot (or data.middle_time_plot) must contain exactly 2 values."
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError(
+            f"{method_name}.middle_time_plot (or data.middle_time_plot) must contain only finite values."
+        )
+    start = float(values[0])
+    end = float(values[1])
+    if end <= start:
+        raise ValueError(
+            f"{method_name}.middle_time_plot (or data.middle_time_plot) must satisfy end > start; got [{start}, {end}]."
+        )
+    return [start, end]
+
+
 def compute_velocity_numpy(
     y_np: np.ndarray,
     dt: float,

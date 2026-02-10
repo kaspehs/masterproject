@@ -140,6 +140,9 @@ vpinn:
   # Data interpretation
   # Generated series contain x and f, but not dy, so we compute v from x.
   velocity_source: file
+  # Optional VPINN-specific rollout plotting window [start_s, end_s].
+  # Overrides data.middle_time_plot when set.
+  middle_time_plot: [15, 17]
   # Optional training-only U_r filtering when using generated series.
   # Validation loading is unchanged.
   train_include_ur: null

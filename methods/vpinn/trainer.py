@@ -44,6 +44,7 @@ from HNN_helper import (
     log_loss_vs_ur,
     log_displacement_plots,
     log_force_plots,
+    resolve_middle_time_plot,
     resample_uniform_series,
 )
 from architectures import ODEPirateNet
@@ -1543,13 +1544,10 @@ def _log_rollout_validation(
         epoch,
         t_np,
         f_pred,
-        np.zeros_like(f_pred),
-        f_pred,
         f_true,
         zoom_mask,
         middle_mask,
         middle_window,
-        include_physical_drag=False,
         reduced_velocity=ur_val,
         tag_prefix=tag_prefix,
         step=step,
@@ -1832,9 +1830,7 @@ def train(config: Config, config_name: str) -> None:
 
     use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
     base_lr = float(optim_cfg.lr)
-    middle_time_plot = getattr(config.data, "middle_time_plot", [0.0, 1.0])
-    if len(middle_time_plot) != 2:
-        middle_time_plot = [0.0, 1.0]
+    middle_time_plot = resolve_middle_time_plot(config.data, vp, method_name="vpinn")
     D_val = float(getattr(config.model, "D", 1.0))
 
     for epoch in range(epochs):
