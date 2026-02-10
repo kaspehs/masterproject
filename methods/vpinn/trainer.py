@@ -30,9 +30,7 @@ from core.runtime import (
 from HNN_helper import (
     Config,
     DISP_ROLLOUT_NRMSE_KEY,
-    FORCE_MAPPING_NRMSE_COEFF_KEY,
     FORCE_MAPPING_NRMSE_KEY,
-    FORCE_ROLLOUT_NRMSE_COEFF_KEY,
     FORCE_ROLLOUT_NRMSE_KEY,
     GradNormBalancer,
     Residual,
@@ -247,7 +245,6 @@ def _force_mapping_nrmse_over_trajs(
         return None
     model.eval()
     values_force: list[torch.Tensor] = []
-    values_coeff: list[torch.Tensor] = []
     with torch.no_grad():
         for traj in val_trajs:
             x_true = traj["x"].to(device)
@@ -276,12 +273,6 @@ def _force_mapping_nrmse_over_trajs(
                     force_std = f_true_force.new_tensor(1.0)
                 nrmse_force = torch.sqrt(torch.mean((f_pred_force - f_true_force) ** 2)) / force_std
                 values_force.append(nrmse_force.detach())
-
-                coeff_std = torch.std(f_true0)
-                if coeff_std <= 0.0:
-                    coeff_std = f_true0.new_tensor(1.0)
-                nrmse_coeff = torch.sqrt(torch.mean((f_pred0 - f_true0) ** 2)) / coeff_std
-                values_coeff.append(nrmse_coeff.detach())
             else:
                 force_std = torch.std(f_true0)
                 if force_std <= 0.0:
@@ -291,12 +282,9 @@ def _force_mapping_nrmse_over_trajs(
 
     if not values_force:
         return None
-    out: dict[str, float] = {
+    return {
         FORCE_MAPPING_NRMSE_KEY: float(torch.mean(torch.stack(values_force)).detach().cpu())
     }
-    if values_coeff:
-        out[FORCE_MAPPING_NRMSE_COEFF_KEY] = float(torch.mean(torch.stack(values_coeff)).detach().cpu())
-    return out
 
 
 def rollout_rk4(
@@ -1479,14 +1467,6 @@ def _log_rollout_validation(
         metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
         if log_metrics:
             writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
-
-        coeff_std = float(np.std(f_true))
-        if coeff_std <= 0.0:
-            coeff_std = 1.0
-        rel_rmse_coeff = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / coeff_std
-        metrics[FORCE_ROLLOUT_NRMSE_COEFF_KEY] = rel_rmse_coeff
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_COEFF_KEY}", rel_rmse_coeff, epoch)
     else:
         rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
         metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
@@ -1504,12 +1484,6 @@ def _log_rollout_validation(
             force_std = 1.0
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data_force - f_true_force) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
-
-        coeff_std = float(np.std(f_true))
-        if coeff_std <= 0.0:
-            coeff_std = 1.0
-        rel_rmse_coeff_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / coeff_std
-        metrics[FORCE_MAPPING_NRMSE_COEFF_KEY] = rel_rmse_coeff_on_data
     else:
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
