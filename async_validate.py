@@ -24,6 +24,8 @@ if str(ROOT) not in sys.path:
 
 from HNN_helper import (
     PHVIV,
+    FORCE_MAPPING_NRMSE_KEY,
+    FORCE_ROLLOUT_NRMSE_KEY,
     build_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
@@ -262,9 +264,9 @@ def _run_hnn_validation(
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-            if "rollout_nrmse_force_total" in metrics:
+            if FORCE_ROLLOUT_NRMSE_KEY in metrics:
                 ur_val = float(np.asarray(_ur_np).reshape(-1)[0])
-                rollout_by_ur.setdefault(ur_val, []).append(float(metrics["rollout_nrmse_force_total"]))
+                rollout_by_ur.setdefault(ur_val, []).append(float(metrics[FORCE_ROLLOUT_NRMSE_KEY]))
             count += 1
         if count > 0:
             for name, total in metrics_sum.items():
@@ -274,9 +276,9 @@ def _run_hnn_validation(
             log_loss_vs_ur(
                 writer,
                 epoch,
-                {"rollout_nrmse_force_total": rollout_mean},
-                tag="val/rollout_vs_ur",
-                title="Rollout NRMSE force vs U_r",
+                {FORCE_ROLLOUT_NRMSE_KEY: rollout_mean},
+                tag=f"val/{FORCE_ROLLOUT_NRMSE_KEY}_vs_U_r",
+                title=f"{FORCE_ROLLOUT_NRMSE_KEY} vs U_r",
             )
 
         rollout_idx = _rollout_index(epoch, rollout_every, len(val_series_raw), cycle_rollout)
@@ -328,7 +330,7 @@ def _run_hnn_validation(
             force_map_sum += rmse / force_std
             count += 1
         if count > 0:
-            writer.add_scalar("val/force_mapping_nrmse_on_data", force_map_sum / float(count), epoch)
+            writer.add_scalar(f"val/{FORCE_MAPPING_NRMSE_KEY}", force_map_sum / float(count), epoch)
 
 
 def _run_vpinn_validation(

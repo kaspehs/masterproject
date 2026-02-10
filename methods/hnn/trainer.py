@@ -32,6 +32,7 @@ from HNN_helper import (
     compute_validation_metrics,
     compute_model_grad_norm,
     load_training_series,
+    format_loss_vs_ur_text,
     log_loss_vs_ur,
     log_final_rollout_errors_vs_ur,
     log_training_metrics,
@@ -1150,6 +1151,34 @@ def train(config: Config, config_name: str) -> None:
             log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
+
+    if val_loader is not None:
+        final_loss_by_ur = _per_ur_loss_map_hnn(
+            model=model,
+            loader=val_loader,
+            device=device,
+            non_blocking=(device.type == "cuda"),
+            force_reg=force_reg,
+            use_force_data_loss=use_force_data_loss,
+            force_data_weight=force_data_weight,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            per_traj_norm_eps=per_traj_norm_eps,
+            force_reg_on_coeff=force_reg_on_coeff,
+        )
+        if final_loss_by_ur:
+            log_loss_vs_ur(
+                writer,
+                epochs,
+                final_loss_by_ur,
+                tag="final_val/loss_vs_ur",
+                title="Final validation loss vs U_r",
+            )
+            writer.add_text(
+                "final_val/loss_vs_ur_text",
+                format_loss_vs_ur_text(final_loss_by_ur, title="Final validation loss vs U_r"),
+                epochs,
+            )
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)

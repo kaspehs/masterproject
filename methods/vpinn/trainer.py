@@ -29,11 +29,17 @@ from core.runtime import (
 )
 from HNN_helper import (
     Config,
+    DISP_ROLLOUT_NRMSE_KEY,
+    FORCE_MAPPING_NRMSE_COEFF_KEY,
+    FORCE_MAPPING_NRMSE_KEY,
+    FORCE_ROLLOUT_NRMSE_COEFF_KEY,
+    FORCE_ROLLOUT_NRMSE_KEY,
     GradNormBalancer,
     Residual,
     compute_velocity_numpy,
     create_window_mask,
     create_zoom_mask,
+    format_loss_vs_ur_text,
     log_final_rollout_errors_vs_ur,
     log_loss_vs_ur,
     log_displacement_plots,
@@ -285,10 +291,10 @@ def _force_mapping_nrmse_over_trajs(
     if not values_force:
         return None
     out: dict[str, float] = {
-        "force_mapping_nrmse_on_data": float(torch.mean(torch.stack(values_force)).detach().cpu())
+        FORCE_MAPPING_NRMSE_KEY: float(torch.mean(torch.stack(values_force)).detach().cpu())
     }
     if values_coeff:
-        out["force_mapping_nrmse_on_data_coeff"] = float(torch.mean(torch.stack(values_coeff)).detach().cpu())
+        out[FORCE_MAPPING_NRMSE_COEFF_KEY] = float(torch.mean(torch.stack(values_coeff)).detach().cpu())
     return out
 
 
@@ -1454,9 +1460,9 @@ def _log_rollout_validation(
     if disp_std <= 0.0:
         disp_std = 1.0
     rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
-    metrics: dict[str, float] = {"rollout_nrmse_y": rel_rmse_y}
+    metrics: dict[str, float] = {DISP_ROLLOUT_NRMSE_KEY: rel_rmse_y}
     if log_metrics:
-        writer.add_scalar("val/rollout_nrmse_y", rel_rmse_y, epoch)
+        writer.add_scalar(f"val/{DISP_ROLLOUT_NRMSE_KEY}", rel_rmse_y, epoch)
 
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
@@ -1469,22 +1475,22 @@ def _log_rollout_validation(
         if force_std <= 0.0:
             force_std = 1.0
         rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
-        metrics["rollout_nrmse_force_total"] = rel_rmse_force
+        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
         if log_metrics:
-            writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
+            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
 
         coeff_std = float(np.std(f_true))
         if coeff_std <= 0.0:
             coeff_std = 1.0
         rel_rmse_coeff = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / coeff_std
-        metrics["rollout_nrmse_force_total_coeff"] = rel_rmse_coeff
+        metrics[FORCE_ROLLOUT_NRMSE_COEFF_KEY] = rel_rmse_coeff
         if log_metrics:
-            writer.add_scalar("val/rollout_nrmse_force_total_coeff", rel_rmse_coeff, epoch)
+            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_COEFF_KEY}", rel_rmse_coeff, epoch)
     else:
         rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-        metrics["rollout_nrmse_force_total"] = rel_rmse_force
+        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
         if log_metrics:
-            writer.add_scalar("val/rollout_nrmse_force_total", rel_rmse_force, epoch)
+            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
@@ -1496,16 +1502,16 @@ def _log_rollout_validation(
         if force_std <= 0.0:
             force_std = 1.0
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data_force - f_true_force) ** 2))) / force_std
-        metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+        metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
         coeff_std = float(np.std(f_true))
         if coeff_std <= 0.0:
             coeff_std = 1.0
         rel_rmse_coeff_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / coeff_std
-        metrics["force_mapping_nrmse_on_data_coeff"] = rel_rmse_coeff_on_data
+        metrics[FORCE_MAPPING_NRMSE_COEFF_KEY] = rel_rmse_coeff_on_data
     else:
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
-        metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+        metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
     y_true_norm = x_true / float(D)
     y_pred_norm = x_pred / float(D)
@@ -2213,6 +2219,42 @@ def train(config: Config, config_name: str) -> None:
             log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
+
+    if val_loader is not None:
+        final_loss_by_ur = _per_ur_loss_map_vpinn(
+            model=model,
+            loader=val_loader,
+            device=device,
+            non_blocking=non_blocking,
+            dt=dt,
+            m=m,
+            c=c,
+            k=k,
+            w=w,
+            wdot=wdot,
+            alpha=alpha,
+            use_force_loss=use_force_loss,
+            use_weak_loss=use_weak_loss,
+            rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
+            expect_scale=return_scale,
+            expect_f0=use_force_coeff,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            per_traj_norm_eps=per_traj_norm_eps,
+        )
+        if final_loss_by_ur:
+            log_loss_vs_ur(
+                writer,
+                epochs,
+                final_loss_by_ur,
+                tag="final_val/loss_vs_ur",
+                title="Final validation loss vs U_r",
+            )
+            writer.add_text(
+                "final_val/loss_vs_ur_text",
+                format_loss_vs_ur_text(final_loss_by_ur, title="Final validation loss vs U_r"),
+                epochs,
+            )
 
     writer.add_text("vpinn/config_vpinn", json.dumps(vp, indent=2, sort_keys=True), 0)
 

@@ -19,6 +19,12 @@ except ImportError:
 
 from architectures import FourierFeatures, ODEPirateNet
 
+DISP_ROLLOUT_NRMSE_KEY = "Disp rollout NRMSE"
+FORCE_ROLLOUT_NRMSE_KEY = "Force rollout NRMSE"
+FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
+FORCE_ROLLOUT_NRMSE_COEFF_KEY = "Force rollout NRMSE (coeff)"
+FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
+
 @dataclass
 class DataConfig:
     file: str = "data.npz"
@@ -470,7 +476,7 @@ def compute_validation_metrics(
     if disp_std_raw <= 0.0:
         disp_std_raw = 1.0
     rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
-    metrics["rollout_nrmse_y"] = rel_rmse_disp
+    metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
     force_target = np.asarray(force_data).reshape(-1)
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
@@ -482,7 +488,7 @@ def compute_validation_metrics(
         if force_std <= 0.0:
             force_std = 1.0
         rel_rmse_force_total = rmse_force / force_std
-        metrics["rollout_nrmse_force_total"] = rel_rmse_force_total
+        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
         if log_extra_metrics:
             force_model_aligned = force_total_pred[:min_len]
             force_true_aligned = force_target[:min_len]
@@ -507,7 +513,7 @@ def compute_validation_metrics(
         if force_std_data <= 0.0:
             force_std_data = 1.0
         rel_rmse_force_on_data = rmse_force_data / force_std_data
-        metrics["force_mapping_nrmse_on_data"] = rel_rmse_force_on_data
+        metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
     return metrics
 
 
@@ -1668,6 +1674,35 @@ def log_loss_vs_ur(
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
 
+
+def format_loss_vs_ur_text(
+    losses_by_ur: dict[str, dict[float, float]],
+    *,
+    title: str = "Validation loss vs U_r",
+) -> str:
+    if not losses_by_ur:
+        return f"{title}\n\nNo per-U_r losses were available."
+    names = [name for name, ur_map in losses_by_ur.items() if ur_map]
+    if not names:
+        return f"{title}\n\nNo per-U_r losses were available."
+    ur_values = sorted({float(ur) for name in names for ur in losses_by_ur[name].keys()})
+    if not ur_values:
+        return f"{title}\n\nNo per-U_r losses were available."
+
+    lines: list[str] = [title, "", "| U_r | " + " | ".join(names) + " |"]
+    lines.append("|---|" + "|".join(["---"] * len(names)) + "|")
+    for ur_val in ur_values:
+        row = [f"{ur_val:.6g}"]
+        for name in names:
+            value = losses_by_ur[name].get(float(ur_val))
+            if value is None or not np.isfinite(float(value)):
+                row.append("nan")
+            else:
+                row.append(f"{float(value):.6e}")
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
 def log_final_rollout_errors_vs_ur(
     writer: SummaryWriter,
     ur_values: Sequence[float],
@@ -1688,9 +1723,9 @@ def log_final_rollout_errors_vs_ur(
     metrics_all = [p[1] for p in pairs]
 
     series = [
-        ("rollout_nrmse_y", "NRMSE disp"),
-        ("rollout_nrmse_force_total", "NRMSE force total"),
-        ("force_mapping_nrmse_on_data", "NRMSE force on data"),
+        (DISP_ROLLOUT_NRMSE_KEY, DISP_ROLLOUT_NRMSE_KEY),
+        (FORCE_ROLLOUT_NRMSE_KEY, FORCE_ROLLOUT_NRMSE_KEY),
+        (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
     ]
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
@@ -1724,8 +1759,8 @@ def log_final_rollout_errors_vs_ur(
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
 
-    # Also log average force-mapping error vs reduced velocity (grouped by U_r).
-    force_key = "force_mapping_nrmse_on_data"
+    # Also log average Force mapping NRMSE vs reduced velocity (grouped by U_r).
+    force_key = FORCE_MAPPING_NRMSE_KEY
     grouped: dict[float, list[float]] = {}
     for ur_val, metrics in pairs:
         if force_key not in metrics:
@@ -1738,15 +1773,15 @@ def log_final_rollout_errors_vs_ur(
         xs = sorted(grouped.keys())
         ys = [float(np.mean(grouped[x])) for x in xs]
         fig2, ax2 = plt.subplots(1, 1, figsize=(6, 4))
-        ax2.plot(xs, ys, marker="o", label="Avg NRMSE force on data")
+        ax2.plot(xs, ys, marker="o", label=f"Avg {FORCE_MAPPING_NRMSE_KEY}")
         ax2.set_xlabel("Reduced velocity (U_r)")
         ax2.set_ylabel("Error")
         ax2.set_yscale("log")
-        ax2.set_title("Avg force-mapping error vs U_r")
+        ax2.set_title(f"Avg {FORCE_MAPPING_NRMSE_KEY} vs U_r")
         ax2.grid(True, alpha=0.3)
         ax2.legend(loc="best")
         plt.tight_layout()
-        writer.add_figure("final_val/force_mapping_avg_vs_ur", fig2, epoch)
+        writer.add_figure(f"final_val/{FORCE_MAPPING_NRMSE_KEY}_avg_vs_U_r", fig2, epoch)
         plt.close(fig2)
 
 def preprocess_timeseries(

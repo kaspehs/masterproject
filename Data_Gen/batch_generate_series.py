@@ -23,6 +23,7 @@ def run_batch(
     train_fraction: float = 0.7,
     val_fraction: float = 0.15,
     seed: int = 1234,
+    downsample_stride: int = 1,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     train_dir = output_dir / "train"
@@ -34,6 +35,9 @@ def run_batch(
 
     if train_fraction <= 0.0 or val_fraction <= 0.0 or (train_fraction + val_fraction) >= 1.0:
         raise ValueError("train/val fractions must be positive and sum to less than 1.")
+    downsample_stride = int(downsample_stride)
+    if downsample_stride < 1:
+        raise ValueError("downsample_stride must be >= 1.")
     rng = np.random.default_rng(int(seed))
     metadata: list[dict[str, float | str | int]] = []
     idx = 1
@@ -61,15 +65,39 @@ def run_batch(
             for a_factor, fhat in split_combos:
                 fname = split_dir / f"series_{idx:03d}_A{a_factor:.2f}_fhat{fhat:.3f}_Ur{ur_val:.2f}.npz"
                 flow_speed = reduced_velocity_to_flow_speed(ur_val)
-                simulate_td_model_cf(
+                sim = simulate_td_model_cf(
                     A_factor=a_factor,
                     fhat=fhat,
                     U=flow_speed,
-                    output_path=fname,
+                    output_path=None,
                     plot=False,
                     seed=idx,
                     verbose=False,
                     integrator=integrator,
+                )
+                time = np.asarray(sim["time"])
+                y = np.asarray(sim["y"])
+                force_total = np.asarray(sim["F_total"])
+                hamiltonian = np.asarray(sim["H"])
+                velocity = np.asarray(sim["dy"])
+                if downsample_stride > 1:
+                    time = time[::downsample_stride]
+                    y = y[::downsample_stride]
+                    force_total = force_total[::downsample_stride]
+                    hamiltonian = hamiltonian[::downsample_stride]
+                    velocity = velocity[::downsample_stride]
+                if time.size < 2:
+                    raise ValueError(
+                        f"Downsampling with stride={downsample_stride} produced too few samples for '{fname.name}'."
+                    )
+                np.savez(
+                    fname,
+                    a=time,
+                    b=y,
+                    c=force_total,
+                    d=hamiltonian,
+                    e=velocity,
+                    U_r=float(sim["U_r"]),
                 )
                 metadata.append(
                     {
@@ -80,6 +108,7 @@ def run_batch(
                         "fhat": fhat,
                         "U_r": float(ur_val),
                         "U": float(flow_speed),
+                        "downsample_stride": int(downsample_stride),
                     }
                 )
                 idx += 1
@@ -102,11 +131,12 @@ def default_reduced_velocity() -> float:
 
 
 def main():
-    output_dir = Path(__file__).parent / "generated_series_Ur_60"
+    output_dir = Path(__file__).parent / "generated_series_Ur_60_100hz"
     integrator = "rk4"
     train_fraction = 0.7
     val_fraction = 0.15
     split_seed = 1234
+    downsample_stride = 100
 
     amplitude_factors = [-1.0, -0.5, 0.0, 0.5, 1.0]
     fhat_values = [-0.25, -0.15, -0.05, 0.05, 0.15, 0.25]
@@ -127,6 +157,7 @@ def main():
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=split_seed,
+        downsample_stride=downsample_stride,
     )
 
 
