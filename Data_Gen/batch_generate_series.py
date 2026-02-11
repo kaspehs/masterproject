@@ -131,7 +131,7 @@ def default_reduced_velocity() -> float:
 
 
 def main():
-    output_dir = Path(__file__).parent / "generated_series_Ur_60_100hz"
+    output_dir = Path(__file__).parent / "generated_series_Ur2_60_100hz"
     integrator = "rk4"
     train_fraction = 0.7
     val_fraction = 0.15
@@ -141,13 +141,20 @@ def main():
     amplitude_factors = [-1.0, -0.5, 0.0, 0.5, 1.0]
     fhat_values = [-0.25, -0.15, -0.05, 0.05, 0.15, 0.25]
     reduced_velocity_values = [
+        1.0,
         2.0,
+        3.0,
         4.0,
+        5.0,
         6.0,
+        7.0,
         8.0,
+        9.0,
         10.0,
+        11.0,
         12.0,
     ]
+
     run_batch(
         amplitude_factors,
         fhat_values,

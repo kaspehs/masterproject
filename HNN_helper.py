@@ -1724,6 +1724,9 @@ def log_final_rollout_errors_vs_ur(
         if not by_ur:
             continue
         errors_by_ur[key] = {ur: float(np.mean(vals)) for ur, vals in by_ur.items() if vals}
+    for metric_name, by_ur in errors_by_ur.items():
+        for ur_key, value in sorted(by_ur.items()):
+            writer.add_scalar(f"final_val/by_ur/{metric_name}/U_r={ur_key:.6g}", float(value), epoch)
     writer.add_text(
         "final_val/errors_vs_ur_text",
         format_loss_vs_ur_text(

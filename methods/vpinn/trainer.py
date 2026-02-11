@@ -566,26 +566,54 @@ def _filter_paths_by_ur(
 
 
 def _infer_dt_target_from_data_cfg(data_cfg: Any) -> Optional[float]:
+    def _dt_from_npz(path: Path) -> Optional[float]:
+        if not path.exists():
+            return None
+        with np.load(path) as base:
+            if "a" in base:
+                t = np.asarray(base["a"])
+            elif "time" in base:
+                t = np.asarray(base["time"])
+            else:
+                return None
+        if t.ndim != 1 or t.size < 2:
+            return None
+        return float(t[1] - t[0])
+
+    # Prefer generated training-series dt when available.
+    if bool(getattr(data_cfg, "use_generated_train_series", False)):
+        series_dir = Path(getattr(data_cfg, "train_series_dir", ""))
+        if series_dir and not series_dir.is_absolute():
+            series_dir = (Path.cwd() / series_dir).resolve()
+        if series_dir.exists():
+            candidates: list[Path] = []
+            train_dir = series_dir / "train"
+            val_dir = series_dir / "val"
+            if train_dir.exists() or val_dir.exists():
+                if train_dir.exists():
+                    candidates.extend(sorted(train_dir.glob("*.npz")))
+                if val_dir.exists():
+                    candidates.extend(sorted(val_dir.glob("*.npz")))
+            else:
+                candidates.extend(sorted(series_dir.glob("*.npz")))
+            for path in candidates:
+                dt_val = _dt_from_npz(path)
+                if dt_val is not None:
+                    return dt_val
+
+    # Fallback to data file dt (legacy single-series mode).
     data_path = Path(getattr(data_cfg, "file", ""))
     if not data_path:
         return None
     if not data_path.is_absolute():
         data_path = (Path.cwd() / data_path).resolve()
-    if not data_path.exists():
-        return None
-    with np.load(data_path) as base:
-        if "a" not in base:
-            return None
-        t = np.asarray(base["a"])
-    if t.ndim != 1 or t.size < 2:
+    dt_val = _dt_from_npz(data_path)
+    if dt_val is None:
         return None
     if bool(getattr(data_cfg, "reduce_time", False)):
-        rf = int(getattr(data_cfg, "reduction_factor", 1))
-        rf = max(1, rf)
-        t = t[::rf]
-    if t.size < 2:
-        return None
-    return float(t[1] - t[0])
+        rf = max(1, int(getattr(data_cfg, "reduction_factor", 1)))
+        dt_val = float(dt_val * rf)
+    return dt_val
 
 def _maybe_reduce_time(
     t: np.ndarray,
