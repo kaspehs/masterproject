@@ -1660,15 +1660,16 @@ def format_loss_vs_ur_text(
     losses_by_ur: dict[str, dict[float, float]],
     *,
     title: str = "Validation loss vs U_r",
+    empty_message: str = "No per-U_r losses were available.",
 ) -> str:
     if not losses_by_ur:
-        return f"{title}\n\nNo per-U_r losses were available."
+        return f"{title}\n\n{empty_message}"
     names = [name for name, ur_map in losses_by_ur.items() if ur_map]
     if not names:
-        return f"{title}\n\nNo per-U_r losses were available."
+        return f"{title}\n\n{empty_message}"
     ur_values = sorted({float(ur) for name in names for ur in losses_by_ur[name].keys()})
     if not ur_values:
-        return f"{title}\n\nNo per-U_r losses were available."
+        return f"{title}\n\n{empty_message}"
 
     lines: list[str] = [title, "", "| U_r | " + " | ".join(names) + " |"]
     lines.append("|---|" + "|".join(["---"] * len(names)) + "|")
@@ -1708,6 +1709,30 @@ def log_final_rollout_errors_vs_ur(
         (FORCE_ROLLOUT_NRMSE_KEY, FORCE_ROLLOUT_NRMSE_KEY),
         (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
     ]
+    grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
+    for ur_val, metrics in pairs:
+        ur_key = float(np.round(ur_val, 6))
+        for key, _label in series:
+            if key not in metrics:
+                continue
+            value = float(metrics[key])
+            if not np.isfinite(value):
+                continue
+            grouped_errors[key].setdefault(ur_key, []).append(value)
+    errors_by_ur: dict[str, dict[float, float]] = {}
+    for key, by_ur in grouped_errors.items():
+        if not by_ur:
+            continue
+        errors_by_ur[key] = {ur: float(np.mean(vals)) for ur, vals in by_ur.items() if vals}
+    writer.add_text(
+        "final_val/errors_vs_ur_text",
+        format_loss_vs_ur_text(
+            errors_by_ur,
+            title="Final rollout errors vs U_r",
+            empty_message="No per-U_r errors were available.",
+        ),
+        epoch,
+    )
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
     plotted = False
