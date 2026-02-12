@@ -26,7 +26,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from HNN_helper import PHVIV, Residual, compute_velocity_numpy, parse_config, rollout_model
-from architectures import ODEPirateNet
+from architectures import ODEPirateNet, TemporalConvForceNet
 
 
 def _env_float(name: str, default: float) -> float:
@@ -204,7 +204,20 @@ def _build_vpinn_force_model(cfg: object, *, input_dim: int, output_dim: int) ->
             in_features = hidden
         modules.append(torch.nn.Linear(in_features, int(output_dim)))
         return torch.nn.Sequential(*modules)
-    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate")
+    if net_type == "tcn":
+        cfg_tcn = dict(getattr(arch, "tcn_kwargs", {}) or {})
+        default_history = int(vp.get("window_M", 50)) + 1
+        return TemporalConvForceNet(
+            input_size=int(input_dim),
+            output_size=int(output_dim),
+            hidden_channels=int(cfg_tcn.get("hidden", 128)),
+            levels=int(cfg_tcn.get("levels", 4)),
+            kernel_size=int(cfg_tcn.get("kernel_size", 3)),
+            dropout=float(cfg_tcn.get("dropout", 0.0)),
+            activation=str(cfg_tcn.get("activation", "gelu")),
+            history_len=int(cfg_tcn.get("history_len", default_history)),
+        )
+    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate, tcn")
 
 
 def _m_eff_from_cfg(cfg: object) -> float:
@@ -234,7 +247,7 @@ def load_model(model_path: Path, *, dt: float) -> tuple[object, dict[str, float]
         return model, derived, float(dt), method
 
     if method == "vpinn":
-        # VPINN checkpoint stores a pointwise force network; rollout uses the known ODE.
+        # VPINN checkpoint stores a force network (pointwise or TCN); rollout uses the known ODE.
         model_cfg = getattr(cfg, "model", None)
         d = 1
         force_model = _build_vpinn_force_model(cfg, input_dim=2 * d + 1, output_dim=d).to(DEVICE)
@@ -466,9 +479,25 @@ def _eval_vpinn_rollout_nrmse_batch(
     disp_std = torch.where(disp_std > 1e-9, disp_std, torch.ones_like(disp_std))
     force_std = torch.where(force_std > 1e-9, force_std, torch.ones_like(force_std))
 
-    def f_theta(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
-        inp = torch.stack((xi, vi, ur), dim=1)
-        return force_model(inp).squeeze(-1)
+    use_tcn = bool(getattr(force_model, "is_tcn_force_model", False))
+    if use_tcn:
+        hist_len = max(1, int(getattr(force_model, "history_len", 1)))
+        x_hist = x.unsqueeze(1).unsqueeze(-1).repeat(1, hist_len, 1)
+        v_hist = v.unsqueeze(1).unsqueeze(-1).repeat(1, hist_len, 1)
+        ur_hist = ur.unsqueeze(1).unsqueeze(-1).repeat(1, hist_len, 1)
+
+        def f_theta(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+            x_in = x_hist.clone()
+            v_in = v_hist.clone()
+            x_in[:, -1, 0] = xi
+            v_in[:, -1, 0] = vi
+            inp = torch.cat((x_in, v_in, ur_hist), dim=-1)
+            f_seq = force_model(inp).squeeze(-1)
+            return f_seq[:, -1]
+    else:
+        def f_theta(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+            inp = torch.stack((xi, vi, ur), dim=1)
+            return force_model(inp).squeeze(-1)
 
     def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
         return (f_theta(xi, vi) - c * vi - k * xi) / m_eff
@@ -501,6 +530,9 @@ def _eval_vpinn_rollout_nrmse_batch(
 
             x = x + (dt_t / 6.0) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
             v = v + (dt_t / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+            if use_tcn:
+                x_hist = torch.cat((x_hist[:, 1:, :], x.unsqueeze(1).unsqueeze(-1)), dim=1)
+                v_hist = torch.cat((v_hist[:, 1:, :], v.unsqueeze(1).unsqueeze(-1)), dim=1)
 
     rmse_x = torch.sqrt(sum_sq_x / float(max(T, 1)))
     rmse_f = torch.sqrt(sum_sq_f / float(max(T, 1)))

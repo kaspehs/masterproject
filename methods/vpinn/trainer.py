@@ -45,7 +45,7 @@ from HNN_helper import (
     resolve_middle_time_plot,
     resample_uniform_series,
 )
-from architectures import ODEPirateNet
+from architectures import ODEPirateNet, TemporalConvForceNet
 
 
 class ForceMLP(nn.Module):
@@ -228,10 +228,103 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         modules.append(nn.Linear(in_features, int(output_dim)))
         return nn.Sequential(*modules)
 
-    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate")
+    if net_type == "tcn":
+        cfg = dict(getattr(arch, "tcn_kwargs", {}) or {})
+        default_history = int(vp.get("window_M", 50)) + 1
+        return TemporalConvForceNet(
+            input_size=int(input_dim),
+            output_size=int(output_dim),
+            hidden_channels=int(cfg.get("hidden", 128)),
+            levels=int(cfg.get("levels", 4)),
+            kernel_size=int(cfg.get("kernel_size", 3)),
+            dropout=float(cfg.get("dropout", 0.0)),
+            activation=str(cfg.get("activation", "gelu")),
+            history_len=int(cfg.get("history_len", default_history)),
+        )
+
+    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate, tcn")
+
+
+def _unwrap_force_model(model: nn.Module) -> nn.Module:
+    current: nn.Module = model
+    seen: set[int] = set()
+    while True:
+        obj_id = id(current)
+        if obj_id in seen:
+            break
+        seen.add(obj_id)
+        if isinstance(current, ScaledForceWrapper):
+            current = current.base
+            continue
+        if hasattr(current, "_orig_mod"):
+            maybe = getattr(current, "_orig_mod")
+            if isinstance(maybe, nn.Module):
+                current = maybe
+                continue
+        if hasattr(current, "module"):
+            maybe = getattr(current, "module")
+            if isinstance(maybe, nn.Module):
+                current = maybe
+                continue
+        break
+    return current
+
+
+def _is_tcn_force_model(model: nn.Module) -> bool:
+    base = _unwrap_force_model(model)
+    return bool(getattr(base, "is_tcn_force_model", False))
+
+
+def _tcn_history_len(model: nn.Module) -> int:
+    base = _unwrap_force_model(model)
+    return max(1, int(getattr(base, "history_len", 1)))
+
+
+def _vpinn_force_sequence(
+    model: nn.Module,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    ur: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Unified VPINN force call.
+
+    Inputs:
+      x, v, ur with shape (B, T, d)
+    Returns:
+      f with shape (B, T, d)
+    """
+    if x.ndim != 3 or v.ndim != 3 or ur.ndim != 3:
+        raise ValueError("x, v, ur must have shape (B, T, d)")
+    inp = torch.cat([x, v, ur], dim=-1)
+    B, T, d = x.shape
+    if _is_tcn_force_model(model):
+        out = model(inp)
+        if out.ndim != 3:
+            raise ValueError("TCN force model must return shape (B, T, d).")
+        return out
+    flat = inp.reshape(B * T, -1)
+    return model(flat).reshape(B, T, d)
 
 
 def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor, ur: torch.Tensor) -> torch.Tensor:
+    """
+    Pointwise force with shape-preserving fallback for sequence models.
+
+    Inputs:
+      x, v, ur with shape (N, d)
+    Returns:
+      f with shape (N, d)
+    """
+    if x.ndim != 2 or v.ndim != 2 or ur.ndim != 2:
+        raise ValueError("x, v, ur must have shape (N, d)")
+    if _is_tcn_force_model(model):
+        return _vpinn_force_sequence(
+            model,
+            x.unsqueeze(0),
+            v.unsqueeze(0),
+            ur.unsqueeze(0),
+        ).squeeze(0)
     return model(torch.cat([x, v, ur], dim=-1))
 
 
@@ -315,18 +408,40 @@ def rollout_rk4(
     c = c.view(1, d)
     k = k.view(1, d)
 
+    use_tcn = _is_tcn_force_model(model)
     x = x0
     v = v0
     xs = [x]
     vs = [v]
-    fs = [_vpinn_force(model, x, v, ur0)]
+
+    if use_tcn:
+        hist_len = _tcn_history_len(model)
+        # Start from a repeated first state; the history then becomes fully model-driven.
+        x_hist = x.unsqueeze(1).repeat(1, hist_len, 1)
+        v_hist = v.unsqueeze(1).repeat(1, hist_len, 1)
+        ur_hist = ur0.unsqueeze(1).repeat(1, hist_len, 1)
+
+        def force_from_history(x_curr: torch.Tensor, v_curr: torch.Tensor) -> torch.Tensor:
+            x_in = x_hist.clone()
+            v_in = v_hist.clone()
+            x_in[:, -1, :] = x_curr
+            v_in[:, -1, :] = v_curr
+            f_seq = _vpinn_force_sequence(model, x_in, v_in, ur_hist)
+            return f_seq[:, -1, :]
+
+        fs = [force_from_history(x, v)]
+    else:
+        fs = [_vpinn_force(model, x, v, ur0)]
 
     dt_t = x0.new_tensor(float(dt))
     half = x0.new_tensor(0.5)
     sixth = x0.new_tensor(1.0 / 6.0)
 
     def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
-        ci = _vpinn_force(model, xi, vi, ur0)
+        if use_tcn:
+            ci = force_from_history(xi, vi)
+        else:
+            ci = _vpinn_force(model, xi, vi, ur0)
         fi = ci if f0 is None else ci * f0
         return (fi - c * vi - k * xi) / m
 
@@ -352,9 +467,16 @@ def rollout_rk4(
         x = x + (dt_t * sixth) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
         v = v + (dt_t * sixth) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
 
+        if use_tcn:
+            x_hist = torch.cat([x_hist[:, 1:, :], x.unsqueeze(1)], dim=1)
+            v_hist = torch.cat([v_hist[:, 1:, :], v.unsqueeze(1)], dim=1)
+
         xs.append(x)
         vs.append(v)
-        fs.append(_vpinn_force(model, x, v, ur0))
+        if use_tcn:
+            fs.append(force_from_history(x, v))
+        else:
+            fs.append(_vpinn_force(model, x, v, ur0))
 
     return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1)
 
@@ -1242,11 +1364,8 @@ def _evaluate_epoch(
                 f0 = f0.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
-            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
-
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                flat = inp.reshape(B * M1, -1)
-                f_pred = model(flat).reshape(B, M1, d)
+                f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
@@ -1344,11 +1463,8 @@ def _per_ur_loss_map_vpinn(
                 f0 = f0.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
-            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
-
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                flat = inp.reshape(B * M1, -1)
-                f_pred = model(flat).reshape(B, M1, d)
+                f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
@@ -1884,12 +2000,9 @@ def train(config: Config, config_name: str) -> None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
-            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
-
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                flat = inp.reshape(B * M1, -1)
-                f_pred = model(flat).reshape(B, M1, d)
+                f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))

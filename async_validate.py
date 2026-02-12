@@ -40,6 +40,7 @@ from methods.vpinn.trainer import (
     _apply_per_traj_scale,
     _force_mapping_nrmse_over_trajs,
     _load_metadata_map,
+    _vpinn_force_sequence,
     ScaledForceWrapper,
     WindowDataset,
     _as_diag_param,
@@ -837,11 +838,9 @@ def _per_ur_loss_map_vpinn(
                 f0 = f0.to(device, non_blocking=non_blocking)
 
             B, M1, d = x_win.shape
-            inp = torch.cat([x_win, v_win, ur_win], dim=-1)
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                flat = inp.reshape(B * M1, -1)
-                f_pred = model(flat).reshape(B, M1, d)
+                f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))

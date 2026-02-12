@@ -27,6 +27,7 @@ smoothing:
 
 architecture:
   # Used when `vpinn.use_architecture_config: true`
+  # Options: residual | mlp | pirate | tcn
   force_net_type: residual
   residual_kwargs:
     hidden: 128
@@ -36,6 +37,14 @@ architecture:
     hidden: 128
     layers: 2
     activation: gelu
+  tcn_kwargs:
+    hidden: 128
+    levels: 4
+    kernel_size: 3
+    dropout: 0.0
+    activation: gelu
+    # Defaults to vpinn.window_M + 1 if omitted.
+    history_len: 64
   pirate_force_kwargs:
     depth: 2
     fourier_features: 64

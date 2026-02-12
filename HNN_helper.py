@@ -75,11 +75,23 @@ def _default_mlp_kwargs() -> dict[str, Any]:
     return {"hidden": 100, "layers": 2, "activation": "gelu"}
 
 
+def _default_tcn_kwargs() -> dict[str, Any]:
+    return {
+        "hidden": 128,
+        "levels": 4,
+        "kernel_size": 3,
+        "dropout": 0.0,
+        "activation": "gelu",
+        "history_len": 64,
+    }
+
+
 @dataclass
 class ArchitectureConfig:
     force_net_type: str = "residual"
     residual_kwargs: dict[str, Any] = field(default_factory=_default_residual_kwargs)
     mlp_kwargs: dict[str, Any] = field(default_factory=_default_mlp_kwargs)
+    tcn_kwargs: dict[str, Any] = field(default_factory=_default_tcn_kwargs)
     pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
 
 @dataclass
@@ -234,6 +246,24 @@ def parse_config(raw: dict[str, Any]) -> Config:
         mlp_kwargs = dict(architecture_cfg.get("mlp_kwargs", {}) or {})
         mlp_kwargs.update(legacy_mlp)
         architecture_cfg["mlp_kwargs"] = mlp_kwargs
+
+    legacy_tcn: dict[str, Any] = {}
+    if "tcn_hidden" in architecture_cfg:
+        legacy_tcn["hidden"] = architecture_cfg.pop("tcn_hidden")
+    if "tcn_levels" in architecture_cfg:
+        legacy_tcn["levels"] = architecture_cfg.pop("tcn_levels")
+    if "tcn_kernel_size" in architecture_cfg:
+        legacy_tcn["kernel_size"] = architecture_cfg.pop("tcn_kernel_size")
+    if "tcn_dropout" in architecture_cfg:
+        legacy_tcn["dropout"] = architecture_cfg.pop("tcn_dropout")
+    if "tcn_activation" in architecture_cfg:
+        legacy_tcn["activation"] = architecture_cfg.pop("tcn_activation")
+    if "tcn_history_len" in architecture_cfg:
+        legacy_tcn["history_len"] = architecture_cfg.pop("tcn_history_len")
+    if legacy_tcn or "tcn_kwargs" in architecture_cfg:
+        tcn_kwargs = dict(architecture_cfg.get("tcn_kwargs", {}) or {})
+        tcn_kwargs.update(legacy_tcn)
+        architecture_cfg["tcn_kwargs"] = tcn_kwargs
 
     pirate_overrides: dict[str, Any] = {}
     if "pirate_activation" in architecture_cfg:

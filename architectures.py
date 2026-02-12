@@ -718,3 +718,163 @@ class ODEPirateNet(torch.nn.Module):
                 "theta_linf": theta_linf,
                 "y_hat_sample": y_hat[:10].detach(), # small peek
             }
+
+
+def _activation_from_string(name: str) -> nn.Module:
+    key = str(name).strip().lower()
+    if key == "tanh":
+        return nn.Tanh()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "gelu":
+        return nn.GELU()
+    if key in {"silu", "swish"}:
+        return nn.SiLU()
+    raise ValueError("activation must be one of: tanh, relu, gelu, silu")
+
+
+class _CausalConv1d(nn.Module):
+    """1D convolution with left padding to preserve strict causality."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        kernel_size: int,
+        dilation: int,
+    ) -> None:
+        super().__init__()
+        if kernel_size < 1:
+            raise ValueError("kernel_size must be >= 1")
+        if dilation < 1:
+            raise ValueError("dilation must be >= 1")
+        self.pad_left = int((kernel_size - 1) * dilation)
+        self.conv = nn.Conv1d(
+            in_channels=int(in_channels),
+            out_channels=int(out_channels),
+            kernel_size=int(kernel_size),
+            dilation=int(dilation),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_padded = F.pad(x, (self.pad_left, 0))
+        return self.conv(x_padded)
+
+
+class _TemporalResidualBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        kernel_size: int,
+        dilation: int,
+        activation: str,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        drop = float(dropout)
+        if drop < 0.0 or drop >= 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+        self.conv1 = _CausalConv1d(
+            in_channels=int(in_channels),
+            out_channels=int(out_channels),
+            kernel_size=int(kernel_size),
+            dilation=int(dilation),
+        )
+        self.conv2 = _CausalConv1d(
+            in_channels=int(out_channels),
+            out_channels=int(out_channels),
+            kernel_size=int(kernel_size),
+            dilation=int(dilation),
+        )
+        self.act = _activation_from_string(activation)
+        self.dropout = nn.Dropout(p=drop)
+        if int(in_channels) != int(out_channels):
+            self.skip = nn.Conv1d(int(in_channels), int(out_channels), kernel_size=1)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.skip(x)
+        y = self.conv1(x)
+        y = self.act(y)
+        y = self.dropout(y)
+        y = self.conv2(y)
+        y = self.act(y)
+        y = self.dropout(y)
+        return y + residual
+
+
+class TemporalConvForceNet(nn.Module):
+    """
+    Causal temporal force model for VPINN.
+
+    Expects sequence input of shape (B, T, C) and returns (B, T, D), where each
+    prediction at time t depends only on samples up to t.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_size: int,
+        output_size: int,
+        hidden_channels: int = 128,
+        levels: int = 4,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+        activation: str = "gelu",
+        history_len: int = 64,
+    ) -> None:
+        super().__init__()
+        hidden = int(hidden_channels)
+        depth = int(levels)
+        if hidden < 1:
+            raise ValueError("hidden_channels must be >= 1")
+        if depth < 1:
+            raise ValueError("levels must be >= 1")
+        if int(history_len) < 1:
+            raise ValueError("history_len must be >= 1")
+
+        blocks: list[nn.Module] = []
+        in_ch = int(input_size)
+        for i in range(depth):
+            dilation = 2**i
+            blocks.append(
+                _TemporalResidualBlock(
+                    in_channels=in_ch,
+                    out_channels=hidden,
+                    kernel_size=int(kernel_size),
+                    dilation=int(dilation),
+                    activation=activation,
+                    dropout=float(dropout),
+                )
+            )
+            in_ch = hidden
+        self.tcn = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(hidden, int(output_size), kernel_size=1)
+
+        # Introspection hooks used by VPINN rollout logic.
+        self.is_tcn_force_model = True
+        self.history_len = int(history_len)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            # Fallback for one-step calls: treat as a sequence with T=1.
+            x = x.unsqueeze(1)
+            squeeze_time = True
+        elif x.ndim == 3:
+            squeeze_time = False
+        else:
+            raise ValueError("TemporalConvForceNet expects input shape (N,C) or (B,T,C).")
+
+        # (B, T, C) -> (B, C, T)
+        h = x.transpose(1, 2)
+        h = self.tcn(h)
+        y = self.head(h)
+        # (B, C_out, T) -> (B, T, C_out)
+        y = y.transpose(1, 2)
+        if squeeze_time:
+            y = y.squeeze(1)
+        return y
