@@ -230,7 +230,8 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
 
     if net_type == "tcn":
         cfg = dict(getattr(arch, "tcn_kwargs", {}) or {})
-        default_history = int(vp.get("window_M", 50)) + 1
+        # Number of *previous* timesteps of context used for the first target in a window.
+        default_history = int(vp.get("window_M", 50))
         return TemporalConvForceNet(
             input_size=int(input_dim),
             output_size=int(output_dim),
@@ -277,7 +278,7 @@ def _is_tcn_force_model(model: nn.Module) -> bool:
 
 def _tcn_history_len(model: nn.Module) -> int:
     base = _unwrap_force_model(model)
-    return max(1, int(getattr(base, "history_len", 1)))
+    return max(0, int(getattr(base, "history_len", 0)))
 
 
 def _vpinn_force_sequence(
@@ -328,6 +329,39 @@ def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor, ur: torch.T
     return model(torch.cat([x, v, ur], dim=-1))
 
 
+def _vpinn_force_on_trajectory(
+    model: nn.Module,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    ur: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Force evaluation over a single trajectory with optional left context padding.
+
+    Inputs:
+      x, v, ur with shape (T, d)
+    Returns:
+      f with shape (T, d)
+    """
+    if not _is_tcn_force_model(model):
+        return _vpinn_force(model, x, v, ur)
+
+    context = _tcn_history_len(model)
+    if context <= 0:
+        return _vpinn_force(model, x, v, ur)
+
+    x_pad = torch.cat([x[0:1, :].expand(context, -1), x], dim=0)
+    v_pad = torch.cat([v[0:1, :].expand(context, -1), v], dim=0)
+    ur_pad = torch.cat([ur[0:1, :].expand(context, -1), ur], dim=0)
+    f_pad = _vpinn_force_sequence(
+        model,
+        x_pad.unsqueeze(0),
+        v_pad.unsqueeze(0),
+        ur_pad.unsqueeze(0),
+    ).squeeze(0)
+    return f_pad[context:, :]
+
+
 def _force_mapping_nrmse_over_trajs(
     *,
     model: nn.Module,
@@ -349,7 +383,7 @@ def _force_mapping_nrmse_over_trajs(
                 f0_true = f0_true.to(device)
             if x_true.ndim != 2:
                 continue
-            f_pred = _vpinn_force(model, x_true, v_true, ur_true)
+            f_pred = _vpinn_force_on_trajectory(model, x_true, v_true, ur_true)
             if f_pred.ndim == 1:
                 f_pred = f_pred.unsqueeze(-1)
             if f_true.ndim == 1:
@@ -415,7 +449,8 @@ def rollout_rk4(
     vs = [v]
 
     if use_tcn:
-        hist_len = _tcn_history_len(model)
+        context = _tcn_history_len(model)
+        hist_len = context + 1
         # Start from a repeated first state; the history then becomes fully model-driven.
         x_hist = x.unsqueeze(1).repeat(1, hist_len, 1)
         v_hist = v.unsqueeze(1).repeat(1, hist_len, 1)
@@ -912,16 +947,21 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         *,
         window_intervals: int,
         stride: int,
+        history_context: int = 0,
         return_scale: bool = False,
     ) -> None:
         if window_intervals < 1:
             raise ValueError("vpinn.window_M must be >= 1")
         if stride < 1:
             raise ValueError("vpinn.stride must be >= 1")
+        if int(history_context) < 0:
+            raise ValueError("history_context must be >= 0")
         self.trajectories = trajectories
         self.M = int(window_intervals)
         self.M1 = self.M + 1
         self.stride = int(stride)
+        self.context = int(history_context)
+        self.window_total = self.M1 + self.context
         self._return_scale = bool(return_scale)
         self._return_f0 = any("f0" in traj for traj in self.trajectories)
 
@@ -930,9 +970,9 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         for traj_id, traj in enumerate(self.trajectories):
             x = traj["x"]
             length = int(x.shape[0])
-            if length < self.M1:
+            if length < self.window_total:
                 continue
-            start_idx = np.arange(0, length - self.M1 + 1, self.stride, dtype=np.int32)
+            start_idx = np.arange(0, length - self.window_total + 1, self.stride, dtype=np.int32)
             if start_idx.size == 0:
                 continue
             traj_ids.append(np.full_like(start_idx, traj_id, dtype=np.int32))
@@ -950,7 +990,7 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # type: ignore[override]
         traj = self.trajectories[int(self._traj_ids[idx])]
         start = int(self._starts[idx])
-        end = start + self.M1
+        end = start + self.window_total
         x = traj["x"][start:end]
         v = traj["v"][start:end]
         f = traj["f"][start:end]
@@ -1363,18 +1403,28 @@ def _evaluate_epoch(
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
-            B, M1, d = x_win.shape
+            M1_target = int(w.shape[-1])
+            if int(x_win.shape[1]) < M1_target:
+                raise ValueError(
+                    f"Window length {int(x_win.shape[1])} is shorter than target length {M1_target}."
+                )
+            start_idx = int(x_win.shape[1]) - M1_target
+            x_eval = x_win[:, start_idx:, :]
+            v_eval = v_win[:, start_idx:, :]
+            f_eval = f_meas[:, start_idx:, :]
+            f0_eval = f0[:, start_idx:, :] if f0 is not None else None
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
-                per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
+                f_pred_eval = f_pred[:, start_idx:, :]
+                per_loss_f = torch.mean((f_pred_eval - f_eval) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
                     R = _weak_residual(
-                        x=x_win,
-                        v=v_win,
-                        f_pred=f_pred,
+                        x=x_eval,
+                        v=v_eval,
+                        f_pred=f_pred_eval,
                         m=m,
                         c=c,
                         k=k,
@@ -1382,7 +1432,7 @@ def _evaluate_epoch(
                         w=w,
                         wdot=wdot,
                         alpha=alpha,
-                        f0=f0,
+                        f0=f0_eval,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
                     if scale is not None:
@@ -1462,18 +1512,29 @@ def _per_ur_loss_map_vpinn(
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
-            B, M1, d = x_win.shape
+            M1_target = int(w.shape[-1])
+            if int(x_win.shape[1]) < M1_target:
+                raise ValueError(
+                    f"Window length {int(x_win.shape[1])} is shorter than target length {M1_target}."
+                )
+            start_idx = int(x_win.shape[1]) - M1_target
+            x_eval = x_win[:, start_idx:, :]
+            v_eval = v_win[:, start_idx:, :]
+            f_eval = f_meas[:, start_idx:, :]
+            ur_eval = ur_win[:, start_idx:, :]
+            f0_eval = f0[:, start_idx:, :] if f0 is not None else None
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
-                per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
+                f_pred_eval = f_pred[:, start_idx:, :]
+                per_loss_f = torch.mean((f_pred_eval - f_eval) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 per_loss_w = per_loss_f.new_zeros(per_loss_f.shape)
                 if use_weak_loss:
                     R = _weak_residual(
-                        x=x_win,
-                        v=v_win,
-                        f_pred=f_pred,
+                        x=x_eval,
+                        v=v_eval,
+                        f_pred=f_pred_eval,
                         m=m,
                         c=c,
                         k=k,
@@ -1481,7 +1542,7 @@ def _per_ur_loss_map_vpinn(
                         w=w,
                         wdot=wdot,
                         alpha=alpha,
-                        f0=f0,
+                        f0=f0_eval,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
                     if scale is not None:
@@ -1489,14 +1550,14 @@ def _per_ur_loss_map_vpinn(
 
                 per_roll = None
                 if rollout_force_steps > 0:
-                    steps_k = min(int(rollout_force_steps), int(M1) - 1)
+                    steps_k = min(int(rollout_force_steps), int(M1_target) - 1)
                     if steps_k > 0:
-                        f0_step = f0[:, 0, :] if f0 is not None else None
+                        f0_step = f0_eval[:, 0, :] if f0_eval is not None else None
                         _x_seq, _v_seq, f_seq = rollout_rk4(
                             model=model,
-                            x0=x_win[:, 0, :],
-                            v0=v_win[:, 0, :],
-                            ur0=ur_win[:, 0, :],
+                            x0=x_eval[:, 0, :],
+                            v0=v_eval[:, 0, :],
+                            ur0=ur_eval[:, 0, :],
                             steps=steps_k,
                             dt=dt,
                             m=m,
@@ -1505,12 +1566,12 @@ def _per_ur_loss_map_vpinn(
                             f0=f0_step,
                         )
                         f_roll = f_seq[:, : steps_k + 1, :]
-                        f_true = f_meas[:, : steps_k + 1, :]
+                        f_true = f_eval[:, : steps_k + 1, :]
                         per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
                         if scale is not None:
                             per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
 
-            ur_vals = ur_win[:, 0, 0].detach().cpu().numpy()
+            ur_vals = ur_eval[:, 0, 0].detach().cpu().numpy()
             per_loss_f_vals = per_loss_f.detach().cpu().numpy()
             per_loss_w_vals = per_loss_w.detach().cpu().numpy()
             for i, u in enumerate(ur_vals):
@@ -1618,7 +1679,7 @@ def _log_rollout_validation(
             writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
 
     with torch.no_grad():
-        f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
+        f_on_data = _vpinn_force_on_trajectory(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
     if f0_true_t is not None:
         f0_np = f0_true_t[:, 0].detach().cpu().numpy()
         f_on_data_force = f_on_data * f0_np
@@ -1884,15 +1945,28 @@ def train(config: Config, config_name: str) -> None:
                 eps=per_traj_norm_eps,
             )
 
+    history_context = _tcn_history_len(model) if _is_tcn_force_model(model) else 0
+    if history_context > 0:
+        print(
+            f"VPINN TCN context enabled: each loaded window has M+T+1 samples "
+            f"(M={window_M}, T={history_context})."
+        )
     return_scale = per_traj_norm != "none"
     train_dataset = WindowDataset(
         train_trajs,
         window_intervals=window_M,
         stride=stride,
+        history_context=history_context,
         return_scale=return_scale,
     )
     val_dataset = (
-        WindowDataset(val_trajs, window_intervals=window_M, stride=stride, return_scale=return_scale)
+        WindowDataset(
+            val_trajs,
+            window_intervals=window_M,
+            stride=stride,
+            history_context=history_context,
+            return_scale=return_scale,
+        )
         if val_trajs
         else None
     )
@@ -1999,19 +2073,30 @@ def train(config: Config, config_name: str) -> None:
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
-            B, M1, d = x_win.shape
+            M1_target = int(window_M) + 1
+            if int(x_win.shape[1]) < M1_target:
+                raise ValueError(
+                    f"Window length {int(x_win.shape[1])} is shorter than target length {M1_target}."
+                )
+            start_idx = int(x_win.shape[1]) - M1_target
+            x_eval = x_win[:, start_idx:, :]
+            v_eval = v_win[:, start_idx:, :]
+            f_eval = f_meas[:, start_idx:, :]
+            ur_eval = ur_win[:, start_idx:, :]
+            f0_eval = f0[:, start_idx:, :] if f0 is not None else None
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 f_pred = _vpinn_force_sequence(model, x_win, v_win, ur_win)
-                per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
+                f_pred_eval = f_pred[:, start_idx:, :]
+                per_loss_f = torch.mean((f_pred_eval - f_eval) ** 2, dim=(1, 2))
                 if scale is not None:
                     per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
                     R = _weak_residual(
-                        x=x_win,
-                        v=v_win,
-                        f_pred=f_pred,
+                        x=x_eval,
+                        v=v_eval,
+                        f_pred=f_pred_eval,
                         m=m,
                         c=c,
                         k=k,
@@ -2019,7 +2104,7 @@ def train(config: Config, config_name: str) -> None:
                         w=w,
                         wdot=wdot,
                         alpha=alpha,
-                        f0=f0,
+                        f0=f0_eval,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
                     if scale is not None:
@@ -2032,14 +2117,14 @@ def train(config: Config, config_name: str) -> None:
                 roll_computed = False
                 if rollout_force_weight > 0.0 and rollout_force_steps > 0:
                     if (step % max(1, int(rollout_force_every))) == 0:
-                        steps_k = min(int(rollout_force_steps), int(M1) - 1)
+                        steps_k = min(int(rollout_force_steps), int(M1_target) - 1)
                         if steps_k > 0:
-                            f0_step = f0[:, 0, :] if f0 is not None else None
+                            f0_step = f0_eval[:, 0, :] if f0_eval is not None else None
                             _x_seq, _v_seq, f_seq = rollout_rk4(
                                 model=model,
-                                x0=x_win[:, 0, :],
-                                v0=v_win[:, 0, :],
-                                ur0=ur_win[:, 0, :],
+                                x0=x_eval[:, 0, :],
+                                v0=v_eval[:, 0, :],
+                                ur0=ur_eval[:, 0, :],
                                 steps=steps_k,
                                 dt=dt,
                                 m=m,
@@ -2048,7 +2133,7 @@ def train(config: Config, config_name: str) -> None:
                                 f0=f0_step,
                             )
                             f_roll = f_seq[:, : steps_k + 1, :]
-                            f_true = f_meas[:, : steps_k + 1, :]
+                            f_true = f_eval[:, : steps_k + 1, :]
                             per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
                             if scale is not None:
                                 per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))

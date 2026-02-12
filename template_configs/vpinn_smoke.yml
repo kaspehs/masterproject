@@ -43,7 +43,8 @@ architecture:
     kernel_size: 3
     dropout: 0.0
     activation: gelu
-    # Defaults to vpinn.window_M + 1 if omitted.
+    # Number of previous timesteps used as left context.
+    # Defaults to vpinn.window_M if omitted.
     history_len: 64
   pirate_force_kwargs:
     depth: 2

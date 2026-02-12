@@ -206,7 +206,7 @@ def _build_vpinn_force_model(cfg: object, *, input_dim: int, output_dim: int) ->
         return torch.nn.Sequential(*modules)
     if net_type == "tcn":
         cfg_tcn = dict(getattr(arch, "tcn_kwargs", {}) or {})
-        default_history = int(vp.get("window_M", 50)) + 1
+        default_history = int(vp.get("window_M", 50))
         return TemporalConvForceNet(
             input_size=int(input_dim),
             output_size=int(output_dim),
@@ -481,7 +481,8 @@ def _eval_vpinn_rollout_nrmse_batch(
 
     use_tcn = bool(getattr(force_model, "is_tcn_force_model", False))
     if use_tcn:
-        hist_len = max(1, int(getattr(force_model, "history_len", 1)))
+        context = max(0, int(getattr(force_model, "history_len", 0)))
+        hist_len = context + 1
         x_hist = x.unsqueeze(1).unsqueeze(-1).repeat(1, hist_len, 1)
         v_hist = v.unsqueeze(1).unsqueeze(-1).repeat(1, hist_len, 1)
         ur_hist = ur.unsqueeze(1).unsqueeze(-1).repeat(1, hist_len, 1)
