@@ -23,13 +23,20 @@ DEFAULT_METRICS = (
 )
 
 # Configuration: edit these values directly instead of passing CLI args.
-LOG_ROOTS = [Path("logs/phnn_Ur1")]
+LOG_ROOTS = [Path("logs/phnn_Ur1"), Path("logs/vpinn_Ur1")]
 OUTPUT_DIR = Path("figs/loo_ur")
 UNSEEN_UR_TOL = 1e-6
 METRICS_TO_PLOT = list(DEFAULT_METRICS)
 USE_LOG_HEATMAP = True
 USE_LOG_UNSEEN_Y = True
 LOG_EPS = 1e-12
+# Optional shared heatmap color limits across all figures.
+# Set to None for auto-scaling.
+HEATMAP_VMIN: float | None = None
+HEATMAP_VMAX: float | None = 1.0
+# Optional per-metric overrides (highest priority).
+HEATMAP_VMIN_BY_METRIC: dict[str, float] = {}
+HEATMAP_VMAX_BY_METRIC: dict[str, float] = {}
 
 BY_UR_TAG_RE = re.compile(r"^final_val/by_ur/(?P<metric>.+)/U_r=(?P<ur>[-+0-9.eE]+)$")
 
@@ -225,15 +232,36 @@ def _plot_heatmap(
     fig, ax = plt.subplots(figsize=(7, 5))
     mat_plot = mat.copy()
     norm = None
+    vmin_cfg = HEATMAP_VMIN_BY_METRIC.get(metric, HEATMAP_VMIN)
+    vmax_cfg = HEATMAP_VMAX_BY_METRIC.get(metric, HEATMAP_VMAX)
     if USE_LOG_HEATMAP:
         finite_pos = mat_plot[np.isfinite(mat_plot) & (mat_plot > 0.0)]
         if finite_pos.size > 0:
-            vmin = max(float(np.min(finite_pos)), float(LOG_EPS))
-            vmax = float(np.max(finite_pos))
+            vmin_auto = max(float(np.min(finite_pos)), float(LOG_EPS))
+            vmax_auto = float(np.max(finite_pos))
+            vmin = vmin_auto if vmin_cfg is None else max(float(vmin_cfg), float(LOG_EPS))
+            vmax = vmax_auto if vmax_cfg is None else float(vmax_cfg)
+            if vmax <= 0.0:
+                raise ValueError("Heatmap vmax must be > 0 when USE_LOG_HEATMAP=True.")
+            if vmax < vmin:
+                raise ValueError(
+                    f"Heatmap limits invalid for metric '{metric}': vmax ({vmax}) < vmin ({vmin})."
+                )
             mat_plot = np.where(mat_plot > 0.0, mat_plot, np.nan)
-            if vmax > vmin:
-                norm = LogNorm(vmin=vmin, vmax=vmax)
-    im = ax.imshow(mat_plot, aspect="auto", interpolation="nearest", norm=norm)
+            norm = LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        if vmin_cfg is not None and vmax_cfg is not None and float(vmax_cfg) < float(vmin_cfg):
+            raise ValueError(
+                f"Heatmap limits invalid for metric '{metric}': vmax ({vmax_cfg}) < vmin ({vmin_cfg})."
+            )
+    im = ax.imshow(
+        mat_plot,
+        aspect="auto",
+        interpolation="nearest",
+        norm=norm,
+        vmin=None if norm is not None else vmin_cfg,
+        vmax=None if norm is not None else vmax_cfg,
+    )
     fig.colorbar(im, ax=ax, label=metric)
     ax.set_xticks(np.arange(len(eval_vals)))
     ax.set_xticklabels([f"{u:g}" for u in eval_vals], rotation=45, ha="right")

@@ -96,6 +96,10 @@ monitoring:
   async_validation_max_concurrent: 6
   async_validation_do_losses: true
   async_validation_do_rollout: true
+  # If true and exactly one train_exclude_ur is configured, validation rollout
+  # targets that excluded U_r from the validation set (if available).
+  rollout_use_excluded_ur: false
+  rollout_target_ur_tol: 1e-6
 
 vpinn:
   # Loss toggles

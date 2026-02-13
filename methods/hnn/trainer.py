@@ -5,6 +5,7 @@ import os
 import time
 import subprocess
 import sys
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -256,6 +257,8 @@ def _validate_if_needed(
     val_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None,
     val_loader: Any | None,
     cycle_validation_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
     m_eff: float,
     dt: float,
     t: np.ndarray,
@@ -346,11 +349,36 @@ def _validate_if_needed(
         if count > 0:
             for name, total in metrics_sum.items():
                 writer.add_scalar(f"val/{name}", total / float(count), epoch + 1)
+        selected_indices: list[int] | None = None
+        if rollout_target_ur is not None:
+            matches: list[int] = []
+            for idx, series_raw in enumerate(val_series_raw):
+                ur_arr = np.asarray(series_raw[5]).reshape(-1)
+                if ur_arr.size == 0:
+                    continue
+                ur_val = float(ur_arr[0])
+                if np.isclose(
+                    ur_val,
+                    float(rollout_target_ur),
+                    rtol=0.0,
+                    atol=float(rollout_target_ur_tol),
+                ):
+                    matches.append(idx)
+            if matches:
+                selected_indices = matches
+            else:
+                warnings.warn(
+                    "monitoring.rollout_use_excluded_ur is enabled but no validation rollout "
+                    f"trajectory matched U_r={float(rollout_target_ur):.6g} "
+                    f"(tol={float(rollout_target_ur_tol):.3g}); falling back to default rollout selection."
+                )
+        if selected_indices is None:
+            selected_indices = list(range(len(val_series_raw)))
         if cycle_validation_rollout:
             step = max(0, (epoch + 1) // max(1, int(rollout_every_epochs)) - 1)
-            rollout_idx = step % len(val_series_raw)
+            rollout_idx = selected_indices[step % len(selected_indices)]
         else:
-            rollout_idx = 0
+            rollout_idx = selected_indices[0]
         series_raw = val_series_raw[rollout_idx]
         sequence = val_sequences[rollout_idx]
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
@@ -498,6 +526,8 @@ def _launch_async_validation(
     async_num_threads: int,
     rollout_every_epochs: int,
     cycle_validation_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
 ) -> list[subprocess.Popen]:
@@ -529,11 +559,15 @@ def _launch_async_validation(
         str(int(rollout_every_epochs)),
         "--cycle-rollout",
         "1" if cycle_validation_rollout else "0",
+        "--rollout-target-ur-tol",
+        str(float(rollout_target_ur_tol)),
         "--do-losses",
         "1" if do_losses else "0",
         "--do-rollout",
         "1" if do_rollout else "0",
     ]
+    if rollout_target_ur is not None:
+        args.extend(["--rollout-target-ur", str(float(rollout_target_ur))])
     processes.append(subprocess.Popen(args, env=env))
     return processes
 
@@ -844,6 +878,8 @@ def train(config: Config, config_name: str) -> None:
 
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
+    rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
@@ -856,6 +892,15 @@ def train(config: Config, config_name: str) -> None:
     async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
     async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
     async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
+    rollout_target_ur: float | None = None
+    if rollout_use_excluded_ur:
+        if train_exclude_ur is not None and len(train_exclude_ur) == 1:
+            rollout_target_ur = float(train_exclude_ur[0])
+        else:
+            warnings.warn(
+                "monitoring.rollout_use_excluded_ur is enabled, but hnn.train_exclude_ur "
+                "must contain exactly one value. Falling back to default rollout selection."
+            )
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
     print(f"Using device: {device}")
@@ -1086,6 +1131,8 @@ def train(config: Config, config_name: str) -> None:
                 async_num_threads=async_num_threads,
                 rollout_every_epochs=rollout_every_epochs,
                 cycle_validation_rollout=cycle_validation_rollout,
+                rollout_target_ur=rollout_target_ur,
+                rollout_target_ur_tol=rollout_target_ur_tol,
                 do_losses=async_do_losses,
                 do_rollout=async_do_rollout,
             )
@@ -1102,6 +1149,8 @@ def train(config: Config, config_name: str) -> None:
                 val_sequences=val_sequences,
                 val_loader=val_loader,
                 cycle_validation_rollout=cycle_validation_rollout,
+                rollout_target_ur=rollout_target_ur,
+                rollout_target_ur_tol=rollout_target_ur_tol,
                 m_eff=m_eff,
                 dt=dt,
                 t=t,

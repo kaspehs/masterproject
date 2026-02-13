@@ -101,6 +101,10 @@ monitoring:
   validate_every_epochs: 20
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
+  # If true and exactly one train_exclude_ur is configured, validation rollout
+  # will target that excluded U_r.
+  rollout_use_excluded_ur: false
+  rollout_target_ur_tol: 1e-6
   final_rollout_all_validation: true
   log_every_epochs: 10
   print_every_epochs: 50

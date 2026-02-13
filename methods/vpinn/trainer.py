@@ -375,6 +375,8 @@ def _launch_async_validation(
     async_num_threads: int,
     rollout_every_epochs: int,
     cycle_validation_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
 ) -> list[subprocess.Popen]:
@@ -406,11 +408,15 @@ def _launch_async_validation(
         str(int(rollout_every_epochs)),
         "--cycle-rollout",
         "1" if cycle_validation_rollout else "0",
+        "--rollout-target-ur-tol",
+        str(float(rollout_target_ur_tol)),
         "--do-losses",
         "1" if do_losses else "0",
         "--do-rollout",
         "1" if do_rollout else "0",
     ]
+    if rollout_target_ur is not None:
+        args.extend(["--rollout-target-ur", str(float(rollout_target_ur))])
     processes.append(subprocess.Popen(args, env=env))
     return processes
 
@@ -1810,6 +1816,8 @@ def train(config: Config, config_name: str) -> None:
     rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
     rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
+    rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
@@ -1818,6 +1826,16 @@ def train(config: Config, config_name: str) -> None:
     async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
     async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
     async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
+    rollout_target_ur: float | None = None
+    if rollout_use_excluded_ur:
+        excluded_arr = _normalize_ur_filter(vp.get("train_exclude_ur"), key="vpinn.train_exclude_ur")
+        if excluded_arr is not None and excluded_arr.size == 1:
+            rollout_target_ur = float(excluded_arr[0])
+        else:
+            warnings.warn(
+                "monitoring.rollout_use_excluded_ur is enabled, but vpinn.train_exclude_ur "
+                "must contain exactly one value. Falling back to default rollout selection."
+            )
 
     writer, run_name = setup_writer(
         config.logging.run_dir_root,
@@ -2073,6 +2091,8 @@ def train(config: Config, config_name: str) -> None:
                 async_num_threads=async_num_threads,
                 rollout_every_epochs=rollout_every,
                 cycle_validation_rollout=cycle_validation_rollout,
+                rollout_target_ur=rollout_target_ur,
+                rollout_target_ur_tol=rollout_target_ur_tol,
                 do_losses=async_do_losses and should_validate,
                 do_rollout=async_do_rollout and should_rollout,
             )
@@ -2138,11 +2158,33 @@ def train(config: Config, config_name: str) -> None:
             candidates = val_trajs if val_trajs else train_trajs
             if not candidates:
                 continue
+            selected_indices: list[int] | None = None
+            if rollout_target_ur is not None:
+                matches: list[int] = []
+                for idx, traj in enumerate(candidates):
+                    ur_val = float(traj["ur"][0, 0].detach().cpu().item())
+                    if np.isclose(
+                        ur_val,
+                        float(rollout_target_ur),
+                        rtol=0.0,
+                        atol=float(rollout_target_ur_tol),
+                    ):
+                        matches.append(idx)
+                if matches:
+                    selected_indices = matches
+                else:
+                    warnings.warn(
+                        "monitoring.rollout_use_excluded_ur is enabled but no validation rollout "
+                        f"trajectory matched U_r={float(rollout_target_ur):.6g} "
+                        f"(tol={float(rollout_target_ur_tol):.3g}); falling back to default rollout selection."
+                    )
+            if selected_indices is None:
+                selected_indices = list(range(len(candidates)))
             if cycle_validation_rollout:
                 step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
-                rollout_idx = step % len(candidates)
+                rollout_idx = selected_indices[step % len(selected_indices)]
             else:
-                rollout_idx = 0
+                rollout_idx = selected_indices[0]
             for traj in candidates[rollout_idx : rollout_idx + 1]:
                 _log_rollout_validation(
                     writer=writer,

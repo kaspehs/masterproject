@@ -61,13 +61,31 @@ def _set_threading(num_threads: int) -> None:
     torch.set_num_interop_threads(max(1, min(4, num_threads)))
 
 
-def _rollout_index(epoch: int, rollout_every: int, num_series: int, cycle: bool) -> int:
+def _rollout_index(
+    epoch: int,
+    rollout_every: int,
+    num_series: int,
+    cycle: bool,
+    *,
+    ur_values: list[float] | None = None,
+    target_ur: float | None = None,
+    target_ur_tol: float = 1e-6,
+) -> int:
     if num_series <= 0:
         return 0
+    selected = list(range(num_series))
+    if target_ur is not None and ur_values is not None and len(ur_values) == num_series:
+        matched = [
+            idx
+            for idx, ur_val in enumerate(ur_values)
+            if np.isclose(float(ur_val), float(target_ur), rtol=0.0, atol=float(target_ur_tol))
+        ]
+        if matched:
+            selected = matched
     if not cycle:
-        return 0
+        return int(selected[0])
     step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
-    return int(step % num_series)
+    return int(selected[step % len(selected)])
 
 
 def _load_checkpoint(path: Path) -> tuple[dict[str, Any], Any, str]:
@@ -95,6 +113,8 @@ def _run_hnn_validation(
     epoch: int,
     rollout_every: int,
     cycle_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
@@ -282,7 +302,16 @@ def _run_hnn_validation(
                 title=f"{FORCE_ROLLOUT_NRMSE_KEY} vs U_r",
             )
 
-        rollout_idx = _rollout_index(epoch, rollout_every, len(val_series_raw), cycle_rollout)
+        ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
+        rollout_idx = _rollout_index(
+            epoch,
+            rollout_every,
+            len(val_series_raw),
+            cycle_rollout,
+            ur_values=ur_values,
+            target_ur=rollout_target_ur,
+            target_ur_tol=rollout_target_ur_tol,
+        )
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[rollout_idx]
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[rollout_idx]
         log_validation_epoch(
@@ -343,6 +372,8 @@ def _run_vpinn_validation(
     epoch: int,
     rollout_every: int,
     cycle_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
@@ -542,7 +573,16 @@ def _run_vpinn_validation(
         )
 
     if do_rollout:
-        rollout_idx = _rollout_index(epoch, rollout_every, len(val_trajs), cycle_rollout)
+        ur_values = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
+        rollout_idx = _rollout_index(
+            epoch,
+            rollout_every,
+            len(val_trajs),
+            cycle_rollout,
+            ur_values=ur_values,
+            target_ur=rollout_target_ur,
+            target_ur_tol=rollout_target_ur_tol,
+        )
         _log_rollout_validation(
             writer=writer,
             epoch=epoch,
@@ -920,6 +960,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--rollout-every", type=int, default=1)
     parser.add_argument("--cycle-rollout", type=int, default=0)
+    parser.add_argument("--rollout-target-ur", type=float, default=None)
+    parser.add_argument("--rollout-target-ur-tol", type=float, default=1e-6)
     parser.add_argument("--do-losses", type=int, default=1)
     parser.add_argument("--do-rollout", type=int, default=1)
     args = parser.parse_args()
@@ -940,6 +982,8 @@ def main() -> None:
                 epoch=int(args.epoch),
                 rollout_every=int(args.rollout_every),
                 cycle_rollout=bool(int(args.cycle_rollout)),
+                rollout_target_ur=args.rollout_target_ur,
+                rollout_target_ur_tol=float(args.rollout_target_ur_tol),
                 do_losses=bool(int(args.do_losses)),
                 do_rollout=bool(int(args.do_rollout)),
                 num_workers=int(args.num_workers),
@@ -953,6 +997,8 @@ def main() -> None:
                 epoch=int(args.epoch),
                 rollout_every=int(args.rollout_every),
                 cycle_rollout=bool(int(args.cycle_rollout)),
+                rollout_target_ur=args.rollout_target_ur,
+                rollout_target_ur_tol=float(args.rollout_target_ur_tol),
                 do_losses=bool(int(args.do_losses)),
                 do_rollout=bool(int(args.do_rollout)),
                 num_workers=int(args.num_workers),

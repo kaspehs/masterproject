@@ -151,6 +151,8 @@ class MonitoringConfig:
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
     cycle_validation_rollout: bool = False
+    rollout_use_excluded_ur: bool = False
+    rollout_target_ur_tol: float = 1e-6
     final_rollout_all_validation: bool = False
     async_validation: bool = False
     async_validation_device: str = "cpu"
@@ -278,6 +280,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "print_every_epochs",
         "log_component_grad_norms",
         "log_extra_validation_metrics",
+        "rollout_use_excluded_ur",
+        "rollout_target_ur_tol",
     }
 
     for key, value in legacy_training.items():
