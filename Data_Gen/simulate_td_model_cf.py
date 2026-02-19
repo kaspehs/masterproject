@@ -191,7 +191,7 @@ def simulate_td_model_cf(
     Fca = Fca[1:-1]
 
     H = 0.5 * K * y**2 + 0.5 * (M + D**2 / 4.0 * rho * np.pi * Ca) * dy**2
-    F_total = Fcv + Fdy
+    F_total = Fcv + Fdy + Fca
 
     if output_path is not None:
         output_path = Path(output_path)

@@ -43,6 +43,28 @@ from HNN_helper import (
 )
 
 
+def _odd_symmetry_penalty_per_sample(
+    *,
+    model: torch.nn.Module,
+    z: torch.Tensor,
+    ur: torch.Tensor,
+    norm: str,
+) -> torch.Tensor:
+    z_flip = -z
+    if getattr(model, "force_output", "force") == "coefficient":
+        f_pos = model.u_theta_coeff(z, reduced_velocity=ur)
+        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur)
+    else:
+        f_pos = model.u_theta(z, reduced_velocity=ur)
+        f_neg = model.u_theta(z_flip, reduced_velocity=ur)
+    sym_residual = f_pos + f_neg
+    if sym_residual.ndim == 1:
+        sym_residual = sym_residual.unsqueeze(-1)
+    if norm == "l1":
+        return torch.mean(torch.abs(sym_residual), dim=1)
+    return torch.mean(sym_residual * sym_residual, dim=1)
+
+
 def _train_one_epoch(
     *,
     model: torch.nn.Module,
@@ -61,12 +83,15 @@ def _train_one_epoch(
     log_component_grad_norms: bool,
     per_traj_norm_eps: float,
     force_reg_on_coeff: bool,
+    symmetry_weight: float,
+    symmetry_norm: str,
 ) -> dict[str, float]:
     batch_count = 0
     loss_sum = torch.zeros((), device=device)
     res_loss_sum = torch.zeros((), device=device)
     force_loss_sum = torch.zeros((), device=device)
     force_data_loss_sum = torch.zeros((), device=device)
+    sym_loss_sum = torch.zeros((), device=device)
     grad_norm_sum = torch.zeros((), device=device)
     avg_force_sum = torch.zeros((), device=device)
     res_grad_component_sum = torch.zeros((), device=device)
@@ -144,6 +169,23 @@ def _train_one_epoch(
                 data_force_loss = torch.mean(per_data)
             else:
                 data_force_loss = res_loss.new_tensor(0.0)
+                z_mid = 0.5 * (z_i + z_next)
+
+            if float(symmetry_weight) > 0.0:
+                per_sym = _odd_symmetry_penalty_per_sample(
+                    model=model,
+                    z=z_mid,
+                    ur=ur_i,
+                    norm=symmetry_norm,
+                )
+                if scale is not None:
+                    if symmetry_norm == "l1":
+                        per_sym = per_sym / (scale + float(per_traj_norm_eps))
+                    else:
+                        per_sym = per_sym / (scale * scale + float(per_traj_norm_eps))
+                sym_loss = torch.mean(per_sym)
+            else:
+                sym_loss = res_loss.new_tensor(0.0)
 
             if gradnorm_balancer is not None:
                 weights = gradnorm_balancer.update(
@@ -175,7 +217,8 @@ def _train_one_epoch(
             force_loss = float(force_reg) * base_force_loss
             weighted_force = float(force_reg) * gradnorm_weighted_force
             weighted_data = float(force_data_weight) * gradnorm_weighted_data
-            loss = (gradnorm_weighted_res + weighted_force + weighted_data).float()
+            weighted_sym = float(symmetry_weight) * sym_loss
+            loss = (gradnorm_weighted_res + weighted_force + weighted_data + weighted_sym).float()
 
         if log_component_grad_norms and scaler.is_enabled():
             raise ValueError(
@@ -217,6 +260,7 @@ def _train_one_epoch(
         # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
         force_loss_sum = force_loss_sum + base_force_loss.detach().float()
         force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
+        sym_loss_sum = sym_loss_sum + sym_loss.detach().float()
         avg_force_sum = avg_force_sum + avg_force.detach().float()
 
     denom = float(max(batch_count, 1))
@@ -225,6 +269,7 @@ def _train_one_epoch(
         "mean_res_loss": float((res_loss_sum / denom).detach().cpu()),
         "mean_force_loss": float((force_loss_sum / denom).detach().cpu()),
         "mean_force_data_loss": float((force_data_loss_sum / denom).detach().cpu()),
+        "mean_sym_loss": float((sym_loss_sum / denom).detach().cpu()),
         "mean_grad_norm": float((grad_norm_sum / denom).detach().cpu()),
         "mean_force": float((avg_force_sum / denom).detach().cpu()),
         "mean_res_grad_component": float((res_grad_component_sum / denom).detach().cpu()),
@@ -274,6 +319,8 @@ def _validate_if_needed(
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
+    symmetry_weight: float,
+    symmetry_norm: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float,
@@ -292,6 +339,8 @@ def _validate_if_needed(
             force_reg=force_reg,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
+            symmetry_weight=symmetry_weight,
+            symmetry_norm=symmetry_norm,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             per_traj_norm_eps=per_traj_norm_eps,
@@ -307,6 +356,8 @@ def _validate_if_needed(
             force_reg=force_reg,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
+            symmetry_weight=symmetry_weight,
+            symmetry_norm=symmetry_norm,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             per_traj_norm_eps=per_traj_norm_eps,
@@ -581,6 +632,8 @@ def _evaluate_val_losses(
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
+    symmetry_weight: float,
+    symmetry_norm: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float,
@@ -593,6 +646,7 @@ def _evaluate_val_losses(
     res_sum = torch.zeros((), device=device)
     force_sum = torch.zeros((), device=device)
     data_sum = torch.zeros((), device=device)
+    sym_sum = torch.zeros((), device=device)
     batches = 0
     with torch.no_grad():
         for batch in loader:
@@ -660,13 +714,35 @@ def _evaluate_val_losses(
                     data_force_loss = torch.mean(per_data)
                 else:
                     data_force_loss = res_loss.new_tensor(0.0)
-                total = res_loss + force_loss + float(force_data_weight) * data_force_loss
+                    z_mid = 0.5 * (z_i + z_next)
+                if float(symmetry_weight) > 0.0:
+                    per_sym = _odd_symmetry_penalty_per_sample(
+                        model=model,
+                        z=z_mid,
+                        ur=ur_i,
+                        norm=symmetry_norm,
+                    )
+                    if scale is not None:
+                        if symmetry_norm == "l1":
+                            per_sym = per_sym / (scale + float(per_traj_norm_eps))
+                        else:
+                            per_sym = per_sym / (scale * scale + float(per_traj_norm_eps))
+                    sym_loss = torch.mean(per_sym)
+                else:
+                    sym_loss = res_loss.new_tensor(0.0)
+                total = (
+                    res_loss
+                    + force_loss
+                    + float(force_data_weight) * data_force_loss
+                    + float(symmetry_weight) * sym_loss
+                )
 
             loss_sum = loss_sum + total.detach().float()
             res_sum = res_sum + res_loss.detach().float()
             # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
             force_sum = force_sum + avg_force.detach().float()
             data_sum = data_sum + data_force_loss.detach().float()
+            sym_sum = sym_sum + sym_loss.detach().float()
             batches += 1
 
     if was_training:
@@ -677,6 +753,7 @@ def _evaluate_val_losses(
         "loss_physics": float((res_sum / denom).detach().cpu()),
         "loss_reg": float((force_sum / denom).detach().cpu()),
         "loss_data": float((data_sum / denom).detach().cpu()),
+        "loss_sym": float((sym_sum / denom).detach().cpu()),
     }
 
 
@@ -689,6 +766,8 @@ def _per_ur_loss_map_hnn(
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
+    symmetry_weight: float,
+    symmetry_norm: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     per_traj_norm_eps: float,
@@ -701,6 +780,7 @@ def _per_ur_loss_map_hnn(
         "loss_physics": {},
         "loss_reg": {},
         "loss_data": {},
+        "loss_sym": {},
     }
     with torch.no_grad():
         for batch in loader:
@@ -759,16 +839,35 @@ def _per_ur_loss_map_hnn(
                     per_data = float(force_data_weight) * per_data
                 else:
                     per_data = per_res.new_zeros(per_res.shape)
+                    z_mid = 0.5 * (z_i + z_next)
+                if float(symmetry_weight) > 0.0:
+                    per_sym = _odd_symmetry_penalty_per_sample(
+                        model=model,
+                        z=z_mid,
+                        ur=ur_i,
+                        norm=symmetry_norm,
+                    )
+                    if scale is not None:
+                        if symmetry_norm == "l1":
+                            per_sym = per_sym / (scale + float(per_traj_norm_eps))
+                        else:
+                            per_sym = per_sym / (scale * scale + float(per_traj_norm_eps))
+                else:
+                    per_sym = per_res.new_zeros(per_res.shape)
 
             ur_vals = ur_i.detach().cpu().view(-1).numpy()
             per_res_vals = per_res.detach().cpu().view(-1).numpy()
             per_reg_vals = per_force.detach().cpu().view(-1).numpy()
             per_data_vals = per_data.detach().cpu().view(-1).numpy()
-            for u, res_v, reg_v, data_v in zip(ur_vals, per_res_vals, per_reg_vals, per_data_vals):
+            per_sym_vals = per_sym.detach().cpu().view(-1).numpy()
+            for u, res_v, reg_v, data_v, sym_v in zip(
+                ur_vals, per_res_vals, per_reg_vals, per_data_vals, per_sym_vals
+            ):
                 key = float(np.round(u, 6))
                 buckets["loss_physics"].setdefault(key, []).append(float(res_v))
                 buckets["loss_reg"].setdefault(key, []).append(float(reg_v))
                 buckets["loss_data"].setdefault(key, []).append(float(data_v))
+                buckets["loss_sym"].setdefault(key, []).append(float(sym_v))
 
     out: dict[str, dict[float, float]] = {}
     for name, by_ur in buckets.items():
@@ -875,6 +974,10 @@ def train(config: Config, config_name: str) -> None:
     force_reg_on_coeff = bool(getattr(loss_cfg, "force_reg_on_coeff", False))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+    symmetry_weight = float(getattr(loss_cfg, "symmetry_weight", 0.0))
+    symmetry_norm = str(getattr(loss_cfg, "symmetry_norm", "l2")).strip().lower()
+    if symmetry_norm not in {"l1", "l2"}:
+        raise ValueError("loss.symmetry_norm must be one of: l1, l2.")
 
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
@@ -1055,12 +1158,15 @@ def train(config: Config, config_name: str) -> None:
             log_component_grad_norms=log_component_grad_norms,
             per_traj_norm_eps=per_traj_norm_eps,
             force_reg_on_coeff=force_reg_on_coeff,
+            symmetry_weight=symmetry_weight,
+            symmetry_norm=symmetry_norm,
         )
 
         mean_loss = epoch_metrics["mean_loss"]
         mean_res_loss = epoch_metrics["mean_res_loss"]
         mean_force_loss = epoch_metrics["mean_force_loss"]
         mean_force_data_loss = epoch_metrics["mean_force_data_loss"]
+        mean_sym_loss = epoch_metrics["mean_sym_loss"]
         mean_grad_norm = epoch_metrics["mean_grad_norm"]
         mean_force = epoch_metrics["mean_force"]
         mean_res_grad_component = epoch_metrics["mean_res_grad_component"]
@@ -1073,6 +1179,7 @@ def train(config: Config, config_name: str) -> None:
             "loss_physics": mean_res_loss,
             "loss_reg": mean_force_loss,
             "loss_data": mean_force_data_loss,
+            "loss_sym": mean_sym_loss,
             "lr": current_lr,
             "grad_norm": mean_grad_norm,
             "avg_force": mean_force,
@@ -1095,10 +1202,13 @@ def train(config: Config, config_name: str) -> None:
             if use_force_data_loss:
                 print(
                     f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
-                    f"force={mean_force_loss:.4e}, data={mean_force_data_loss:.4e}"
+                    f"force={mean_force_loss:.4e}, data={mean_force_data_loss:.4e}, sym={mean_sym_loss:.4e}"
                 )
             else:
-                print(f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, force={mean_force_loss:.4e}")
+                print(
+                    f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
+                    f"force={mean_force_loss:.4e}, sym={mean_sym_loss:.4e}"
+                )
 
         should_validate = rollout_every_epochs > 0 and (
             (epoch + 1) % int(rollout_every_epochs) == 0 or epoch == (epochs - 1)
@@ -1166,6 +1276,8 @@ def train(config: Config, config_name: str) -> None:
                 force_reg=force_reg,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
+                symmetry_weight=symmetry_weight,
+                symmetry_norm=symmetry_norm,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 per_traj_norm_eps=per_traj_norm_eps,
@@ -1210,6 +1322,8 @@ def train(config: Config, config_name: str) -> None:
             force_reg=force_reg,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
+            symmetry_weight=symmetry_weight,
+            symmetry_norm=symmetry_norm,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             per_traj_norm_eps=per_traj_norm_eps,

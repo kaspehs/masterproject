@@ -124,6 +124,8 @@ class LossConfig:
     gradnorm_max_weight: float = 10.0
     use_force_data_loss: bool = False
     force_data_weight: float = 1.0
+    symmetry_weight: float = 0.0
+    symmetry_norm: str = "l2"  # "l2" (default) or "l1"
 
 @dataclass
 class RuntimeConfig:
@@ -267,6 +269,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "gradnorm_max_weight",
         "use_force_data_loss",
         "force_data_weight",
+        "symmetry_weight",
+        "symmetry_norm",
     }
     runtime_keys = {"device", "num_workers"}
     precision_keys = {"use_tf32", "use_amp", "amp_dtype"}

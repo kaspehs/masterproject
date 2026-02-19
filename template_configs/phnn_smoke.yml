@@ -78,6 +78,9 @@ loss:
   force_reg_on_coeff: true
   use_force_data_loss: false
   force_data_weight: 1.0
+  # Odd-symmetry regularization on force map: F(-z, U_r) ~= -F(z, U_r)
+  symmetry_weight: 0.0
+  symmetry_norm: l2
   use_gradnorm: false
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.2

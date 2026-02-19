@@ -432,7 +432,7 @@ def _m_eff_from_model_cfg(model_cfg: Any) -> float:
 
 def _read_timeseries_npz(
     path: Path,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
     with np.load(path) as data:
         ur_raw = data["U_r"] if "U_r" in data else None
         if "time" in data:
@@ -487,15 +487,25 @@ def _read_timeseries_npz(
         raise ValueError(f"{path} is missing reduced velocity 'U_r'.")
     ur_arr = np.asarray(ur_raw, dtype=float)
     if ur_arr.ndim == 0:
-        ur_val = float(ur_arr)
+        ur_series = np.full((t.size,), float(ur_arr), dtype=float)
     else:
         ur_flat = ur_arr.reshape(-1)
-        if ur_flat.shape[0] != t.size:
-            raise ValueError(f"{path} reduced velocity length must match time series length.")
-        ur_val = float(ur_flat[0])
-        if not np.allclose(ur_flat, ur_val, rtol=1e-6, atol=1e-9):
-            raise ValueError(f"{path} reduced velocity must be constant within a series.")
-    return t, x, f, v, ur_val
+        if ur_flat.size == 1:
+            ur_series = np.full((t.size,), float(ur_flat[0]), dtype=float)
+        elif ur_flat.shape[0] == t.size:
+            ur_series = ur_flat.astype(float, copy=False)
+        else:
+            raise ValueError(
+                f"{path} reduced velocity must be scalar or length-matched to time "
+                f"(got len={ur_flat.shape[0]}, expected {t.size})."
+            )
+    if not np.all(np.isfinite(ur_series)):
+        idx = np.arange(ur_series.size, dtype=float)
+        finite = np.isfinite(ur_series)
+        if not np.any(finite):
+            raise ValueError(f"{path} reduced velocity contains no finite values.")
+        ur_series = np.interp(idx, idx[finite], ur_series[finite])
+    return t, x, f, v, ur_series
 
 
 def _load_metadata_map(meta_path: Path) -> dict[str, float]:
@@ -545,12 +555,10 @@ def _read_reduced_velocity_from_npz(path: Path) -> float:
     if ur_arr.ndim == 0:
         return float(ur_arr)
     ur_flat = ur_arr.reshape(-1)
+    ur_flat = ur_flat[np.isfinite(ur_flat)]
     if ur_flat.size == 0:
-        raise ValueError(f"{path} has an empty reduced velocity array.")
-    ur_val = float(ur_flat[0])
-    if not np.allclose(ur_flat, ur_val, rtol=1e-6, atol=1e-9):
-        raise ValueError(f"{path} reduced velocity must be constant within a series.")
-    return ur_val
+        raise ValueError(f"{path} has an empty/non-finite reduced velocity array.")
+    return float(np.mean(ur_flat))
 
 
 def _filter_paths_by_ur(
@@ -626,12 +634,13 @@ def _maybe_reduce_time(
     x: np.ndarray,
     f: np.ndarray,
     v: Optional[np.ndarray],
+    ur: np.ndarray,
     *,
     enabled: bool,
     reduction_factor: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
     if not enabled:
-        return t, x, f, v
+        return t, x, f, v, ur
     rf_requested = max(1, int(reduction_factor))
     # Keep at least two samples after decimation whenever possible.
     rf = min(rf_requested, max(1, int(t.size) - 1))
@@ -644,9 +653,10 @@ def _maybe_reduce_time(
     x2 = x[::rf]
     f2 = f[::rf]
     v2 = v[::rf] if v is not None else None
+    ur2 = ur[::rf]
     if t2.size < 2:
         raise ValueError("reduce_time produced too few samples")
-    return t2, x2, f2, v2
+    return t2, x2, f2, v2, ur2
 
 
 def _load_trajectory(
@@ -663,12 +673,13 @@ def _load_trajectory(
     rho: float,
     D: float,
 ) -> tuple[dict[str, Any], float]:
-    t, x, f_meas, v_file, ur_val = _read_timeseries_npz(path)
-    t, x, f_meas, v_file = _maybe_reduce_time(
+    t, x, f_meas, v_file, ur_series = _read_timeseries_npz(path)
+    t, x, f_meas, v_file, ur_series = _maybe_reduce_time(
         t,
         x,
         f_meas,
         v_file,
+        ur_series,
         enabled=reduce_time,
         reduction_factor=reduction_factor,
     )
@@ -684,6 +695,7 @@ def _load_trajectory(
             v_file, t_vel = _resample_uniform_nd(t_in, v_file, float(dt_target))
             if not np.allclose(t, t_vel, rtol=1e-9, atol=1e-12):
                 raise ValueError(f"{path.name}: resampled v landed on different time grid")
+        ur_series = np.interp(t, t_in, ur_series)
         dt = float(dt_target)
 
     cut_start_seconds = max(0.0, float(cut_start_seconds))
@@ -693,6 +705,7 @@ def _load_trajectory(
         t = t[mask]
         x = x[mask]
         f_meas = f_meas[mask]
+        ur_series = ur_series[mask]
         if v_file is not None:
             v_file = v_file[mask]
         if t.size < 2:
@@ -734,7 +747,9 @@ def _load_trajectory(
             raise ValueError(f"Invalid F0 for '{path.name}': {f0_val}")
         f_meas = f_meas / float(f0_val)
 
-    ur_series = np.full((t.shape[0], 1), float(ur_val), dtype=np.float32)
+    if ur_series.shape[0] != t.shape[0]:
+        raise ValueError(f"{path.name}: U_r length {ur_series.shape[0]} does not match time {t.shape[0]}.")
+    ur_series = np.asarray(ur_series, dtype=np.float32).reshape(-1, 1)
     traj = {
         "name": path.name,
         "t": torch.from_numpy(t.astype(np.float32)),
