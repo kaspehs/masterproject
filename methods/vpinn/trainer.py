@@ -281,6 +281,24 @@ def _tcn_history_len(model: nn.Module) -> int:
     return max(0, int(getattr(base, "history_len", 0)))
 
 
+def _configured_validation_history_len(config: Config) -> int:
+    """
+    Resolve TCN history requirement from config (without constructing the model).
+    """
+    vp = dict(config.vpinn or {})
+    if not bool(vp.get("use_architecture_config", False)):
+        return 0
+    arch = getattr(config, "architecture", None)
+    if arch is None:
+        return 0
+    net_type = str(getattr(arch, "force_net_type", "residual")).strip().lower()
+    if net_type != "tcn":
+        return 0
+    cfg = dict(getattr(arch, "tcn_kwargs", {}) or {})
+    default_history = int(vp.get("window_M", 50))
+    return max(0, int(cfg.get("history_len", default_history)))
+
+
 def _vpinn_force_sequence(
     model: nn.Module,
     x: torch.Tensor,
@@ -381,9 +399,16 @@ def _force_mapping_nrmse_over_trajs(
             f0_true = traj.get("f0", None)
             if f0_true is not None:
                 f0_true = f0_true.to(device)
+            val_start_idx = max(0, int(traj.get("val_start_idx", 0)))
             if x_true.ndim != 2:
                 continue
+            if val_start_idx >= int(x_true.shape[0]):
+                continue
             f_pred = _vpinn_force_on_trajectory(model, x_true, v_true, ur_true)
+            f_pred = f_pred[val_start_idx:, :]
+            f_true = f_true[val_start_idx:, :]
+            if f0_true is not None:
+                f0_true = f0_true[val_start_idx:, :]
             if f_pred.ndim == 1:
                 f_pred = f_pred.unsqueeze(-1)
             if f_true.ndim == 1:
@@ -426,6 +451,9 @@ def rollout_rk4(
     c: torch.Tensor,
     k: torch.Tensor,
     f0: Optional[torch.Tensor] = None,
+    x_hist_init: Optional[torch.Tensor] = None,
+    v_hist_init: Optional[torch.Tensor] = None,
+    ur_hist_init: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Differentiable RK4 rollout of:
@@ -451,10 +479,31 @@ def rollout_rk4(
     if use_tcn:
         context = _tcn_history_len(model)
         hist_len = context + 1
-        # Start from a repeated first state; the history then becomes fully model-driven.
-        x_hist = x.unsqueeze(1).repeat(1, hist_len, 1)
-        v_hist = v.unsqueeze(1).repeat(1, hist_len, 1)
-        ur_hist = ur0.unsqueeze(1).repeat(1, hist_len, 1)
+        provided_history = any(t is not None for t in (x_hist_init, v_hist_init, ur_hist_init))
+        if provided_history and not all(t is not None for t in (x_hist_init, v_hist_init, ur_hist_init)):
+            raise ValueError("x_hist_init, v_hist_init, and ur_hist_init must be provided together.")
+        if provided_history:
+            x_hist = x_hist_init
+            v_hist = v_hist_init
+            ur_hist = ur_hist_init
+            assert x_hist is not None and v_hist is not None and ur_hist is not None
+            if x_hist.ndim != 3 or v_hist.ndim != 3 or ur_hist.ndim != 3:
+                raise ValueError("History tensors must have shape (B, T_hist, d).")
+            expected_shape = (B, hist_len, d)
+            if tuple(x_hist.shape) != expected_shape:
+                raise ValueError(f"x_hist_init must have shape {expected_shape}, got {tuple(x_hist.shape)}.")
+            if tuple(v_hist.shape) != expected_shape:
+                raise ValueError(f"v_hist_init must have shape {expected_shape}, got {tuple(v_hist.shape)}.")
+            if tuple(ur_hist.shape) != expected_shape:
+                raise ValueError(f"ur_hist_init must have shape {expected_shape}, got {tuple(ur_hist.shape)}.")
+            x_hist = x_hist.clone()
+            v_hist = v_hist.clone()
+            ur_hist = ur_hist.clone()
+        else:
+            # Fallback cold start from repeated initial state.
+            x_hist = x.unsqueeze(1).repeat(1, hist_len, 1)
+            v_hist = v.unsqueeze(1).repeat(1, hist_len, 1)
+            ur_hist = ur0.unsqueeze(1).repeat(1, hist_len, 1)
 
         def force_from_history(x_curr: torch.Tensor, v_curr: torch.Tensor) -> torch.Tensor:
             x_in = x_hist.clone()
@@ -813,6 +862,8 @@ def _load_trajectory(
     f0_lookup: Optional[dict[str, float]],
     rho: float,
     D: float,
+    preserve_prefix_for_history: bool = False,
+    min_history_context: int = 0,
 ) -> tuple[dict[str, Any], float]:
     t, x, f_meas, v_file, ur_val = _read_timeseries_npz(path)
     t, x, f_meas, v_file = _maybe_reduce_time(
@@ -838,14 +889,32 @@ def _load_trajectory(
         dt = float(dt_target)
 
     cut_start_seconds = max(0.0, float(cut_start_seconds))
-    if cut_start_seconds > 0.0:
-        t0 = float(t[0])
-        mask = t >= (t0 + cut_start_seconds)
-        t = t[mask]
-        x = x[mask]
-        f_meas = f_meas[mask]
-        if v_file is not None:
-            v_file = v_file[mask]
+    min_history_context = max(0, int(min_history_context))
+    t0 = float(t[0])
+    validation_start_idx = int(np.searchsorted(t, t0 + cut_start_seconds, side="left"))
+    if preserve_prefix_for_history:
+        if validation_start_idx < min_history_context:
+            available_s = float(validation_start_idx * dt)
+            needed_s = float(min_history_context * dt)
+            raise ValueError(
+                f"{path.name}: validation start at t={t0 + cut_start_seconds:.6g}s "
+                f"(index={validation_start_idx}) is too early for TCN history_len={min_history_context}. "
+                f"Need at least {needed_s:.6g}s ({min_history_context} samples) before validation start, "
+                f"but only {available_s:.6g}s are available."
+            )
+        if (int(t.shape[0]) - validation_start_idx) < 2:
+            raise ValueError(
+                f"{path.name}: too few validation samples remain after cut_start_seconds={cut_start_seconds}."
+            )
+    else:
+        if validation_start_idx > 0:
+            mask = np.arange(t.shape[0]) >= validation_start_idx
+            t = t[mask]
+            x = x[mask]
+            f_meas = f_meas[mask]
+            if v_file is not None:
+                v_file = v_file[mask]
+        validation_start_idx = 0
         if t.size < 2:
             raise ValueError(f"{path.name}: too few samples remain after cut_start_seconds={cut_start_seconds}.")
 
@@ -893,6 +962,8 @@ def _load_trajectory(
         "v": torch.from_numpy(np.asarray(v, dtype=np.float32)),
         "f": torch.from_numpy(f_meas.astype(np.float32)),
         "ur": torch.from_numpy(ur_series),
+        # First timestep included in validation targets (prefix before this can be used as TCN history).
+        "val_start_idx": int(validation_start_idx),
     }
     if f0_val is not None:
         f0_series = np.full((t.shape[0], 1), float(f0_val), dtype=np.float32)
@@ -970,9 +1041,12 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         for traj_id, traj in enumerate(self.trajectories):
             x = traj["x"]
             length = int(x.shape[0])
-            if length < self.window_total:
+            val_start_idx = max(0, int(traj.get("val_start_idx", 0)))
+            min_start = max(0, val_start_idx - self.context)
+            max_start = length - self.window_total
+            if max_start < min_start:
                 continue
-            start_idx = np.arange(0, length - self.window_total + 1, self.stride, dtype=np.int32)
+            start_idx = np.arange(min_start, max_start + 1, self.stride, dtype=np.int32)
             if start_idx.size == 0:
                 continue
             traj_ids.append(np.full_like(start_idx, traj_id, dtype=np.int32))
@@ -1087,6 +1161,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
                 f"exclude={vp.get('train_exclude_ur')}, "
                 f"series_dir='{getattr(data_cfg, 'train_series_dir', '')}'."
             )
+    val_history_context = _configured_validation_history_len(config)
 
     trajectories: list[dict[str, Any]] = []
     val_trajectories: list[dict[str, Any]] = []
@@ -1133,6 +1208,8 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            preserve_prefix_for_history=(val_history_context > 0),
+            min_history_context=val_history_context,
         )
         if dt_ref is None:
             dt_ref = dt
@@ -1619,7 +1696,8 @@ def _log_rollout_validation(
     f0_true_t = traj.get("f0", None)
     if f0_true_t is not None:
         f0_true_t = f0_true_t.to(device)
-    t_np = traj["t"].detach().cpu().numpy()
+    t_full = traj["t"].detach().cpu().numpy()
+    val_start_idx = max(0, int(traj.get("val_start_idx", 0)))
     if x_true_t.ndim != 2:
         return {}
     d = int(x_true_t.shape[-1])
@@ -1627,28 +1705,68 @@ def _log_rollout_validation(
         return {}
     if d > 1:
         print("vpinn rollout validation: d>1 detected; logging only the first DOF.")
+    if val_start_idx >= int(x_true_t.shape[0]) - 1:
+        raise ValueError(
+            f"Trajectory '{traj.get('name', '<unknown>')}' has too few samples after validation start "
+            f"(val_start_idx={val_start_idx}, total={int(x_true_t.shape[0])})."
+        )
 
-    steps = int(x_true_t.shape[0] - 1)
+    use_tcn = _is_tcn_force_model(model)
+    context = _tcn_history_len(model) if use_tcn else 0
+    if use_tcn and val_start_idx < context:
+        raise ValueError(
+            f"Trajectory '{traj.get('name', '<unknown>')}' validation starts at index {val_start_idx}, "
+            f"but TCN history_len is {context}. Increase validation start time/cut."
+        )
+
+    x_eval_t = x_true_t[val_start_idx:, :]
+    v_eval_t = v_true_t[val_start_idx:, :]
+    f_eval_t = f_true_t[val_start_idx:, :]
+    ur_eval_t = ur_true_t[val_start_idx:, :]
+    f0_eval_t = f0_true_t[val_start_idx:, :] if f0_true_t is not None else None
+    t_np = t_full[val_start_idx:]
+
+    steps = int(x_eval_t.shape[0] - 1)
     if steps < 1:
         return {}
-
-    x_seq, v_seq, f_seq = rollout_rk4(
-        model=model,
-        x0=x_true_t[0:1, :],
-        v0=v_true_t[0:1, :],
-        ur0=ur_true_t[0:1, :],
-        steps=steps,
-        dt=dt,
-        m=m,
-        c=c,
-        k=k,
-        f0=(f0_true_t[0:1, :] if f0_true_t is not None else None),
-    )
+    if use_tcn and context > 0:
+        hist_start = val_start_idx - context
+        x_hist_init = x_true_t[hist_start : val_start_idx + 1, :].unsqueeze(0)
+        v_hist_init = v_true_t[hist_start : val_start_idx + 1, :].unsqueeze(0)
+        ur_hist_init = ur_true_t[hist_start : val_start_idx + 1, :].unsqueeze(0)
+        x_seq, v_seq, f_seq = rollout_rk4(
+            model=model,
+            x0=x_eval_t[0:1, :],
+            v0=v_eval_t[0:1, :],
+            ur0=ur_eval_t[0:1, :],
+            steps=steps,
+            dt=dt,
+            m=m,
+            c=c,
+            k=k,
+            f0=(f0_eval_t[0:1, :] if f0_eval_t is not None else None),
+            x_hist_init=x_hist_init,
+            v_hist_init=v_hist_init,
+            ur_hist_init=ur_hist_init,
+        )
+    else:
+        x_seq, v_seq, f_seq = rollout_rk4(
+            model=model,
+            x0=x_eval_t[0:1, :],
+            v0=v_eval_t[0:1, :],
+            ur0=ur_eval_t[0:1, :],
+            steps=steps,
+            dt=dt,
+            m=m,
+            c=c,
+            k=k,
+            f0=(f0_eval_t[0:1, :] if f0_eval_t is not None else None),
+        )
     x_pred = x_seq[0, :, 0].detach().cpu().numpy()
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
     f_pred = f_seq[0, :, 0].detach().cpu().numpy()
-    x_true = x_true_t[:, 0].detach().cpu().numpy()
-    f_true = f_true_t[:, 0].detach().cpu().numpy()
+    x_true = x_eval_t[:, 0].detach().cpu().numpy()
+    f_true = f_eval_t[:, 0].detach().cpu().numpy()
 
     disp_std = float(np.std(x_true))
     if disp_std <= 0.0:
@@ -1661,8 +1779,8 @@ def _log_rollout_validation(
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
         force_std = 1.0
-    if f0_true_t is not None:
-        f0_np = f0_true_t[:, 0].detach().cpu().numpy()
+    if f0_eval_t is not None:
+        f0_np = f0_eval_t[:, 0].detach().cpu().numpy()
         f_true_force = f_true * f0_np
         f_pred_force = f_pred * f0_np
         force_std = float(np.std(f_true_force))
@@ -1679,9 +1797,10 @@ def _log_rollout_validation(
             writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
 
     with torch.no_grad():
-        f_on_data = _vpinn_force_on_trajectory(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
-    if f0_true_t is not None:
-        f0_np = f0_true_t[:, 0].detach().cpu().numpy()
+        f_on_data_full = _vpinn_force_on_trajectory(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
+        f_on_data = f_on_data_full[val_start_idx:]
+    if f0_eval_t is not None:
+        f0_np = f0_eval_t[:, 0].detach().cpu().numpy()
         f_on_data_force = f_on_data * f0_np
         f_true_force = f_true * f0_np
         force_std = float(np.std(f_true_force))
@@ -1702,7 +1821,7 @@ def _log_rollout_validation(
     zoom_mask = create_zoom_mask(t_np)
     middle_mask = create_window_mask(t_np, middle_time_plot)
     middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
-    ur_val = float(ur_true_t[0, 0].detach().cpu().item())
+    ur_val = float(ur_eval_t[0, 0].detach().cpu().item())
     log_displacement_plots(
         writer,
         epoch,
@@ -1789,6 +1908,7 @@ def train(config: Config, config_name: str) -> None:
     set_num_threads_from_slurm(default=1)
     non_blocking = device.type == "cuda"
 
+    val_history_context = _configured_validation_history_len(config)
     train_trajs, val_trajs, dt = _prepare_trajectories(config)
     validation_only_data_file = bool(vp.get("validation_only_data_file", False))
     use_data_file_for_validation = bool(vp.get("use_data_file_for_validation", False))
@@ -1825,6 +1945,8 @@ def train(config: Config, config_name: str) -> None:
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            preserve_prefix_for_history=(val_history_context > 0),
+            min_history_context=val_history_context,
         )
         if val_dt != dt:
             raise ValueError(f"Validation data dt={val_dt} does not match training dt={dt}.")

@@ -38,6 +38,7 @@ from HNN_helper import (
 )
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
+    _configured_validation_history_len,
     _force_mapping_nrmse_over_trajs,
     _is_tcn_force_model,
     _load_metadata_map,
@@ -389,6 +390,7 @@ def _run_vpinn_validation(
         else:
             meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
         f0_lookup = _load_metadata_map(meta_path)
+    val_history_context = _configured_validation_history_len(cfg)
 
     for path in sources:
         traj, dt = _load_trajectory(
@@ -403,6 +405,8 @@ def _run_vpinn_validation(
             f0_lookup=f0_lookup,
             rho=float(getattr(cfg.model, "rho", 1000.0)),
             D=float(getattr(cfg.model, "D", 0.1)),
+            preserve_prefix_for_history=(val_history_context > 0),
+            min_history_context=val_history_context,
         )
         if dt_ref is None:
             dt_ref = dt
