@@ -3,11 +3,11 @@
 #SBATCH --job-name=gpu_test
 #SBATCH --account=nn9352k
 #SBATCH --partition=accel
-#SBATCH --time=01:00:00
+#SBATCH --time=01:30:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=16G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 
 #SBATCH --output=output/%j.txt
