@@ -85,6 +85,43 @@ class ForceMLP(nn.Module):
         return self.net(x)
 
 
+class TemporalBackboneWithHead(nn.Module):
+    """
+    Temporal encoder + pointwise head.
+
+    The backbone consumes (B, T, C_in) and outputs (B, T, C_mid).
+    The head is then applied independently at each timestep to map C_mid -> C_out.
+    """
+
+    def __init__(self, backbone: nn.Module, head: nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+
+        # Introspection hooks used by VPINN sequence logic.
+        self.is_tcn_force_model = True
+        self.history_len = int(getattr(backbone, "history_len", 0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+            squeeze_time = True
+        elif x.ndim == 3:
+            squeeze_time = False
+        else:
+            raise ValueError("TemporalBackboneWithHead expects input shape (N,C) or (B,T,C).")
+
+        h = self.backbone(x)
+        if h.ndim != 3:
+            raise ValueError("Temporal backbone must return shape (B,T,C_mid).")
+
+        B, T, C = h.shape
+        y = self.head(h.reshape(B * T, C)).reshape(B, T, -1)
+        if squeeze_time:
+            y = y.squeeze(1)
+        return y
+
+
 class ScaledForceWrapper(nn.Module):
     """
     Wrap a force network so VPINN sees well-conditioned inputs and produces forces
@@ -169,6 +206,58 @@ def _activation_from_string(name: str) -> nn.Module:
     raise ValueError("activation must be one of: tanh, relu, gelu, silu")
 
 
+def _build_arch_pointwise_head(
+    *,
+    config: Config,
+    arch: Any,
+    net_type: str,
+    input_dim: int,
+    output_dim: int,
+) -> nn.Module:
+    key = str(net_type).strip().lower()
+
+    if key == "pirate":
+        pirate_kwargs = {}
+        pirate_kwargs.update(getattr(config.model, "pirate_force_kwargs", {}) or {})
+        pirate_kwargs.update(getattr(arch, "pirate_force_kwargs", {}) or {})
+        pirate_kwargs.setdefault("depth", 2)
+        pirate_kwargs.setdefault("fourier_features", 64)
+        pirate_kwargs.setdefault("sigma", 1.0)
+        pirate_kwargs.setdefault("activation", "tanh")
+        return ODEPirateNet(
+            input_size=int(input_dim),
+            output_size=int(output_dim),
+            **pirate_kwargs,
+        )
+
+    if key == "residual":
+        cfg = dict(getattr(arch, "residual_kwargs", {}) or {})
+        hidden = int(cfg.get("hidden", 128))
+        layers = int(cfg.get("layers", 2))
+        activation = str(cfg.get("activation", "gelu"))
+        layers_list: list[nn.Module] = [nn.Linear(int(input_dim), hidden)]
+        for _ in range(max(1, layers)):
+            layers_list.append(Residual(hidden, activation=activation))
+        layers_list.append(nn.Linear(hidden, int(output_dim)))
+        return nn.Sequential(*layers_list)
+
+    if key == "mlp":
+        cfg = dict(getattr(arch, "mlp_kwargs", {}) or {})
+        hidden = int(cfg.get("hidden", 128))
+        layers = int(cfg.get("layers", 2))
+        activation = _activation_from_string(str(cfg.get("activation", "gelu")))
+        modules: list[nn.Module] = []
+        in_features = int(input_dim)
+        for _ in range(max(1, layers)):
+            modules.append(nn.Linear(in_features, hidden))
+            modules.append(activation)
+            in_features = hidden
+        modules.append(nn.Linear(in_features, int(output_dim)))
+        return nn.Sequential(*modules)
+
+    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate, tcn")
+
+
 def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn.Module:
     vp = dict(config.vpinn or {})
     use_arch_cfg = bool(vp.get("use_architecture_config", False))
@@ -188,62 +277,60 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         raise ValueError("vpinn.use_architecture_config is True but config has no 'architecture:' block.")
     arch = config.architecture
     net_type = str(getattr(arch, "force_net_type", "residual")).strip().lower()
+    if net_type not in {"residual", "mlp", "pirate", "tcn"}:
+        raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate, tcn")
 
-    if net_type == "pirate":
-        pirate_kwargs = {}
-        pirate_kwargs.update(getattr(config.model, "pirate_force_kwargs", {}) or {})
-        pirate_kwargs.update(getattr(arch, "pirate_force_kwargs", {}) or {})
-        pirate_kwargs.setdefault("depth", 2)
-        pirate_kwargs.setdefault("fourier_features", 64)
-        pirate_kwargs.setdefault("sigma", 1.0)
-        pirate_kwargs.setdefault("activation", "tanh")
-        return ODEPirateNet(
-            input_size=int(input_dim),
-            output_size=int(output_dim),
-            **pirate_kwargs,
-        )
-
-    if net_type == "residual":
-        cfg = dict(getattr(arch, "residual_kwargs", {}) or {})
-        hidden = int(cfg.get("hidden", 128))
-        layers = int(cfg.get("layers", 2))
-        activation = str(cfg.get("activation", "gelu"))
-        layers_list: list[nn.Module] = [nn.Linear(int(input_dim), hidden)]
-        for _ in range(max(1, layers)):
-            layers_list.append(Residual(hidden, activation=activation))
-        layers_list.append(nn.Linear(hidden, int(output_dim)))
-        return nn.Sequential(*layers_list)
-
-    if net_type == "mlp":
-        cfg = dict(getattr(arch, "mlp_kwargs", {}) or {})
-        hidden = int(cfg.get("hidden", 128))
-        layers = int(cfg.get("layers", 2))
-        activation = _activation_from_string(str(cfg.get("activation", "gelu")))
-        modules: list[nn.Module] = []
-        in_features = int(input_dim)
-        for _ in range(max(1, layers)):
-            modules.append(nn.Linear(in_features, hidden))
-            modules.append(activation)
-            in_features = hidden
-        modules.append(nn.Linear(in_features, int(output_dim)))
-        return nn.Sequential(*modules)
+    tcn_cfg = dict(getattr(arch, "tcn_kwargs", {}) or {})
+    use_tcn_backbone = bool(
+        tcn_cfg.get("enabled", tcn_cfg.get("use_as_backbone", False))
+        or vp.get("use_tcn_backbone", False)
+    )
 
     if net_type == "tcn":
-        cfg = dict(getattr(arch, "tcn_kwargs", {}) or {})
         # Number of *previous* timesteps of context used for the first target in a window.
         default_history = int(vp.get("window_M", 50))
         return TemporalConvForceNet(
             input_size=int(input_dim),
             output_size=int(output_dim),
-            hidden_channels=int(cfg.get("hidden", 128)),
-            levels=int(cfg.get("levels", 4)),
-            kernel_size=int(cfg.get("kernel_size", 3)),
-            dropout=float(cfg.get("dropout", 0.0)),
-            activation=str(cfg.get("activation", "gelu")),
-            history_len=int(cfg.get("history_len", default_history)),
+            hidden_channels=int(tcn_cfg.get("hidden", 128)),
+            levels=int(tcn_cfg.get("levels", 4)),
+            kernel_size=int(tcn_cfg.get("kernel_size", 3)),
+            dropout=float(tcn_cfg.get("dropout", 0.0)),
+            activation=str(tcn_cfg.get("activation", "gelu")),
+            history_len=int(tcn_cfg.get("history_len", default_history)),
         )
 
-    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate, tcn")
+    if use_tcn_backbone:
+        default_history = int(vp.get("window_M", 50))
+        head_input_dim = int(tcn_cfg.get("head_input_dim", tcn_cfg.get("hidden", 128)))
+        if head_input_dim < 1:
+            raise ValueError("architecture.tcn_kwargs.head_input_dim must be >= 1.")
+        backbone = TemporalConvForceNet(
+            input_size=int(input_dim),
+            output_size=int(head_input_dim),
+            hidden_channels=int(tcn_cfg.get("hidden", 128)),
+            levels=int(tcn_cfg.get("levels", 4)),
+            kernel_size=int(tcn_cfg.get("kernel_size", 3)),
+            dropout=float(tcn_cfg.get("dropout", 0.0)),
+            activation=str(tcn_cfg.get("activation", "gelu")),
+            history_len=int(tcn_cfg.get("history_len", default_history)),
+        )
+        head = _build_arch_pointwise_head(
+            config=config,
+            arch=arch,
+            net_type=net_type,
+            input_dim=int(head_input_dim),
+            output_dim=int(output_dim),
+        )
+        return TemporalBackboneWithHead(backbone=backbone, head=head)
+
+    return _build_arch_pointwise_head(
+        config=config,
+        arch=arch,
+        net_type=net_type,
+        input_dim=int(input_dim),
+        output_dim=int(output_dim),
+    )
 
 
 def _unwrap_force_model(model: nn.Module) -> nn.Module:
@@ -292,9 +379,13 @@ def _configured_validation_history_len(config: Config) -> int:
     if arch is None:
         return 0
     net_type = str(getattr(arch, "force_net_type", "residual")).strip().lower()
-    if net_type != "tcn":
-        return 0
     cfg = dict(getattr(arch, "tcn_kwargs", {}) or {})
+    use_tcn_backbone = bool(
+        cfg.get("enabled", cfg.get("use_as_backbone", False))
+        or vp.get("use_tcn_backbone", False)
+    )
+    if net_type != "tcn" and not use_tcn_backbone:
+        return 0
     default_history = int(vp.get("window_M", 50))
     return max(0, int(cfg.get("history_len", default_history)))
 

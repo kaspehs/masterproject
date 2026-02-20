@@ -38,7 +38,13 @@ architecture:
     layers: 2
     activation: gelu
   tcn_kwargs:
+    # If true (and force_net_type is residual/mlp/pirate), run TCN first and then
+    # feed its per-timestep features into that head network.
+    enabled: false
     hidden: 128
+    # Output feature width from TCN backbone into the head network.
+    # Defaults to `hidden` if omitted.
+    head_input_dim: 128
     levels: 4
     kernel_size: 3
     dropout: 0.0
