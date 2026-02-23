@@ -17,9 +17,31 @@ except ModuleNotFoundError as exc:
         sys.path.insert(0, str(current_dir))
     import plot_extracted_channels as extracted
 
+MAT_FILES_COMBINED = [
+    Path("Experimental_Data/Combined/test4001.mat"),
+    Path("Experimental_Data/Combined/test4002.mat"),
+    Path("Experimental_Data/Combined/test4003.mat"),
+    Path("Experimental_Data/Combined/test4004.mat"),
+    Path("Experimental_Data/Combined/test4005.mat"),
+    Path("Experimental_Data/Combined/test4006.mat"),
+    Path("Experimental_Data/Combined/test4007.mat"),
+    Path("Experimental_Data/Combined/test4008.mat"),
+    Path("Experimental_Data/Combined/test4009.mat"),
+    Path("Experimental_Data/Combined/test4010.mat"),
+    Path("Experimental_Data/Combined/test4011.mat"),
+    Path("Experimental_Data/Combined/test4012.mat"),
+    Path("Experimental_Data/Combined/test4013.mat"),
+    Path("Experimental_Data/Combined/test5002.mat"),
+    Path("Experimental_Data/Combined/test5003.mat"),
+    Path("Experimental_Data/Combined/test5004.mat"),
+    Path("Experimental_Data/Combined/test5005.mat"),
+]
+
 
 # Input
-MAT_FILES = list(extracted.MAT_FILES)
+MAT_FILES_CF = list(extracted.MAT_FILES)
+
+MAT_FILES = MAT_FILES_COMBINED + MAT_FILES_CF
 
 # Keep data-loading behavior aligned with the channel-extraction script.
 DATA_VARIABLE = extracted.DATA_VARIABLE
@@ -317,8 +339,21 @@ def _plot_phase_drift_all(results: list[dict[str, object]]) -> None:
     ax_f.set_title("Dominant frequency used for phase estimate")
     ax_dl.set_title("Sliding-window lag drift rate")
     ax_py.axhline(0.0, color="black", linewidth=0.9, alpha=0.7)
-    ax_py.legend(loc="best", fontsize="small")
-    fig_phase.tight_layout()
+    handles, labels = ax_py.get_legend_handles_labels()
+    if handles:
+        ncols = min(4, max(1, len(labels)))
+        fig_phase.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.995),
+            ncol=ncols,
+            fontsize="small",
+            frameon=True,
+        )
+        fig_phase.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    else:
+        fig_phase.tight_layout()
 
 
 def main() -> None:
