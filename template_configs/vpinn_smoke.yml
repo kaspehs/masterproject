@@ -136,6 +136,10 @@ vpinn:
   # If >0, computes rollout loss on a random sub-batch of this size to reduce GPU memory.
   # 0 means use the full training batch.
   rollout_force_batch_size: 0
+  # RK4 substeps per data step for rollout loss during training (cost-sensitive).
+  rollout_train_substeps: 1
+  # RK4 substeps per data step for validation/final rollouts and rollout metrics.
+  rollout_val_substeps: 1
   # Test functions for weak residual: polynomials (degree 0..num_poly_test-1) and sines (k=1..num_sine_test).
   # If num_poly_test is omitted, it defaults to 2 (degree 0 and 1).
   num_poly_test: 3

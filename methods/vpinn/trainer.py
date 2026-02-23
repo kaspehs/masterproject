@@ -538,6 +538,7 @@ def rollout_rk4(
     ur0: torch.Tensor,
     steps: int,
     dt: float,
+    substeps: int = 1,
     m: torch.Tensor,
     c: torch.Tensor,
     k: torch.Tensor,
@@ -556,6 +557,9 @@ def rollout_rk4(
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
+    substeps = int(substeps)
+    if substeps < 1:
+        raise ValueError("substeps must be >= 1")
     B, d = x0.shape
     m = m.view(1, d)
     c = c.view(1, d)
@@ -609,6 +613,7 @@ def rollout_rk4(
         fs = [_vpinn_force(model, x, v, ur0)]
 
     dt_t = x0.new_tensor(float(dt))
+    dt_sub = dt_t / float(substeps)
     half = x0.new_tensor(0.5)
     sixth = x0.new_tensor(1.0 / 6.0)
 
@@ -621,30 +626,31 @@ def rollout_rk4(
         return (fi - c * vi - k * xi) / m
 
     for _ in range(int(steps)):
-        k1_x = v
-        k1_v = accel(x, v)
+        for _sub in range(substeps):
+            k1_x = v
+            k1_v = accel(x, v)
 
-        x2 = x + half * dt_t * k1_x
-        v2 = v + half * dt_t * k1_v
-        k2_x = v2
-        k2_v = accel(x2, v2)
+            x2 = x + half * dt_sub * k1_x
+            v2 = v + half * dt_sub * k1_v
+            k2_x = v2
+            k2_v = accel(x2, v2)
 
-        x3 = x + half * dt_t * k2_x
-        v3 = v + half * dt_t * k2_v
-        k3_x = v3
-        k3_v = accel(x3, v3)
+            x3 = x + half * dt_sub * k2_x
+            v3 = v + half * dt_sub * k2_v
+            k3_x = v3
+            k3_v = accel(x3, v3)
 
-        x4 = x + dt_t * k3_x
-        v4 = v + dt_t * k3_v
-        k4_x = v4
-        k4_v = accel(x4, v4)
+            x4 = x + dt_sub * k3_x
+            v4 = v + dt_sub * k3_v
+            k4_x = v4
+            k4_v = accel(x4, v4)
 
-        x = x + (dt_t * sixth) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
-        v = v + (dt_t * sixth) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+            x = x + (dt_sub * sixth) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
+            v = v + (dt_sub * sixth) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
 
-        if use_tcn:
-            x_hist = torch.cat([x_hist[:, 1:, :], x.unsqueeze(1)], dim=1)
-            v_hist = torch.cat([v_hist[:, 1:, :], v.unsqueeze(1)], dim=1)
+            if use_tcn:
+                x_hist = torch.cat([x_hist[:, 1:, :], x.unsqueeze(1)], dim=1)
+                v_hist = torch.cat([v_hist[:, 1:, :], v.unsqueeze(1)], dim=1)
 
         xs.append(x)
         vs.append(v)
@@ -1635,6 +1641,7 @@ def _per_ur_loss_map_vpinn(
     use_force_loss: bool,
     use_weak_loss: bool,
     rollout_force_steps: int,
+    rollout_substeps: int,
     expect_scale: bool,
     expect_f0: bool,
     amp_enabled: bool,
@@ -1728,6 +1735,7 @@ def _per_ur_loss_map_vpinn(
                             ur0=ur_eval[:, 0, :],
                             steps=steps_k,
                             dt=dt,
+                            substeps=rollout_substeps,
                             m=m,
                             c=c,
                             k=k,
@@ -1775,6 +1783,7 @@ def _log_rollout_validation(
     D: float,
     middle_time_plot: Sequence[float],
     device: torch.device,
+    rollout_substeps: int = 1,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     log_metrics: bool = True,
@@ -1832,6 +1841,7 @@ def _log_rollout_validation(
             ur0=ur_eval_t[0:1, :],
             steps=steps,
             dt=dt,
+            substeps=rollout_substeps,
             m=m,
             c=c,
             k=k,
@@ -1848,6 +1858,7 @@ def _log_rollout_validation(
             ur0=ur_eval_t[0:1, :],
             steps=steps,
             dt=dt,
+            substeps=rollout_substeps,
             m=m,
             c=c,
             k=k,
@@ -1968,8 +1979,14 @@ def train(config: Config, config_name: str) -> None:
     rollout_force_steps = int(vp.get("rollout_force_steps", 0))
     rollout_force_every = int(vp.get("rollout_force_every", 1))
     rollout_force_batch_size = int(vp.get("rollout_force_batch_size", 0))
+    rollout_train_substeps = int(vp.get("rollout_train_substeps", 1))
+    rollout_val_substeps = int(vp.get("rollout_val_substeps", 1))
     if rollout_force_batch_size < 0:
         raise ValueError("vpinn.rollout_force_batch_size must be >= 0.")
+    if rollout_train_substeps < 1:
+        raise ValueError("vpinn.rollout_train_substeps must be >= 1.")
+    if rollout_val_substeps < 1:
+        raise ValueError("vpinn.rollout_val_substeps must be >= 1.")
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
@@ -2368,6 +2385,7 @@ def train(config: Config, config_name: str) -> None:
                                 ur0=ur_roll[:, 0, :],
                                 steps=steps_k,
                                 dt=dt,
+                                substeps=rollout_train_substeps,
                                 m=m,
                                 c=c,
                                 k=k,
@@ -2559,6 +2577,7 @@ def train(config: Config, config_name: str) -> None:
                 use_force_loss=use_force_loss,
                 use_weak_loss=use_weak_loss,
                 rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
+                rollout_substeps=rollout_val_substeps,
                 expect_scale=return_scale,
                 expect_f0=use_force_coeff,
                 amp_enabled=amp_enabled,
@@ -2595,6 +2614,7 @@ def train(config: Config, config_name: str) -> None:
                     D=D_val,
                     middle_time_plot=middle_time_plot,
                     device=device,
+                    rollout_substeps=rollout_val_substeps,
                 )
 
     if final_rollout_all_validation and val_trajs:
@@ -2627,6 +2647,7 @@ def train(config: Config, config_name: str) -> None:
                 D=D_val,
                 middle_time_plot=middle_time_plot,
                 device=device,
+                rollout_substeps=rollout_val_substeps,
                 tag_prefix="final_val/rollout",
                 step=idx,
                 log_metrics=False,
@@ -2673,6 +2694,7 @@ def train(config: Config, config_name: str) -> None:
             use_force_loss=use_force_loss,
             use_weak_loss=use_weak_loss,
             rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
+            rollout_substeps=rollout_val_substeps,
             expect_scale=return_scale,
             expect_f0=use_force_coeff,
             amp_enabled=amp_enabled,

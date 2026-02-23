@@ -353,6 +353,9 @@ def _run_vpinn_validation(
 ) -> None:
     data_cfg = cfg.data
     vp = dict(cfg.vpinn or {})
+    rollout_val_substeps = int(vp.get("rollout_val_substeps", 1))
+    if rollout_val_substeps < 1:
+        raise ValueError("vpinn.rollout_val_substeps must be >= 1.")
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
@@ -536,6 +539,7 @@ def _run_vpinn_validation(
             use_force_loss=bool(vp.get("use_force_loss", True)),
             use_weak_loss=bool(vp.get("use_weak_loss", True)),
             rollout_force_steps=int(vp.get("rollout_force_steps", 0)),
+            rollout_substeps=rollout_val_substeps,
             expect_scale=return_scale,
             expect_f0=(force_representation == "coefficient"),
             amp_enabled=amp_enabled,
@@ -564,6 +568,7 @@ def _run_vpinn_validation(
             D=float(getattr(cfg.model, "D", 1.0)),
             middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
             device=device,
+            rollout_substeps=rollout_val_substeps,
         )
 
 
@@ -801,6 +806,7 @@ def _per_ur_loss_map_vpinn(
     use_force_loss: bool,
     use_weak_loss: bool,
     rollout_force_steps: int,
+    rollout_substeps: int,
     expect_scale: bool,
     expect_f0: bool,
     amp_enabled: bool,
@@ -894,6 +900,7 @@ def _per_ur_loss_map_vpinn(
                             ur0=ur_eval[:, 0, :],
                             steps=steps_k,
                             dt=dt,
+                            substeps=rollout_substeps,
                             m=m,
                             c=c,
                             k=k,
