@@ -40,6 +40,7 @@ smoothing:
   polyorder: 3
 
 architecture:
+  # Options: residual | mlp | pirate | tcn
   force_net_type: residual
   residual_kwargs:
     hidden: 128
@@ -49,6 +50,21 @@ architecture:
     hidden: 128
     layers: 2
     activation: gelu
+  tcn_kwargs:
+    # Set enabled/use_as_backbone=true to use TCN as temporal encoder before
+    # residual/mlp/pirate head (when force_net_type is not "tcn").
+    enabled: false
+    use_as_backbone: false
+    hidden: 128
+    levels: 4
+    kernel_size: 3
+    dropout: 0.0
+    activation: gelu
+    # Output feature width from TCN backbone before pointwise head.
+    # If null, defaults to `hidden`.
+    head_input_dim: null
+    # Number of previous timesteps used as left context in PHNN force evaluation.
+    history_len: 64
   pirate_force_kwargs:
     depth: 2
     fourier_features: 64

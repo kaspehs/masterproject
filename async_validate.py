@@ -151,6 +151,7 @@ def _run_hnn_validation(
     model_dict = asdict(cfg.model)
     arch_dict = asdict(cfg.architecture)
     model, derived = PHVIV.from_config(dt=float(dt), cfg=model_dict, arch_cfg=arch_dict, device=device)
+    history_context = int(getattr(model, "history_len", 0)) if bool(getattr(model, "is_tcn_force_model", False)) else 0
     _load_state(model, ckpt["model_state"])
     model.eval()
 
@@ -205,6 +206,7 @@ def _run_hnn_validation(
         pin_memory=(device.type == "cuda"),
         per_traj_norm=per_traj_norm,
         per_traj_norm_eps=per_traj_norm_eps,
+        history_len=history_context,
     )
 
     if do_losses:
@@ -588,6 +590,8 @@ def _evaluate_val_losses(
 ) -> dict[str, float]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
+    force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
+    use_tcn_force = bool(getattr(model, "is_tcn_force_model", False))
     loss_sum = torch.zeros((), device=device)
     res_sum = torch.zeros((), device=device)
     force_sum = torch.zeros((), device=device)
@@ -595,27 +599,51 @@ def _evaluate_val_losses(
     batches = 0
     with torch.no_grad():
         for batch in loader:
-            if len(batch) == 5:
-                z_i, t_i, z_next, t_next, ur_i = batch
-                f_i = None
-                f_next = None
-                scale = None
-            elif len(batch) == 6:
-                z_i, t_i, z_next, t_next, ur_i, scale = batch
-                f_i = None
-                f_next = None
-            elif len(batch) == 7:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
-                scale = None
-            elif len(batch) == 8:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
+            z_hist = None
+            ur_hist = None
+            if not use_tcn_force:
+                if len(batch) == 5:
+                    z_i, t_i, z_next, t_next, ur_i = batch
+                    f_i = None
+                    f_next = None
+                    scale = None
+                elif len(batch) == 6:
+                    z_i, t_i, z_next, t_next, ur_i, scale = batch
+                    f_i = None
+                    f_next = None
+                elif len(batch) == 7:
+                    z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+                    scale = None
+                elif len(batch) == 8:
+                    z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
+                else:
+                    raise ValueError("Unexpected batch format from dataloader.")
             else:
-                raise ValueError("Unexpected batch format from dataloader.")
+                if len(batch) == 7:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist = batch
+                    f_i = None
+                    f_next = None
+                    scale = None
+                elif len(batch) == 8:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist, scale = batch
+                    f_i = None
+                    f_next = None
+                elif len(batch) == 9:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist, f_i, f_next = batch
+                    scale = None
+                elif len(batch) == 10:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist, f_i, f_next, scale = batch
+                else:
+                    raise ValueError("Unexpected TCN batch format from dataloader.")
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
+            if z_hist is not None:
+                z_hist = z_hist.to(device, non_blocking=non_blocking)
+            if ur_hist is not None:
+                ur_hist = ur_hist.to(device, non_blocking=non_blocking)
             if f_i is not None:
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
@@ -625,17 +653,65 @@ def _evaluate_val_losses(
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 if scale is None:
-                    res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    res_loss = model.res_loss(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        z_hist=z_hist,
+                        ur_hist=ur_hist,
+                    )
                     if force_reg_on_coeff:
-                        avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                        avg_force = model.avg_force_coeff(
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                     else:
-                        avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                        avg_force = model.avg_force(
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                 else:
-                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_res = model.res_loss_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        z_hist=z_hist,
+                        ur_hist=ur_hist,
+                    )
                     if force_reg_on_coeff:
-                        per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                        per_force = model.avg_force_coeff_per_sample(
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                     else:
-                        per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                        per_force = model.avg_force_per_sample(
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                     denom = scale * scale + float(per_traj_norm_eps)
                     res_loss = torch.mean(per_res / denom)
                     avg_force = torch.mean(per_force / denom)
@@ -647,7 +723,22 @@ def _evaluate_val_losses(
                         )
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
-                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                    if force_output_coeff:
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f_pred = model.u_theta_coeff(
+                            z_mid,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
+                        f_mid = f_mid / f0
+                    else:
+                        f_pred = model.u_theta(
+                            z_mid,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     if scale is not None:
                         per_data = per_data / (scale * scale + float(per_traj_norm_eps))
@@ -688,6 +779,7 @@ def _per_ur_loss_map_hnn(
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
+    use_tcn_force = bool(getattr(model, "is_tcn_force_model", False))
     buckets: dict[str, dict[float, list[float]]] = {
         "loss_physics": {},
         "loss_reg": {},
@@ -695,27 +787,51 @@ def _per_ur_loss_map_hnn(
     }
     with torch.no_grad():
         for batch in loader:
-            if len(batch) == 5:
-                z_i, t_i, z_next, t_next, ur_i = batch
-                f_i = None
-                f_next = None
-                scale = None
-            elif len(batch) == 6:
-                z_i, t_i, z_next, t_next, ur_i, scale = batch
-                f_i = None
-                f_next = None
-            elif len(batch) == 7:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
-                scale = None
-            elif len(batch) == 8:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
+            z_hist = None
+            ur_hist = None
+            if not use_tcn_force:
+                if len(batch) == 5:
+                    z_i, t_i, z_next, t_next, ur_i = batch
+                    f_i = None
+                    f_next = None
+                    scale = None
+                elif len(batch) == 6:
+                    z_i, t_i, z_next, t_next, ur_i, scale = batch
+                    f_i = None
+                    f_next = None
+                elif len(batch) == 7:
+                    z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
+                    scale = None
+                elif len(batch) == 8:
+                    z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
+                else:
+                    raise ValueError("Unexpected batch format from dataloader.")
             else:
-                raise ValueError("Unexpected batch format from dataloader.")
+                if len(batch) == 7:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist = batch
+                    f_i = None
+                    f_next = None
+                    scale = None
+                elif len(batch) == 8:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist, scale = batch
+                    f_i = None
+                    f_next = None
+                elif len(batch) == 9:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist, f_i, f_next = batch
+                    scale = None
+                elif len(batch) == 10:
+                    z_i, t_i, z_next, t_next, ur_i, z_hist, ur_hist, f_i, f_next, scale = batch
+                else:
+                    raise ValueError("Unexpected TCN batch format from dataloader.")
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
+            if z_hist is not None:
+                z_hist = z_hist.to(device, non_blocking=non_blocking)
+            if ur_hist is not None:
+                ur_hist = ur_hist.to(device, non_blocking=non_blocking)
             if f_i is not None:
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
@@ -725,24 +841,64 @@ def _per_ur_loss_map_hnn(
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 if scale is None:
-                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_res = model.res_loss_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        z_hist=z_hist,
+                        ur_hist=ur_hist,
+                    )
                     if force_reg_on_coeff:
                         per_force = model.avg_force_coeff_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
                         )
                     else:
                         per_force = model.avg_force_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
                         )
                 else:
-                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_res = model.res_loss_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        z_hist=z_hist,
+                        ur_hist=ur_hist,
+                    )
                     if force_reg_on_coeff:
                         per_force = model.avg_force_coeff_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
                         )
                     else:
                         per_force = model.avg_force_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
                         )
                     denom = scale * scale + float(per_traj_norm_eps)
                     per_res = per_res / denom
@@ -754,10 +910,20 @@ def _per_ur_loss_map_hnn(
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
                         f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
-                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_pred = model.u_theta_coeff(
+                            z_mid,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                         f_mid = f_mid / f0
                     else:
-                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                        f_pred = model.u_theta(
+                            z_mid,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     if scale is not None:
                         per_data = per_data / (scale * scale + float(per_traj_norm_eps))

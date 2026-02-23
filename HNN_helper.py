@@ -17,7 +17,7 @@ try:
 except ImportError:
     savgol_filter = None
 
-from architectures import FourierFeatures, ODEPirateNet
+from architectures import FourierFeatures, ODEPirateNet, TemporalConvForceNet
 
 DISP_ROLLOUT_NRMSE_KEY = "Disp rollout NRMSE"
 FORCE_ROLLOUT_NRMSE_KEY = "Force rollout NRMSE"
@@ -83,6 +83,9 @@ def _default_tcn_kwargs() -> dict[str, Any]:
         "dropout": 0.0,
         "activation": "gelu",
         "history_len": 64,
+        "enabled": False,
+        "use_as_backbone": False,
+        "head_input_dim": None,
     }
 
 
@@ -260,6 +263,14 @@ def parse_config(raw: dict[str, Any]) -> Config:
         legacy_tcn["activation"] = architecture_cfg.pop("tcn_activation")
     if "tcn_history_len" in architecture_cfg:
         legacy_tcn["history_len"] = architecture_cfg.pop("tcn_history_len")
+    if "tcn_enabled" in architecture_cfg:
+        legacy_tcn["enabled"] = architecture_cfg.pop("tcn_enabled")
+    if "tcn_use_as_backbone" in architecture_cfg:
+        legacy_tcn["use_as_backbone"] = architecture_cfg.pop("tcn_use_as_backbone")
+    if "use_tcn_backbone" in architecture_cfg:
+        legacy_tcn["enabled"] = architecture_cfg.pop("use_tcn_backbone")
+    if "tcn_head_input_dim" in architecture_cfg:
+        legacy_tcn["head_input_dim"] = architecture_cfg.pop("tcn_head_input_dim")
     if legacy_tcn or "tcn_kwargs" in architecture_cfg:
         tcn_kwargs = dict(architecture_cfg.get("tcn_kwargs", {}) or {})
         tcn_kwargs.update(legacy_tcn)
@@ -541,7 +552,7 @@ def compute_validation_metrics(
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
         rv = reduced_velocity.to(device=device, non_blocking=(device.type == "cuda"))
-        force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
+        force_on_data = model.u_theta_on_trajectory(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
     min_len_data = min(force_on_data.shape[0], force_target.shape[0])
     if min_len_data > 0:
         force_data_pred = force_on_data[:min_len_data]
@@ -671,6 +682,37 @@ class Residual(nn.Module):
         out = self.fc2(out)
         return out + x  
 
+
+class TemporalBackboneWithHead(nn.Module):
+    """Causal temporal encoder followed by a pointwise head at each timestep."""
+
+    def __init__(self, backbone: nn.Module, head: nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+        self.is_tcn_force_model = True
+        self.history_len = int(getattr(backbone, "history_len", 0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+            squeeze_time = True
+        elif x.ndim == 3:
+            squeeze_time = False
+        else:
+            raise ValueError("TemporalBackboneWithHead expects input shape (N,C) or (B,T,C).")
+
+        h = self.backbone(x)
+        if h.ndim != 3:
+            raise ValueError("Temporal backbone must return shape (B,T,C_mid).")
+
+        B, T, C = h.shape
+        y = self.head(h.reshape(B * T, C)).reshape(B, T, -1)
+        if squeeze_time:
+            y = y.squeeze(1)
+        return y
+
+
 def dominant_frequency(signal: np.ndarray, dt: float) -> float:
     """Return dominant frequency (Hz) of the provided signal using FFT."""
     if dt <= 0.0:
@@ -771,6 +813,7 @@ class PHVIV(nn.Module):
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
+        tcn_kwargs: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.dt = dt
@@ -811,6 +854,26 @@ class PHVIV(nn.Module):
         self.mlp_hidden = int(mlp_cfg.get("hidden", 100))
         self.mlp_layers = max(1, int(mlp_cfg.get("layers", 2)))
         self.mlp_activation = mlp_cfg.get("activation", "gelu")
+        tcn_cfg = _default_tcn_kwargs()
+        if tcn_kwargs:
+            tcn_cfg.update(tcn_kwargs)
+        self.tcn_hidden = int(tcn_cfg.get("hidden", 128))
+        self.tcn_levels = max(1, int(tcn_cfg.get("levels", 4)))
+        self.tcn_kernel_size = max(1, int(tcn_cfg.get("kernel_size", 3)))
+        self.tcn_dropout = float(tcn_cfg.get("dropout", 0.0))
+        self.tcn_activation = str(tcn_cfg.get("activation", "gelu"))
+        self.tcn_history_len = max(1, int(tcn_cfg.get("history_len", 64)))
+        self.use_tcn_backbone = bool(
+            tcn_cfg.get("enabled", tcn_cfg.get("use_as_backbone", False))
+        )
+        head_input_raw = tcn_cfg.get("head_input_dim", self.tcn_hidden)
+        if head_input_raw is None:
+            head_input_raw = self.tcn_hidden
+        self.tcn_head_input_dim = int(head_input_raw)
+        if self.tcn_head_input_dim < 1:
+            raise ValueError("architecture.tcn_kwargs.head_input_dim must be >= 1.")
+        self.is_tcn_force_model = False
+        self.history_len = 0
 
         self.nn_q_scale = q_scale
         self.nn_p_scale = p_scale
@@ -835,18 +898,19 @@ class PHVIV(nn.Module):
         force_in_features = base_force_dim
         selected_net = force_net_type if force_net_type not in (None, "") else ("pirate" if use_pirate_force else "residual")
         net_type = str(selected_net).lower()
-        valid_types = {"residual", "mlp", "pirate"}
+        valid_types = {"residual", "mlp", "pirate", "tcn"}
         if net_type not in valid_types:
             raise ValueError(f"force_net_type must be one of {valid_types}, got '{force_net_type}'.")
         self.use_pirate_force = net_type == "pirate"
+        self.use_tcn_force = net_type == "tcn"
         self.residual_net = net_type == "residual"
+        tcn_mode_requested = self.use_tcn_force or self.use_tcn_backbone
         if self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
-            if self.use_pirate_force:
+            if self.use_pirate_force or tcn_mode_requested:
                 raise ValueError(
-                    "Random Fourier features are already handled inside ODEPirateNet. "
-                    "Disable use_fourier_features when use_pirate_force is True."
+                    "use_fourier_features is not supported together with pirate/tcn force networks."
                 )
             self.force_embed = FourierFeatures(
                 in_dim=base_force_dim,
@@ -857,34 +921,69 @@ class PHVIV(nn.Module):
             force_in_features = 2 * self.fourier_features
 
         pirate_cfg = dict(pirate_force_kwargs) if pirate_force_kwargs is not None else {}
-        if self.use_pirate_force:
-            pirate_args = {
-                "input_size": base_force_dim,
-                "output_size": 1,
-                "depth": int(pirate_cfg.pop("depth", pirate_cfg.pop("pirate_layers", 2))),
-                "fourier_features": int(pirate_cfg.pop("fourier_features", 64)),
-                "sigma": float(pirate_cfg.pop("sigma", 1.0)),
-                "use_rwf": bool(pirate_cfg.pop("use_rwf", True)),
-                "activation": pirate_cfg.pop("activation", "tanh"),
-            }
-            pirate_args.update(pirate_cfg)
-            self.u_net = ODEPirateNet(**pirate_args)
-        elif self.residual_net:
-            layers = [nn.Linear(force_in_features, self.residual_hidden)]
-            for _ in range(self.residual_layers):
-                layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
-            layers.append(nn.Linear(self.residual_hidden, 1))
-            self.u_net = nn.Sequential(*layers)
+        def _build_pointwise_force_head(head_net_type: str, in_features: int) -> nn.Module:
+            key = str(head_net_type).strip().lower()
+            if key == "pirate":
+                head_cfg = dict(pirate_cfg)
+                pirate_args = {
+                    "input_size": int(in_features),
+                    "output_size": 1,
+                    "depth": int(head_cfg.pop("depth", head_cfg.pop("pirate_layers", 2))),
+                    "fourier_features": int(head_cfg.pop("fourier_features", 64)),
+                    "sigma": float(head_cfg.pop("sigma", 1.0)),
+                    "use_rwf": bool(head_cfg.pop("use_rwf", True)),
+                    "activation": head_cfg.pop("activation", "tanh"),
+                }
+                pirate_args.update(head_cfg)
+                return ODEPirateNet(**pirate_args)
+            if key == "residual":
+                layers = [nn.Linear(int(in_features), self.residual_hidden)]
+                for _ in range(self.residual_layers):
+                    layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
+                layers.append(nn.Linear(self.residual_hidden, 1))
+                return nn.Sequential(*layers)
+            if key == "mlp":
+                mlp_layers: list[nn.Module] = []
+                head_in = int(in_features)
+                mlp_act_cls = _activation_factory(self.mlp_activation)
+                for _ in range(self.mlp_layers):
+                    mlp_layers.append(nn.Linear(head_in, self.mlp_hidden))
+                    mlp_layers.append(mlp_act_cls())
+                    head_in = self.mlp_hidden
+                mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
+                return nn.Sequential(*mlp_layers)
+            raise ValueError(f"Unsupported PHNN force head type '{head_net_type}'.")
+
+        if self.use_tcn_force:
+            self.u_net = TemporalConvForceNet(
+                input_size=force_in_features,
+                output_size=1,
+                hidden_channels=self.tcn_hidden,
+                levels=self.tcn_levels,
+                kernel_size=self.tcn_kernel_size,
+                dropout=self.tcn_dropout,
+                activation=self.tcn_activation,
+                history_len=self.tcn_history_len,
+            )
+            self.is_tcn_force_model = True
+            self.history_len = self.tcn_history_len
+        elif self.use_tcn_backbone:
+            backbone = TemporalConvForceNet(
+                input_size=force_in_features,
+                output_size=self.tcn_head_input_dim,
+                hidden_channels=self.tcn_hidden,
+                levels=self.tcn_levels,
+                kernel_size=self.tcn_kernel_size,
+                dropout=self.tcn_dropout,
+                activation=self.tcn_activation,
+                history_len=self.tcn_history_len,
+            )
+            head = _build_pointwise_force_head(net_type, self.tcn_head_input_dim)
+            self.u_net = TemporalBackboneWithHead(backbone=backbone, head=head)
+            self.is_tcn_force_model = True
+            self.history_len = self.tcn_history_len
         else:
-            mlp_layers: list[nn.Module] = []
-            in_features = force_in_features
-            mlp_act_cls = _activation_factory(self.mlp_activation)
-            for _ in range(self.mlp_layers):
-                mlp_layers.append(nn.Linear(in_features, self.mlp_hidden))
-                mlp_layers.append(mlp_act_cls())
-                in_features = self.mlp_hidden
-            mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
-            self.u_net = nn.Sequential(*mlp_layers)
+            self.u_net = _build_pointwise_force_head(net_type, force_in_features)
 
         if self.learn_hamiltonian:
             h_in_features = self.base_feature_dim
@@ -955,6 +1054,8 @@ class PHVIV(nn.Module):
         residual_kwargs.update(arch_cfg.get("residual_kwargs", {}) or {})
         mlp_kwargs = _default_mlp_kwargs()
         mlp_kwargs.update(arch_cfg.get("mlp_kwargs", {}) or {})
+        tcn_kwargs = _default_tcn_kwargs()
+        tcn_kwargs.update(arch_cfg.get("tcn_kwargs", {}) or {})
         pirate_arch_kwargs = arch_cfg.get("pirate_force_kwargs", {}) or {}
         combined_pirate_kwargs = dict(pirate_force_kwargs)
         combined_pirate_kwargs.update(pirate_arch_kwargs)
@@ -997,6 +1098,7 @@ class PHVIV(nn.Module):
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
+            tcn_kwargs=tcn_kwargs,
         )
         if device is not None:
             model = model.to(device)
@@ -1134,57 +1236,303 @@ class PHVIV(nn.Module):
             base_features = torch.cat([base_features, rv], dim=-1)
         return base_features
 
-    def _force_net_raw(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def _force_features_sequence(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        base_features = self._base_features(x)
+        if self.use_reduced_velocity:
+            rv = self._prepare_reduced_velocity(reduced_velocity, like=base_features)
+            base_features = torch.cat([base_features, rv], dim=-1)
+        return base_features
+
+    def _force_net_raw_sequence(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError("TCN sequence force evaluation expects x with shape (B, T, 2).")
+        base_features = self._force_features_sequence(x, reduced_velocity=reduced_velocity)
+        if self.force_embed is not None:
+            B, T, C = base_features.shape
+            embedded = self.force_embed(base_features.reshape(B * T, C))
+            base_features = embedded.reshape(B, T, -1)
+        if self.is_tcn_force_model:
+            raw = self.u_net(base_features)
+            if raw.ndim != 3:
+                raise ValueError("TCN force network must return shape (B, T, 1).")
+            return raw
+        B, T, C = base_features.shape
+        return self.u_net(base_features.reshape(B * T, C)).reshape(B, T, -1)
+
+    def _force_net_raw_with_history(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.is_tcn_force_model:
+            base_features = self._force_features(x, reduced_velocity=reduced_velocity)
+            features = self.force_embed(base_features) if self.force_embed is not None else base_features
+            return self.u_net(features)
+        if x.ndim != 2 or x.shape[-1] != 2:
+            raise ValueError("TCN force history evaluation expects x with shape (B, 2).")
+        B = int(x.shape[0])
+        hist_len = int(self.history_len) + 1
+        rv_raw = None
+        if self.use_reduced_velocity:
+            rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=x[..., :1])
+        if z_hist is None:
+            z_hist = x.unsqueeze(1).repeat(1, hist_len, 1)
+        if ur_hist is None and self.use_reduced_velocity:
+            assert rv_raw is not None
+            ur_hist = rv_raw.unsqueeze(1).repeat(1, hist_len, 1)
+        if z_hist.ndim != 3 or z_hist.shape[0] != B or z_hist.shape[1] != hist_len or z_hist.shape[2] != 2:
+            raise ValueError(f"z_hist must have shape (B, {hist_len}, 2) for TCN force evaluation.")
+        z_in = z_hist.clone()
+        z_in[:, -1, :] = x
+        rv_in = None
+        if self.use_reduced_velocity:
+            if ur_hist is None:
+                raise ValueError("ur_hist is required when use_reduced_velocity is True.")
+            if ur_hist.ndim != 3 or ur_hist.shape[0] != B or ur_hist.shape[1] != hist_len or ur_hist.shape[2] != 1:
+                raise ValueError(f"ur_hist must have shape (B, {hist_len}, 1) for TCN force evaluation.")
+            rv_in = ur_hist.clone()
+            assert rv_raw is not None
+            rv_in[:, -1, :] = rv_raw
+        raw_seq = self._force_net_raw_sequence(z_in, reduced_velocity=rv_in)
+        return raw_seq[:, -1, :]
+
+    def _force_net_raw(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        if self.is_tcn_force_model:
+            return self._force_net_raw_with_history(
+                x,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         base_features = self._force_features(x, reduced_velocity=reduced_velocity)
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
         return self.u_net(features)
 
-    def learned_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
+    def learned_force_coeff(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        raw = self._force_net_raw(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         if self.force_output == "coefficient":
             return raw
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
         return raw * self.k * self.D / f0
 
-    def learned_force(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
+    def learned_force(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        raw = self._force_net_raw(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
             return raw * f0
         return raw * self.k * self.D
+
+    def learned_force_sequence(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        raw = self._force_net_raw_sequence(x, reduced_velocity=reduced_velocity)
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
+            return raw * f0
+        return raw * self.k * self.D
+
+    def learned_force_coeff_sequence(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        raw = self._force_net_raw_sequence(x, reduced_velocity=reduced_velocity)
+        if self.force_output == "coefficient":
+            return raw
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
+        return raw * self.k * self.D / f0
 
     def drag_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         drag = self.drag_force(x)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=drag)
         return drag / f0
 
-    def u_theta_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        coeff = self.learned_force_coeff(x, reduced_velocity=reduced_velocity)
+    def u_theta_coeff(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        coeff = self.learned_force_coeff(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         if self.include_physical_drag:
             coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
         return coeff
 
-    def u_theta1(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        return self.learned_force(x, reduced_velocity=reduced_velocity)
-    
-    def u_theta2(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        return self.u_theta1(x, reduced_velocity=reduced_velocity) + self.drag_force(x)
-    
-    def u_theta(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        if self.force_output == "coefficient":
-            coeff = self.u_theta_coeff(x, reduced_velocity=reduced_velocity)
-            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff)
-            return coeff * f0
-        return self.u_theta2(x, reduced_velocity=reduced_velocity) if self.include_physical_drag else self.u_theta1(
-            x, reduced_velocity=reduced_velocity
+    def u_theta_coeff_sequence(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        coeff = self.learned_force_coeff_sequence(x, reduced_velocity=reduced_velocity)
+        if self.include_physical_drag:
+            coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
+        return coeff
+
+    def u_theta1(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        return self.learned_force(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
         )
     
-    def f(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        u = self.u_theta(x, reduced_velocity=reduced_velocity)
+    def u_theta2(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        return self.u_theta1(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        ) + self.drag_force(x)
+    
+    def u_theta(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        if self.force_output == "coefficient":
+            coeff = self.u_theta_coeff(
+                x,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff)
+            return coeff * f0
+        return self.u_theta2(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        ) if self.include_physical_drag else self.u_theta1(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+
+    def u_theta_sequence(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        if self.force_output == "coefficient":
+            coeff = self.u_theta_coeff_sequence(x, reduced_velocity=reduced_velocity)
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff)
+            return coeff * f0
+        total = self.learned_force_sequence(x, reduced_velocity=reduced_velocity)
+        if self.include_physical_drag:
+            total = total + self.drag_force(x)
+        return total
+
+    def u_theta_on_trajectory(
+        self,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[-1] != 2:
+            raise ValueError("u_theta_on_trajectory expects x with shape (T, 2).")
+        if not self.is_tcn_force_model:
+            return self.u_theta(x, reduced_velocity=reduced_velocity)
+        x_seq = x.unsqueeze(0)
+        if self.use_reduced_velocity:
+            rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=x[..., :1])
+            assert rv_raw is not None
+            rv_seq = rv_raw.unsqueeze(0)
+        else:
+            rv_seq = None
+        context = int(self.history_len)
+        if context > 0:
+            x_seq = torch.cat([x_seq[:, 0:1, :].expand(-1, context, -1), x_seq], dim=1)
+            if rv_seq is not None:
+                rv_seq = torch.cat([rv_seq[:, 0:1, :].expand(-1, context, -1), rv_seq], dim=1)
+        force_seq = self.u_theta_sequence(x_seq, reduced_velocity=rv_seq)
+        if context > 0:
+            force_seq = force_seq[:, context:, :]
+        return force_seq.squeeze(0)
+    
+    def f(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        u = self.u_theta(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         g_vec = self.G.squeeze(-1)
         return u * g_vec
 
-    def g(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def g(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
         gH = self.grad_H(x)                         # (..., 2)
         JgH = torch.matmul(gH, self.J.T)
         if self.discover_damping:
@@ -1193,34 +1541,62 @@ class PHVIV(nn.Module):
         else:
             c_eff = self.fixed_c
         damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
-        return (JgH - damping_term) + self.f(x, reduced_velocity=reduced_velocity)
+        return (JgH - damping_term) + self.f(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
 
     def step_euler(self, x, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         return x + dt * self.g(x, reduced_velocity=reduced_velocity)
 
-    def step_rk4(self, x, t, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        x_next, _ = self.rk4_step(x, t, dt, reduced_velocity=reduced_velocity)
+    def step_rk4(
+        self,
+        x,
+        t,
+        dt,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        x_next, _ = self.rk4_step(
+            x,
+            t,
+            dt,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         return x_next
 
-    def rk4_step(self, x, t, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def rk4_step(
+        self,
+        x,
+        t,
+        dt,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
         """
         Perform one Runge-Kutta 4 integration step and return both the next state
         and the averaged force over the step.
         """
-        k1 = self.g(x, reduced_velocity=reduced_velocity)
-        force1 = self.u_theta(x, reduced_velocity=reduced_velocity)
+        k1 = self.g(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        force1 = self.u_theta(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x2 = x + 0.5 * dt * k1
-        k2 = self.g(x2, reduced_velocity=reduced_velocity)
-        force2 = self.u_theta(x2, reduced_velocity=reduced_velocity)
+        k2 = self.g(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        force2 = self.u_theta(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x3 = x + 0.5 * dt * k2
-        k3 = self.g(x3, reduced_velocity=reduced_velocity)
-        force3 = self.u_theta(x3, reduced_velocity=reduced_velocity)
+        k3 = self.g(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        force3 = self.u_theta(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x4 = x + dt * k3
-        k4 = self.g(x4, reduced_velocity=reduced_velocity)
-        force4 = self.u_theta(x4, reduced_velocity=reduced_velocity)
+        k4 = self.g(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        force4 = self.u_theta(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
@@ -1242,9 +1618,31 @@ class PHVIV(nn.Module):
         F_hist = []
 
         z = z0
+        history_len = int(self.history_len) + 1 if self.is_tcn_force_model else 0
+        z_hist = None
+        ur_hist = None
+        if self.is_tcn_force_model:
+            z_hist = z.unsqueeze(1).repeat(1, history_len, 1)
+            if self.use_reduced_velocity:
+                rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=z[..., :1])
+                assert rv_raw is not None
+                ur_hist = rv_raw.unsqueeze(1).repeat(1, history_len, 1)
         for k in range(K):
             t = t_seq[:, k]
-            z, Fk = self.rk4_step(z, t, dt, reduced_velocity=reduced_velocity)
+            z, Fk = self.rk4_step(
+                z,
+                t,
+                dt,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
+            if self.is_tcn_force_model and z_hist is not None:
+                z_hist = torch.cat([z_hist[:, 1:, :], z.unsqueeze(1)], dim=1)
+                if ur_hist is not None:
+                    rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=z[..., :1])
+                    assert rv_raw is not None
+                    ur_hist = torch.cat([ur_hist[:, 1:, :], rv_raw.unsqueeze(1)], dim=1)
             Z_pred.append(z)
             F_hist.append(Fk)
 
@@ -1266,11 +1664,45 @@ class PHVIV(nn.Module):
         return w_state[0]*Ly + w_state[1]*Lp
 
     
-    def res_loss(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        return self.res_loss_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+    def res_loss(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        return self.res_loss_SRK4(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
     
-    def avg_force(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        return self.avg_force_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+    def avg_force(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        return self.avg_force_SRK4(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
 
     def res_loss_per_sample(
         self,
@@ -1279,8 +1711,18 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.res_loss_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+        return self.res_loss_SRK4_per_sample(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
 
     def avg_force_per_sample(
         self,
@@ -1289,11 +1731,38 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.avg_force_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+        return self.avg_force_SRK4_per_sample(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
 
-    def avg_force_coeff(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        return self.avg_force_coeff_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+    def avg_force_coeff(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        return self.avg_force_coeff_SRK4(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
 
     def avg_force_coeff_per_sample(
         self,
@@ -1302,8 +1771,18 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.avg_force_coeff_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+        return self.avg_force_coeff_SRK4_per_sample(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
     
     def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dz = (zin-zi)/self.dt
@@ -1324,7 +1803,16 @@ class PHVIV(nn.Module):
         return loss
     
 
-    def res_loss_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def res_loss_SRK4(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
         dt = self.dt
         # constants from the scheme
         a = 0.5
@@ -1341,16 +1829,36 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin   # (B, d)
 
         # stage evaluations of g
-        g_a_plus  = self.g(z_a_plus, reduced_velocity=reduced_velocity)                  # (B, d)
-        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)                 # (B, d)
+        g_a_plus = self.g(
+            z_a_plus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )                  # (B, d)
+        g_a_minus = self.g(
+            z_a_minus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )                 # (B, d)
 
         # two corrected midpoints
         z_corr_minus = z_mid - b * dt * g_a_plus      # (B, d)
         z_corr_plus  = z_mid + b * dt * g_a_minus     # (B, d)
 
         # final two g-evals
-        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)                     # (B, d)
-        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)                      # (B, d)
+        g1 = self.g(
+            z_corr_minus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )                     # (B, d)
+        g2 = self.g(
+            z_corr_plus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )                      # (B, d)
 
         dz_model = 0.5 * g1 + 0.5 * g2                # (B, d)
 
@@ -1368,7 +1876,14 @@ class PHVIV(nn.Module):
         return loss
 
     def res_loss_SRK4_per_sample(
-        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dt = self.dt
         a = 0.5
@@ -1379,14 +1894,14 @@ class PHVIV(nn.Module):
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
-        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity)
-        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)
+        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         z_corr_minus = z_mid - b * dt * g_a_plus
         z_corr_plus = z_mid + b * dt * g_a_minus
 
-        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)
-        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)
+        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         dz_model = 0.5 * g1 + 0.5 * g2
         res = dz_fd - dz_model
@@ -1397,7 +1912,16 @@ class PHVIV(nn.Module):
             res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
         return torch.sum(res_scaled**2, dim=1)
     
-    def avg_force_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def avg_force_SRK4(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
         dt = self.dt
         b = math.sqrt(3.0) / 6.0
 
@@ -1406,25 +1930,49 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
         # evaluate learned force at both stages
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)    # assume (B, 1) or (B, 2)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        f1 = self.f(
+            z_a_plus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )    # assume (B, 1) or (B, 2)
+        f2 = self.f(
+            z_a_minus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
 
         loss = 0.5 * torch.mean(torch.sum(torch.abs(f1), dim=1)) \
             + 0.5 * torch.mean(torch.sum(torch.abs(f2), dim=1))
         return loss
 
     def avg_force_SRK4_per_sample(
-        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
         return 0.5 * torch.sum(torch.abs(f1), dim=1) + 0.5 * torch.sum(torch.abs(f2), dim=1)
 
     def avg_force_coeff_SRK4(
-        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ):
         dt = self.dt
         b = math.sqrt(3.0) / 6.0
@@ -1432,8 +1980,8 @@ class PHVIV(nn.Module):
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1)
 
         f1c = f1 / f0
@@ -1443,13 +1991,20 @@ class PHVIV(nn.Module):
         return loss
 
     def avg_force_coeff_SRK4_per_sample(
-        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1)
         f1c = f1 / f0
         f2c = f2 / f0
@@ -1984,6 +2539,7 @@ def build_dataloader_from_series(
     prefetch_factor: int = 4,
     per_traj_norm: str = "none",
     per_traj_norm_eps: float = 1e-8,
+    history_len: int = 0,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
         raise ValueError("series_data must contain at least one (y, t, dt, vel, force, U_r) tuple.")
@@ -2037,6 +2593,7 @@ def build_dataloader_from_series(
                 reduced_velocity=ur_tensor,
                 force_tensor=force_tensor,
                 traj_scale=traj_scale,
+                history_len=history_len,
             )
         )
         seq_len = y_tensor.shape[0]
@@ -2303,6 +2860,7 @@ def build_dataset(
     reduced_velocity: torch.Tensor,
     force_tensor: torch.Tensor | None = None,
     traj_scale: float | None = None,
+    history_len: int = 0,
 ) -> TensorDataset:
     """Construct consecutive state/time pairs for training (optionally with force labels)."""
     z = torch.stack((y_data_t, vel * m_eff), dim=1)
@@ -2313,10 +2871,34 @@ def build_dataset(
         raise ValueError("Reduced velocity tensor must have shape (T,) or (T, 1).")
     if ur.shape[0] != z.shape[0]:
         raise ValueError("Reduced velocity tensor must match the sequence length.")
+    hist = max(0, int(history_len))
+    if hist > 0 and z.shape[0] < (hist + 2):
+        raise ValueError(
+            f"Not enough samples ({int(z.shape[0])}) for history_len={hist}. Need at least {hist + 2}."
+        )
     scale_tensor: torch.Tensor | None = None
-    if traj_scale is not None:
-        scale_tensor = torch.full((z.shape[0] - 1,), float(traj_scale), dtype=torch.float32)
-    if force_tensor is None:
+    if hist == 0:
+        if traj_scale is not None:
+            scale_tensor = torch.full((z.shape[0] - 1,), float(traj_scale), dtype=torch.float32)
+        if force_tensor is None:
+            if scale_tensor is None:
+                return TensorDataset(
+                    z[:-1],
+                    t_tensor[:-1].unsqueeze(1),
+                    z[1:],
+                    t_tensor[1:].unsqueeze(1),
+                    ur[:-1],
+                )
+            return TensorDataset(
+                z[:-1],
+                t_tensor[:-1].unsqueeze(1),
+                z[1:],
+                t_tensor[1:].unsqueeze(1),
+                ur[:-1],
+                scale_tensor,
+            )
+        if force_tensor.shape[0] != z.shape[0]:
+            raise ValueError("force_tensor must match the sequence length.")
         if scale_tensor is None:
             return TensorDataset(
                 z[:-1],
@@ -2324,18 +2906,9 @@ def build_dataset(
                 z[1:],
                 t_tensor[1:].unsqueeze(1),
                 ur[:-1],
+                force_tensor[:-1].unsqueeze(1),
+                force_tensor[1:].unsqueeze(1),
             )
-        return TensorDataset(
-            z[:-1],
-            t_tensor[:-1].unsqueeze(1),
-            z[1:],
-            t_tensor[1:].unsqueeze(1),
-            ur[:-1],
-            scale_tensor,
-        )
-    if force_tensor.shape[0] != z.shape[0]:
-        raise ValueError("force_tensor must match the sequence length.")
-    if scale_tensor is None:
         return TensorDataset(
             z[:-1],
             t_tensor[:-1].unsqueeze(1),
@@ -2344,15 +2917,67 @@ def build_dataset(
             ur[:-1],
             force_tensor[:-1].unsqueeze(1),
             force_tensor[1:].unsqueeze(1),
+            scale_tensor,
+        )
+
+    idx = torch.arange(hist, z.shape[0] - 1, dtype=torch.long)
+    z_i = z[idx]
+    z_next = z[idx + 1]
+    t_i = t_tensor[idx].unsqueeze(1)
+    t_next = t_tensor[idx + 1].unsqueeze(1)
+    ur_i = ur[idx]
+
+    z_hist = z.unfold(0, hist + 1, 1).permute(0, 2, 1)[:-1].contiguous()
+    ur_hist = ur.unfold(0, hist + 1, 1).permute(0, 2, 1)[:-1].contiguous()
+
+    if traj_scale is not None:
+        scale_tensor = torch.full((z_i.shape[0],), float(traj_scale), dtype=torch.float32)
+
+    if force_tensor is None:
+        if scale_tensor is None:
+            return TensorDataset(
+                z_i,
+                t_i,
+                z_next,
+                t_next,
+                ur_i,
+                z_hist,
+                ur_hist,
+            )
+        return TensorDataset(
+            z_i,
+            t_i,
+            z_next,
+            t_next,
+            ur_i,
+            z_hist,
+            ur_hist,
+            scale_tensor,
+        )
+    if force_tensor.shape[0] != z.shape[0]:
+        raise ValueError("force_tensor must match the sequence length.")
+    if scale_tensor is None:
+        return TensorDataset(
+            z_i,
+            t_i,
+            z_next,
+            t_next,
+            ur_i,
+            z_hist,
+            ur_hist,
+            force_tensor[idx].unsqueeze(1),
+            force_tensor[idx + 1].unsqueeze(1),
         )
     return TensorDataset(
-        z[:-1],
-        t_tensor[:-1].unsqueeze(1),
-        z[1:],
-        t_tensor[1:].unsqueeze(1),
-        ur[:-1],
-        force_tensor[:-1].unsqueeze(1),
-        force_tensor[1:].unsqueeze(1),
+        z_i,
+        t_i,
+        z_next,
+        t_next,
+        ur_i,
+        z_hist,
+        ur_hist,
+        force_tensor[idx].unsqueeze(1),
+        force_tensor[idx + 1].unsqueeze(1),
         scale_tensor,
     )
 
@@ -2455,44 +3080,43 @@ def rollout_model(
 ) -> dict[str, np.ndarray]:
     """Roll the model forward over the full time grid and return normalised traces."""
     p0 = vel[0] * m_eff
-    state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
+    z0 = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
+    t_seq = torch.from_numpy(np.asarray(t, dtype=np.float32)).to(device=device).unsqueeze(0)
     rv_val = reduced_velocity
     if torch.is_tensor(rv_val):
         rv_val = float(rv_val.reshape(-1)[0].detach().cpu())
     else:
         rv_val = float(np.asarray(rv_val).reshape(-1)[0])
-    rv_tensor = torch.tensor(rv_val, device=device)
-    y_samples: list[torch.Tensor] = []
-    p_samples: list[torch.Tensor] = []
-    force_total: list[torch.Tensor] = []
-    force_drag: list[torch.Tensor] = []
-    force_model: list[torch.Tensor] = []
-    hamiltonian_model_vals: list[torch.Tensor] = []
-    with torch.no_grad():
-        for _ in range(len(t)):
-            y_samples.append(state[0, 0].detach())
-            p_samples.append(state[0, 1].detach())
-            model_force = model.learned_force(state, reduced_velocity=rv_tensor).squeeze().detach()
-            if model.include_physical_drag:
-                drag_force = model.drag_force(state).squeeze().detach()
-            else:
-                drag_force = model_force.new_tensor(0.0)
-            total_force = model.u_theta(state, reduced_velocity=rv_tensor).squeeze().detach()
-            H_val = model.H(state).detach()
-            force_model.append(model_force)
-            force_drag.append(drag_force)
-            force_total.append(total_force)
-            hamiltonian_model_vals.append(H_val)
-            state = model.step_rk4(state, t, dt, reduced_velocity=rv_tensor)
+    rv_tensor = torch.tensor(rv_val, dtype=z0.dtype, device=device).view(1, 1)
 
-    y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
-    p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()
+    with torch.no_grad():
+        z_pred, f_hist = model.rollout(z0, t_seq, dt, reduced_velocity=rv_tensor)
+        if f_hist is None:
+            force_total_t = model.u_theta_sequence(
+                z_pred,
+                reduced_velocity=rv_tensor.unsqueeze(1).expand(1, z_pred.shape[1], 1),
+            )
+        else:
+            force_total_t = f_hist
+        rv_seq = rv_tensor.unsqueeze(1).expand(1, z_pred.shape[1], 1)
+        if model.is_tcn_force_model:
+            force_model_t = model.learned_force_sequence(z_pred, reduced_velocity=rv_seq)
+        else:
+            force_model_t = model.learned_force(z_pred, reduced_velocity=rv_seq)
+        if model.include_physical_drag:
+            force_drag_t = force_total_t - force_model_t
+        else:
+            force_drag_t = torch.zeros_like(force_total_t)
+        hamiltonian_model_t = model.H(z_pred)
+
+    y_samples_arr = z_pred[0, :, 0].detach().cpu().numpy()
+    p_samples_arr = z_pred[0, :, 1].detach().cpu().numpy()
     y_pred_norm = y_samples_arr / D
     p_pred_norm = (p_samples_arr / m_eff) / (np.sqrt(k / m_eff) * D)
-    force_total_arr = torch.stack(force_total).detach().cpu().numpy()
-    force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
-    force_model_arr = torch.stack(force_model).detach().cpu().numpy()
-    hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
+    force_total_arr = force_total_t[0, :, 0].detach().cpu().numpy()
+    force_drag_arr = force_drag_t[0, :, 0].detach().cpu().numpy()
+    force_model_arr = force_model_t[0, :, 0].detach().cpu().numpy()
+    hamiltonian_model_arr = hamiltonian_model_t[0, :].detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
