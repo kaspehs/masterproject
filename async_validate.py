@@ -149,8 +149,10 @@ def _run_hnn_validation(
     )
 
     model_dict = asdict(cfg.model)
+    model_dict["physics_loss_discretization"] = str(getattr(loss_cfg, "physics_loss_discretization", "srk4"))
     arch_dict = asdict(cfg.architecture)
     model, derived = PHVIV.from_config(dt=float(dt), cfg=model_dict, arch_cfg=arch_dict, device=device)
+    model.set_loss_discretization(str(getattr(loss_cfg, "physics_loss_discretization", "srk4")))
     history_context = int(getattr(model, "history_len", 0)) if bool(getattr(model, "is_tcn_force_model", False)) else 0
     _load_state(model, ckpt["model_state"])
     model.eval()

@@ -131,6 +131,8 @@ class OptimConfig:
 @dataclass
 class LossConfig:
     force_reg: float = 1e-2
+    # PHNN only: "srk4" (default) or "implicit_euler"
+    physics_loss_discretization: str = "srk4"
     force_reg_on_coeff: bool = False
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
@@ -298,6 +300,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
     optim_keys = {"lr", "optimizer", "weight_decay", "use_lr_scheduler", "scheduler"}
     loss_keys = {
         "force_reg",
+        "physics_loss_discretization",
         "force_reg_on_coeff",
         "use_gradnorm",
         "gradnorm_alpha",
@@ -814,6 +817,7 @@ class PHVIV(nn.Module):
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
         tcn_kwargs: dict[str, Any] | None = None,
+        physics_loss_discretization: str = "srk4",
     ):
         super().__init__()
         self.dt = dt
@@ -831,6 +835,8 @@ class PHVIV(nn.Module):
         if force_output not in {"force", "coefficient"}:
             raise ValueError("force_output must be one of: force, coefficient")
         self.force_output = force_output
+        self.loss_discretization = "srk4"
+        self.set_loss_discretization(physics_loss_discretization)
         self.learn_hamiltonian = bool(learn_hamiltonian)
         self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
@@ -1046,6 +1052,7 @@ class PHVIV(nn.Module):
         fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
+        physics_loss_discretization = str(cfg.get("physics_loss_discretization", "srk4"))
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         arch_cfg = arch_cfg or {}
@@ -1099,6 +1106,7 @@ class PHVIV(nn.Module):
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
             tcn_kwargs=tcn_kwargs,
+            physics_loss_discretization=physics_loss_discretization,
         )
         if device is not None:
             model = model.to(device)
@@ -1110,6 +1118,27 @@ class PHVIV(nn.Module):
             "p_scale": p_scale,
         }
         return model, derived
+
+    @staticmethod
+    def _normalize_loss_discretization(name: str) -> str:
+        key = str(name).strip().lower().replace("-", "_")
+        aliases = {
+            "srk4": "srk4",
+            "rk4": "srk4",
+            "s_rk4": "srk4",
+            "implicit_euler": "implicit_euler",
+            "euler": "implicit_euler",
+            "midpoint_euler": "implicit_euler",
+            "implicit_midpoint": "implicit_euler",
+        }
+        if key not in aliases:
+            raise ValueError(
+                "loss.physics_loss_discretization must be one of: srk4, implicit_euler."
+            )
+        return aliases[key]
+
+    def set_loss_discretization(self, name: str) -> None:
+        self.loss_discretization = self._normalize_loss_discretization(name)
 
     def H(self, x):
         if not self.learn_hamiltonian:
@@ -1674,6 +1703,16 @@ class PHVIV(nn.Module):
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
     ):
+        if self.loss_discretization == "implicit_euler":
+            return self.res_loss_Euler(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         return self.res_loss_SRK4(
             zi,
             ti,
@@ -1694,6 +1733,16 @@ class PHVIV(nn.Module):
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
     ):
+        if self.loss_discretization == "implicit_euler":
+            return self.avg_force_Euler(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         return self.avg_force_SRK4(
             zi,
             ti,
@@ -1714,6 +1763,16 @@ class PHVIV(nn.Module):
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.loss_discretization == "implicit_euler":
+            return self.res_loss_Euler_per_sample(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         return self.res_loss_SRK4_per_sample(
             zi,
             ti,
@@ -1734,6 +1793,16 @@ class PHVIV(nn.Module):
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.loss_discretization == "implicit_euler":
+            return self.avg_force_Euler_per_sample(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         return self.avg_force_SRK4_per_sample(
             zi,
             ti,
@@ -1754,6 +1823,16 @@ class PHVIV(nn.Module):
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
     ):
+        if self.loss_discretization == "implicit_euler":
+            return self.avg_force_coeff_Euler(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         return self.avg_force_coeff_SRK4(
             zi,
             ti,
@@ -1774,6 +1853,16 @@ class PHVIV(nn.Module):
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.loss_discretization == "implicit_euler":
+            return self.avg_force_coeff_Euler_per_sample(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
         return self.avg_force_coeff_SRK4_per_sample(
             zi,
             ti,
@@ -1783,11 +1872,35 @@ class PHVIV(nn.Module):
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
-    
-    def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        dz = (zin-zi)/self.dt
-        z_mean = 0.5*(zin+zi)
-        res = dz - self.g(z_mean, reduced_velocity=reduced_velocity)
+
+    def _pair_dt(self, ti: torch.Tensor | None, tin: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor:
+        if ti is None or tin is None:
+            return like.new_full((like.shape[0], 1), float(self.dt))
+        dt = tin - ti
+        if dt.ndim == 1:
+            dt = dt.unsqueeze(1)
+        dt_safe = torch.where(dt.abs() > 0.0, dt, dt.new_full(dt.shape, float(self.dt)))
+        return dt_safe
+
+    def res_loss_Euler(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        dt_pair = self._pair_dt(ti, tin, like=zi)
+        dz = (zin - zi) / dt_pair
+        z_mean = 0.5 * (zin + zi)
+        res = dz - self.g(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         res_scaled = res / self.res_scale
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
@@ -1796,12 +1909,109 @@ class PHVIV(nn.Module):
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
         return loss
 
-    def avg_force_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        z_mean = 0.5*(zin+zi)
-        forces = self.learned_force(z_mean, reduced_velocity=reduced_velocity)
+    def res_loss_Euler_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        dt_pair = self._pair_dt(ti, tin, like=zi)
+        dz = (zin - zi) / dt_pair
+        z_mean = 0.5 * (zin + zi)
+        res = dz - self.g(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        res_scaled = res / self.res_scale
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            res_scaled = res_scaled.clone()
+            res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
+        return torch.sum(res_scaled**2, dim=1)
+
+    def avg_force_Euler(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        z_mean = 0.5 * (zin + zi)
+        forces = self.f(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         loss = torch.mean(torch.linalg.norm(forces, ord=1, dim=1))
         return loss
-    
+
+    def avg_force_Euler_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        z_mean = 0.5 * (zin + zi)
+        forces = self.f(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        return torch.linalg.norm(forces, ord=1, dim=1)
+
+    def avg_force_coeff_Euler(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        z_mean = 0.5 * (zin + zi)
+        force_coeff = self.u_theta_coeff(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        return torch.mean(torch.linalg.norm(force_coeff, ord=1, dim=1))
+
+    def avg_force_coeff_Euler_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        z_mean = 0.5 * (zin + zi)
+        force_coeff = self.u_theta_coeff(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        return torch.linalg.norm(force_coeff, ord=1, dim=1)
+
 
     def res_loss_SRK4(
         self,

@@ -90,6 +90,8 @@ optim:
     scheduler_type: cosine
 
 loss:
+  # Options: srk4 (default) | implicit_euler
+  physics_loss_discretization: srk4
   force_reg: 0.0001
   force_reg_on_coeff: true
   use_force_data_loss: false

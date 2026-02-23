@@ -1061,6 +1061,7 @@ def train(config: Config, config_name: str) -> None:
     scheduler_cfg = optim_cfg.scheduler
 
     force_reg = float(loss_cfg.force_reg)
+    physics_loss_discretization = str(getattr(loss_cfg, "physics_loss_discretization", "srk4"))
     force_reg_on_coeff = bool(getattr(loss_cfg, "force_reg_on_coeff", False))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
@@ -1089,15 +1090,22 @@ def train(config: Config, config_name: str) -> None:
     non_blocking = device.type == "cuda"
 
     model_dict = asdict(model_cfg)
+    model_dict["physics_loss_discretization"] = physics_loss_discretization
     arch_dict = asdict(config.architecture)
     model, derived_params = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    model.set_loss_discretization(physics_loss_discretization)
     history_context = int(getattr(model, "history_len", 0)) if bool(getattr(model, "is_tcn_force_model", False)) else 0
     if history_context > 0:
         print(f"PHNN TCN context enabled: history_len={history_context}")
+    print(f"PHNN physics loss discretization: {model.loss_discretization}")
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
     try:
         setattr(model, "is_tcn_force_model", history_context > 0)
         setattr(model, "history_len", history_context)
+        if hasattr(model, "set_loss_discretization"):
+            model.set_loss_discretization(physics_loss_discretization)
+        else:
+            setattr(model, "loss_discretization", physics_loss_discretization)
     except Exception:
         pass
     D = derived_params["D"]
