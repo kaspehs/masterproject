@@ -1967,6 +1967,9 @@ def train(config: Config, config_name: str) -> None:
     rollout_force_weight = float(vp.get("rollout_force_weight", 0.0))
     rollout_force_steps = int(vp.get("rollout_force_steps", 0))
     rollout_force_every = int(vp.get("rollout_force_every", 1))
+    rollout_force_batch_size = int(vp.get("rollout_force_batch_size", 0))
+    if rollout_force_batch_size < 0:
+        raise ValueError("vpinn.rollout_force_batch_size must be >= 0.")
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
@@ -2091,6 +2094,11 @@ def train(config: Config, config_name: str) -> None:
     gradnorm_last_weak = None
     gradnorm_last_rollout = None
     use_rollout_loss = rollout_force_weight > 0.0 and rollout_force_steps > 0
+    if use_rollout_loss and rollout_force_batch_size > 0:
+        print(
+            "VPINN rollout loss uses sub-batches: "
+            f"rollout_force_batch_size={rollout_force_batch_size} (0 means full batch)."
+        )
     if use_gradnorm:
         gradnorm_names: list[str] = []
         if use_force_loss:
@@ -2332,12 +2340,32 @@ def train(config: Config, config_name: str) -> None:
                     if (step % max(1, int(rollout_force_every))) == 0:
                         steps_k = min(int(rollout_force_steps), int(M1_target) - 1)
                         if steps_k > 0:
-                            f0_step = f0_eval[:, 0, :] if f0_eval is not None else None
+                            x_roll = x_eval
+                            v_roll = v_eval
+                            ur_roll = ur_eval
+                            f_roll_true = f_eval
+                            f0_roll = f0_eval
+                            scale_roll = scale
+
+                            if int(rollout_force_batch_size) > 0 and int(x_eval.shape[0]) > int(rollout_force_batch_size):
+                                sel = torch.randperm(int(x_eval.shape[0]), device=x_eval.device)[
+                                    : int(rollout_force_batch_size)
+                                ]
+                                x_roll = x_eval.index_select(0, sel)
+                                v_roll = v_eval.index_select(0, sel)
+                                ur_roll = ur_eval.index_select(0, sel)
+                                f_roll_true = f_eval.index_select(0, sel)
+                                if f0_eval is not None:
+                                    f0_roll = f0_eval.index_select(0, sel)
+                                if scale is not None:
+                                    scale_roll = scale.index_select(0, sel)
+
+                            f0_step = f0_roll[:, 0, :] if f0_roll is not None else None
                             _x_seq, _v_seq, f_seq = rollout_rk4(
                                 model=model,
-                                x0=x_eval[:, 0, :],
-                                v0=v_eval[:, 0, :],
-                                ur0=ur_eval[:, 0, :],
+                                x0=x_roll[:, 0, :],
+                                v0=v_roll[:, 0, :],
+                                ur0=ur_roll[:, 0, :],
                                 steps=steps_k,
                                 dt=dt,
                                 m=m,
@@ -2346,10 +2374,10 @@ def train(config: Config, config_name: str) -> None:
                                 f0=f0_step,
                             )
                             f_roll = f_seq[:, : steps_k + 1, :]
-                            f_true = f_eval[:, : steps_k + 1, :]
+                            f_true = f_roll_true[:, : steps_k + 1, :]
                             per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
-                            if scale is not None:
-                                per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
+                            if scale_roll is not None:
+                                per_roll = per_roll / (scale_roll * scale_roll + float(per_traj_norm_eps))
                             loss_roll = torch.mean(per_roll)
                             roll_computed = True
 
