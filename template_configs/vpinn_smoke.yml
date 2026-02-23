@@ -120,7 +120,7 @@ vpinn:
   use_gradnorm: true
   gradnorm_alpha: 0.9
   gradnorm_eps: 1.0e-8
-  gradnorm_min_weight: 000.1
+  gradnorm_min_weight: 0.001
   gradnorm_max_weight: 1000.0
   gradnorm_update_every_steps: 10
   window_M: 10
