@@ -914,7 +914,7 @@ def train(config: Config, config_name: str) -> None:
     t = data["a"]
     y_data = data["b"]
     F_data = data["c"]
-    H_data = data["d"]
+    H_data = data["d"] if "d" in data else None
     if "U_r" not in data:
         raise KeyError(f"{data_path} is missing reduced velocity 'U_r'.")
     reduced_velocity = data["U_r"]

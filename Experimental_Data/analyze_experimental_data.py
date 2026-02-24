@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import warnings
 
 import matplotlib.pyplot as plt
@@ -12,21 +13,35 @@ from scipy.signal import savgol_filter
 
 
 # Input file settings
-MAT_FILES_CROSSFLOW = [
-    #Path("Experimental_Data/CrossFlow/test3002.mat"),
-    Path("Experimental_Data/CrossFlow/test3003.mat"),
-    Path("Experimental_Data/CrossFlow/test3004.mat"),
-    Path("Experimental_Data/CrossFlow/test3005.mat"),
-    Path("Experimental_Data/CrossFlow/test3006.mat"),
-    Path("Experimental_Data/CrossFlow/test3008.mat"),
-    Path("Experimental_Data/CrossFlow/test3009.mat"),
-    Path("Experimental_Data/CrossFlow/test3010.mat"),
-    Path("Experimental_Data/CrossFlow/test3011.mat"),
-    Path("Experimental_Data/CrossFlow/test3012.mat"),
-    Path("Experimental_Data/CrossFlow/test3014.mat"),
+MAT_FILES_CROSSFLOW_RAW = [
+    Path("Experimental_Data/CrossFlow/RawData/test3002.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3003.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3004.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3005.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3006.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3008.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3009.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3010.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3011.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3012.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3014.mat"),
 ]
 
-MAT_FILES_COMBINED = [
+MAT_FILES_CROSSFLOW_CORRECTED = [
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3002_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3003_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3004_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3005_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3006_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3008_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3009_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3010_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3011_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3012_corrected.mat"),
+    Path("Experimental_Data/CrossFlow/CorrectedData/test3014_corrected.mat"),
+]
+
+MAT_FILES_COMBINED_RAW = [
     Path("Experimental_Data/Combined/test4001.mat"),
     Path("Experimental_Data/Combined/test4002.mat"),
     Path("Experimental_Data/Combined/test4003.mat"),
@@ -46,19 +61,37 @@ MAT_FILES_COMBINED = [
     Path("Experimental_Data/Combined/test5005.mat"),
 ]
 
-# Choose input set: "crossflow" or "combined".
-MAT_SOURCE = "crossflow"
-if str(MAT_SOURCE).strip().lower() == "combined":
-    MAT_FILES = MAT_FILES_COMBINED
+# Backward-compatible aliases.
+MAT_FILES_CROSSFLOW = MAT_FILES_CROSSFLOW_RAW
+MAT_FILES_COMBINED = MAT_FILES_COMBINED_RAW
+
+# Choose input set:
+# - "crossflow_raw" (legacy alias: "crossflow")
+# - "crossflow_corrected" (legacy aliases: "corrected", "crossflow_corr")
+# - "combined"
+MAT_SOURCE = "crossflow_corrected"
+MAT_SOURCE_KEY = str(MAT_SOURCE).strip().lower()
+if MAT_SOURCE_KEY == "combined":
+    MAT_FILES = MAT_FILES_COMBINED_RAW
     MAT_GLOB_BASE_DIR = Path("Experimental_Data/Combined")
+    DATA_VARIABLE_DEFAULT = "data"
+elif MAT_SOURCE_KEY in {"crossflow_corrected", "corrected", "crossflow_corr"}:
+    MAT_FILES = MAT_FILES_CROSSFLOW_CORRECTED
+    MAT_GLOB_BASE_DIR = Path("Experimental_Data/CrossFlow/CorrectedData")
+    DATA_VARIABLE_DEFAULT = "data_corrected"
 else:
-    MAT_FILES = MAT_FILES_CROSSFLOW
-    MAT_GLOB_BASE_DIR = Path("Experimental_Data/CrossFlow")
+    MAT_FILES = MAT_FILES_CROSSFLOW_RAW
+    MAT_GLOB_BASE_DIR = Path("Experimental_Data/CrossFlow/RawData")
+    DATA_VARIABLE_DEFAULT = "data"
 
 MAT_GLOB = None  # e.g. "test40*.mat" (merged with MAT_FILES if set)
-DATA_VARIABLE = "data"  # Set to None to auto-detect the first 2D numeric array.
+DATA_VARIABLE = DATA_VARIABLE_DEFAULT  # Set to None to auto-detect the first 2D numeric array.
 FIRST_WINDOW_SECONDS = 10.0
 USE_RELATIVE_TIME = True  # Plot time starting at 0 for each file when True.
+
+# Exclude files by test number parsed from filename, e.g. `test3009.mat`
+# or `test3009_corrected.mat` -> 3009.
+EXCLUDE_TEST_NUMBERS: list[int] = [3009, 3002]
 
 # Base physical parameters
 D = 0.1  # Diameter of the test cylinder (m)
@@ -74,7 +107,7 @@ LA = 4.21 + 0.5  # Length between cylinder center and top end (m)
 # External-force convention:
 # F_hydro = F_wake - m_a * y_ddot  =>  F_wake = F_hydro + m_a * y_ddot
 # where m_a = C_a * rho * pi * D^2 * L / 4
-REMOVE_ADDED_MASS_FROM_CF = False
+REMOVE_ADDED_MASS_FROM_CF = True
 ADDED_MASS_COEFF = 1.0
 
 # Optional inertia removal on CF force (external-force convention):
@@ -98,7 +131,7 @@ CF_SIGN = 1.0
 
 # Savitzky-Golay settings for velocity/acceleration estimation from displacement.
 USE_SAVGOL_DERIVATIVES = True
-SAVGOL_WINDOW_LENGTH = 31
+SAVGOL_WINDOW_LENGTH = 71
 SAVGOL_POLYORDER = 3
 
 # Spectrum plotting
@@ -118,7 +151,16 @@ PHASE_MIN_SAMPLES_PER_BIN = 6
 REF_CA_FOR_FN_LINE = 1.0
 
 
+def _using_corrected_input() -> bool:
+    return MAT_SOURCE_KEY in {"crossflow_corrected", "corrected", "crossflow_corr"}
+
+
 def _cf_force_mode_label() -> str:
+    if _using_corrected_input():
+        base = "calculated_force (corrected MAT)"
+        if CF_SIGN < 0.0:
+            base = f"-({base})"
+        return base
     base = "Fy2 - Fy1"
     if CF_SIGN < 0.0:
         base = f"-({base})"
@@ -167,13 +209,10 @@ def _drag_name() -> str:
     return "Drag force" if _use_raw_force_signals() else "Drag coefficient"
 
 
-def _maybe_fix_orientation(arr: np.ndarray, *, min_cols: int = 25) -> np.ndarray:
+def _maybe_fix_orientation(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
     if arr.ndim != 2:
         return arr
-    # MATLAB v7.3/HDF5 datasets are often effectively transposed when read directly.
-    if arr.shape[1] < min_cols and arr.shape[0] >= min_cols:
-        return arr.T
     # For time-series tables we expect rows >> cols. If cols are much larger than rows,
     # the matrix is likely transposed and should be flipped.
     if arr.shape[0] < arr.shape[1] and (arr.shape[1] / max(arr.shape[0], 1)) > 3.0:
@@ -335,6 +374,91 @@ def _select_column(
     return np.asarray(data[:, fallback_idx]).reshape(-1)
 
 
+def _find_column_index(
+    data: np.ndarray,
+    channel_names: list[str] | None,
+    aliases: list[str],
+) -> int | None:
+    if channel_names is None:
+        return None
+    index_map = {_norm_name(name): idx for idx, name in enumerate(channel_names)}
+    for alias in aliases:
+        idx = index_map.get(_norm_name(alias))
+        if idx is not None and 0 <= idx < data.shape[1]:
+            return int(idx)
+    return None
+
+
+def _load_optional_vector_from_mat(mat_file: Path, variable_names: list[str]) -> np.ndarray | None:
+    try:
+        raw = loadmat(mat_file, squeeze_me=True)
+    except NotImplementedError:
+        try:
+            import h5py  # type: ignore
+        except Exception:
+            return None
+        with h5py.File(mat_file, "r") as f:
+            for name in variable_names:
+                if name not in f:
+                    continue
+                obj = f[name]
+                if isinstance(obj, h5py.Dataset):
+                    arr = np.asarray(obj)
+                    if arr.ndim == 0:
+                        return np.asarray([float(arr)], dtype=float)
+                    if arr.ndim in (1, 2) and np.issubdtype(arr.dtype, np.number):
+                        return np.asarray(arr, dtype=float).reshape(-1)
+        return None
+
+    for name in variable_names:
+        if name not in raw:
+            continue
+        arr = np.asarray(raw[name])
+        if arr.ndim == 0:
+            return np.asarray([float(arr)], dtype=float)
+        if arr.ndim in (1, 2) and np.issubdtype(arr.dtype, np.number):
+            return np.asarray(arr, dtype=float).reshape(-1)
+    return None
+
+
+def _fit_vector_length(values: np.ndarray, *, n: int, role: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == n:
+        return arr
+    if arr.size == 1:
+        return np.full(n, float(arr[0]), dtype=float)
+    if arr.size < n:
+        raise ValueError(f"{role}: length {arr.size} is shorter than required length {n}.")
+    return arr[:n]
+
+
+def _fill_nonfinite_1d(values: np.ndarray, *, role: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        raise ValueError(f"{role} contains no finite samples.")
+    if np.all(finite):
+        return arr
+    idx = np.arange(arr.size, dtype=float)
+    arr[~finite] = np.interp(idx[~finite], idx[finite], arr[finite])
+    return arr
+
+
+def _infer_dt(time: np.ndarray, *, role: str) -> float:
+    t = np.asarray(time, dtype=float).reshape(-1)
+    if t.size < 2:
+        raise ValueError(f"{role}: not enough samples to infer dt.")
+    diffs = np.diff(t)
+    diffs = diffs[np.isfinite(diffs)]
+    diffs = diffs[diffs > 0.0]
+    if diffs.size == 0:
+        raise ValueError(f"{role}: could not infer positive dt from time vector.")
+    dt = float(np.median(diffs))
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"{role}: invalid inferred dt={dt}.")
+    return dt
+
+
 def _spec(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray, int]:
     # Simple single-sided power spectrum (FFT-based), analogous to MATLAB helper `spec`.
     n = int(signal.size)
@@ -413,9 +537,24 @@ def _dominant_frequency_and_spread(
     s = np.nan_to_num(np.asarray(spec, dtype=float).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
     band = (f >= float(fmin)) & (f <= float(fmax))
     if not np.any(band):
-        raise ValueError(f"No spectral bins in [{fmin}, {fmax}] Hz.")
-    fb = f[band]
-    sb = s[band]
+        # Fallback for short/coarsely sampled signals where the requested
+        # frequency range does not align with available FFT bins.
+        pos = f > 0.0
+        if not np.any(pos):
+            warnings.warn(
+                f"No spectral bins in [{fmin}, {fmax}] Hz and no positive-frequency bins available; "
+                "returning NaN dominant frequency."
+            )
+            return float("nan"), float("nan")
+        fb = f[pos]
+        sb = s[pos]
+        warnings.warn(
+            f"No spectral bins in [{fmin}, {fmax}] Hz. "
+            f"Falling back to available positive-frequency bins [{float(np.min(fb)):.6g}, {float(np.max(fb)):.6g}] Hz."
+        )
+    else:
+        fb = f[band]
+        sb = s[band]
     idx_peak = int(np.argmax(sb))
     f_peak = float(fb[idx_peak])
     w_sum = float(np.sum(sb))
@@ -585,10 +724,33 @@ def _savgol_window_length(n_samples: int, preferred_window: int, polyorder: int)
     return window
 
 
+def _extract_test_number(path: Path) -> int | None:
+    stem = str(path.stem).lower()
+    match = re.search(r"test(\d+)", stem)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
+    excluded_raw = list(EXCLUDE_TEST_NUMBERS)
+    if not excluded_raw:
+        return paths
+    excluded = {int(v) for v in excluded_raw}
+    kept: list[Path] = []
+    for p in paths:
+        test_no = _extract_test_number(Path(p))
+        if test_no is not None and test_no in excluded:
+            continue
+        kept.append(Path(p))
+    return kept
+
+
 def _resolve_mat_files() -> list[Path]:
     files = [Path(p) for p in MAT_FILES]
     if MAT_GLOB:
         files.extend(sorted(Path(MAT_GLOB_BASE_DIR).glob(str(MAT_GLOB))))
+    files = _filter_excluded_tests(files)
     unique: list[Path] = []
     seen: set[Path] = set()
     for p in files:
@@ -607,6 +769,211 @@ def _resolve_mat_files() -> list[Path]:
 
 def _process_file(mat_file: Path) -> dict[str, object]:
     data, channel_names = _load_data_matrix(mat_file, DATA_VARIABLE)
+    if _using_corrected_input():
+        if data.shape[1] < 5:
+            raise ValueError(f"{mat_file.name}: corrected input must have at least 5 columns, got {data.shape}")
+
+        is_raw_layout = bool(data.shape[1] >= 25)
+        y_fallback = 23 if is_raw_layout else 1
+
+        time = _fill_nonfinite_1d(
+            _select_column(data, channel_names, ["time", "Time"], 0, role="time"),
+            role=f"{mat_file.name}: time",
+        )
+        ypos = _fill_nonfinite_1d(
+            _select_column(
+                data,
+                channel_names,
+                ["y_corrected", "xpos1", "y"],
+                y_fallback,
+                role="corrected displacement",
+            ),
+            role=f"{mat_file.name}: corrected displacement",
+        )
+
+        nt = int(min(time.size, ypos.size))
+        if nt < 2:
+            raise ValueError(f"{mat_file.name}: not enough samples to compute sampling frequency.")
+        time = np.asarray(time[:nt], dtype=float)
+        ypos = np.asarray(ypos[:nt], dtype=float)
+
+        dt = _infer_dt(time, role=f"{mat_file.name}: corrected time")
+        fs = 1.0 / dt
+
+        idx_ur = _find_column_index(data, channel_names, ["u_r", "ur", "U_r"])
+        if idx_ur is not None:
+            ur_inst = _fill_nonfinite_1d(
+                _fit_vector_length(data[:, idx_ur], n=nt, role=f"{mat_file.name}: reduced velocity"),
+                role=f"{mat_file.name}: reduced velocity",
+            )
+        else:
+            ur_aux = _load_optional_vector_from_mat(mat_file, ["U_r", "u_r", "ur"])
+            if ur_aux is not None:
+                ur_inst = _fill_nonfinite_1d(
+                    _fit_vector_length(ur_aux, n=nt, role=f"{mat_file.name}: reduced velocity"),
+                    role=f"{mat_file.name}: reduced velocity",
+                )
+            elif is_raw_layout:
+                flow = _select_column(data, channel_names, ["Water_Speed"], 19, role="flow speed")
+                flow = _fill_nonfinite_1d(
+                    _fit_vector_length(flow, n=nt, role=f"{mat_file.name}: flow speed"),
+                    role=f"{mat_file.name}: flow speed",
+                )
+                ur_inst = flow / (FN * D)
+            else:
+                raise ValueError(f"{mat_file.name}: could not resolve reduced-velocity signal.")
+
+        idx_yvel = _find_column_index(data, channel_names, ["dy_corrected", "dy", "e"])
+        if idx_yvel is not None:
+            yvel = _fill_nonfinite_1d(
+                _fit_vector_length(data[:, idx_yvel], n=nt, role=f"{mat_file.name}: corrected velocity"),
+                role=f"{mat_file.name}: corrected velocity",
+            )
+        else:
+            yvel_aux = _load_optional_vector_from_mat(mat_file, ["dy_corrected", "dy", "e"])
+            if yvel_aux is not None:
+                yvel = _fill_nonfinite_1d(
+                    _fit_vector_length(yvel_aux, n=nt, role=f"{mat_file.name}: corrected velocity"),
+                    role=f"{mat_file.name}: corrected velocity",
+                )
+            else:
+                yvel = np.gradient(ypos, dt)
+
+        idx_force = _find_column_index(data, channel_names, ["calculated_force", "f_total", "F_total", "c"])
+        if idx_force is not None:
+            fy_combined = _fill_nonfinite_1d(
+                _fit_vector_length(data[:, idx_force], n=nt, role=f"{mat_file.name}: corrected force"),
+                role=f"{mat_file.name}: corrected force",
+            )
+        else:
+            force_aux = _load_optional_vector_from_mat(
+                mat_file,
+                ["calculated_force", "F_total", "f_total", "c"],
+            )
+            if force_aux is not None:
+                fy_combined = _fill_nonfinite_1d(
+                    _fit_vector_length(force_aux, n=nt, role=f"{mat_file.name}: corrected force"),
+                    role=f"{mat_file.name}: corrected force",
+                )
+            elif is_raw_layout:
+                fy_spr1 = _select_column(data, channel_names, ["9130_FORCE_1"], 6, role="Fy_spring1")
+                fy_spr2 = _select_column(data, channel_names, ["9133_FORCE_4"], 9, role="Fy_spring2")
+                fy_spr1 = _fill_nonfinite_1d(
+                    _fit_vector_length(fy_spr1, n=nt, role=f"{mat_file.name}: Fy_spring1"),
+                    role=f"{mat_file.name}: Fy_spring1",
+                )
+                fy_spr2 = _fill_nonfinite_1d(
+                    _fit_vector_length(fy_spr2, n=nt, role=f"{mat_file.name}: Fy_spring2"),
+                    role=f"{mat_file.name}: Fy_spring2",
+                )
+                fy1 = (fy_spr1 - np.mean(fy_spr1)) * LB / LA
+                fy2 = (fy_spr2 - np.mean(fy_spr2)) * LB / LA
+                fy_combined = fy2 - fy1
+            else:
+                raise ValueError(f"{mat_file.name}: could not resolve corrected force signal.")
+
+        yacc = np.gradient(yvel, dt)
+
+        ur = float(np.mean(ur_inst))
+        umean = float(ur * FN * D)
+        fdrag = np.zeros_like(fy_combined)
+
+        if _use_mean_u_plus_dy2_norm():
+            coeff_norm_mode_used = "mean_u_plus_dy2"
+            q_ref_vec = 0.5 * RUO * L * D * ((umean**2) + np.asarray(yvel, dtype=float) ** 2)
+            q_ref_vec = np.maximum(q_ref_vec, float(COEFF_NORM_EPS))
+        else:
+            coeff_norm_mode_used = "mean_u"
+            q_ref_scalar = max(0.5 * RUO * L * D * (umean**2), float(COEFF_NORM_EPS))
+            q_ref_vec = np.full_like(np.asarray(ypos, dtype=float), q_ref_scalar, dtype=float)
+        q_ref = float(np.nanmean(q_ref_vec))
+        cdrag_coeff = np.zeros_like(fy_combined)
+        cd = float(np.nanmean(cdrag_coeff))
+
+        finite_y = np.isfinite(ypos)
+        y_mean = float(np.nanmean(ypos)) if np.any(finite_y) else 0.0
+        y_nd = (ypos - y_mean) / D
+
+        m_added = float(ADDED_MASS_COEFF) * 0.25 * np.pi * RUO * D * D * L
+        m_inertia_removed = 0.0
+        fy_combined = float(CF_SIGN) * fy_combined
+        cfy_coeff = fy_combined / q_ref_vec
+
+        if _use_raw_force_signals():
+            cfy = fy_combined
+            cdrag = fdrag
+        else:
+            cfy = cfy_coeff
+            cdrag = cdrag_coeff
+
+        spcy, fhiy, nhiy = _spec(ypos, fs)
+        if NORMALIZE_SPECTRA:
+            spcy = _normalize_spectrum(spcy, eps=SPECTRUM_NORM_EPS)
+        freq = np.asarray(fhiy, dtype=float)
+        spec = np.asarray(spcy, dtype=float)
+        ydomfreq, ydomfreq_std = _dominant_frequency_and_spread(
+            freq,
+            spec,
+            fmin=DOM_FREQ_MIN_HZ,
+            fmax=DOM_FREQ_MAX_HZ,
+        )
+        phase_cfy_y_deg = _phase_lag_deg_at_frequency(y_nd, cfy, fs=fs, target_hz=ydomfreq)
+        phase_cdrag_y_deg = _phase_lag_deg_at_frequency(y_nd, cdrag, fs=fs, target_hz=ydomfreq)
+
+        time_plot = time - float(time[0]) if USE_RELATIVE_TIME else time
+        t_end = float(FIRST_WINDOW_SECONDS) if USE_RELATIVE_TIME else float(time[0]) + float(FIRST_WINDOW_SECONDS)
+        mask_early = time_plot <= t_end
+
+        spc_cfy, f_cfy, n_cfy = _spec(cfy, fs)
+        spc_cdrag, f_cdrag, n_cdrag = _spec(cdrag, fs)
+        spc_ur, f_ur, n_ur = _spec(ur_inst, fs)
+        if NORMALIZE_SPECTRA:
+            spc_cfy = _normalize_spectrum(spc_cfy, eps=SPECTRUM_NORM_EPS)
+            spc_cdrag = _normalize_spectrum(spc_cdrag, eps=SPECTRUM_NORM_EPS)
+            spc_ur = _normalize_spectrum(spc_ur, eps=SPECTRUM_NORM_EPS)
+
+        amp_stats = _displacement_amplitude_stats(y_nd)
+
+        return {
+            "path": mat_file,
+            "label": mat_file.stem,
+            "time": np.asarray(time, dtype=float),
+            "y": np.asarray(ypos, dtype=float),
+            "yacc": np.asarray(yacc, dtype=float),
+            "cfy_force": np.asarray(fy_combined, dtype=float),
+            "is_corrected_input": True,
+            "time_plot": time_plot,
+            "ur_inst": ur_inst,
+            "y_nd": y_nd,
+            "yvel": yvel,
+            "cdrag": cdrag,
+            "cfy": cfy,
+            "mask_early": mask_early,
+            "sp_disp": (fhiy, spcy, nhiy),
+            "sp_cfy": (f_cfy, spc_cfy, n_cfy),
+            "sp_cdrag": (f_cdrag, spc_cdrag, n_cdrag),
+            "sp_ur": (f_ur, spc_ur, n_ur),
+            "summary": {
+                "umean": umean,
+                "ur": ur,
+                "cd": cd,
+                "ydomfreq": ydomfreq,
+                "ydomfreq_std": ydomfreq_std,
+                "phase_cfy_y_deg": phase_cfy_y_deg,
+                "phase_cdrag_y_deg": phase_cdrag_y_deg,
+                "amp_mean": amp_stats["amp_mean"],
+                "amp_std": amp_stats["amp_std"],
+                "amp_min": amp_stats["amp_min"],
+                "amp_max": amp_stats["amp_max"],
+                "nt": nt,
+                "dt": dt,
+                "fs": fs,
+                "m_added": m_added,
+                "m_inertia_removed": float(m_inertia_removed),
+                "coeff_norm_mode": coeff_norm_mode_used,
+            },
+        }
+
     if data.shape[1] < 25:
         raise ValueError(f"{mat_file.name}: expected at least 25 columns, got shape {data.shape}")
 
@@ -635,7 +1002,7 @@ def _process_file(mat_file: Path) -> dict[str, object]:
     nt = int(ypos.size)
     if nt < 2:
         raise ValueError(f"{mat_file.name}: not enough samples to compute sampling frequency.")
-    dt = float(time[1] - time[0])
+    dt = _infer_dt(time, role=f"{mat_file.name}: raw time")
     fs = 1.0 / dt
     if USE_SAVGOL_DERIVATIVES:
         sg_window = _savgol_window_length(nt, SAVGOL_WINDOW_LENGTH, SAVGOL_POLYORDER)
@@ -736,6 +1103,11 @@ def _process_file(mat_file: Path) -> dict[str, object]:
     return {
         "path": mat_file,
         "label": mat_file.stem,
+        "time": np.asarray(time, dtype=float),
+        "y": np.asarray(ypos, dtype=float),
+        "yacc": np.asarray(yacc, dtype=float),
+        "cfy_force": np.asarray(fy_combined, dtype=float),
+        "is_corrected_input": False,
         "time_plot": time_plot,
         "ur_inst": ur_inst,
         "y_nd": y_nd,

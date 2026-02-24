@@ -10,7 +10,7 @@ from scipy.signal import savgol_filter
 
 
 # Paths / selection
-INPUT_DIR = Path("Experimental_Data/CrossFlow")
+INPUT_DIR = Path("Experimental_Data/CrossFlow/RawData")
 OUTPUT_DIR = Path("Experimental_Data/npz_exports")
 INPUT_GLOB = "*.mat"  # Use "*.mat" for measurement files.
 DATA_VARIABLE = "data"  # Set to None to auto-detect first 2D numeric dataset.

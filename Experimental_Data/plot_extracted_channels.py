@@ -1,38 +1,47 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import butter, detrend, filtfilt, savgol_filter
 
-import analyze_test3005 as analysis
+try:
+    import Experimental_Data.analyze_experimental_data as analysis
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") != "Experimental_Data":
+        raise
+    current_dir = Path(__file__).resolve().parent
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+    import analyze_experimental_data as analysis
 
 
 # Input
 MAT_FILES = [
-    #Path("Experimental_Data/CrossFlow/test3002.mat"),
-    Path("Experimental_Data/CrossFlow/test3003.mat"),
-    Path("Experimental_Data/CrossFlow/test3004.mat"),
-    Path("Experimental_Data/CrossFlow/test3005.mat"),
-    Path("Experimental_Data/CrossFlow/test3006.mat"),
-    Path("Experimental_Data/CrossFlow/test3008.mat"),
-    Path("Experimental_Data/CrossFlow/test3009.mat"),
-    Path("Experimental_Data/CrossFlow/test3010.mat"),
-    Path("Experimental_Data/CrossFlow/test3011.mat"),
-    Path("Experimental_Data/CrossFlow/test3012.mat"),
-    Path("Experimental_Data/CrossFlow/test3014.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3002.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3003.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3004.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3005.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3006.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3008.mat"),
+    #Path("Experimental_Data/CrossFlow/RawData/test3009.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3010.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3011.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3012.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3014.mat"),
 ]
 DATA_VARIABLE = "data"  # Set to None to auto-detect first numeric 2D array.
 USE_RELATIVE_TIME = True
 PLOT_FIRST_SECONDS = 1000.0
-PLOT_DETAILED_CHANNELS = False
+PLOT_DETAILED_CHANNELS = True
 PLOT_DETAILED_FOR_ALL_FILES = False
 DETAILED_FILE_INDEX = 3  # MAT_FILES[3] -> test3005.mat
 
 USE_DETREND_BEFORE_DERIVATIVES = False
 DETREND_TYPE = "linear"  # "linear" or "constant"
-SAVGOL_WINDOW_LENGTH_OVERRIDE = 21  # e.g. 71 (odd int). None -> use analysis.SAVGOL_WINDOW_LENGTH
+SAVGOL_WINDOW_LENGTH_OVERRIDE = None  # e.g. 71 (odd int). None -> use analysis.SAVGOL_WINDOW_LENGTH
 DERIVATIVE_METHOD = "savgol"  # one of: "savgol", "filtfilt_gradient", "gradient"
 FILTFILT_DERIV_ORDER = 4
 FILTFILT_DERIV_CUTOFF_HZ = 3.0
