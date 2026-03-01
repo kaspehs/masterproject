@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import sys
 import warnings
+
+_MPLCONFIGDIR_DEFAULT = Path("/tmp/matplotlib")
+_MPLCONFIGDIR_DEFAULT.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIGDIR_DEFAULT))
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,6 +37,8 @@ EXCLUDE_TEST_NUMBERS: list[int] = list(getattr(analysis, "EXCLUDE_TEST_NUMBERS",
 # Time-window plotting behavior (mirrors analyze_experimental_data style).
 USE_RELATIVE_TIME = bool(getattr(analysis, "USE_RELATIVE_TIME", True))
 FIRST_WINDOW_SECONDS = float(getattr(analysis, "FIRST_WINDOW_SECONDS", 10.0))
+# Start/end trimming is intentionally not applied here; exported NPZ files are expected
+# to be pretrimmed in export_corrected_dataset.py when needed.
 
 # When true, prepend split to labels for easier visual grouping, e.g. "train:test3005".
 PREFIX_LABEL_WITH_SPLIT = False
@@ -42,6 +50,19 @@ KEEP_ONLY_ONE_CHUNK_PER_TEST = True
 # - "middle": middle chunk
 # - "last": latest chunk
 CHUNK_SELECTION_PER_TEST = "first"
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_path_in_project(path: Path) -> Path:
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    if p.exists():
+        return p.resolve()
+    return (_project_root() / p).resolve()
 
 
 def _extract_test_number(path: Path) -> int | None:
@@ -67,7 +88,7 @@ def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
 
 
 def _resolve_npz_files() -> list[Path]:
-    root = Path(NPZ_DATASET_ROOT)
+    root = _resolve_path_in_project(Path(NPZ_DATASET_ROOT))
     if not root.exists():
         raise FileNotFoundError(f"Dataset root not found: {root}")
 
@@ -234,8 +255,10 @@ def _process_npz(npz_path: Path) -> dict[str, object]:
     y_mean = float(np.nanmean(ypos)) if np.any(finite_y) else 0.0
     y_nd = (ypos - y_mean) / analysis.D
 
-    m_added = float(analysis.ADDED_MASS_COEFF) * 0.25 * np.pi * analysis.RUO * analysis.D * analysis.D * analysis.L
-    m_inertia_removed = 0.0
+    m_added, m_inertia_removed = analysis._cf_inertia_masses()
+    if m_inertia_removed != 0.0:
+        f_inertia = m_inertia_removed * yacc
+        fy_combined = fy_combined + f_inertia
     fy_combined = float(analysis.CF_SIGN) * fy_combined
     cfy_coeff = fy_combined / q_ref_vec
 
@@ -281,6 +304,7 @@ def _process_npz(npz_path: Path) -> dict[str, object]:
         "y": np.asarray(ypos, dtype=float),
         "yacc": np.asarray(yacc, dtype=float),
         "cfy_force": np.asarray(fy_combined, dtype=float),
+        "q_ref_vec": np.asarray(q_ref_vec, dtype=float),
         "is_corrected_input": True,
         "time_plot": time_plot,
         "ur_inst": ur_inst,
@@ -320,6 +344,13 @@ def _add_legends(axes) -> None:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(loc="best", fontsize="small")
+
+
+def _show_or_close() -> None:
+    if "agg" in str(plt.get_backend()).lower():
+        plt.close("all")
+        return
+    plt.show()
 
 
 def main() -> None:
@@ -710,7 +741,7 @@ def main() -> None:
     ax_p_cd.legend(loc="best", fontsize="small")
     fig8.tight_layout()
 
-    plt.show()
+    _show_or_close()
 
 
 if __name__ == "__main__":

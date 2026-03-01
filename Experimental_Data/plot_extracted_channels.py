@@ -149,14 +149,17 @@ def _process_file(mat_file: Path) -> dict[str, object]:
     data, channel_names = analysis._load_data_matrix(mat_file, DATA_VARIABLE)
 
     time = analysis._select_column(data, channel_names, ["Time"], 0, role="time")
+    water_speed = analysis._select_column(data, channel_names, ["Water_Speed"], 19, role="flow speed")
     ypos = analysis._select_column(data, channel_names, ["xpos1"], 23, role="CF displacement (xpos1)")
     fy_spring1 = analysis._select_column(data, channel_names, ["9130_FORCE_1"], 6, role="Fy_spring1")
     fy_spring2 = analysis._select_column(data, channel_names, ["9133_FORCE_4"], 9, role="Fy_spring2")
 
     time_arr = _fill_nonfinite_1d(np.asarray(time, dtype=float), role=f"{mat_file.name}: time")
+    water_speed_arr = _fill_nonfinite_1d(np.asarray(water_speed, dtype=float), role=f"{mat_file.name}: flow speed")
     disp = _fill_nonfinite_1d(np.asarray(ypos, dtype=float), role=f"{mat_file.name}: displacement")
     fy1 = _fill_nonfinite_1d(np.asarray(fy_spring1, dtype=float), role=f"{mat_file.name}: Fy_spring1")
     fy2 = _fill_nonfinite_1d(np.asarray(fy_spring2, dtype=float), role=f"{mat_file.name}: Fy_spring2")
+    ur_inst = np.asarray(water_speed_arr, dtype=float) / (float(analysis.FN) * float(analysis.D))
 
     t = time_arr - float(time_arr[0]) if USE_RELATIVE_TIME else time_arr
     if USE_RELATIVE_TIME:
@@ -180,6 +183,7 @@ def _process_file(mat_file: Path) -> dict[str, object]:
     fy2_minus_fy1 = fy2_center - fy1_center
 
     channels: list[tuple[str, np.ndarray]] = [
+        ("Reduced velocity U_r (-)", ur_inst),
         ("Displacement y (m)", disp),
         ("Velocity y_dot (m/s)", vel_y),
         ("Acceleration y_ddot (m/s^2)", acc_y),

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import warnings
+
+_MPLCONFIGDIR_DEFAULT = Path("/tmp/matplotlib")
+_MPLCONFIGDIR_DEFAULT.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIGDIR_DEFAULT))
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,7 +27,8 @@ MAT_FILES_CROSSFLOW_RAW = [
     Path("Experimental_Data/CrossFlow/RawData/test3006.mat"),
     Path("Experimental_Data/CrossFlow/RawData/test3008.mat"),
     Path("Experimental_Data/CrossFlow/RawData/test3009.mat"),
-    Path("Experimental_Data/CrossFlow/RawData/test3010.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3010_part1.mat"),
+    Path("Experimental_Data/CrossFlow/RawData/test3010_part2.mat"),
     Path("Experimental_Data/CrossFlow/RawData/test3011.mat"),
     Path("Experimental_Data/CrossFlow/RawData/test3012.mat"),
     Path("Experimental_Data/CrossFlow/RawData/test3014.mat"),
@@ -69,7 +76,7 @@ MAT_FILES_COMBINED = MAT_FILES_COMBINED_RAW
 # - "crossflow_raw" (legacy alias: "crossflow")
 # - "crossflow_corrected" (legacy aliases: "corrected", "crossflow_corr")
 # - "combined"
-MAT_SOURCE = "crossflow_corrected"
+MAT_SOURCE = "crossflow_raw"
 MAT_SOURCE_KEY = str(MAT_SOURCE).strip().lower()
 if MAT_SOURCE_KEY == "combined":
     MAT_FILES = MAT_FILES_COMBINED_RAW
@@ -88,6 +95,9 @@ MAT_GLOB = None  # e.g. "test40*.mat" (merged with MAT_FILES if set)
 DATA_VARIABLE = DATA_VARIABLE_DEFAULT  # Set to None to auto-detect the first 2D numeric array.
 FIRST_WINDOW_SECONDS = 10.0
 USE_RELATIVE_TIME = True  # Plot time starting at 0 for each file when True.
+# Optional trimming of each time series before analysis (seconds removed from start/end).
+TRIM_START_SECONDS = 0.0
+TRIM_END_SECONDS = 0.0
 
 # Exclude files by test number parsed from filename, e.g. `test3009.mat`
 # or `test3009_corrected.mat` -> 3009.
@@ -103,23 +113,25 @@ K = 1218.0  # Stiffness (N/m)
 LB = 2.37  # Length between spring location and top end (m)
 LA = 4.21 + 0.5  # Length between cylinder center and top end (m)
 
-# Added-mass correction on measured CF force:
-# External-force convention:
-# F_hydro = F_wake - m_a * y_ddot  =>  F_wake = F_hydro + m_a * y_ddot
-# where m_a = C_a * rho * pi * D^2 * L / 4
-REMOVE_ADDED_MASS_FROM_CF = True
+# Added-mass coefficient for inertia-removal options:
+# m_a = C_a * rho * pi * D^2 * L / 4
 ADDED_MASS_COEFF = 1.0
 
 # Optional inertia removal on CF force (external-force convention):
 # F_hydro = F_reduced - m_remove * y_ddot  =>  F_reduced = F_hydro + m_remove * y_ddot
-# where m_remove = M (+ m_a optionally).
+# where m_remove = M (+ m_a if INERTIA_INCLUDE_ADDED_MASS=True).
 REMOVE_INERTIA_FROM_CF = True
-INERTIA_INCLUDE_ADDED_MASS = True
+INERTIA_INCLUDE_ADDED_MASS = False
+
+# Spring-force CF sign convention:
+# F_spring = SPRING_FORCE_SIGN * (Fy2 - Fy1), after individual spring mean removal
+# and geometric scaling (LB/LA).
+SPRING_FORCE_SIGN = 1.0
 
 # Force signal representation for force-related plots:
 # - "coefficient": plot C_F and C_D (default)
 # - "force": plot raw forces in N
-FORCE_SIGNAL_REPRESENTATION = "coefficient"  # one of: coefficient, force
+FORCE_SIGNAL_REPRESENTATION = "force"  # one of: coefficient, force
 # Coefficient normalization reference:
 # - "mean_u": q_ref = 0.5*rho*L*D*(U_mean^2)
 # - "mean_u_plus_dy2": q_ref(t) = 0.5*rho*L*D*(U_mean^2 + y_dot(t)^2)
@@ -128,6 +140,22 @@ COEFF_NORMALIZATION_MODE = "mean_u_plus_dy2"  # one of: mean_u, mean_u_plus_dy2
 COEFF_NORM_EPS = 1e-12
 # Global CF sign convention (set to -1.0 to flip CF phase/sign everywhere).
 CF_SIGN = 1.0
+
+# Optional force-generation models.
+# Leave FORCE_MODELS empty to use legacy settings
+# (SPRING_FORCE_SIGN + REMOVE_INERTIA_FROM_CF + INERTIA_INCLUDE_ADDED_MASS + CF_SIGN).
+# Each model supports:
+# - name: unique label
+# - fy1_mult, fy2_mult: spring-force coefficients
+# - global_sign: multiplies the full expression
+# - include_structural_mass: include M*y_ddot inertia term
+# - include_added_mass: include m_a*y_ddot inertia term
+# - inertia_sign: sign on inertia term before global_sign
+FORCE_MODELS: list[dict[str, object]] = []
+ACTIVE_FORCE_MODEL_NAME: str | None = None
+# Empty means: plot all configured models together in CF panels.
+PLOT_FORCE_MODEL_NAMES: list[str] = []
+FORCE_MODEL_LINESTYLES = ["-", "--", "-.", ":"]
 
 # Savitzky-Golay settings for velocity/acceleration estimation from displacement.
 USE_SAVGOL_DERIVATIVES = True
@@ -151,26 +179,161 @@ PHASE_MIN_SAMPLES_PER_BIN = 6
 REF_CA_FOR_FN_LINE = 1.0
 
 
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_path_in_project(path: Path) -> Path:
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    if p.exists():
+        return p.resolve()
+    return (_project_root() / p).resolve()
+
+
 def _using_corrected_input() -> bool:
     return MAT_SOURCE_KEY in {"crossflow_corrected", "corrected", "crossflow_corr"}
 
 
+def _legacy_default_force_model() -> dict[str, object]:
+    return {
+        "name": "legacy_default",
+        "fy1_mult": -float(SPRING_FORCE_SIGN),
+        "fy2_mult": float(SPRING_FORCE_SIGN),
+        "global_sign": float(CF_SIGN),
+        "include_structural_mass": bool(REMOVE_INERTIA_FROM_CF),
+        "include_added_mass": bool(REMOVE_INERTIA_FROM_CF and INERTIA_INCLUDE_ADDED_MASS),
+        "inertia_sign": 1.0,
+    }
+
+
+def _normalized_force_model(model: dict[str, object], *, index: int) -> dict[str, object]:
+    name_raw = model.get("name", f"force_{index + 1}")
+    name = str(name_raw).strip() or f"force_{index + 1}"
+    return {
+        "name": name,
+        "fy1_mult": float(model.get("fy1_mult", 0.0)),
+        "fy2_mult": float(model.get("fy2_mult", 0.0)),
+        "global_sign": float(model.get("global_sign", 1.0)),
+        "include_structural_mass": bool(model.get("include_structural_mass", False)),
+        "include_added_mass": bool(model.get("include_added_mass", False)),
+        "inertia_sign": float(model.get("inertia_sign", 1.0)),
+    }
+
+
+def _resolved_force_models() -> list[dict[str, object]]:
+    raw_models = list(FORCE_MODELS)
+    if not raw_models:
+        raw_models = [_legacy_default_force_model()]
+    out = [_normalized_force_model(m, index=i) for i, m in enumerate(raw_models)]
+    names = [str(m["name"]) for m in out]
+    if len(set(names)) != len(names):
+        raise ValueError("FORCE_MODELS must have unique model names.")
+    return out
+
+
+def _active_force_model_name(models: list[dict[str, object]]) -> str:
+    if not models:
+        raise ValueError("No force models available.")
+    if ACTIVE_FORCE_MODEL_NAME is None:
+        return str(models[0]["name"])
+    name = str(ACTIVE_FORCE_MODEL_NAME).strip()
+    if not name:
+        return str(models[0]["name"])
+    valid = {str(m["name"]) for m in models}
+    if name not in valid:
+        raise ValueError(f"ACTIVE_FORCE_MODEL_NAME='{name}' not found in FORCE_MODELS: {sorted(valid)}")
+    return name
+
+
+def _plot_force_model_names(models: list[dict[str, object]]) -> list[str]:
+    valid = [str(m["name"]) for m in models]
+    wanted_raw = [str(v).strip() for v in PLOT_FORCE_MODEL_NAMES if str(v).strip()]
+    if not wanted_raw:
+        return valid
+    missing = [v for v in wanted_raw if v not in valid]
+    if missing:
+        raise ValueError(f"PLOT_FORCE_MODEL_NAMES contains unknown model(s): {missing}. Valid: {valid}")
+    return wanted_raw
+
+
 def _cf_force_mode_label() -> str:
+    models = _resolved_force_models()
+    active = _active_force_model_name(models)
+    spring_base = f"force model '{active}'"
     if _using_corrected_input():
-        base = "calculated_force (corrected MAT)"
-        if CF_SIGN < 0.0:
-            base = f"-({base})"
-        return base
-    base = "Fy2 - Fy1"
-    if CF_SIGN < 0.0:
-        base = f"-({base})"
+        return f"{spring_base} (spring-derived, corrected MAT)"
+    return spring_base
+
+
+def _cf_inertia_masses() -> tuple[float, float]:
+    m_added = float(ADDED_MASS_COEFF) * 0.25 * np.pi * RUO * D * D * L
+    m_inertia_removed = 0.0
     if REMOVE_INERTIA_FROM_CF:
+        m_inertia_removed = float(M)
         if INERTIA_INCLUDE_ADDED_MASS:
-            return f"{base}, inertia removed (m + m_a)"
-        return f"{base}, inertia removed (m)"
-    if REMOVE_ADDED_MASS_FROM_CF:
-        return f"{base}, added mass removed"
-    return base
+            m_inertia_removed += m_added
+    return m_added, float(m_inertia_removed)
+
+
+def _combine_spring_cf_force(fy_spr1: np.ndarray, fy_spr2: np.ndarray) -> np.ndarray:
+    fy1 = (np.asarray(fy_spr1, dtype=float) - np.mean(fy_spr1)) * LB / LA
+    fy2 = (np.asarray(fy_spr2, dtype=float) - np.mean(fy_spr2)) * LB / LA
+    return float(SPRING_FORCE_SIGN) * (fy2 - fy1)
+
+
+def _spring_force_components(fy_spr1: np.ndarray, fy_spr2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    fy1 = (np.asarray(fy_spr1, dtype=float) - np.mean(fy_spr1)) * LB / LA
+    fy2 = (np.asarray(fy_spr2, dtype=float) - np.mean(fy_spr2)) * LB / LA
+    return np.asarray(fy1, dtype=float), np.asarray(fy2, dtype=float)
+
+
+def _build_force_model_outputs(
+    *,
+    fy1: np.ndarray,
+    fy2: np.ndarray,
+    yacc: np.ndarray,
+    q_ref_vec: np.ndarray,
+) -> dict[str, object]:
+    models = _resolved_force_models()
+    active_name = _active_force_model_name(models)
+    plot_names = _plot_force_model_names(models)
+    m_added = float(ADDED_MASS_COEFF) * 0.25 * np.pi * RUO * D * D * L
+
+    force_by_name: dict[str, np.ndarray] = {}
+    cfy_by_name: dict[str, np.ndarray] = {}
+    model_meta: dict[str, dict[str, float]] = {}
+    for m in models:
+        name = str(m["name"])
+        m_inertia = 0.0
+        if bool(m["include_structural_mass"]):
+            m_inertia += float(M)
+        if bool(m["include_added_mass"]):
+            m_inertia += m_added
+        f_variant = float(m["global_sign"]) * (
+            float(m["fy1_mult"]) * np.asarray(fy1, dtype=float)
+            + float(m["fy2_mult"]) * np.asarray(fy2, dtype=float)
+            + float(m["inertia_sign"]) * m_inertia * np.asarray(yacc, dtype=float)
+        )
+        force_by_name[name] = np.asarray(f_variant, dtype=float)
+        if _use_raw_force_signals():
+            cfy_by_name[name] = np.asarray(f_variant, dtype=float)
+        else:
+            cfy_by_name[name] = np.asarray(f_variant, dtype=float) / np.asarray(q_ref_vec, dtype=float)
+        model_meta[name] = {
+            "m_inertia_removed": float(m_inertia),
+            "m_added": float(m_added),
+        }
+
+    return {
+        "models": models,
+        "active_name": active_name,
+        "plot_names": plot_names,
+        "force_by_name": force_by_name,
+        "cfy_by_name": cfy_by_name,
+        "model_meta": model_meta,
+    }
 
 
 def _use_raw_force_signals() -> bool:
@@ -325,8 +488,14 @@ def _load_data_matrix(mat_file: Path, variable_name: str | None = "data") -> tup
 
     try:
         raw = loadmat(mat_file, squeeze_me=True)
-    except NotImplementedError:
-        return _load_data_matrix_hdf5(mat_file, variable_name)
+    except (NotImplementedError, ValueError) as exc:
+        # scipy raises NotImplementedError for MATLAB v7.3 files with proper MAT headers.
+        # If the file is still HDF5 but missing that header, it may raise:
+        #   ValueError("Unknown mat file type, version 0, 0")
+        # In both cases, fall back to direct HDF5 loading.
+        if isinstance(exc, NotImplementedError) or "Unknown mat file type" in str(exc):
+            return _load_data_matrix_hdf5(mat_file, variable_name)
+        raise
 
     if variable_name is not None:
         if variable_name not in raw:
@@ -358,15 +527,17 @@ def _select_column(
     role: str,
 ) -> np.ndarray:
     if channel_names is not None:
-        index_map = {_norm_name(name): idx for idx, name in enumerate(channel_names)}
-        for alias in aliases:
-            idx = index_map.get(_norm_name(alias))
-            if idx is not None and 0 <= idx < data.shape[1]:
-                return np.asarray(data[:, idx]).reshape(-1)
-        warnings.warn(
-            f"Could not find channel(s) {aliases} by name for '{role}'. "
-            f"Falling back to fixed column {fallback_idx + 1}."
-        )
+        norm_pairs = [(_norm_name(name), idx) for idx, name in enumerate(channel_names)]
+        index_map = {name_norm: idx for name_norm, idx in norm_pairs if name_norm}
+        if index_map:
+            for alias in aliases:
+                idx = index_map.get(_norm_name(alias))
+                if idx is not None and 0 <= idx < data.shape[1]:
+                    return np.asarray(data[:, idx]).reshape(-1)
+            warnings.warn(
+                f"Could not find channel(s) {aliases} by name for '{role}'. "
+                f"Falling back to fixed column {fallback_idx + 1}."
+            )
     if not (0 <= fallback_idx < data.shape[1]):
         raise IndexError(
             f"Fallback index {fallback_idx} out of bounds for role '{role}' and shape {data.shape}."
@@ -381,7 +552,7 @@ def _find_column_index(
 ) -> int | None:
     if channel_names is None:
         return None
-    index_map = {_norm_name(name): idx for idx, name in enumerate(channel_names)}
+    index_map = {_norm_name(name): idx for idx, name in enumerate(channel_names) if _norm_name(name)}
     for alias in aliases:
         idx = index_map.get(_norm_name(alias))
         if idx is not None and 0 <= idx < data.shape[1]:
@@ -392,7 +563,9 @@ def _find_column_index(
 def _load_optional_vector_from_mat(mat_file: Path, variable_names: list[str]) -> np.ndarray | None:
     try:
         raw = loadmat(mat_file, squeeze_me=True)
-    except NotImplementedError:
+    except (NotImplementedError, ValueError) as exc:
+        if not (isinstance(exc, NotImplementedError) or "Unknown mat file type" in str(exc)):
+            raise
         try:
             import h5py  # type: ignore
         except Exception:
@@ -457,6 +630,48 @@ def _infer_dt(time: np.ndarray, *, role: str) -> float:
     if not np.isfinite(dt) or dt <= 0.0:
         raise ValueError(f"{role}: invalid inferred dt={dt}.")
     return dt
+
+
+def _time_trim_mask(
+    time: np.ndarray,
+    *,
+    role: str,
+    trim_start_seconds: float | None = None,
+    trim_end_seconds: float | None = None,
+) -> np.ndarray:
+    t = np.asarray(time, dtype=float).reshape(-1)
+    n = int(t.size)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    start_s = float(TRIM_START_SECONDS if trim_start_seconds is None else trim_start_seconds)
+    end_s = float(TRIM_END_SECONDS if trim_end_seconds is None else trim_end_seconds)
+    if not np.isfinite(start_s) or start_s < 0.0:
+        raise ValueError(f"{role}: TRIM_START_SECONDS must be finite and >= 0, got {start_s}.")
+    if not np.isfinite(end_s) or end_s < 0.0:
+        raise ValueError(f"{role}: TRIM_END_SECONDS must be finite and >= 0, got {end_s}.")
+
+    if start_s <= 0.0 and end_s <= 0.0:
+        return np.ones(n, dtype=bool)
+    if n < 2:
+        raise ValueError(f"{role}: not enough samples to apply start/end trimming.")
+
+    t_rel = t - float(t[0])
+    duration = float(t_rel[-1])
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError(f"{role}: invalid time span ({duration}) for trimming.")
+
+    if (start_s + end_s) >= duration:
+        raise ValueError(
+            f"{role}: TRIM_START_SECONDS + TRIM_END_SECONDS ({start_s + end_s:.6g} s) "
+            f"must be smaller than record duration ({duration:.6g} s)."
+        )
+
+    t_hi = duration - end_s
+    mask = (t_rel >= start_s) & (t_rel <= t_hi)
+    if int(np.count_nonzero(mask)) < 2:
+        raise ValueError(f"{role}: trimming leaves fewer than 2 samples.")
+    return np.asarray(mask, dtype=bool)
 
 
 def _spec(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray, int]:
@@ -749,12 +964,13 @@ def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
 def _resolve_mat_files() -> list[Path]:
     files = [Path(p) for p in MAT_FILES]
     if MAT_GLOB:
-        files.extend(sorted(Path(MAT_GLOB_BASE_DIR).glob(str(MAT_GLOB))))
+        glob_base = _resolve_path_in_project(Path(MAT_GLOB_BASE_DIR))
+        files.extend(sorted(glob_base.glob(str(MAT_GLOB))))
     files = _filter_excluded_tests(files)
     unique: list[Path] = []
     seen: set[Path] = set()
     for p in files:
-        pp = p if p.is_absolute() else p
+        pp = _resolve_path_in_project(Path(p))
         if pp in seen:
             continue
         seen.add(pp)
@@ -791,11 +1007,17 @@ def _process_file(mat_file: Path) -> dict[str, object]:
             role=f"{mat_file.name}: corrected displacement",
         )
 
-        nt = int(min(time.size, ypos.size))
-        if nt < 2:
+        nt_full = int(min(time.size, ypos.size))
+        if nt_full < 2:
             raise ValueError(f"{mat_file.name}: not enough samples to compute sampling frequency.")
-        time = np.asarray(time[:nt], dtype=float)
-        ypos = np.asarray(ypos[:nt], dtype=float)
+        time = np.asarray(time[:nt_full], dtype=float)
+        ypos = np.asarray(ypos[:nt_full], dtype=float)
+        trim_mask = _time_trim_mask(time, role=f"{mat_file.name}: corrected time")
+        time = np.asarray(time[trim_mask], dtype=float)
+        ypos = np.asarray(ypos[trim_mask], dtype=float)
+        nt = int(time.size)
+        if nt < 2:
+            raise ValueError(f"{mat_file.name}: not enough samples after trimming.")
 
         dt = _infer_dt(time, role=f"{mat_file.name}: corrected time")
         fs = 1.0 / dt
@@ -803,80 +1025,122 @@ def _process_file(mat_file: Path) -> dict[str, object]:
         idx_ur = _find_column_index(data, channel_names, ["u_r", "ur", "U_r"])
         if idx_ur is not None:
             ur_inst = _fill_nonfinite_1d(
-                _fit_vector_length(data[:, idx_ur], n=nt, role=f"{mat_file.name}: reduced velocity"),
+                _fit_vector_length(data[:, idx_ur], n=nt_full, role=f"{mat_file.name}: reduced velocity"),
                 role=f"{mat_file.name}: reduced velocity",
             )
+            ur_inst = np.asarray(ur_inst[trim_mask], dtype=float)
         else:
             ur_aux = _load_optional_vector_from_mat(mat_file, ["U_r", "u_r", "ur"])
             if ur_aux is not None:
                 ur_inst = _fill_nonfinite_1d(
-                    _fit_vector_length(ur_aux, n=nt, role=f"{mat_file.name}: reduced velocity"),
+                    _fit_vector_length(ur_aux, n=nt_full, role=f"{mat_file.name}: reduced velocity"),
                     role=f"{mat_file.name}: reduced velocity",
                 )
+                ur_inst = np.asarray(ur_inst[trim_mask], dtype=float)
             elif is_raw_layout:
                 flow = _select_column(data, channel_names, ["Water_Speed"], 19, role="flow speed")
                 flow = _fill_nonfinite_1d(
-                    _fit_vector_length(flow, n=nt, role=f"{mat_file.name}: flow speed"),
+                    _fit_vector_length(flow, n=nt_full, role=f"{mat_file.name}: flow speed"),
                     role=f"{mat_file.name}: flow speed",
                 )
-                ur_inst = flow / (FN * D)
+                ur_inst = np.asarray(flow[trim_mask], dtype=float) / (FN * D)
             else:
                 raise ValueError(f"{mat_file.name}: could not resolve reduced-velocity signal.")
 
         idx_yvel = _find_column_index(data, channel_names, ["dy_corrected", "dy", "e"])
         if idx_yvel is not None:
             yvel = _fill_nonfinite_1d(
-                _fit_vector_length(data[:, idx_yvel], n=nt, role=f"{mat_file.name}: corrected velocity"),
+                _fit_vector_length(data[:, idx_yvel], n=nt_full, role=f"{mat_file.name}: corrected velocity"),
                 role=f"{mat_file.name}: corrected velocity",
             )
+            yvel = np.asarray(yvel[trim_mask], dtype=float)
         else:
             yvel_aux = _load_optional_vector_from_mat(mat_file, ["dy_corrected", "dy", "e"])
             if yvel_aux is not None:
                 yvel = _fill_nonfinite_1d(
-                    _fit_vector_length(yvel_aux, n=nt, role=f"{mat_file.name}: corrected velocity"),
+                    _fit_vector_length(yvel_aux, n=nt_full, role=f"{mat_file.name}: corrected velocity"),
                     role=f"{mat_file.name}: corrected velocity",
                 )
+                yvel = np.asarray(yvel[trim_mask], dtype=float)
             else:
                 yvel = np.gradient(ypos, dt)
 
-        idx_force = _find_column_index(data, channel_names, ["calculated_force", "f_total", "F_total", "c"])
-        if idx_force is not None:
-            fy_combined = _fill_nonfinite_1d(
-                _fit_vector_length(data[:, idx_force], n=nt, role=f"{mat_file.name}: corrected force"),
-                role=f"{mat_file.name}: corrected force",
-            )
+        fy_spr1_raw = None
+        fy_spr2_raw = None
+        idx_fy1 = _find_column_index(data, channel_names, ["9130_FORCE_1", "Fy_spring1", "fy_spring1"])
+        idx_fy2 = _find_column_index(data, channel_names, ["9133_FORCE_4", "Fy_spring2", "fy_spring2"])
+        if idx_fy1 is not None:
+            fy_spr1_raw = data[:, idx_fy1]
+        elif is_raw_layout:
+            fy_spr1_raw = _select_column(data, channel_names, ["9130_FORCE_1"], 6, role="Fy_spring1")
         else:
-            force_aux = _load_optional_vector_from_mat(
-                mat_file,
-                ["calculated_force", "F_total", "f_total", "c"],
+            fy_spr1_raw = _load_optional_vector_from_mat(mat_file, ["9130_FORCE_1", "Fy_spring1", "fy_spring1"])
+        if idx_fy2 is not None:
+            fy_spr2_raw = data[:, idx_fy2]
+        elif is_raw_layout:
+            fy_spr2_raw = _select_column(data, channel_names, ["9133_FORCE_4"], 9, role="Fy_spring2")
+        else:
+            fy_spr2_raw = _load_optional_vector_from_mat(mat_file, ["9133_FORCE_4", "Fy_spring2", "fy_spring2"])
+
+        if fy_spr1_raw is None or fy_spr2_raw is None:
+            raise ValueError(
+                f"{mat_file.name}: corrected-input mode requires spring-force channels "
+                "(Fy_spring1/9130_FORCE_1 and Fy_spring2/9133_FORCE_4). "
+                "calculated_force/F_total is intentionally ignored."
             )
-            if force_aux is not None:
-                fy_combined = _fill_nonfinite_1d(
-                    _fit_vector_length(force_aux, n=nt, role=f"{mat_file.name}: corrected force"),
-                    role=f"{mat_file.name}: corrected force",
-                )
-            elif is_raw_layout:
-                fy_spr1 = _select_column(data, channel_names, ["9130_FORCE_1"], 6, role="Fy_spring1")
-                fy_spr2 = _select_column(data, channel_names, ["9133_FORCE_4"], 9, role="Fy_spring2")
-                fy_spr1 = _fill_nonfinite_1d(
-                    _fit_vector_length(fy_spr1, n=nt, role=f"{mat_file.name}: Fy_spring1"),
-                    role=f"{mat_file.name}: Fy_spring1",
-                )
-                fy_spr2 = _fill_nonfinite_1d(
-                    _fit_vector_length(fy_spr2, n=nt, role=f"{mat_file.name}: Fy_spring2"),
-                    role=f"{mat_file.name}: Fy_spring2",
-                )
-                fy1 = (fy_spr1 - np.mean(fy_spr1)) * LB / LA
-                fy2 = (fy_spr2 - np.mean(fy_spr2)) * LB / LA
-                fy_combined = fy2 - fy1
-            else:
-                raise ValueError(f"{mat_file.name}: could not resolve corrected force signal.")
+
+        fy_spr1 = _fill_nonfinite_1d(
+            _fit_vector_length(fy_spr1_raw, n=nt_full, role=f"{mat_file.name}: Fy_spring1"),
+            role=f"{mat_file.name}: Fy_spring1",
+        )
+        fy_spr2 = _fill_nonfinite_1d(
+            _fit_vector_length(fy_spr2_raw, n=nt_full, role=f"{mat_file.name}: Fy_spring2"),
+            role=f"{mat_file.name}: Fy_spring2",
+        )
+        fy_spr1 = np.asarray(fy_spr1[trim_mask], dtype=float)
+        fy_spr2 = np.asarray(fy_spr2[trim_mask], dtype=float)
+        fy1_comp, fy2_comp = _spring_force_components(fy_spr1, fy_spr2)
+        fy_combined = float(SPRING_FORCE_SIGN) * (fy2_comp - fy1_comp)
+
+        fx_chain_raw = None
+        fx_spr_raw = None
+        idx_fx_chain = _find_column_index(data, channel_names, ["9131_FORCE_2", "Fx_chain", "fx_chain"])
+        idx_fx_spr = _find_column_index(data, channel_names, ["9132_FORCE_3", "Fx_spring", "fx_spring"])
+        if idx_fx_chain is not None:
+            fx_chain_raw = data[:, idx_fx_chain]
+        elif is_raw_layout:
+            fx_chain_raw = _select_column(data, channel_names, ["9131_FORCE_2"], 7, role="Fx_chain")
+        else:
+            fx_chain_raw = _load_optional_vector_from_mat(mat_file, ["9131_FORCE_2", "Fx_chain", "fx_chain"])
+        if idx_fx_spr is not None:
+            fx_spr_raw = data[:, idx_fx_spr]
+        elif is_raw_layout:
+            fx_spr_raw = _select_column(data, channel_names, ["9132_FORCE_3"], 8, role="Fx_spring")
+        else:
+            fx_spr_raw = _load_optional_vector_from_mat(mat_file, ["9132_FORCE_3", "Fx_spring", "fx_spring"])
+
+        if fx_chain_raw is not None and fx_spr_raw is not None:
+            fx_chain = _fill_nonfinite_1d(
+                _fit_vector_length(fx_chain_raw, n=nt_full, role=f"{mat_file.name}: Fx_chain"),
+                role=f"{mat_file.name}: Fx_chain",
+            )
+            fx_spr = _fill_nonfinite_1d(
+                _fit_vector_length(fx_spr_raw, n=nt_full, role=f"{mat_file.name}: Fx_spring"),
+                role=f"{mat_file.name}: Fx_spring",
+            )
+            fx_chain = np.asarray(fx_chain[trim_mask], dtype=float)
+            fx_spr = np.asarray(fx_spr[trim_mask], dtype=float)
+            fdrag = (fx_chain - fx_spr) * LB / LA
+        else:
+            warnings.warn(
+                f"{mat_file.name}: missing drag spring channels (9131_FORCE_2/9132_FORCE_3); using zero drag."
+            )
+            fdrag = np.zeros_like(fy_combined)
 
         yacc = np.gradient(yvel, dt)
 
         ur = float(np.mean(ur_inst))
         umean = float(ur * FN * D)
-        fdrag = np.zeros_like(fy_combined)
 
         if _use_mean_u_plus_dy2_norm():
             coeff_norm_mode_used = "mean_u_plus_dy2"
@@ -887,15 +1151,17 @@ def _process_file(mat_file: Path) -> dict[str, object]:
             q_ref_scalar = max(0.5 * RUO * L * D * (umean**2), float(COEFF_NORM_EPS))
             q_ref_vec = np.full_like(np.asarray(ypos, dtype=float), q_ref_scalar, dtype=float)
         q_ref = float(np.nanmean(q_ref_vec))
-        cdrag_coeff = np.zeros_like(fy_combined)
+        cdrag_coeff = fdrag / q_ref_vec
         cd = float(np.nanmean(cdrag_coeff))
 
         finite_y = np.isfinite(ypos)
         y_mean = float(np.nanmean(ypos)) if np.any(finite_y) else 0.0
         y_nd = (ypos - y_mean) / D
 
-        m_added = float(ADDED_MASS_COEFF) * 0.25 * np.pi * RUO * D * D * L
-        m_inertia_removed = 0.0
+        m_added, m_inertia_removed = _cf_inertia_masses()
+        if m_inertia_removed != 0.0:
+            f_inertia = m_inertia_removed * yacc
+            fy_combined = fy_combined + f_inertia
         fy_combined = float(CF_SIGN) * fy_combined
         cfy_coeff = fy_combined / q_ref_vec
 
@@ -941,6 +1207,9 @@ def _process_file(mat_file: Path) -> dict[str, object]:
             "y": np.asarray(ypos, dtype=float),
             "yacc": np.asarray(yacc, dtype=float),
             "cfy_force": np.asarray(fy_combined, dtype=float),
+            "fy1_component": np.asarray(fy1_comp, dtype=float),
+            "fy2_component": np.asarray(fy2_comp, dtype=float),
+            "q_ref_vec": np.asarray(q_ref_vec, dtype=float),
             "is_corrected_input": True,
             "time_plot": time_plot,
             "ur_inst": ur_inst,
@@ -971,37 +1240,79 @@ def _process_file(mat_file: Path) -> dict[str, object]:
                 "m_added": m_added,
                 "m_inertia_removed": float(m_inertia_removed),
                 "coeff_norm_mode": coeff_norm_mode_used,
+                "trim_start_seconds": float(TRIM_START_SECONDS),
+                "trim_end_seconds": float(TRIM_END_SECONDS),
             },
         }
 
     if data.shape[1] < 25:
         raise ValueError(f"{mat_file.name}: expected at least 25 columns, got shape {data.shape}")
 
-    time = _select_column(data, channel_names, ["Time"], 0, role="time")
-    u = _select_column(data, channel_names, ["Water_Speed"], 19, role="flow speed")
-    ypos = _select_column(
+    time = _fill_nonfinite_1d(
+        _select_column(data, channel_names, ["Time"], 0, role="time"),
+        role=f"{mat_file.name}: raw time",
+    )
+    u = _fill_nonfinite_1d(
+        _select_column(data, channel_names, ["Water_Speed"], 19, role="flow speed"),
+        role=f"{mat_file.name}: flow speed",
+    )
+    ypos = _fill_nonfinite_1d(
+        _select_column(
         data,
         channel_names,
         ["xpos1"],  # Keep original MATLAB convention: CF displacement from xpos1 channel.
         23,
         role="CF displacement (xpos1)",
+        ),
+        role=f"{mat_file.name}: CF displacement",
     )
-    fx_chain = _select_column(data, channel_names, ["9131_FORCE_2"], 7, role="Fx_chain")
-    fx_spr = _select_column(data, channel_names, ["9132_FORCE_3"], 8, role="Fx_spring")
-    fy_spr1 = _select_column(data, channel_names, ["9130_FORCE_1"], 6, role="Fy_spring1")
-    fy_spr2 = _select_column(data, channel_names, ["9133_FORCE_4"], 9, role="Fy_spring2")
+    fx_chain = _fill_nonfinite_1d(
+        _select_column(data, channel_names, ["9131_FORCE_2"], 7, role="Fx_chain"),
+        role=f"{mat_file.name}: Fx_chain",
+    )
+    fx_spr = _fill_nonfinite_1d(
+        _select_column(data, channel_names, ["9132_FORCE_3"], 8, role="Fx_spring"),
+        role=f"{mat_file.name}: Fx_spring",
+    )
+    fy_spr1 = _fill_nonfinite_1d(
+        _select_column(data, channel_names, ["9130_FORCE_1"], 6, role="Fy_spring1"),
+        role=f"{mat_file.name}: Fy_spring1",
+    )
+    fy_spr2 = _fill_nonfinite_1d(
+        _select_column(data, channel_names, ["9133_FORCE_4"], 9, role="Fy_spring2"),
+        role=f"{mat_file.name}: Fy_spring2",
+    )
+
+    nt_full = int(min(time.size, u.size, ypos.size, fx_chain.size, fx_spr.size, fy_spr1.size, fy_spr2.size))
+    if nt_full < 2:
+        raise ValueError(f"{mat_file.name}: not enough samples to compute sampling frequency.")
+    time = np.asarray(time[:nt_full], dtype=float)
+    u = np.asarray(u[:nt_full], dtype=float)
+    ypos = np.asarray(ypos[:nt_full], dtype=float)
+    fx_chain = np.asarray(fx_chain[:nt_full], dtype=float)
+    fx_spr = np.asarray(fx_spr[:nt_full], dtype=float)
+    fy_spr1 = np.asarray(fy_spr1[:nt_full], dtype=float)
+    fy_spr2 = np.asarray(fy_spr2[:nt_full], dtype=float)
+
+    trim_mask = _time_trim_mask(time, role=f"{mat_file.name}: raw time")
+    time = np.asarray(time[trim_mask], dtype=float)
+    u = np.asarray(u[trim_mask], dtype=float)
+    ypos = np.asarray(ypos[trim_mask], dtype=float)
+    fx_chain = np.asarray(fx_chain[trim_mask], dtype=float)
+    fx_spr = np.asarray(fx_spr[trim_mask], dtype=float)
+    fy_spr1 = np.asarray(fy_spr1[trim_mask], dtype=float)
+    fy_spr2 = np.asarray(fy_spr2[trim_mask], dtype=float)
 
     umean = float(np.mean(u))
     ur = float(umean / (FN * D))
     ur_inst = u / (FN * D)
     fdrag = (fx_chain - fx_spr) * LB / LA
-    fy1 = (fy_spr1 - np.mean(fy_spr1)) * LB / LA
-    fy2 = (fy_spr2 - np.mean(fy_spr2)) * LB / LA
-    fy_combined = fy2 - fy1
+    fy1_comp, fy2_comp = _spring_force_components(fy_spr1, fy_spr2)
+    fy_combined = float(SPRING_FORCE_SIGN) * (fy2_comp - fy1_comp)
 
     nt = int(ypos.size)
     if nt < 2:
-        raise ValueError(f"{mat_file.name}: not enough samples to compute sampling frequency.")
+        raise ValueError(f"{mat_file.name}: not enough samples after trimming.")
     dt = _infer_dt(time, role=f"{mat_file.name}: raw time")
     fs = 1.0 / dt
     if USE_SAVGOL_DERIVATIVES:
@@ -1050,15 +1361,7 @@ def _process_file(mat_file: Path) -> dict[str, object]:
     y_mean = float(np.nanmean(ypos)) if np.any(finite_y) else 0.0
     y_nd = (ypos - y_mean) / D
 
-    m_added = float(ADDED_MASS_COEFF) * 0.25 * np.pi * RUO * D * D * L
-    m_inertia_removed = 0.0
-    if REMOVE_INERTIA_FROM_CF:
-        m_inertia_removed = float(M)
-        if INERTIA_INCLUDE_ADDED_MASS:
-            m_inertia_removed += m_added
-    elif REMOVE_ADDED_MASS_FROM_CF:
-        # Legacy behavior: remove only added-mass inertia.
-        m_inertia_removed = m_added
+    m_added, m_inertia_removed = _cf_inertia_masses()
     if m_inertia_removed != 0.0:
         f_inertia = m_inertia_removed * yacc
         fy_combined = fy_combined + f_inertia
@@ -1107,6 +1410,9 @@ def _process_file(mat_file: Path) -> dict[str, object]:
         "y": np.asarray(ypos, dtype=float),
         "yacc": np.asarray(yacc, dtype=float),
         "cfy_force": np.asarray(fy_combined, dtype=float),
+        "fy1_component": np.asarray(fy1_comp, dtype=float),
+        "fy2_component": np.asarray(fy2_comp, dtype=float),
+        "q_ref_vec": np.asarray(q_ref_vec, dtype=float),
         "is_corrected_input": False,
         "time_plot": time_plot,
         "ur_inst": ur_inst,
@@ -1137,6 +1443,8 @@ def _process_file(mat_file: Path) -> dict[str, object]:
             "m_added": m_added,
             "m_inertia_removed": float(m_inertia_removed),
             "coeff_norm_mode": coeff_norm_mode_used,
+            "trim_start_seconds": float(TRIM_START_SECONDS),
+            "trim_end_seconds": float(TRIM_END_SECONDS),
         },
     }
 
@@ -1146,6 +1454,13 @@ def _add_legends(axes) -> None:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(loc="best", fontsize="small")
+
+
+def _show_or_close() -> None:
+    if "agg" in str(plt.get_backend()).lower():
+        plt.close("all")
+        return
+    plt.show()
 
 
 def main() -> None:
@@ -1166,11 +1481,6 @@ def main() -> None:
                 f"{entry['label']}: applied inertia removal with "
                 f"m_remove={s['m_inertia_removed']:.6f} kg "
                 f"(M={M:.6f} kg, m_a={s['m_added']:.6f} kg, include_m_a={INERTIA_INCLUDE_ADDED_MASS})"
-            )
-        elif REMOVE_ADDED_MASS_FROM_CF:
-            print(
-                f"{entry['label']}: applied added-mass removal with "
-                f"C_a={ADDED_MASS_COEFF:.3f}, m_a={s['m_added']:.6f} kg"
             )
 
     colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(entries), 2)))
@@ -1547,7 +1857,7 @@ def main() -> None:
 
     fig8.tight_layout()
 
-    plt.show()
+    _show_or_close()
 
 
 if __name__ == "__main__":
