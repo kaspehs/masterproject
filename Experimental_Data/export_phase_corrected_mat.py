@@ -43,7 +43,7 @@ CLEAN_OUTPUT_DIR_BEFORE_EXPORT = True
 # Keep selection aligned with phase_analysis.py.
 # This script uses phase._resolve_phase_input_files() and phase._filter_excluded_tests().
 # You can apply extra export-only exclusions below.
-EXCLUDE_TEST_NUMBERS: list[int] = [3009]
+EXCLUDE_TEST_NUMBERS: list[int] = [3009, 3002]
 
 # Displacement-column replacement settings.
 CORRECTED_DISPLACEMENT_ALIASES = ["xpos1"]
@@ -142,22 +142,33 @@ def _build_corrected_displacement_by_label(
 
 def _compute_corrected_kinematics(y_corr: np.ndarray, *, dt: float) -> tuple[np.ndarray, np.ndarray]:
     y_arr = np.asarray(y_corr, dtype=float).reshape(-1)
-    if y_arr.size < 2:
-        zeros = np.zeros_like(y_arr)
-        return zeros, zeros
+    if y_arr.size < 5:
+        raise ValueError("Corrected kinematics require Savitzky-Golay derivatives (need at least 5 samples).")
     if not np.isfinite(float(dt)) or float(dt) <= 0.0:
         raise ValueError("dt must be finite and positive for corrected kinematics.")
 
     try:
-        y_dot, y_ddot, _ = extracted._compute_derivatives(y_arr, dt=float(dt))
-        return np.asarray(y_dot, dtype=float), np.asarray(y_ddot, dtype=float)
+        deriv_out = extracted._compute_derivatives(y_arr, dt=float(dt))
     except Exception as exc:
-        warnings.warn(
-            f"Falling back to finite differences for corrected kinematics because derivative routine failed: {exc}"
+        raise RuntimeError(
+            "Corrected kinematics require Savitzky-Golay derivatives, "
+            f"but derivative computation failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if not (isinstance(deriv_out, tuple) and len(deriv_out) >= 2):
+        raise RuntimeError(f"Unexpected derivative return format: {type(deriv_out).__name__}")
+    y_dot = np.asarray(deriv_out[0], dtype=float)
+    y_ddot = np.asarray(deriv_out[1], dtype=float)
+    deriv_meta = deriv_out[2] if len(deriv_out) >= 3 else {}
+    mode = ""
+    if isinstance(deriv_meta, dict):
+        mode = str(deriv_meta.get("mode", "")).strip().lower()
+    if "savgol" not in mode:
+        raise RuntimeError(
+            "Corrected kinematics require Savitzky-Golay derivatives; "
+            f"got derivative mode='{mode or 'unknown'}'."
         )
-        y_dot = np.gradient(y_arr, float(dt))
-        y_ddot = np.gradient(y_dot, float(dt))
-        return np.asarray(y_dot, dtype=float), np.asarray(y_ddot, dtype=float)
+    return y_dot, y_ddot
 
 
 def _export_one(
@@ -240,6 +251,10 @@ def main() -> None:
         phase.DATA_VARIABLE = DATA_VARIABLE_OVERRIDE
     extracted.DATA_VARIABLE = phase.DATA_VARIABLE
     extracted.USE_RELATIVE_TIME = phase.USE_RELATIVE_TIME
+    if hasattr(extracted, "DERIV_SAVGOL_WINDOW"):
+        extracted.DERIV_SAVGOL_WINDOW = int(phase.PHASE_CORRECTION_POST_SAVGOL_WINDOW)
+    if hasattr(extracted, "DERIV_SAVGOL_POLYORDER"):
+        extracted.DERIV_SAVGOL_POLYORDER = int(phase.PHASE_CORRECTION_POST_SAVGOL_POLYORDER)
 
     files, source_desc = _resolve_input_files()
     print(f"Corrected-MAT export source: {source_desc}")

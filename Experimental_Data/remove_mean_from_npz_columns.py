@@ -9,8 +9,8 @@ import numpy as np
 # -------------------------
 # Settings (edit these)
 # -------------------------
-INPUT_DIR = Path("Experimental_Data/npz_exports")
-OUTPUT_DIR = Path("Experimental_Data/npz_exports_zero_mean")
+INPUT_DIR = Path("Experimental_Data/npz_exports_v2")
+OUTPUT_DIR = Path("Experimental_Data/npz_exports__v2_zero_mean")
 INPUT_GLOB = "*.npz"
 RECURSIVE = True
 
@@ -20,10 +20,14 @@ OVERWRITE = True
 
 # Either process specific keys or all numeric keys.
 PROCESS_ALL_NUMERIC_KEYS = False
+# If True, remove a Hann-window weighted mean instead of plain mean.
+USE_HANN_WEIGHTED_MEAN = True
 TARGET_KEYS = [
     "F_total",
     "cf_force",
     "c",
+    "y",
+    "b",
 ]
 
 
@@ -48,20 +52,69 @@ def _demean_numeric_array(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return arr, np.asarray([], dtype=float)
 
     if work.ndim == 1:
-        mean = np.nanmean(work)
+        if bool(USE_HANN_WEIGHTED_MEAN):
+            mean = _weighted_mean_1d(work)
+        else:
+            mean = np.nanmean(work)
         if not np.isfinite(mean):
             mean = 0.0
         out = work - float(mean)
         return np.asarray(out, dtype=float), np.asarray([mean], dtype=float)
 
     if work.ndim == 2:
-        means = np.nanmean(work, axis=0)
+        if bool(USE_HANN_WEIGHTED_MEAN):
+            means = _weighted_mean_2d_cols(work)
+        else:
+            means = np.nanmean(work, axis=0)
         means = np.where(np.isfinite(means), means, 0.0)
         out = work - means.reshape(1, -1)
         return np.asarray(out, dtype=float), np.asarray(means, dtype=float)
 
     # Higher-dimensional arrays are left unchanged.
     return arr, np.asarray([], dtype=float)
+
+
+def _hann_weights(n: int) -> np.ndarray:
+    n_int = int(n)
+    if n_int <= 2:
+        return np.ones(max(n_int, 0), dtype=float)
+    w = np.hanning(n_int).astype(float)
+    if not np.isfinite(np.sum(w)) or float(np.sum(w)) <= 0.0:
+        return np.ones(n_int, dtype=float)
+    return w
+
+
+def _weighted_mean_1d(values: np.ndarray) -> float:
+    x = np.asarray(values, dtype=float).reshape(-1)
+    if x.size == 0:
+        return float("nan")
+    w = _hann_weights(x.size)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return float("nan")
+    x_f = x[finite]
+    w_f = w[finite]
+    denom = float(np.sum(w_f))
+    if not np.isfinite(denom) or denom <= 0.0:
+        return float(np.nanmean(x_f))
+    return float(np.sum(w_f * x_f) / denom)
+
+
+def _weighted_mean_2d_cols(values: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=float)
+    if x.ndim != 2:
+        return np.asarray([], dtype=float)
+    n_rows, n_cols = x.shape
+    w = _hann_weights(n_rows).reshape(-1, 1)
+    finite = np.isfinite(x)
+    wx = np.where(finite, x * w, 0.0)
+    ww = np.where(finite, w, 0.0)
+    num = np.sum(wx, axis=0)
+    den = np.sum(ww, axis=0)
+    out = np.full(n_cols, np.nan, dtype=float)
+    good = np.isfinite(den) & (den > 0.0)
+    out[good] = num[good] / den[good]
+    return out
 
 
 def _build_output_path(src: Path, *, input_base: Path) -> Path:

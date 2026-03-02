@@ -9,14 +9,14 @@ import numpy as np
 from scipy.io import loadmat, savemat
 
 # Edit these constants directly.
-ACTION = "trim_trailing"  # "trim_trailing" | "split_nan_gap"
-INPUT_MAT_PATH = Path("Experimental_Data/CrossFlow/CorrectedData/test3006_corrected.mat")
+ACTION = "split_nan_gap"  # "trim_trailing" | "split_nan_gap"
+INPUT_MAT_PATH = Path("Experimental_Data/CrossFlow/CorrectedData/test3010_corrected.mat")
 DATA_KEY = "data"
 # If None, time axis is inferred as the longest axis in `data`.
 TIME_AXIS: int | None = None
 
 # Trim mode settings.
-OUTPUT_MAT_PATH: Path | None = Path("Experimental_Data/CrossFlow/CleanedCorrectedData/test3006_corrected.mat")
+OUTPUT_MAT_PATH: Path | None = Path("Experimental_Data/CrossFlow/CleanedCorrectedSmoothedData/test3010_corrected.mat")
 DROP_FIRST_TIME_SAMPLES = 6000
 DROP_LAST_TIME_SAMPLES = 0
 OVERWRITE_INPLACE = False
