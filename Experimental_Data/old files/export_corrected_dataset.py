@@ -58,8 +58,7 @@ CHUNK_USE_GLOBAL_MEAN_UR = True
 # Kinematics are computed using the same derivative routine as phase-analysis
 # plotting (plot_extracted_channels._compute_derivatives).
 
-# Exporting only the same plotted analysis window can be useful when
-# PLOT_FIRST_SECONDS is used in phase/diagnostic scripts.
+# Exporting only the same active phase-analysis mask window can be useful.
 USE_PHASE_MASK_WINDOW = True
 # For corrected-dataset export, force a common linear lag model with extrapolation
 # so correction is applied over full record duration (including times beyond the
@@ -71,7 +70,8 @@ NPZ_TRIM_START_SECONDS = float(getattr(analysis, "TRIM_START_SECONDS", 0.0))
 NPZ_TRIM_END_SECONDS = float(getattr(analysis, "TRIM_END_SECONDS", 0.0))
 
 # Exclude files by test number parsed from filename.
-# By default, mirror phase-analysis exclusion unless overridden here.
+# These are additional exclusions applied after phase-analysis selection/exclusion.
+# By default, mirror phase-analysis exclusion (idempotent if identical).
 EXCLUDE_TEST_NUMBERS: list[int] = list(getattr(phase, "EXCLUDE_TEST_NUMBERS", []))
 
 # Calculated-force knobs:
@@ -141,13 +141,30 @@ def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
 
 
 def _resolve_mat_files() -> list[Path]:
-    mat_files = [Path(p) for p in list(phase.MAT_FILES)]
+    source_desc = "phase.MAT_FILES (fallback)"
+    if hasattr(phase, "_resolve_phase_input_files"):
+        phase_files, phase_source_desc = phase._resolve_phase_input_files()
+        mat_files = [Path(p) for p in phase_files]
+        source_desc = str(phase_source_desc)
+    else:
+        mat_files = [Path(p) for p in list(phase.MAT_FILES)]
+
+    # Always apply the same exclusion step as phase_analysis first.
+    if hasattr(phase, "_filter_excluded_tests"):
+        mat_files = phase._filter_excluded_tests(mat_files)
+
+    # Optional additional export-specific exclusions.
     mat_files = _filter_excluded_tests(mat_files)
+
     if not mat_files:
-        raise ValueError("No MAT files selected (check phase.MAT_FILES and EXCLUDE_TEST_NUMBERS).")
+        raise ValueError(
+            "No MAT files selected (check phase file selection settings and EXCLUDE_TEST_NUMBERS)."
+        )
     missing = [p for p in mat_files if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Missing MAT file(s): {missing}")
+    print(f"Export source files: {source_desc}")
+    print(f"Export selected {len(mat_files)} file(s) after exclusions.")
     return mat_files
 
 
@@ -609,7 +626,6 @@ def _export_corrected_mat(
 def main() -> None:
     phase.extracted.DATA_VARIABLE = phase.DATA_VARIABLE
     phase.extracted.USE_RELATIVE_TIME = phase.USE_RELATIVE_TIME
-    phase.extracted.PLOT_FIRST_SECONDS = phase.PLOT_FIRST_SECONDS
     if bool(FORCE_COMMON_LINEAR_LAG_EXTRAPOLATION):
         phase.PHASE_CORRECTION_MODE = "common"
         phase.PHASE_COMMON_LAG_POLYORDER = 1

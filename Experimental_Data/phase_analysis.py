@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import sys
 
 import matplotlib.pyplot as plt
@@ -9,45 +8,53 @@ import numpy as np
 from scipy.signal import savgol_filter
 
 try:
-    import Experimental_Data.plot_extracted_channels as extracted
-    import Experimental_Data.analyze_experimental_data as analysis
-except ModuleNotFoundError as exc:
-    if getattr(exc, "name", "") != "Experimental_Data":
-        raise
-    # Support direct execution: python3 Experimental_Data/phase_analysis.py
+    from Experimental_Data.script_helpers import (
+        filter_excluded_tests as _filter_excluded_tests_common,
+        import_analysis_and_extracted,
+        resolve_existing_dir as _resolve_existing_dir_common,
+    )
+except ModuleNotFoundError:
     current_dir = Path(__file__).resolve().parent
     if str(current_dir) not in sys.path:
         sys.path.insert(0, str(current_dir))
-    import plot_extracted_channels as extracted
-    import analyze_experimental_data as analysis
+    from script_helpers import (
+        filter_excluded_tests as _filter_excluded_tests_common,
+        import_analysis_and_extracted,
+        resolve_existing_dir as _resolve_existing_dir_common,
+    )
+
+analysis, extracted, _USED_EXTRACTED_FALLBACK = import_analysis_and_extracted(
+    __file__,
+    allow_extracted_fallback=True,
+    print_fallback_message=False,
+)
+if _USED_EXTRACTED_FALLBACK and __name__ == "__main__":
+    print(
+        "phase_analysis: 'plot_extracted_channels.py' not found; "
+        "using analyze_experimental_data fallback for processing/derivatives."
+    )
 
 
-# Input (single source of truth in analyze_experimental_data.py)
-# Supported sources here are raw sets because phase_analysis relies on
-# extracted._process_file(), which reads raw channel names.
-PHASE_MAT_SOURCE = "crossflow_raw"  # one of: crossflow_raw, crossflow, combined
-_phase_source = str(PHASE_MAT_SOURCE).strip().lower()
-if _phase_source == "combined":
-    MAT_FILES = list(analysis.MAT_FILES_COMBINED_RAW)
-elif _phase_source in {"crossflow_raw", "crossflow"}:
-    MAT_FILES = list(analysis.MAT_FILES_CROSSFLOW_RAW)
-else:
-    raise ValueError("PHASE_MAT_SOURCE must be one of: crossflow_raw, crossflow, combined")
+# Input selection (folder-only).
+PHASE_MAT_DIR = Path("CrossFlow/RawData")
+PHASE_MAT_DIR_PATTERN = "*.mat"
+PHASE_MAT_DIR_RECURSIVE = False
 
 # Exclude files by test number parsed from filename, e.g. test3009.mat -> 3009.
-EXCLUDE_TEST_NUMBERS: list[int] = [3009, 3002]
+EXCLUDE_TEST_NUMBERS: list[int] = [3009]
 
-# Keep data-loading behavior aligned with the channel-extraction script.
-DATA_VARIABLE = extracted.DATA_VARIABLE
-USE_RELATIVE_TIME = extracted.USE_RELATIVE_TIME
-PLOT_FIRST_SECONDS = extracted.PLOT_FIRST_SECONDS
-# Optional additional trim before all phase analysis/plots, relative to each
-# loaded record start time.
-PHASE_TRIM_START_SECONDS = 0.0
-PHASE_TRIM_END_SECONDS = 0.0
-# When True, use the full trimmed interval as active mask for analysis/plots.
-# This ensures "before" plots reflect the cut range directly.
-PHASE_TRIM_REPLACE_MASK_WITH_TRIM = True
+# Data-variable selection for phase input MAT files.
+# Avoid inheriting analysis/extracted DATA_VARIABLE blindly, because that may be
+# configured for a different source than the selected folder.
+_phase_data_variable_default = "data"
+PHASE_DATA_VARIABLE_OVERRIDE: str | None = None  # e.g. "data_corrected"
+DATA_VARIABLE = (
+    str(PHASE_DATA_VARIABLE_OVERRIDE)
+    if PHASE_DATA_VARIABLE_OVERRIDE is not None
+    else str(_phase_data_variable_default)
+)
+# Time-window settings are owned by this script only.
+USE_RELATIVE_TIME = True
 
 # Phase-drift settings
 PHASE_WINDOW_SECONDS = 20.0
@@ -57,7 +64,7 @@ PHASE_FREQ_MAX_HZ = 5.0
 PHASE_MAX_LAG_SECONDS = 2.0
 # Lag is estimated from phase/frequency in each window.
 # Unwrap by period keeps lag continuity across consecutive windows.
-LAG_UNWRAP_BY_PERIOD = False
+LAG_UNWRAP_BY_PERIOD = True
 
 # Displacement correction settings
 PHASE_CORRECTION_ENABLED = True
@@ -68,7 +75,7 @@ PHASE_COMMON_LAG_POLYORDER = 1
 # In common-mode lag evaluation:
 # - False: clip evaluation to fitted relative-time span
 # - True: extrapolate polynomial beyond fitted span
-PHASE_COMMON_LAG_EXTRAPOLATE = False
+PHASE_COMMON_LAG_EXTRAPOLATE = True
 # Optional zero-phase smoothing around the warp step to reduce correction noise.
 # Set to odd integer > 1 to enable.
 PHASE_CORRECTION_PRE_SMOOTH_WINDOW = 5
@@ -81,59 +88,21 @@ PHASE_CORRECTION_POST_SAVGOL_POLYORDER = 3
 # depending on USE_RELATIVE_TIME.
 # Example: (390.0, 400.0)
 DISPLACEMENT_PLOT_TIME_WINDOW: tuple[float, float] | list[float] | None = [397, 399]
-PLOT_CORRECTED_DISPLACEMENT = True
-PLOT_CORRECTED_DISPLACEMENT_FULL = True
-PLOT_CORRECTED_ACCELERATION = True
+PLOT_CORRECTED_DISPLACEMENT = False
+PLOT_CORRECTED_DISPLACEMENT_FULL = False
+PLOT_CORRECTED_ACCELERATION = False
 PHASE_DOT_MARKERS = True
 PHASE_DOT_MARKER_SIZE = 2.2
 PHASE_DOT_MAX_POINTS = 250
 
 # Key timeseries view: U_r, Fy2-Fy1, and displacement, each with a rotated
 # (horizontal) histogram panel at the right side.
-PLOT_KEY_TIMESERIES_WITH_END_HIST = True
-PLOT_KEY_TIMESERIES_FOR_ALL_FILES = True
+PLOT_KEY_TIMESERIES_WITH_END_HIST = False
+PLOT_KEY_TIMESERIES_FOR_ALL_FILES = False
 KEY_TIMESERIES_FILE_INDEX = 0
 KEY_TIMESERIES_HIST_BINS = 60
 KEY_TIMESERIES_FIG_WIDTH = 12.0
 KEY_TIMESERIES_FIG_HEIGHT = 7.5
-
-
-def _trim_result_time_window(result: dict[str, object]) -> dict[str, object]:
-    t = np.asarray(result["t"], dtype=float).reshape(-1)
-    mask = np.asarray(result["mask"], dtype=bool).reshape(-1)
-    channels = result["channels"]
-    assert isinstance(channels, list)
-
-    channel_arrays = [np.asarray(values, dtype=float).reshape(-1) for _, values in channels]
-    n = int(min([t.size, mask.size] + [arr.size for arr in channel_arrays]))
-    if n < 2:
-        raise ValueError(f"{result['label']}: not enough samples for phase trimming.")
-
-    t = t[:n]
-    mask = mask[:n]
-    trim_mask = analysis._time_trim_mask(
-        t,
-        role=f"{result['label']}: phase-analysis trim",
-        trim_start_seconds=float(PHASE_TRIM_START_SECONDS),
-        trim_end_seconds=float(PHASE_TRIM_END_SECONDS),
-    )
-    if int(np.count_nonzero(trim_mask)) < 2:
-        raise ValueError(f"{result['label']}: phase trimming left fewer than 2 samples.")
-
-    t_trim = np.asarray(t[trim_mask], dtype=float)
-    if bool(PHASE_TRIM_REPLACE_MASK_WITH_TRIM):
-        mask_trim = np.ones(t_trim.size, dtype=bool)
-    else:
-        mask_trim = np.asarray(mask[trim_mask], dtype=bool)
-
-    trimmed = dict(result)
-    trimmed["t"] = t_trim
-    trimmed["mask"] = mask_trim
-    trimmed["channels"] = [
-        (str(name), np.asarray(values, dtype=float).reshape(-1)[:n][trim_mask])
-        for (name, values) in channels
-    ]
-    return trimmed
 
 
 def _wrap_phase_deg(phase_rad: np.ndarray) -> np.ndarray:
@@ -196,26 +165,22 @@ def _lag_derivative_per_second(t_seconds: np.ndarray, lag_seconds: np.ndarray) -
     return np.gradient(lag, t)
 
 
-def _extract_test_number(path: Path) -> int | None:
-    stem = str(path.stem).lower()
-    match = re.search(r"test(\d+)", stem)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
-    excluded_raw = list(EXCLUDE_TEST_NUMBERS)
-    if not excluded_raw:
-        return paths
-    excluded = {int(v) for v in excluded_raw}
-    kept: list[Path] = []
-    for p in paths:
-        test_no = _extract_test_number(Path(p))
-        if test_no is not None and test_no in excluded:
-            continue
-        kept.append(Path(p))
-    return kept
+    return _filter_excluded_tests_common([Path(p) for p in paths], EXCLUDE_TEST_NUMBERS)
+
+
+def _resolve_existing_dir(path_like: Path | str) -> Path:
+    return _resolve_existing_dir_common(path_like, script_file=__file__)
+
+
+def _resolve_phase_input_files() -> tuple[list[Path], str]:
+    mat_dir = _resolve_existing_dir(PHASE_MAT_DIR)
+    pattern = str(PHASE_MAT_DIR_PATTERN) if str(PHASE_MAT_DIR_PATTERN).strip() else "*.mat"
+    if bool(PHASE_MAT_DIR_RECURSIVE):
+        files = sorted(mat_dir.rglob(pattern))
+    else:
+        files = sorted(mat_dir.glob(pattern))
+    return [Path(p) for p in files], f"folder: {mat_dir} (pattern='{pattern}', recursive={bool(PHASE_MAT_DIR_RECURSIVE)})"
 
 
 def _phase_drift_diagnostics(
@@ -461,6 +426,15 @@ def _collect_phase_series(
         tc, ph_deg, lag_s, f_dom = _filter_finite_phase_series(tc, ph_deg, lag_s, f_dom)
         phase_by_label[label] = (tc, ph_deg, lag_s, f_dom)
     return phase_by_label
+
+
+def _has_any_valid_phase_windows(
+    phase_by_label: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+) -> bool:
+    for tc, _, _, _ in phase_by_label.values():
+        if np.asarray(tc, dtype=float).size >= 2:
+            return True
+    return False
 
 
 def _fit_common_lag_model(
@@ -932,18 +906,18 @@ def _plot_phase_drift_all(
 
 
 def main() -> None:
-    if not MAT_FILES:
-        raise ValueError("MAT_FILES is empty.")
-
     # Ensure phase script can override these settings from the extraction script.
     extracted.DATA_VARIABLE = DATA_VARIABLE
     extracted.USE_RELATIVE_TIME = USE_RELATIVE_TIME
-    extracted.PLOT_FIRST_SECONDS = PLOT_FIRST_SECONDS
 
-    mat_files = [Path(p) for p in MAT_FILES]
+    mat_files, source_desc = _resolve_phase_input_files()
+    if not mat_files:
+        raise ValueError("No MAT files selected for phase analysis.")
     mat_files = _filter_excluded_tests(mat_files)
     if not mat_files:
         raise ValueError("No MAT files left after applying EXCLUDE_TEST_NUMBERS.")
+    print(f"Phase analysis file source: {source_desc}")
+    print(f"Phase analysis selected {len(mat_files)} file(s) after exclusions.")
     missing = [p for p in mat_files if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Missing MAT file(s): {missing}")
@@ -951,8 +925,9 @@ def main() -> None:
     results: list[dict[str, object]] = []
     for mat_file in mat_files:
         result = extracted._process_file(mat_file)
-        if bool(float(PHASE_TRIM_START_SECONDS) > 0.0 or float(PHASE_TRIM_END_SECONDS) > 0.0):
-            result = _trim_result_time_window(result)
+        # Phase analysis always uses full available series in this script.
+        t_arr = np.asarray(result["t"], dtype=float).reshape(-1)
+        result["mask"] = np.ones(t_arr.size, dtype=bool)
         results.append(result)
 
     if bool(PLOT_KEY_TIMESERIES_WITH_END_HIST):
@@ -969,25 +944,37 @@ def main() -> None:
 
     if bool(PHASE_CORRECTION_ENABLED):
         phase_before = _collect_phase_series(results)
-        corrected_disp = _build_corrected_displacement(results, phase_before)
-        phase_after = _collect_phase_series(results, disp_overrides=corrected_disp)
-        _print_phase_before_after_summary(phase_before, phase_after)
-        if bool(PLOT_CORRECTED_DISPLACEMENT):
-            _plot_corrected_displacement(
-                results,
-                corrected_disp,
-                time_window=DISPLACEMENT_PLOT_TIME_WINDOW,
+        if not _has_any_valid_phase_windows(phase_before):
+            warnings.warn(
+                "Skipping phase correction: no valid phase windows were found "
+                "(adjust PHASE_WINDOW_SECONDS or signal quality)."
             )
-            if bool(PLOT_CORRECTED_DISPLACEMENT_FULL) and DISPLACEMENT_PLOT_TIME_WINDOW is not None:
-                _plot_corrected_displacement(
-                    results,
-                    corrected_disp,
-                    time_window=None,
-                    title_suffix="(full interval)",
-                )
-        if bool(PLOT_CORRECTED_ACCELERATION):
-            _plot_corrected_acceleration(results, corrected_disp)
-        _plot_phase_drift_all(results, disp_overrides=corrected_disp, title_suffix="(corrected displacement)")
+        else:
+            try:
+                corrected_disp = _build_corrected_displacement(results, phase_before)
+            except Exception as exc:
+                warnings.warn(f"Skipping phase correction due to error: {type(exc).__name__}: {exc}")
+                corrected_disp = None
+
+            if corrected_disp is not None:
+                phase_after = _collect_phase_series(results, disp_overrides=corrected_disp)
+                _print_phase_before_after_summary(phase_before, phase_after)
+                if bool(PLOT_CORRECTED_DISPLACEMENT):
+                    _plot_corrected_displacement(
+                        results,
+                        corrected_disp,
+                        time_window=DISPLACEMENT_PLOT_TIME_WINDOW,
+                    )
+                    if bool(PLOT_CORRECTED_DISPLACEMENT_FULL) and DISPLACEMENT_PLOT_TIME_WINDOW is not None:
+                        _plot_corrected_displacement(
+                            results,
+                            corrected_disp,
+                            time_window=None,
+                            title_suffix="(full interval)",
+                        )
+                if bool(PLOT_CORRECTED_ACCELERATION):
+                    _plot_corrected_acceleration(results, corrected_disp)
+                _plot_phase_drift_all(results, disp_overrides=corrected_disp, title_suffix="(corrected displacement)")
     plt.show()
 
 

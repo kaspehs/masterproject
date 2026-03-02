@@ -10,15 +10,16 @@ from scipy.io import loadmat, savemat
 
 # Edit these constants directly.
 ACTION = "trim_trailing"  # "trim_trailing" | "split_nan_gap"
-INPUT_MAT_PATH = Path("Experimental_Data/CrossFlow/CorrectedData/test3004_corrected.mat")
+INPUT_MAT_PATH = Path("Experimental_Data/CrossFlow/CorrectedData/test3006_corrected.mat")
 DATA_KEY = "data"
 # If None, time axis is inferred as the longest axis in `data`.
 TIME_AXIS: int | None = None
 
 # Trim mode settings.
-OUTPUT_MAT_PATH: Path | None = None
-DROP_LAST_TIME_SAMPLES = 2
-OVERWRITE_INPLACE = True
+OUTPUT_MAT_PATH: Path | None = Path("Experimental_Data/CrossFlow/CleanedCorrectedData/test3006_corrected.mat")
+DROP_FIRST_TIME_SAMPLES = 6000
+DROP_LAST_TIME_SAMPLES = 0
+OVERWRITE_INPLACE = False
 
 # Split mode settings.
 SPLIT_OUTPUT_PREFIX: str | None = None  # Default: <input_stem>
@@ -218,17 +219,22 @@ def _nan_blocks_from_data(data: np.ndarray, *, time_axis: int) -> list[tuple[int
 
 
 def _run_trim_mode(input_path: Path) -> None:
-    if int(DROP_LAST_TIME_SAMPLES) < 1:
-        raise ValueError("DROP_LAST_TIME_SAMPLES must be >= 1.")
+    if int(DROP_FIRST_TIME_SAMPLES) < 0:
+        raise ValueError("DROP_FIRST_TIME_SAMPLES must be >= 0.")
+    if int(DROP_LAST_TIME_SAMPLES) < 0:
+        raise ValueError("DROP_LAST_TIME_SAMPLES must be >= 0.")
 
     data = _read_data_array(input_path, DATA_KEY)
     time_axis_idx = _resolve_time_axis(tuple(data.shape), TIME_AXIS)
     old_n = int(data.shape[time_axis_idx])
 
-    keep_n = old_n - int(DROP_LAST_TIME_SAMPLES)
+    start_idx = int(DROP_FIRST_TIME_SAMPLES)
+    end_idx = old_n - int(DROP_LAST_TIME_SAMPLES)
+    keep_n = end_idx - start_idx
     if keep_n < 1:
         raise ValueError(
-            f"Cannot drop {DROP_LAST_TIME_SAMPLES} time samples from axis length {old_n}."
+            f"Cannot trim start={DROP_FIRST_TIME_SAMPLES} and end={DROP_LAST_TIME_SAMPLES} "
+            f"time samples from axis length {old_n}."
         )
 
     if bool(OVERWRITE_INPLACE):
@@ -239,13 +245,14 @@ def _run_trim_mode(input_path: Path) -> None:
                 dst_path=tmp_path,
                 data_key=DATA_KEY,
                 time_axis=TIME_AXIS,
-                start_idx=0,
-                end_idx=keep_n,
+                start_idx=start_idx,
+                end_idx=end_idx,
             )
             tmp_path.replace(input_path)
             print(
                 f"Updated in-place: {input_path}\n"
                 f"  data shape: {before} -> {after}\n"
+                f"  dropped leading time samples: {int(DROP_FIRST_TIME_SAMPLES)}\n"
                 f"  dropped trailing time samples: {int(DROP_LAST_TIME_SAMPLES)}"
             )
         return
@@ -261,12 +268,13 @@ def _run_trim_mode(input_path: Path) -> None:
         dst_path=output_path,
         data_key=DATA_KEY,
         time_axis=TIME_AXIS,
-        start_idx=0,
-        end_idx=keep_n,
+        start_idx=start_idx,
+        end_idx=end_idx,
     )
     print(
         f"Wrote: {output_path}\n"
         f"  data shape: {before} -> {after}\n"
+        f"  dropped leading time samples: {int(DROP_FIRST_TIME_SAMPLES)}\n"
         f"  dropped trailing time samples: {int(DROP_LAST_TIME_SAMPLES)}"
     )
 
