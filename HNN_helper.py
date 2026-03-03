@@ -27,8 +27,8 @@ FORCE_ROLLOUT_NRMSE_COEFF_KEY = "Force rollout NRMSE (coeff)"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
 DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
 MEAN_DISP_AMP_REL_ERROR_KEY = "Mean displacement amplitude relative error"
-DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error (second half)"
-FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error (second half)"
+DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
+FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error"
 
 SPECTRAL_ERROR_FMIN_HZ = 0.1
 SPECTRAL_ERROR_FMAX_HZ = 5.0
@@ -529,11 +529,8 @@ def compute_validation_metrics(
     if min_len > 0:
         disp_model_aligned = np.asarray(y_pred_raw[:min_len], dtype=float)
         disp_true_aligned = np.asarray(y_data_raw[:min_len], dtype=float)
-        half_idx_disp = disp_true_aligned.size // 2
-        disp_true_half = disp_true_aligned[half_idx_disp:]
-        disp_model_half = disp_model_aligned[half_idx_disp:]
-        if disp_true_half.size > 0 and disp_model_half.size > 0:
-            disp_spec_err = spectral_relative_error(disp_true_half, disp_model_half, dt)
+        if disp_true_aligned.size > 0 and disp_model_aligned.size > 0:
+            disp_spec_err = spectral_relative_error(disp_true_aligned, disp_model_aligned, dt)
             if np.isfinite(disp_spec_err):
                 metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
         if include_force_nrmse:
@@ -547,11 +544,8 @@ def compute_validation_metrics(
             metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
         force_model_aligned = force_total_pred[:min_len]
         force_true_aligned = force_target[:min_len]
-        half_idx_force = force_true_aligned.size // 2
-        force_true_half = force_true_aligned[half_idx_force:]
-        force_model_half = force_model_aligned[half_idx_force:]
-        if force_true_half.size > 0 and force_model_half.size > 0:
-            spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
+        if force_true_aligned.size > 0 and force_model_aligned.size > 0:
+            spectral_rel_err = spectral_relative_error(force_true_aligned, force_model_aligned, dt)
             if np.isfinite(spectral_rel_err):
                 metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(spectral_rel_err)
     with torch.no_grad():

@@ -434,12 +434,24 @@ def _run_vpinn_validation(
     dt_target = None if dt_target is None else float(dt_target)
 
     f0_lookup = None
+    fn_hz = None
     if force_representation == "coefficient":
+        m_eff_cfg = _m_eff_from_model_cfg(cfg.model)
+        k_cfg = float(getattr(cfg.model, "k", 1218.0))
+        if m_eff_cfg > 0.0 and k_cfg > 0.0:
+            fn_hz = float(np.sqrt(k_cfg / m_eff_cfg) / (2.0 * np.pi))
         if bool(getattr(data_cfg, "use_generated_train_series", False)):
             meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
         else:
             meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+        try:
+            f0_lookup = _load_metadata_map(meta_path)
+        except FileNotFoundError:
+            f0_lookup = None
+            print(
+                f"Warning: metadata file '{meta_path}' not found. "
+                "Falling back to U_r-based F0 conversion."
+            )
 
     for path in sources:
         traj, dt = _load_trajectory(
@@ -454,6 +466,7 @@ def _run_vpinn_validation(
             f0_lookup=f0_lookup,
             rho=float(getattr(cfg.model, "rho", 1000.0)),
             D=float(getattr(cfg.model, "D", 0.1)),
+            fn_hz=fn_hz,
         )
         if dt_ref is None:
             dt_ref = dt

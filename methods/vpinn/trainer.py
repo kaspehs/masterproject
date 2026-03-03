@@ -539,6 +539,17 @@ def _load_metadata_map(meta_path: Path) -> dict[str, float]:
     return mapping
 
 
+def _try_load_metadata_map(meta_path: Path) -> Optional[dict[str, float]]:
+    try:
+        return _load_metadata_map(meta_path)
+    except FileNotFoundError:
+        warnings.warn(
+            f"Metadata file '{meta_path}' not found. Falling back to U_r-based F0 conversion "
+            "for vpinn.force_representation='coefficient'."
+        )
+        return None
+
+
 def _normalize_ur_filter(values: Any, *, key: str) -> np.ndarray | None:
     if values is None:
         return None
@@ -681,6 +692,7 @@ def _load_trajectory(
     f0_lookup: Optional[dict[str, float]],
     rho: float,
     D: float,
+    fn_hz: Optional[float],
 ) -> tuple[dict[str, Any], float]:
     t, x, f_meas, v_file, ur_series = _read_timeseries_npz(path)
     t, x, f_meas, v_file, ur_series = _maybe_reduce_time(
@@ -746,11 +758,18 @@ def _load_trajectory(
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
     f0_val = None
     if force_representation == "coefficient":
-        if f0_lookup is None:
-            raise ValueError("Missing metadata lookup for force coefficient conversion.")
-        if path.name not in f0_lookup:
-            raise KeyError(f"Metadata missing U for '{path.name}'.")
-        U_val = float(f0_lookup[path.name])
+        if f0_lookup is not None and path.name in f0_lookup:
+            U_val = float(f0_lookup[path.name])
+        else:
+            if fn_hz is None or not np.isfinite(float(fn_hz)) or float(fn_hz) <= 0.0:
+                raise ValueError(
+                    "Missing metadata lookup for force coefficient conversion and invalid fn_hz fallback."
+                )
+            ur_finite = np.asarray(ur_series, dtype=float).reshape(-1)
+            ur_finite = ur_finite[np.isfinite(ur_finite)]
+            if ur_finite.size == 0:
+                raise ValueError(f"{path.name}: cannot derive F0 from U_r because U_r has no finite values.")
+            U_val = float(np.mean(ur_finite)) * float(fn_hz) * float(D)
         f0_val = 0.5 * float(rho) * float(D) * float(U_val) ** 2
         if not np.isfinite(f0_val) or f0_val <= 0.0:
             raise ValueError(f"Invalid F0 for '{path.name}': {f0_val}")
@@ -893,12 +912,17 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
         raise ValueError("vpinn.train_ur_filter_tol must be non-negative.")
 
     f0_lookup: Optional[dict[str, float]] = None
+    fn_hz: Optional[float] = None
     if force_representation == "coefficient":
+        m_eff = _m_eff_from_model_cfg(config.model)
+        k_val = float(getattr(config.model, "k", 1218.0))
+        if m_eff > 0.0 and k_val > 0.0:
+            fn_hz = float(math.sqrt(k_val / m_eff) / (2.0 * math.pi))
         if data_cfg.use_generated_train_series:
             meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
         else:
             meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+        f0_lookup = _try_load_metadata_map(meta_path)
 
     if data_cfg.use_generated_train_series:
         series_dir = Path(data_cfg.train_series_dir)
@@ -982,6 +1006,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            fn_hz=fn_hz,
         )
         if dt_ref is None:
             dt_ref = dt
@@ -1001,6 +1026,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            fn_hz=fn_hz,
         )
         if dt_ref is None:
             dt_ref = dt
@@ -1530,11 +1556,8 @@ def _log_rollout_validation(
         metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel_error)
         if log_metrics:
             writer.add_scalar(f"val/{MEAN_DISP_AMP_REL_ERROR_KEY}", float(amp_rel_error), epoch)
-    half_idx_disp = x_true.size // 2
-    x_true_half = x_true[half_idx_disp:]
-    x_pred_half = x_pred[half_idx_disp:]
-    if x_true_half.size > 0 and x_pred_half.size > 0:
-        disp_spec_err = spectral_relative_error(x_true_half, x_pred_half, dt)
+    if x_true.size > 0 and x_pred.size > 0:
+        disp_spec_err = spectral_relative_error(x_true, x_pred, dt)
         if np.isfinite(disp_spec_err):
             metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
             if log_metrics:
@@ -1566,11 +1589,8 @@ def _log_rollout_validation(
             if log_metrics:
                 writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
 
-    half_idx_force = force_for_spec_true.size // 2
-    force_true_half = force_for_spec_true[half_idx_force:]
-    force_pred_half = force_for_spec_pred[half_idx_force:]
-    if force_true_half.size > 0 and force_pred_half.size > 0:
-        force_spec_err = spectral_relative_error(force_true_half, force_pred_half, dt)
+    if force_for_spec_true.size > 0 and force_for_spec_pred.size > 0:
+        force_spec_err = spectral_relative_error(force_for_spec_true, force_for_spec_pred, dt)
         if np.isfinite(force_spec_err):
             metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
             if log_metrics:
@@ -1661,12 +1681,17 @@ def train(config: Config, config_name: str) -> None:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
     use_force_coeff = force_representation == "coefficient"
     f0_lookup: Optional[dict[str, float]] = None
+    fn_hz: Optional[float] = None
     if use_force_coeff:
+        m_eff_cfg = _m_eff_from_model_cfg(config.model)
+        k_cfg = float(getattr(config.model, "k", 1218.0))
+        if m_eff_cfg > 0.0 and k_cfg > 0.0:
+            fn_hz = float(math.sqrt(k_cfg / m_eff_cfg) / (2.0 * math.pi))
         if bool(getattr(config.data, "use_generated_train_series", False)):
             meta_path = Path(config.data.train_series_dir) / "metadata.json"
         else:
             meta_path = Path(config.data.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+        f0_lookup = _try_load_metadata_map(meta_path)
     per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
     if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
@@ -1724,6 +1749,7 @@ def train(config: Config, config_name: str) -> None:
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            fn_hz=fn_hz,
         )
         if val_dt != dt:
             raise ValueError(f"Validation data dt={val_dt} does not match training dt={dt}.")
