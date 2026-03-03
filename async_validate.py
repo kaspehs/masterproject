@@ -35,6 +35,7 @@ from HNN_helper import (
     preprocess_timeseries,
     resolve_cut_start_seconds,
     resolve_middle_time_plot,
+    sample_one_index_per_ur,
 )
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
@@ -275,7 +276,15 @@ def _run_hnn_validation(
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
-        for series_raw, sequence in zip(val_series_raw, val_sequences):
+        total = min(len(val_series_raw), len(val_sequences))
+        ur_for_sampling: list[float] = []
+        for idx in range(total):
+            ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
+            ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
+        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=int(epoch) + 1)
+        for idx in sampled_indices:
+            series_raw = val_series_raw[idx]
+            sequence = val_sequences[idx]
             y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
             y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
             metrics = compute_validation_metrics(
@@ -589,7 +598,38 @@ def _run_vpinn_validation(
     if do_rollout:
         include_disp_nrmse = bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True))
         include_force_nrmse = bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True))
-        ur_values = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
+        ur_values_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
+        sampled_metric_indices = sample_one_index_per_ur(ur_values_all, seed=int(epoch) + 1)
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
+        for sidx in sampled_metric_indices:
+            metrics = _log_rollout_validation(
+                writer=writer,
+                epoch=epoch,
+                model=model,
+                traj=val_trajs[sidx],
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                D=float(getattr(cfg.model, "D", 1.0)),
+                middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
+                device=device,
+                log_metrics=False,
+                log_plots=False,
+                include_disp_nrmse=include_disp_nrmse,
+                include_force_nrmse=include_force_nrmse,
+            )
+            for name, value in metrics.items():
+                if not np.isfinite(float(value)):
+                    continue
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for name, total in metrics_sum.items():
+            denom = float(max(1, metrics_count.get(name, 0)))
+            writer.add_scalar(f"val/{name}", total / denom, epoch)
+
+        ur_values = ur_values_all
         rollout_idx = _rollout_index(
             epoch,
             rollout_every,
@@ -611,6 +651,8 @@ def _run_vpinn_validation(
             D=float(getattr(cfg.model, "D", 1.0)),
             middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
             device=device,
+            log_metrics=False,
+            log_plots=True,
             include_disp_nrmse=include_disp_nrmse,
             include_force_nrmse=include_force_nrmse,
         )

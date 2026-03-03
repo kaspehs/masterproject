@@ -40,6 +40,7 @@ from HNN_helper import (
     log_validation_epoch,
     preprocess_timeseries,
     resolve_cut_start_seconds,
+    sample_one_index_per_ur,
 )
 
 
@@ -376,7 +377,15 @@ def _validate_if_needed(
     if val_series_raw is not None and val_sequences is not None:
         metrics_sum: dict[str, float] = {}
         count = 0
-        for series_raw, sequence in zip(val_series_raw, val_sequences):
+        total = min(len(val_series_raw), len(val_sequences))
+        ur_for_sampling: list[float] = []
+        for idx in range(total):
+            ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
+            ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
+        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=int(epoch) + 1)
+        for idx in sampled_indices:
+            series_raw = val_series_raw[idx]
+            sequence = val_sequences[idx]
             y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
             y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
             if force_np is None:
@@ -428,7 +437,7 @@ def _validate_if_needed(
                     f"(tol={float(rollout_target_ur_tol):.3g}); falling back to default rollout selection."
                 )
         if selected_indices is None:
-            selected_indices = list(range(len(val_series_raw)))
+            selected_indices = list(range(total))
         if cycle_validation_rollout:
             step = max(0, (epoch + 1) // max(1, int(rollout_every_epochs)) - 1)
             rollout_idx = selected_indices[step % len(selected_indices)]

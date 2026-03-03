@@ -730,6 +730,36 @@ def relative_error(model_value: float, true_value: float, eps: float = 1e-12) ->
     return float((model_value - true_value) / (denom + eps))
 
 
+def sample_one_index_per_ur(
+    ur_values: Sequence[float],
+    *,
+    seed: int | None = None,
+    decimals: int = 6,
+) -> list[int]:
+    """
+    Pick one random index per reduced-velocity bucket.
+    Buckets are formed by rounding U_r to `decimals`.
+    """
+    buckets: dict[float, list[int]] = {}
+    for idx, ur in enumerate(ur_values):
+        if not np.isfinite(float(ur)):
+            continue
+        key = float(np.round(float(ur), int(decimals)))
+        buckets.setdefault(key, []).append(int(idx))
+    if not buckets:
+        return []
+    rng = np.random.default_rng(seed)
+    selected: list[int] = []
+    for key in sorted(buckets):
+        candidates = buckets[key]
+        if len(candidates) == 1:
+            selected.append(candidates[0])
+        else:
+            pick = int(rng.integers(0, len(candidates)))
+            selected.append(candidates[pick])
+    return selected
+
+
 def spectral_relative_error(
     true_signal: np.ndarray,
     model_signal: np.ndarray,

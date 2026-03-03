@@ -51,6 +51,7 @@ from HNN_helper import (
     resolve_middle_time_plot,
     relative_error,
     resample_uniform_series,
+    sample_one_index_per_ur,
     spectral_relative_error,
 )
 from architectures import ODEPirateNet
@@ -1462,6 +1463,7 @@ def _log_rollout_validation(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     log_metrics: bool = True,
+    log_plots: bool = True,
     include_disp_nrmse: bool = True,
     include_force_nrmse: bool = True,
     title_suffix: str = "",
@@ -1589,45 +1591,46 @@ def _log_rollout_validation(
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
-    y_true_norm = x_true / float(D)
-    y_pred_norm = x_pred / float(D)
-    freq = float(torch.sqrt(k[0] / m[0]).detach().cpu())
-    denom = float(freq * float(D)) if freq > 0 else 1.0
-    p_pred_norm = v_pred / denom
+    if log_plots:
+        y_true_norm = x_true / float(D)
+        y_pred_norm = x_pred / float(D)
+        freq = float(torch.sqrt(k[0] / m[0]).detach().cpu())
+        denom = float(freq * float(D)) if freq > 0 else 1.0
+        p_pred_norm = v_pred / denom
 
-    zoom_mask = create_zoom_mask(t_np)
-    middle_mask = create_window_mask(t_np, middle_time_plot)
-    middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
-    ur_val = float(ur_true_t[0, 0].detach().cpu().item())
-    log_displacement_plots(
-        writer,
-        epoch,
-        t_np,
-        y_true_norm,
-        y_pred_norm,
-        p_pred_norm,
-        zoom_mask,
-        middle_mask,
-        middle_window,
-        reduced_velocity=ur_val,
-        tag_prefix=tag_prefix,
-        step=step,
-        title_suffix=title_suffix,
-    )
-    log_force_plots(
-        writer,
-        epoch,
-        t_np,
-        f_pred,
-        f_true,
-        zoom_mask,
-        middle_mask,
-        middle_window,
-        reduced_velocity=ur_val,
-        tag_prefix=tag_prefix,
-        step=step,
-        title_suffix=title_suffix,
-    )
+        zoom_mask = create_zoom_mask(t_np)
+        middle_mask = create_window_mask(t_np, middle_time_plot)
+        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
+        ur_val = float(ur_true_t[0, 0].detach().cpu().item())
+        log_displacement_plots(
+            writer,
+            epoch,
+            t_np,
+            y_true_norm,
+            y_pred_norm,
+            p_pred_norm,
+            zoom_mask,
+            middle_mask,
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
+        log_force_plots(
+            writer,
+            epoch,
+            t_np,
+            f_pred,
+            f_true,
+            zoom_mask,
+            middle_mask,
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
     return metrics
 
 
@@ -2227,6 +2230,37 @@ def train(config: Config, config_name: str) -> None:
             candidates = val_trajs if val_trajs else train_trajs
             if not candidates:
                 continue
+            ur_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in candidates]
+            sampled_metric_indices = sample_one_index_per_ur(ur_all, seed=int(epoch) + 1)
+            metrics_sum: dict[str, float] = {}
+            metrics_count: dict[str, int] = {}
+            for sidx in sampled_metric_indices:
+                metrics = _log_rollout_validation(
+                    writer=writer,
+                    epoch=epoch,
+                    model=model,
+                    traj=candidates[sidx],
+                    dt=dt,
+                    m=m,
+                    c=c,
+                    k=k,
+                    D=D_val,
+                    middle_time_plot=middle_time_plot,
+                    device=device,
+                    log_metrics=False,
+                    log_plots=False,
+                    include_disp_nrmse=include_disp_nrmse,
+                    include_force_nrmse=include_force_nrmse,
+                )
+                for name, value in metrics.items():
+                    if not np.isfinite(float(value)):
+                        continue
+                    metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                    metrics_count[name] = metrics_count.get(name, 0) + 1
+            for name, total in metrics_sum.items():
+                denom = float(max(1, metrics_count.get(name, 0)))
+                writer.add_scalar(f"val/{name}", total / denom, epoch)
+
             selected_indices: list[int] | None = None
             if rollout_target_ur is not None:
                 matches: list[int] = []
@@ -2267,6 +2301,8 @@ def train(config: Config, config_name: str) -> None:
                     D=D_val,
                     middle_time_plot=middle_time_plot,
                     device=device,
+                    log_metrics=False,
+                    log_plots=True,
                     include_disp_nrmse=include_disp_nrmse,
                     include_force_nrmse=include_force_nrmse,
                 )
