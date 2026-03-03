@@ -270,6 +270,8 @@ def _run_hnn_validation(
         )
 
     rollout_by_ur: dict[float, list[float]] = {}
+    include_disp_nrmse = bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True))
+    include_force_nrmse = bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True))
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
@@ -290,6 +292,8 @@ def _run_hnn_validation(
                 k=k,
                 device=device,
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+                include_disp_nrmse=include_disp_nrmse,
+                include_force_nrmse=include_force_nrmse,
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -341,6 +345,8 @@ def _run_hnn_validation(
             getattr(data_cfg, "middle_time_plot", [0.0, 1.0]),
             hamiltonian_data,
             log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+            include_disp_nrmse=include_disp_nrmse,
+            include_force_nrmse=include_force_nrmse,
             log_metrics=False,
         )
     else:
@@ -581,6 +587,8 @@ def _run_vpinn_validation(
         )
 
     if do_rollout:
+        include_disp_nrmse = bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True))
+        include_force_nrmse = bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True))
         ur_values = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
         rollout_idx = _rollout_index(
             epoch,
@@ -603,6 +611,8 @@ def _run_vpinn_validation(
             D=float(getattr(cfg.model, "D", 1.0)),
             middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
             device=device,
+            include_disp_nrmse=include_disp_nrmse,
+            include_force_nrmse=include_force_nrmse,
         )
 
 

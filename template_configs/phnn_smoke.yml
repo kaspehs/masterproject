@@ -108,6 +108,8 @@ monitoring:
   # will target that excluded U_r.
   rollout_use_excluded_ur: false
   rollout_target_ur_tol: 1e-6
+  rollout_include_disp_nrmse: true
+  rollout_include_force_nrmse: true
   final_rollout_all_validation: true
   log_every_epochs: 10
   print_every_epochs: 50

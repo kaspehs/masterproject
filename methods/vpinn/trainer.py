@@ -29,21 +29,29 @@ from core.runtime import (
 )
 from HNN_helper import (
     Config,
+    DOMINANT_FREQ_REL_ERROR_KEY,
+    DISP_SPECTRAL_SHAPE_ERROR_KEY,
     DISP_ROLLOUT_NRMSE_KEY,
+    FORCE_SPECTRAL_SHAPE_ERROR_KEY,
     FORCE_MAPPING_NRMSE_KEY,
     FORCE_ROLLOUT_NRMSE_KEY,
     GradNormBalancer,
+    MEAN_DISP_AMP_REL_ERROR_KEY,
     Residual,
     compute_velocity_numpy,
     create_window_mask,
     create_zoom_mask,
+    dominant_frequency,
     format_loss_vs_ur_text,
     log_final_rollout_errors_vs_ur,
     log_loss_vs_ur,
     log_displacement_plots,
     log_force_plots,
+    mean_displacement_amplitude,
     resolve_middle_time_plot,
+    relative_error,
     resample_uniform_series,
+    spectral_relative_error,
 )
 from architectures import ODEPirateNet
 
@@ -1454,6 +1462,8 @@ def _log_rollout_validation(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     log_metrics: bool = True,
+    include_disp_nrmse: bool = True,
+    include_force_nrmse: bool = True,
     title_suffix: str = "",
 ) -> dict[str, float]:
     x_true_t = traj["x"].to(device)
@@ -1494,33 +1504,75 @@ def _log_rollout_validation(
     x_true = x_true_t[:, 0].detach().cpu().numpy()
     f_true = f_true_t[:, 0].detach().cpu().numpy()
 
-    disp_std = float(np.std(x_true))
-    if disp_std <= 0.0:
-        disp_std = 1.0
-    rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
-    metrics: dict[str, float] = {DISP_ROLLOUT_NRMSE_KEY: rel_rmse_y}
-    if log_metrics:
-        writer.add_scalar(f"val/{DISP_ROLLOUT_NRMSE_KEY}", rel_rmse_y, epoch)
+    metrics: dict[str, float] = {}
+    if include_disp_nrmse:
+        disp_std = float(np.std(x_true))
+        if disp_std <= 0.0:
+            disp_std = 1.0
+        rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
+        metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_y
+        if log_metrics:
+            writer.add_scalar(f"val/{DISP_ROLLOUT_NRMSE_KEY}", rel_rmse_y, epoch)
+
+    dom_freq_true = dominant_frequency(x_true, dt)
+    dom_freq_pred = dominant_frequency(x_pred, dt)
+    dom_freq_rel_error = abs(relative_error(dom_freq_pred, dom_freq_true))
+    if np.isfinite(dom_freq_rel_error):
+        metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(dom_freq_rel_error)
+        if log_metrics:
+            writer.add_scalar(f"val/{DOMINANT_FREQ_REL_ERROR_KEY}", float(dom_freq_rel_error), epoch)
+    amp_true = mean_displacement_amplitude(x_true)
+    amp_pred = mean_displacement_amplitude(x_pred)
+    amp_rel_error = abs(relative_error(amp_pred, amp_true))
+    if np.isfinite(amp_rel_error):
+        metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel_error)
+        if log_metrics:
+            writer.add_scalar(f"val/{MEAN_DISP_AMP_REL_ERROR_KEY}", float(amp_rel_error), epoch)
+    half_idx_disp = x_true.size // 2
+    x_true_half = x_true[half_idx_disp:]
+    x_pred_half = x_pred[half_idx_disp:]
+    if x_true_half.size > 0 and x_pred_half.size > 0:
+        disp_spec_err = spectral_relative_error(x_true_half, x_pred_half, dt)
+        if np.isfinite(disp_spec_err):
+            metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
+            if log_metrics:
+                writer.add_scalar(f"val/{DISP_SPECTRAL_SHAPE_ERROR_KEY}", float(disp_spec_err), epoch)
 
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
         force_std = 1.0
+    force_for_spec_true = np.asarray(f_true, dtype=float)
+    force_for_spec_pred = np.asarray(f_pred, dtype=float)
     if f0_true_t is not None:
         f0_np = f0_true_t[:, 0].detach().cpu().numpy()
         f_true_force = f_true * f0_np
         f_pred_force = f_pred * f0_np
+        force_for_spec_true = np.asarray(f_true_force, dtype=float)
+        force_for_spec_pred = np.asarray(f_pred_force, dtype=float)
         force_std = float(np.std(f_true_force))
         if force_std <= 0.0:
             force_std = 1.0
-        rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
+        if include_force_nrmse:
+            rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
+            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
+            if log_metrics:
+                writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
     else:
-        rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
+        if include_force_nrmse:
+            rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
+            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
+            if log_metrics:
+                writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
+
+    half_idx_force = force_for_spec_true.size // 2
+    force_true_half = force_for_spec_true[half_idx_force:]
+    force_pred_half = force_for_spec_pred[half_idx_force:]
+    if force_true_half.size > 0 and force_pred_half.size > 0:
+        force_spec_err = spectral_relative_error(force_true_half, force_pred_half, dt)
+        if np.isfinite(force_spec_err):
+            metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
+            if log_metrics:
+                writer.add_scalar(f"val/{FORCE_SPECTRAL_SHAPE_ERROR_KEY}", float(force_spec_err), epoch)
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
@@ -1834,6 +1886,8 @@ def train(config: Config, config_name: str) -> None:
     rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
     rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
+    include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
+    include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
@@ -2213,6 +2267,8 @@ def train(config: Config, config_name: str) -> None:
                     D=D_val,
                     middle_time_plot=middle_time_plot,
                     device=device,
+                    include_disp_nrmse=include_disp_nrmse,
+                    include_force_nrmse=include_force_nrmse,
                 )
 
     if final_rollout_all_validation and val_trajs:
@@ -2248,6 +2304,8 @@ def train(config: Config, config_name: str) -> None:
                 tag_prefix="final_val/rollout",
                 step=idx,
                 log_metrics=False,
+                include_disp_nrmse=include_disp_nrmse,
+                include_force_nrmse=include_force_nrmse,
                 title_suffix=f" [final {idx+1}/{len(selected_trajs)}]",
             )
             if metrics:

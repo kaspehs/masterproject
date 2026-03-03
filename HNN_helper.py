@@ -13,9 +13,10 @@ from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 try:
-    from scipy.signal import savgol_filter
+    from scipy.signal import savgol_filter, welch
 except ImportError:
     savgol_filter = None
+    welch = None
 
 from architectures import FourierFeatures, ODEPirateNet
 
@@ -24,6 +25,14 @@ FORCE_ROLLOUT_NRMSE_KEY = "Force rollout NRMSE"
 FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
 FORCE_ROLLOUT_NRMSE_COEFF_KEY = "Force rollout NRMSE (coeff)"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
+DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
+MEAN_DISP_AMP_REL_ERROR_KEY = "Mean displacement amplitude relative error"
+DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error (second half)"
+FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error (second half)"
+
+SPECTRAL_ERROR_FMIN_HZ = 0.1
+SPECTRAL_ERROR_FMAX_HZ = 5.0
+SPECTRAL_ERROR_NPERSEG = 1024
 
 @dataclass
 class DataConfig:
@@ -163,6 +172,8 @@ class MonitoringConfig:
     async_validation_max_concurrent: int = 1
     async_validation_do_losses: bool = True
     async_validation_do_rollout: bool = True
+    rollout_include_disp_nrmse: bool = True
+    rollout_include_force_nrmse: bool = True
 
 @dataclass
 class LoggingConfig:
@@ -286,6 +297,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "log_extra_validation_metrics",
         "rollout_use_excluded_ur",
         "rollout_target_ur_tol",
+        "rollout_include_disp_nrmse",
+        "rollout_include_force_nrmse",
     }
 
     for key, value in legacy_training.items():
@@ -375,6 +388,8 @@ def log_validation_epoch(
     hamiltonian_data: np.ndarray | None,
     *,
     log_extra_metrics: bool = False,
+    include_disp_nrmse: bool = True,
+    include_force_nrmse: bool = True,
     log_metrics: bool = True,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
@@ -406,6 +421,8 @@ def log_validation_epoch(
         k=k,
         device=device,
         log_extra_metrics=log_extra_metrics,
+        include_disp_nrmse=include_disp_nrmse,
+        include_force_nrmse=include_force_nrmse,
         rollout=rollout,
     )
     if torch.is_tensor(reduced_velocity):
@@ -471,6 +488,8 @@ def compute_validation_metrics(
     k: float,
     device: torch.device,
     log_extra_metrics: bool = False,
+    include_disp_nrmse: bool = True,
+    include_force_nrmse: bool = True,
     rollout: dict[str, np.ndarray] | None = None,
 ) -> dict[str, float]:
     if rollout is None:
@@ -491,30 +510,50 @@ def compute_validation_metrics(
     disp_std_raw = float(np.std(y_data_raw))
     if disp_std_raw <= 0.0:
         disp_std_raw = 1.0
-    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
-    metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
+    if include_disp_nrmse:
+        rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
+        metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
+    dom_freq_true = dominant_frequency(y_data_raw, dt)
+    dom_freq_pred = dominant_frequency(y_pred_raw, dt)
+    dom_freq_rel_error = abs(relative_error(dom_freq_pred, dom_freq_true))
+    if np.isfinite(dom_freq_rel_error):
+        metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(dom_freq_rel_error)
+    amp_true = mean_displacement_amplitude(y_data_raw)
+    amp_pred = mean_displacement_amplitude(y_pred_raw)
+    amp_rel_error = abs(relative_error(amp_pred, amp_true))
+    if np.isfinite(amp_rel_error):
+        metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel_error)
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
     force_target = np.asarray(force_data).reshape(-1)
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
     if min_len > 0:
-        rmse_force = float(
-            np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
-        )
-        force_std = float(np.std(force_target[:min_len]))
-        if force_std <= 0.0:
-            force_std = 1.0
-        rel_rmse_force_total = rmse_force / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
-        if log_extra_metrics:
-            force_model_aligned = force_total_pred[:min_len]
-            force_true_aligned = force_target[:min_len]
-            half_idx_force = force_true_aligned.size // 2
-            force_true_half = force_true_aligned[half_idx_force:]
-            force_model_half = force_model_aligned[half_idx_force:]
-            if force_true_half.size > 0 and force_model_half.size > 0:
-                spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
-                if np.isfinite(spectral_rel_err):
-                    metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
+        disp_model_aligned = np.asarray(y_pred_raw[:min_len], dtype=float)
+        disp_true_aligned = np.asarray(y_data_raw[:min_len], dtype=float)
+        half_idx_disp = disp_true_aligned.size // 2
+        disp_true_half = disp_true_aligned[half_idx_disp:]
+        disp_model_half = disp_model_aligned[half_idx_disp:]
+        if disp_true_half.size > 0 and disp_model_half.size > 0:
+            disp_spec_err = spectral_relative_error(disp_true_half, disp_model_half, dt)
+            if np.isfinite(disp_spec_err):
+                metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
+        if include_force_nrmse:
+            rmse_force = float(
+                np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
+            )
+            force_std = float(np.std(force_target[:min_len]))
+            if force_std <= 0.0:
+                force_std = 1.0
+            rel_rmse_force_total = rmse_force / force_std
+            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
+        force_model_aligned = force_total_pred[:min_len]
+        force_true_aligned = force_target[:min_len]
+        half_idx_force = force_true_aligned.size // 2
+        force_true_half = force_true_aligned[half_idx_force:]
+        force_model_half = force_model_aligned[half_idx_force:]
+        if force_true_half.size > 0 and force_model_half.size > 0:
+            spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
+            if np.isfinite(spectral_rel_err):
+                metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(spectral_rel_err)
     with torch.no_grad():
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
@@ -672,6 +711,15 @@ def dominant_frequency(signal: np.ndarray, dt: float) -> float:
     return float(freqs[dominant_idx])
 
 
+def mean_displacement_amplitude(signal: np.ndarray) -> float:
+    """Return mean absolute centered displacement as an amplitude proxy."""
+    signal = np.asarray(signal, dtype=float).reshape(-1)
+    if signal.size == 0:
+        return float("nan")
+    centered = signal - float(np.mean(signal))
+    return float(np.mean(np.abs(centered)))
+
+
 def relative_error(model_value: float, true_value: float, eps: float = 1e-12) -> float:
     """Compute signed (model - true)/|true| with small epsilon safeguard."""
     if not np.isfinite(true_value) or not np.isfinite(model_value):
@@ -686,34 +734,80 @@ def spectral_relative_error(
     true_signal: np.ndarray,
     model_signal: np.ndarray,
     dt: float,
+    fmin_hz: float = SPECTRAL_ERROR_FMIN_HZ,
+    fmax_hz: float = SPECTRAL_ERROR_FMAX_HZ,
+    nperseg: int = SPECTRAL_ERROR_NPERSEG,
     eps: float = 1e-12,
 ) -> float:
     """
-    Compute relative L2 error between FFT magnitudes of true and model signals.
-    Signals are centered and windowed with a Hann taper to reduce leakage.
+    Compute a normalized PSD-shape error in [0, 1] using Welch spectra.
+    Uses total-variation distance between band-limited, area-normalized PSDs.
     """
     if dt <= 0.0:
         return float("nan")
-    true_signal = np.asarray(true_signal)
-    model_signal = np.asarray(model_signal)
+    true_signal = np.asarray(true_signal, dtype=float).reshape(-1)
+    model_signal = np.asarray(model_signal, dtype=float).reshape(-1)
     length = min(true_signal.size, model_signal.size)
-    if length < 2:
+    if length < 8:
         return float("nan")
     true_trim = true_signal[-length:]
     model_trim = model_signal[-length:]
-    window = np.hanning(length)
-    true_proc = (true_trim - np.mean(true_trim)) * window
-    model_proc = (model_trim - np.mean(model_trim)) * window
-    true_fft = np.abs(np.fft.rfft(true_proc))
-    model_fft = np.abs(np.fft.rfft(model_proc))
-    if true_fft.size == 0:
+    true_proc = true_trim - np.mean(true_trim)
+    model_proc = model_trim - np.mean(model_trim)
+
+    if welch is not None:
+        fs = 1.0 / float(dt)
+        seg = int(max(8, min(int(nperseg), length)))
+        ov = seg // 2
+        freqs, true_psd = welch(
+            true_proc,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend=False,
+            scaling="density",
+        )
+        _, model_psd = welch(
+            model_proc,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend=False,
+            scaling="density",
+        )
+    else:
+        # Fallback path when scipy is unavailable.
+        freqs = np.fft.rfftfreq(length, d=float(dt))
+        true_psd = np.abs(np.fft.rfft(true_proc)) ** 2
+        model_psd = np.abs(np.fft.rfft(model_proc)) ** 2
+
+    if freqs.size == 0:
         return float("nan")
-    true_fft[0] = 0.0
-    model_fft[0] = 0.0
-    denom = np.linalg.norm(true_fft)
-    if denom <= eps:
+
+    band = np.isfinite(freqs)
+    band = band & (freqs >= float(fmin_hz))
+    if np.isfinite(float(fmax_hz)) and float(fmax_hz) > 0.0:
+        band = band & (freqs <= float(fmax_hz))
+    if np.count_nonzero(band) < 2:
         return float("nan")
-    return float(np.linalg.norm(model_fft - true_fft) / (denom + eps))
+
+    f_band = freqs[band]
+    p_true = np.clip(true_psd[band], a_min=0.0, a_max=None)
+    p_model = np.clip(model_psd[band], a_min=0.0, a_max=None)
+
+    area_true = float(np.trapz(p_true, f_band))
+    area_model = float(np.trapz(p_model, f_band))
+    if area_true <= eps or area_model <= eps:
+        return float("nan")
+
+    p_true_norm = p_true / (area_true + eps)
+    p_model_norm = p_model / (area_model + eps)
+    tv = 0.5 * float(np.trapz(np.abs(p_model_norm - p_true_norm), f_band))
+    if not np.isfinite(tv):
+        return float("nan")
+    return float(np.clip(tv, 0.0, 1.0))
 
 
 class PHVIV(nn.Module):
@@ -1716,6 +1810,10 @@ def log_final_rollout_errors_vs_ur(
         (DISP_ROLLOUT_NRMSE_KEY, DISP_ROLLOUT_NRMSE_KEY),
         (FORCE_ROLLOUT_NRMSE_KEY, FORCE_ROLLOUT_NRMSE_KEY),
         (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
+        (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
+        (MEAN_DISP_AMP_REL_ERROR_KEY, MEAN_DISP_AMP_REL_ERROR_KEY),
+        (DISP_SPECTRAL_SHAPE_ERROR_KEY, DISP_SPECTRAL_SHAPE_ERROR_KEY),
+        (FORCE_SPECTRAL_SHAPE_ERROR_KEY, FORCE_SPECTRAL_SHAPE_ERROR_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
     for ur_val, metrics in pairs:
