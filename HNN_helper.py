@@ -428,6 +428,7 @@ def log_validation_epoch(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
+    validation_start_idx: int = 0,
 ) -> dict[str, float]:
     rollout = rollout_model(
         model,
@@ -440,6 +441,7 @@ def log_validation_epoch(
         D,
         k,
         device,
+        validation_start_idx=validation_start_idx,
     )
     metrics = compute_validation_metrics(
         model=model,
@@ -458,6 +460,7 @@ def log_validation_epoch(
         include_disp_nrmse=include_disp_nrmse,
         include_force_nrmse=include_force_nrmse,
         rollout=rollout,
+        validation_start_idx=validation_start_idx,
     )
     if torch.is_tensor(reduced_velocity):
         reduced_velocity_scalar = float(reduced_velocity.reshape(-1)[0].detach().cpu())
@@ -525,6 +528,7 @@ def compute_validation_metrics(
     include_disp_nrmse: bool = True,
     include_force_nrmse: bool = True,
     rollout: dict[str, np.ndarray] | None = None,
+    validation_start_idx: int = 0,
 ) -> dict[str, float]:
     if rollout is None:
         rollout = rollout_model(
@@ -538,6 +542,7 @@ def compute_validation_metrics(
             D,
             k,
             device,
+            validation_start_idx=validation_start_idx,
         )
     metrics: dict[str, float] = {}
     y_pred_raw = rollout["y_norm"] * D
@@ -565,6 +570,9 @@ def compute_validation_metrics(
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
         rv = reduced_velocity.to(device=device, non_blocking=(device.type == "cuda"))
         force_on_data = model.u_theta_on_trajectory(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
+    start_idx = max(0, int(validation_start_idx))
+    if start_idx > 0:
+        force_on_data = force_on_data[start_idx:]
     min_len_data = min(force_on_data.shape[0], force_target.shape[0])
     if min_len_data > 0:
         force_data_pred = force_on_data[:min_len_data]
@@ -1675,7 +1683,15 @@ class PHVIV(nn.Module):
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
         return x_next, force_avg
 
-    def rollout(self, z0, t_seq, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def rollout(
+        self,
+        z0,
+        t_seq,
+        dt,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist_init: torch.Tensor | None = None,
+        ur_hist_init: torch.Tensor | None = None,
+    ):
         """
         z0: (B, state_dim)    starting state from data
         t_seq: (B, K+1)       absolute times t0..tK
@@ -1695,11 +1711,28 @@ class PHVIV(nn.Module):
         z_hist = None
         ur_hist = None
         if self.is_tcn_force_model:
-            z_hist = z.unsqueeze(1).repeat(1, history_len, 1)
-            if self.use_reduced_velocity:
-                rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=z[..., :1])
-                assert rv_raw is not None
-                ur_hist = rv_raw.unsqueeze(1).repeat(1, history_len, 1)
+            provided_history = (z_hist_init is not None) or (ur_hist_init is not None)
+            if provided_history and (z_hist_init is None or ur_hist_init is None):
+                raise ValueError("z_hist_init and ur_hist_init must be provided together.")
+            if provided_history:
+                z_hist = z_hist_init.to(device=z.device, dtype=z.dtype)
+                ur_hist = ur_hist_init.to(device=z.device, dtype=z.dtype)
+                expected_z_shape = (B, history_len, state_dim)
+                expected_ur_shape = (B, history_len, 1)
+                if tuple(z_hist.shape) != expected_z_shape:
+                    raise ValueError(
+                        f"z_hist_init must have shape {expected_z_shape}, got {tuple(z_hist.shape)}."
+                    )
+                if tuple(ur_hist.shape) != expected_ur_shape:
+                    raise ValueError(
+                        f"ur_hist_init must have shape {expected_ur_shape}, got {tuple(ur_hist.shape)}."
+                    )
+            else:
+                z_hist = z.unsqueeze(1).repeat(1, history_len, 1)
+                if self.use_reduced_velocity:
+                    rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=z[..., :1])
+                    assert rv_raw is not None
+                    ur_hist = rv_raw.unsqueeze(1).repeat(1, history_len, 1)
         for k in range(K):
             t = t_seq[:, k]
             z, Fk = self.rk4_step(
@@ -3338,11 +3371,20 @@ def rollout_model(
     D: float,
     k: float,
     device: torch.device,
+    validation_start_idx: int = 0,
 ) -> dict[str, np.ndarray]:
     """Roll the model forward over the full time grid and return normalised traces."""
-    p0 = vel[0] * m_eff
-    z0 = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
-    t_seq = torch.from_numpy(np.asarray(t, dtype=np.float32)).to(device=device).unsqueeze(0)
+    start_idx = max(0, int(validation_start_idx))
+    if start_idx >= int(y0.shape[0]):
+        raise ValueError(
+            f"validation_start_idx={start_idx} is out of bounds for sequence length {int(y0.shape[0])}."
+        )
+    p0 = vel[start_idx] * m_eff
+    z0 = torch.stack((y0[start_idx], p0), dim=0).unsqueeze(0).to(device)
+    t_eval = np.asarray(t, dtype=np.float32)
+    if start_idx > 0:
+        t_eval = t_eval[start_idx:]
+    t_seq = torch.from_numpy(t_eval).to(device=device).unsqueeze(0)
     rv_val = reduced_velocity
     if torch.is_tensor(rv_val):
         rv_val = float(rv_val.reshape(-1)[0].detach().cpu())
@@ -3350,8 +3392,33 @@ def rollout_model(
         rv_val = float(np.asarray(rv_val).reshape(-1)[0])
     rv_tensor = torch.tensor(rv_val, dtype=z0.dtype, device=device).view(1, 1)
 
+    z_hist_init = None
+    ur_hist_init = None
+    if bool(getattr(model, "is_tcn_force_model", False)):
+        history_len = int(getattr(model, "history_len", 0))
+        if start_idx < history_len:
+            available_s = float(start_idx * dt)
+            needed_s = float(history_len * dt)
+            start_t = float(np.asarray(t, dtype=float).reshape(-1)[0])
+            raise ValueError(
+                f"validation start at t={start_t + start_idx * dt:.6g}s (index={start_idx}) is too early "
+                f"for TCN history_len={history_len}. Need at least {needed_s:.6g}s ({history_len} samples) "
+                f"before validation start, but only {available_s:.6g}s are available."
+            )
+        hist_start = start_idx - history_len
+        z_full = torch.stack((y0, vel * m_eff), dim=1).to(device=device)
+        z_hist_init = z_full[hist_start : start_idx + 1, :].unsqueeze(0)
+        ur_hist_init = rv_tensor.unsqueeze(1).expand(1, history_len + 1, 1).contiguous()
+
     with torch.no_grad():
-        z_pred, f_hist = model.rollout(z0, t_seq, dt, reduced_velocity=rv_tensor)
+        z_pred, f_hist = model.rollout(
+            z0,
+            t_seq,
+            dt,
+            reduced_velocity=rv_tensor,
+            z_hist_init=z_hist_init,
+            ur_hist_init=ur_hist_init,
+        )
         if f_hist is None:
             force_total_t = model.u_theta_sequence(
                 z_pred,

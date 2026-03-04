@@ -353,6 +353,8 @@ def _validate_if_needed(
     log_extra_validation_metrics: bool,
     rollout_include_disp_nrmse: bool,
     rollout_include_force_nrmse: bool,
+    validation_start_seconds: float,
+    history_context: int,
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -361,6 +363,25 @@ def _validate_if_needed(
     per_traj_norm_eps: float,
     force_reg_on_coeff: bool,
 ) -> None:
+    def _validation_start_index_for_series(series_t: np.ndarray, series_dt: float, *, label: str) -> int:
+        t_arr = np.asarray(series_t, dtype=float).reshape(-1)
+        if t_arr.size < 2:
+            raise ValueError(f"{label}: not enough samples to validate.")
+        t0 = float(t_arr[0])
+        start_s = max(0.0, float(validation_start_seconds))
+        start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
+        if history_context > 0 and start_idx < int(history_context):
+            available_s = float(start_idx * series_dt)
+            needed_s = float(int(history_context) * series_dt)
+            raise ValueError(
+                f"{label}: validation start at t={t0 + start_s:.6g}s (index={start_idx}) is too early for "
+                f"TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
+                f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
+            )
+        if (int(t_arr.size) - start_idx) < 2:
+            raise ValueError(f"{label}: too few validation samples after validation start.")
+        return start_idx
+
     if rollout_every_epochs <= 0:
         return
     if (epoch + 1) % int(rollout_every_epochs) != 0:
@@ -428,6 +449,14 @@ def _validate_if_needed(
             y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
             if force_np is None:
                 continue
+            val_start_idx = _validation_start_index_for_series(
+                np.asarray(t_np),
+                float(dt_value),
+                label=f"validation series #{idx}",
+            )
+            t_eval = np.asarray(t_np)[val_start_idx:]
+            y_eval = np.asarray(y_np)[val_start_idx:]
+            force_eval = np.asarray(force_np)[val_start_idx:]
             metrics = compute_validation_metrics(
                 model=model,
                 y_data_t=y_tensor,
@@ -435,15 +464,16 @@ def _validate_if_needed(
                 reduced_velocity=ur_tensor,
                 m_eff=m_eff,
                 dt=dt_value,
-                t=t_np,
-                y_data_raw=y_np,
-                force_data=force_np,
+                t=t_eval,
+                y_data_raw=y_eval,
+                force_data=force_eval,
                 D=D,
                 k=k,
                 device=device,
                 log_extra_metrics=log_extra_validation_metrics,
                 include_disp_nrmse=rollout_include_disp_nrmse,
                 include_force_nrmse=rollout_include_force_nrmse,
+                validation_start_idx=val_start_idx,
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -464,6 +494,14 @@ def _validate_if_needed(
         y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
         if force_np is None:
             return
+        val_start_idx = _validation_start_index_for_series(
+            np.asarray(t_np),
+            float(dt_value),
+            label=f"validation series #{rollout_idx}",
+        )
+        t_eval = np.asarray(t_np)[val_start_idx:]
+        y_eval = np.asarray(y_np)[val_start_idx:]
+        force_eval = np.asarray(force_np)[val_start_idx:]
         log_validation_epoch(
             writer,
             epoch + 1,
@@ -473,10 +511,10 @@ def _validate_if_needed(
             ur_tensor,
             m_eff,
             dt_value,
-            t_np,
-            y_np / D,
-            y_np,
-            force_np,
+            t_eval,
+            y_eval / D,
+            y_eval,
+            force_eval,
             D,
             k,
             device,
@@ -486,8 +524,34 @@ def _validate_if_needed(
             include_disp_nrmse=rollout_include_disp_nrmse,
             include_force_nrmse=rollout_include_force_nrmse,
             log_metrics=False,
+            validation_start_idx=val_start_idx,
         )
         return
+    val_start_idx = 0
+    t_eval = np.asarray(t)
+    y_eval = np.asarray(y_data)
+    force_eval = np.asarray(force_data)
+    if history_context > 0:
+        t_arr = np.asarray(t, dtype=float).reshape(-1)
+        if t_arr.size < 2:
+            raise ValueError("validation series: not enough samples to validate.")
+        t0 = float(t_arr[0])
+        start_s = max(0.0, float(validation_start_seconds))
+        val_start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
+        if val_start_idx < int(history_context):
+            available_s = float(val_start_idx * dt)
+            needed_s = float(int(history_context) * dt)
+            raise ValueError(
+                f"validation series: validation start at t={t0 + start_s:.6g}s (index={val_start_idx}) is too early "
+                f"for TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
+                f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
+            )
+        if (int(t_arr.size) - val_start_idx) < 2:
+            raise ValueError("validation series: too few validation samples after validation start.")
+        t_eval = t_arr[val_start_idx:]
+        y_eval = np.asarray(y_data)[val_start_idx:]
+        force_eval = np.asarray(force_data)[val_start_idx:]
+
     log_validation_epoch(
         writer,
         epoch + 1,
@@ -497,10 +561,10 @@ def _validate_if_needed(
         reduced_velocity,
         m_eff,
         dt,
-        t,
-        y_true_norm,
-        y_data,
-        force_data,
+        t_eval,
+        y_eval / D,
+        y_eval,
+        force_eval,
         D,
         k,
         device,
@@ -509,6 +573,7 @@ def _validate_if_needed(
         log_extra_metrics=log_extra_validation_metrics,
         include_disp_nrmse=rollout_include_disp_nrmse,
         include_force_nrmse=rollout_include_force_nrmse,
+        validation_start_idx=val_start_idx,
     )
 
 
@@ -527,6 +592,8 @@ def _log_final_rollouts_all(
     log_extra_validation_metrics: bool,
     rollout_include_disp_nrmse: bool,
     rollout_include_force_nrmse: bool,
+    validation_start_seconds: float,
+    history_context: int,
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
@@ -553,6 +620,23 @@ def _log_final_rollouts_all(
         if force_np is None:
             continue
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[idx]
+        t_arr = np.asarray(t_np, dtype=float).reshape(-1)
+        t0 = float(t_arr[0])
+        start_s = max(0.0, float(validation_start_seconds))
+        val_start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
+        if history_context > 0 and val_start_idx < int(history_context):
+            available_s = float(val_start_idx * float(dt_value))
+            needed_s = float(int(history_context) * float(dt_value))
+            raise ValueError(
+                f"validation series #{idx}: validation start at t={t0 + start_s:.6g}s (index={val_start_idx}) "
+                f"is too early for TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
+                f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
+            )
+        if (int(t_arr.size) - val_start_idx) < 2:
+            raise ValueError(f"validation series #{idx}: too few validation samples after validation start.")
+        t_eval = t_arr[val_start_idx:]
+        y_eval = np.asarray(y_np)[val_start_idx:]
+        force_eval = np.asarray(force_np)[val_start_idx:]
         ur_val = float(np.asarray(ur_tensor.detach().cpu()).reshape(-1)[0])
         metrics = log_validation_epoch(
             writer,
@@ -563,10 +647,10 @@ def _log_final_rollouts_all(
             ur_tensor,
             m_eff,
             dt_value,
-            t_np,
-            y_np / D,
-            y_np,
-            force_np,
+            t_eval,
+            y_eval / D,
+            y_eval,
+            force_eval,
             D,
             k,
             device,
@@ -579,6 +663,7 @@ def _log_final_rollouts_all(
             tag_prefix="final_val/rollout",
             step=step_idx,
             title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
+            validation_start_idx=val_start_idx,
         )
         if metrics:
             ur_values.append(ur_val)
@@ -1191,6 +1276,7 @@ def train(config: Config, config_name: str) -> None:
         val_dir = train_series_root / "val"
         if val_dir.exists():
             val_cut = resolve_cut_start_seconds(data_cfg, "val")
+            val_cut_for_load = 0.0 if history_context > 0 else val_cut
             val_series_raw, _ = load_training_series(
                 y_data,
                 t,
@@ -1205,7 +1291,7 @@ def train(config: Config, config_name: str) -> None:
                 eval_reduced_velocity=reduced_velocity,
                 require_force=True,
                 eval_force=F_data,
-                cut_start_seconds=val_cut,
+                cut_start_seconds=val_cut_for_load,
             )
             val_loader, val_sequences, _ = build_dataloader_from_series(
                 val_series_raw,
@@ -1393,6 +1479,8 @@ def train(config: Config, config_name: str) -> None:
                 log_extra_validation_metrics=log_extra_validation_metrics,
                 rollout_include_disp_nrmse=rollout_include_disp_nrmse,
                 rollout_include_force_nrmse=rollout_include_force_nrmse,
+                validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
+                history_context=history_context,
                 force_reg=force_reg,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
@@ -1421,6 +1509,8 @@ def train(config: Config, config_name: str) -> None:
             log_extra_validation_metrics=log_extra_validation_metrics,
             rollout_include_disp_nrmse=rollout_include_disp_nrmse,
             rollout_include_force_nrmse=rollout_include_force_nrmse,
+            validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
+            history_context=history_context,
         )
         if used > 0 and avg_metrics:
             summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]

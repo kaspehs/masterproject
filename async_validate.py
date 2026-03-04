@@ -213,6 +213,7 @@ def _run_hnn_validation(
 
     if bool(getattr(data_cfg, "use_generated_train_series", False)):
         series_dir = Path(data_cfg.train_series_dir) / "val"
+        val_cut_for_load = 0.0 if history_context > 0 else val_cut
         val_series_raw, _ = load_training_series(
             y_data,
             t,
@@ -227,7 +228,7 @@ def _run_hnn_validation(
             eval_reduced_velocity=reduced_velocity,
             require_force=True,
             eval_force=F_data,
-            cut_start_seconds=val_cut,
+            cut_start_seconds=val_cut_for_load,
         )
     else:
         val_series_raw, _ = load_training_series(
@@ -301,6 +302,25 @@ def _run_hnn_validation(
 
     rollout_by_ur: dict[float, list[float]] = {}
     if do_rollout:
+        def _validation_start_index_for_series(series_t: np.ndarray, series_dt: float, *, label: str) -> int:
+            t_arr = np.asarray(series_t, dtype=float).reshape(-1)
+            if t_arr.size < 2:
+                raise ValueError(f"{label}: not enough samples to validate.")
+            t0 = float(t_arr[0])
+            start_s = max(0.0, float(val_cut))
+            start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
+            if history_context > 0 and start_idx < int(history_context):
+                available_s = float(start_idx * series_dt)
+                needed_s = float(int(history_context) * series_dt)
+                raise ValueError(
+                    f"{label}: validation start at t={t0 + start_s:.6g}s (index={start_idx}) is too early for "
+                    f"TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
+                    f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
+                )
+            if (int(t_arr.size) - start_idx) < 2:
+                raise ValueError(f"{label}: too few validation samples after validation start.")
+            return start_idx
+
         sampled_indices = _sample_one_hnn_series_per_ur(val_series_raw, seed=int(epoch) + 1)
         if not sampled_indices:
             return
@@ -311,6 +331,14 @@ def _run_hnn_validation(
             sequence = val_sequences[idx]
             y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
             y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
+            val_start_idx = _validation_start_index_for_series(
+                np.asarray(t_np),
+                float(dt_value),
+                label=f"validation series #{idx}",
+            )
+            t_eval = np.asarray(t_np)[val_start_idx:]
+            y_eval = np.asarray(y_np)[val_start_idx:]
+            force_eval = np.asarray(force_np)[val_start_idx:]
             metrics = compute_validation_metrics(
                 model=model,
                 y_data_t=y_tensor,
@@ -318,15 +346,16 @@ def _run_hnn_validation(
                 reduced_velocity=ur_tensor,
                 m_eff=m_eff,
                 dt=dt_value,
-                t=t_np,
-                y_data_raw=y_np,
-                force_data=force_np,
+                t=t_eval,
+                y_data_raw=y_eval,
+                force_data=force_eval,
                 D=D,
                 k=k,
                 device=device,
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
                 include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
                 include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
+                validation_start_idx=val_start_idx,
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -351,6 +380,14 @@ def _run_hnn_validation(
         rollout_idx = sampled_indices[rollout_rel_idx]
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[rollout_idx]
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[rollout_idx]
+        val_start_idx = _validation_start_index_for_series(
+            np.asarray(t_np),
+            float(dt_value),
+            label=f"validation series #{rollout_idx}",
+        )
+        t_eval = np.asarray(t_np)[val_start_idx:]
+        y_eval = np.asarray(y_np)[val_start_idx:]
+        force_eval = np.asarray(force_np)[val_start_idx:]
         log_validation_epoch(
             writer,
             epoch,
@@ -360,10 +397,10 @@ def _run_hnn_validation(
             ur_tensor,
             m_eff,
             dt_value,
-            t_np,
-            y_np / D,
-            y_np,
-            force_np,
+            t_eval,
+            y_eval / D,
+            y_eval,
+            force_eval,
             D,
             k,
             device,
@@ -373,6 +410,7 @@ def _run_hnn_validation(
             include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
             include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
             log_metrics=False,
+            validation_start_idx=val_start_idx,
         )
     else:
         force_map_sum = 0.0
