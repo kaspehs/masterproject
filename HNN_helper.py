@@ -472,15 +472,38 @@ def log_validation_epoch(
     if log_metrics:
         for name, value in metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
-    zoom_mask = create_zoom_mask(t)
-    middle_mask = create_window_mask(t, middle_time_plot)
+    t_plot = np.asarray(t, dtype=float).reshape(-1)
+    y_true_plot = np.asarray(y_true_norm, dtype=float).reshape(-1)
+    y_pred_plot = np.asarray(rollout["y_norm"], dtype=float).reshape(-1)
+    p_pred_plot = np.asarray(rollout["p_norm"], dtype=float).reshape(-1)
+    n_disp = int(min(t_plot.size, y_true_plot.size, y_pred_plot.size, p_pred_plot.size))
+    if n_disp <= 1:
+        raise ValueError("Validation plotting failed: not enough aligned displacement samples.")
+    t_plot = t_plot[:n_disp]
+    y_true_plot = y_true_plot[:n_disp]
+    y_pred_plot = y_pred_plot[:n_disp]
+    p_pred_plot = p_pred_plot[:n_disp]
+
+    force_pred_plot = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
+    force_true_plot = np.asarray(force_data, dtype=float).reshape(-1)
+    n_force = int(min(t_plot.size, force_pred_plot.size, force_true_plot.size))
+    if n_force <= 1:
+        raise ValueError("Validation plotting failed: not enough aligned force samples.")
+    t_force = t_plot[:n_force]
+    force_pred_plot = force_pred_plot[:n_force]
+    force_true_plot = force_true_plot[:n_force]
+
+    zoom_mask = create_zoom_mask(t_plot)
+    middle_mask = create_window_mask(t_plot, middle_time_plot)
+    zoom_mask_force = create_zoom_mask(t_force)
+    middle_mask_force = create_window_mask(t_force, middle_time_plot)
     log_displacement_plots(
         writer,
         epoch,
-        t,
-        y_true_norm,
-        rollout["y_norm"],
-        rollout["p_norm"],
+        t_plot,
+        y_true_plot,
+        y_pred_plot,
+        p_pred_plot,
         zoom_mask,
         middle_mask,
         middle_time_plot,
@@ -498,11 +521,11 @@ def log_validation_epoch(
     log_force_plots(
         writer,
         epoch,
-        t,
-        np.asarray(rollout["force_total"]) / force_scale,
-        np.asarray(force_data) / force_scale,
-        zoom_mask,
-        middle_mask,
+        t_force,
+        force_pred_plot / force_scale,
+        force_true_plot / force_scale,
+        zoom_mask_force,
+        middle_mask_force,
         middle_time_plot,
         reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
@@ -547,11 +570,17 @@ def compute_validation_metrics(
             validation_start_idx=validation_start_idx,
         )
     metrics: dict[str, float] = {}
-    y_pred_raw = rollout["y_norm"] * D
-    disp_std_raw = float(np.std(y_data_raw))
+    y_pred_raw = np.asarray(rollout["y_norm"], dtype=float).reshape(-1) * D
+    y_true_raw = np.asarray(y_data_raw, dtype=float).reshape(-1)
+    n_disp = int(min(y_pred_raw.size, y_true_raw.size))
+    if n_disp <= 0:
+        raise ValueError("Validation metrics failed: no aligned displacement samples.")
+    y_pred_raw = y_pred_raw[:n_disp]
+    y_true_raw = y_true_raw[:n_disp]
+    disp_std_raw = float(np.std(y_true_raw))
     if disp_std_raw <= 0.0:
         disp_std_raw = 1.0
-    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
+    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_true_raw) ** 2))) / disp_std_raw
     if include_disp_nrmse:
         metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
@@ -586,19 +615,19 @@ def compute_validation_metrics(
         rel_rmse_force_on_data = rmse_force_data / force_std_data
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
     if log_extra_metrics:
-        freq_true = dominant_frequency(y_data_raw, dt)
+        freq_true = dominant_frequency(y_true_raw, dt)
         freq_pred = dominant_frequency(y_pred_raw, dt)
         freq_rel = abs(relative_error(freq_pred, freq_true))
         if np.isfinite(freq_rel):
             metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(freq_rel)
 
-        amp_true = mean_displacement_amplitude(y_data_raw)
+        amp_true = mean_displacement_amplitude(y_true_raw)
         amp_pred = mean_displacement_amplitude(y_pred_raw)
         amp_rel = abs(relative_error(amp_pred, amp_true))
         if np.isfinite(amp_rel):
             metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel)
 
-        disp_spec_err = spectral_relative_error(y_data_raw, y_pred_raw, dt)
+        disp_spec_err = spectral_relative_error(y_true_raw, y_pred_raw, dt)
         if np.isfinite(disp_spec_err):
             metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
 
@@ -3383,9 +3412,24 @@ def rollout_model(
         )
     p0 = vel[start_idx] * m_eff
     z0 = torch.stack((y0[start_idx], p0), dim=0).unsqueeze(0).to(device)
-    t_eval = np.asarray(t, dtype=np.float32)
+    t_arr = np.asarray(t, dtype=np.float32).reshape(-1)
+    total_len = int(y0.shape[0])
+    expected_post_start_len = max(0, total_len - start_idx)
     if start_idx > 0:
-        t_eval = t_eval[start_idx:]
+        # Support both call patterns:
+        # 1) t is full series -> trim by start_idx here.
+        # 2) t is already post-start series -> do not trim again.
+        if int(t_arr.size) == total_len:
+            t_eval = t_arr[start_idx:]
+        elif int(t_arr.size) == expected_post_start_len:
+            t_eval = t_arr
+        else:
+            raise ValueError(
+                f"Time vector length ({int(t_arr.size)}) is incompatible with validation_start_idx={start_idx} "
+                f"and sequence length {total_len}."
+            )
+    else:
+        t_eval = t_arr
     t_seq = torch.from_numpy(t_eval).to(device=device).unsqueeze(0)
     rv_val = reduced_velocity
     if torch.is_tensor(rv_val):
