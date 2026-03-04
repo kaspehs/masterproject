@@ -9,7 +9,7 @@ import sys
 import warnings
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -364,6 +364,84 @@ def rollout_rk4(
         xs.append(x)
         vs.append(v)
         fs.append(_vpinn_force(model, x, v, ur0))
+
+    return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1)
+
+
+def rollout_rk4_with_progress(
+    *,
+    model: nn.Module,
+    x0: torch.Tensor,
+    v0: torch.Tensor,
+    ur0: torch.Tensor,
+    steps: int,
+    dt: float,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
+    f0: Optional[torch.Tensor] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    callback_every: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Same as rollout_rk4, but optionally emits progress callbacks.
+
+    progress_callback(completed, total) is called every `callback_every` steps and
+    on the final step.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    B, d = x0.shape
+    m = m.view(1, d)
+    c = c.view(1, d)
+    k = k.view(1, d)
+    every = max(1, int(callback_every))
+
+    x = x0
+    v = v0
+    xs = [x]
+    vs = [v]
+    fs = [_vpinn_force(model, x, v, ur0)]
+
+    dt_t = x0.new_tensor(float(dt))
+    half = x0.new_tensor(0.5)
+    sixth = x0.new_tensor(1.0 / 6.0)
+
+    def accel(xi: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+        ci = _vpinn_force(model, xi, vi, ur0)
+        fi = ci if f0 is None else ci * f0
+        return (fi - c * vi - k * xi) / m
+
+    total_steps = int(steps)
+    for step_idx in range(total_steps):
+        k1_x = v
+        k1_v = accel(x, v)
+
+        x2 = x + half * dt_t * k1_x
+        v2 = v + half * dt_t * k1_v
+        k2_x = v2
+        k2_v = accel(x2, v2)
+
+        x3 = x + half * dt_t * k2_x
+        v3 = v + half * dt_t * k2_v
+        k3_x = v3
+        k3_v = accel(x3, v3)
+
+        x4 = x + dt_t * k3_x
+        v4 = v + dt_t * k3_v
+        k4_x = v4
+        k4_v = accel(x4, v4)
+
+        x = x + (dt_t * sixth) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
+        v = v + (dt_t * sixth) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+
+        xs.append(x)
+        vs.append(v)
+        fs.append(_vpinn_force(model, x, v, ur0))
+
+        completed = step_idx + 1
+        if progress_callback is not None and (completed % every == 0 or completed == total_steps):
+            progress_callback(completed, total_steps)
 
     return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1)
 

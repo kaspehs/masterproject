@@ -100,6 +100,9 @@ def _extract_channel_names_from_hdf5(f) -> list[str] | None:
             continue
         ds = f[ref]
         arr = np.asarray(ds)
+        if arr.size == 0:
+            names.append("")
+            continue
         if arr.dtype.kind in {"U", "S"}:
             names.append(str(arr.reshape(-1)[0]))
         elif arr.dtype.kind in {"u", "i"}:
@@ -120,6 +123,9 @@ def _extract_channel_names_from_raw(raw: dict) -> list[str] | None:
             names.append(item)
             continue
         item_arr = np.asarray(item)
+        if item_arr.size == 0:
+            names.append("")
+            continue
         if item_arr.dtype.kind in {"U", "S"}:
             names.append(str(item_arr.reshape(-1)[0]))
         elif item_arr.dtype.kind in {"u", "i"}:
