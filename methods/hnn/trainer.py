@@ -1421,6 +1421,9 @@ def train(config: Config, config_name: str) -> None:
         should_validate = rollout_every_epochs > 0 and (
             (epoch + 1) % int(rollout_every_epochs) == 0 or epoch == (epochs - 1)
         )
+        validation_timer_start: float | None = None
+        if should_validate and not async_validation:
+            validation_timer_start = time.perf_counter()
         if async_validation and should_validate and (async_do_losses or async_do_rollout):
             async_processes = _prune_async_processes(async_processes)
             state_source = model
@@ -1489,6 +1492,10 @@ def train(config: Config, config_name: str) -> None:
                 per_traj_norm_eps=per_traj_norm_eps,
                 force_reg_on_coeff=force_reg_on_coeff,
             )
+            if validation_timer_start is not None:
+                validation_elapsed = time.perf_counter() - validation_timer_start
+                writer.add_scalar("val/validation_wall_time_s", float(validation_elapsed), epoch + 1)
+                print(f"Validation epoch {epoch + 1}: total wall time {validation_elapsed:.2f}s")
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -1264,6 +1265,7 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=str(args.log_dir))
     try:
+        validation_start = time.perf_counter()
         if method in {"hnn", "phnn"}:
             _run_hnn_validation(
                 ckpt=ckpt,
@@ -1292,6 +1294,9 @@ def main() -> None:
             )
         else:
             raise ValueError(f"Unsupported method '{method}'.")
+        validation_elapsed = time.perf_counter() - validation_start
+        writer.add_scalar("val/validation_wall_time_s", float(validation_elapsed), int(args.epoch))
+        print(f"Async validation epoch {int(args.epoch)}: total wall time {validation_elapsed:.2f}s")
     finally:
         writer.flush()
         writer.close()

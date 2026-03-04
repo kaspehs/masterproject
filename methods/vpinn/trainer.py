@@ -2632,6 +2632,9 @@ def train(config: Config, config_name: str) -> None:
             and ((epoch % validate_every) == 0 or epoch == (epochs - 1))
         )
         should_rollout = rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == (epochs - 1))
+        validation_timer_start: float | None = None
+        if (should_validate or should_rollout) and not async_validation:
+            validation_timer_start = time.perf_counter()
 
         if async_validation and (should_validate or should_rollout) and (async_do_losses or async_do_rollout):
             async_processes = _prune_async_processes(async_processes)
@@ -2784,6 +2787,10 @@ def train(config: Config, config_name: str) -> None:
                 log_metrics=False,
                 log_plots=True,
             )
+        if validation_timer_start is not None:
+            validation_elapsed = time.perf_counter() - validation_timer_start
+            writer.add_scalar("val/validation_wall_time_s", float(validation_elapsed), epoch)
+            print(f"Validation epoch {epoch}: total wall time {validation_elapsed:.2f}s")
 
     if final_rollout_all_validation and val_trajs:
         print("Final validation rollout (all trajectories) started.")
