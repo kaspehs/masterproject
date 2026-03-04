@@ -819,6 +819,43 @@ def _load_metadata_map(meta_path: Path) -> dict[str, float]:
     return mapping
 
 
+def _try_load_metadata_map(meta_path: Path) -> Optional[dict[str, float]]:
+    """
+    Best-effort metadata loading for force-coefficient mode.
+    Returns None when metadata is unavailable/invalid so callers can fall back
+    to U_r-based F0 construction.
+    """
+    try:
+        return _load_metadata_map(meta_path)
+    except Exception as exc:
+        warnings.warn(
+            f"Could not load metadata file '{meta_path}'. "
+            f"Falling back to U_r-based F0 conversion. Reason: {type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _f0_from_reduced_velocity(
+    ur_val: float,
+    *,
+    rho: float,
+    D: float,
+    m_eff: float,
+    k: float,
+) -> float:
+    ur = float(ur_val)
+    if not np.isfinite(ur):
+        raise ValueError(f"Invalid reduced velocity value for F0 conversion: {ur}")
+    if m_eff <= 0.0 or k <= 0.0:
+        raise ValueError(f"Invalid model parameters for F0 conversion: m_eff={m_eff}, k={k}")
+    fn_hz = math.sqrt(float(k) / float(m_eff)) / (2.0 * math.pi)
+    U_val = ur * float(fn_hz) * float(D)
+    f0 = 0.5 * float(rho) * float(D) * (float(U_val) ** 2)
+    if not np.isfinite(f0) or f0 <= 0.0:
+        raise ValueError(f"Invalid F0 from U_r conversion: {f0}")
+    return float(f0)
+
+
 def _normalize_ur_filter(values: Any, *, key: str) -> np.ndarray | None:
     if values is None:
         return None
@@ -961,6 +998,8 @@ def _load_trajectory(
     f0_lookup: Optional[dict[str, float]],
     rho: float,
     D: float,
+    m_eff: float,
+    k: float,
     preserve_prefix_for_history: bool = False,
     min_history_context: int = 0,
 ) -> tuple[dict[str, Any], float]:
@@ -1043,12 +1082,21 @@ def _load_trajectory(
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
     f0_val = None
     if force_representation == "coefficient":
-        if f0_lookup is None:
-            raise ValueError("Missing metadata lookup for force coefficient conversion.")
-        if path.name not in f0_lookup:
-            raise KeyError(f"Metadata missing U for '{path.name}'.")
-        U_val = float(f0_lookup[path.name])
-        f0_val = 0.5 * float(rho) * float(D) * float(U_val) ** 2
+        if f0_lookup is not None and path.name in f0_lookup:
+            U_val = float(f0_lookup[path.name])
+            f0_val = 0.5 * float(rho) * float(D) * float(U_val) ** 2
+        else:
+            if f0_lookup is not None and path.name not in f0_lookup:
+                warnings.warn(
+                    f"Metadata missing U for '{path.name}'. Falling back to U_r-based F0 conversion."
+                )
+            f0_val = _f0_from_reduced_velocity(
+                ur_val,
+                rho=float(rho),
+                D=float(D),
+                m_eff=float(m_eff),
+                k=float(k),
+            )
         if not np.isfinite(f0_val) or f0_val <= 0.0:
             raise ValueError(f"Invalid F0 for '{path.name}': {f0_val}")
         f_meas = f_meas / float(f0_val)
@@ -1203,7 +1251,9 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
         else:
             meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+        f0_lookup = _try_load_metadata_map(meta_path)
+    m_eff_cfg = float(_m_eff_from_model_cfg(config.model))
+    k_cfg = float(getattr(config.model, "k", 1218.0))
 
     if data_cfg.use_generated_train_series:
         series_dir = Path(data_cfg.train_series_dir)
@@ -1288,6 +1338,8 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            m_eff=m_eff_cfg,
+            k=k_cfg,
         )
         if dt_ref is None:
             dt_ref = dt
@@ -1307,6 +1359,8 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            m_eff=m_eff_cfg,
+            k=k_cfg,
             preserve_prefix_for_history=(val_history_context > 0),
             min_history_context=val_history_context,
         )
@@ -1999,7 +2053,7 @@ def train(config: Config, config_name: str) -> None:
             meta_path = Path(config.data.train_series_dir) / "metadata.json"
         else:
             meta_path = Path(config.data.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+        f0_lookup = _try_load_metadata_map(meta_path)
     per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
     if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
@@ -2058,6 +2112,8 @@ def train(config: Config, config_name: str) -> None:
             f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+            m_eff=float(_m_eff_from_model_cfg(config.model)),
+            k=float(getattr(config.model, "k", 1218.0)),
             preserve_prefix_for_history=(val_history_context > 0),
             min_history_context=val_history_context,
         )
