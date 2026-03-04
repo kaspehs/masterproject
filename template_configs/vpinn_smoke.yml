@@ -108,6 +108,8 @@ monitoring:
   # Toggle rollout NRMSE validation metrics.
   rollout_include_disp_nrmse: true
   rollout_include_force_nrmse: true
+  # Disable to skip per-U_r loss-map pass/logging.
+  log_loss_vs_ur_map: true
   # Extra rollout metrics: dominant frequency relative error, amplitude relative error,
   # displacement/force spectral shape errors.
   log_extra_validation_metrics: true

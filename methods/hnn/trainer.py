@@ -351,6 +351,7 @@ def _validate_if_needed(
     middle_time_plot,
     hamiltonian_data,
     log_extra_validation_metrics: bool,
+    log_loss_vs_ur_map: bool,
     rollout_include_disp_nrmse: bool,
     rollout_include_force_nrmse: bool,
     validation_start_seconds: float,
@@ -402,26 +403,27 @@ def _validate_if_needed(
         )
         for name, value in val_loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch + 1)
-        loss_by_ur = _per_ur_loss_map_hnn(
-            model=model,
-            loader=val_loader,
-            device=device,
-            non_blocking=(device.type == "cuda"),
-            force_reg=force_reg,
-            use_force_data_loss=use_force_data_loss,
-            force_data_weight=force_data_weight,
-            amp_enabled=amp_enabled,
-            amp_dtype=amp_dtype,
-            per_traj_norm_eps=per_traj_norm_eps,
-            force_reg_on_coeff=force_reg_on_coeff,
-        )
-        log_loss_vs_ur(
-            writer,
-            epoch + 1,
-            loss_by_ur,
-            tag="val/loss_vs_ur",
-            title="Validation loss vs U_r",
-        )
+        if log_loss_vs_ur_map:
+            loss_by_ur = _per_ur_loss_map_hnn(
+                model=model,
+                loader=val_loader,
+                device=device,
+                non_blocking=(device.type == "cuda"),
+                force_reg=force_reg,
+                use_force_data_loss=use_force_data_loss,
+                force_data_weight=force_data_weight,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
+                per_traj_norm_eps=per_traj_norm_eps,
+                force_reg_on_coeff=force_reg_on_coeff,
+            )
+            log_loss_vs_ur(
+                writer,
+                epoch + 1,
+                loss_by_ur,
+                tag="val/loss_vs_ur",
+                title="Validation loss vs U_r",
+            )
 
     if val_series_raw is not None and val_sequences is not None:
         total = min(len(val_series_raw), len(val_sequences))
@@ -1190,6 +1192,7 @@ def train(config: Config, config_name: str) -> None:
     log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
+    log_loss_vs_ur_map = bool(getattr(monitoring_cfg, "log_loss_vs_ur_map", True))
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
     rollout_include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
     rollout_include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
@@ -1480,6 +1483,7 @@ def train(config: Config, config_name: str) -> None:
                 middle_time_plot=middle_time_plot,
                 hamiltonian_data=hamiltonian_data,
                 log_extra_validation_metrics=log_extra_validation_metrics,
+                log_loss_vs_ur_map=log_loss_vs_ur_map,
                 rollout_include_disp_nrmse=rollout_include_disp_nrmse,
                 rollout_include_force_nrmse=rollout_include_force_nrmse,
                 validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
@@ -1530,7 +1534,7 @@ def train(config: Config, config_name: str) -> None:
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
-    if val_loader is not None:
+    if val_loader is not None and log_loss_vs_ur_map:
         final_loss_by_ur = _per_ur_loss_map_hnn(
             model=model,
             loader=val_loader,

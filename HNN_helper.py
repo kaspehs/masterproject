@@ -171,6 +171,7 @@ class MonitoringConfig:
     log_every_epochs: int = 1
     print_every_epochs: int = 1
     log_component_grad_norms: bool = False
+    log_loss_vs_ur_map: bool = True
     log_extra_validation_metrics: bool = False
     cycle_validation_rollout: bool = False
     final_rollout_all_validation: bool = False
@@ -330,6 +331,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "log_every_epochs",
         "print_every_epochs",
         "log_component_grad_norms",
+        "log_loss_vs_ur_map",
         "log_extra_validation_metrics",
         "rollout_include_disp_nrmse",
         "rollout_include_force_nrmse",

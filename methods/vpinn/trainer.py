@@ -2133,6 +2133,7 @@ def train(config: Config, config_name: str) -> None:
     training_cfg = config.training
     optim_cfg = config.optim
     monitoring_cfg = config.monitoring
+    log_loss_vs_ur_map = bool(getattr(monitoring_cfg, "log_loss_vs_ur_map", True))
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
     rollout_include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
     rollout_include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
@@ -2739,35 +2740,36 @@ def train(config: Config, config_name: str) -> None:
             if force_map is not None:
                 for k_name, v_value in force_map.items():
                     writer.add_scalar(f"val/{k_name}", v_value, epoch)
-            loss_by_ur = _per_ur_loss_map_vpinn(
-                model=model,
-                loader=val_loader,
-                device=device,
-                non_blocking=non_blocking,
-                dt=dt,
-                m=m,
-                c=c,
-                k=k,
-                w=w,
-                wdot=wdot,
-                alpha=alpha,
-                use_force_loss=use_force_loss,
-                use_weak_loss=use_weak_loss,
-                rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
-                rollout_substeps=rollout_val_substeps,
-                expect_scale=return_scale,
-                expect_f0=use_force_coeff,
-                amp_enabled=amp_enabled,
-                amp_dtype=amp_dtype,
-                per_traj_norm_eps=per_traj_norm_eps,
-            )
-            log_loss_vs_ur(
-                writer,
-                epoch,
-                loss_by_ur,
-                tag="val/loss_vs_ur",
-                title="Validation loss vs U_r",
-            )
+            if log_loss_vs_ur_map:
+                loss_by_ur = _per_ur_loss_map_vpinn(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    non_blocking=non_blocking,
+                    dt=dt,
+                    m=m,
+                    c=c,
+                    k=k,
+                    w=w,
+                    wdot=wdot,
+                    alpha=alpha,
+                    use_force_loss=use_force_loss,
+                    use_weak_loss=use_weak_loss,
+                    rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
+                    rollout_substeps=rollout_val_substeps,
+                    expect_scale=return_scale,
+                    expect_f0=use_force_coeff,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
+                    per_traj_norm_eps=per_traj_norm_eps,
+                )
+                log_loss_vs_ur(
+                    writer,
+                    epoch,
+                    loss_by_ur,
+                    tag="val/loss_vs_ur",
+                    title="Validation loss vs U_r",
+                )
 
         if should_rollout and not async_validation:
             candidates = val_trajs if val_trajs else train_trajs
@@ -2899,7 +2901,7 @@ def train(config: Config, config_name: str) -> None:
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
-    if val_loader is not None:
+    if val_loader is not None and log_loss_vs_ur_map:
         final_loss_by_ur = _per_ur_loss_map_vpinn(
             model=model,
             loader=val_loader,

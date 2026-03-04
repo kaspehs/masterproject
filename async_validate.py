@@ -159,6 +159,7 @@ def _run_hnn_validation(
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
     per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
+    log_loss_vs_ur_map = bool(getattr(cfg.monitoring, "log_loss_vs_ur_map", True))
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
@@ -280,26 +281,27 @@ def _run_hnn_validation(
         )
         for name, value in loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch)
-        loss_by_ur = _per_ur_loss_map_hnn(
-            model=model,
-            loader=val_loader,
-            device=device,
-            non_blocking=(device.type == "cuda"),
-            force_reg=float(loss_cfg.force_reg),
-            force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
-            use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
-            force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
-            amp_enabled=amp_enabled,
-            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-            per_traj_norm_eps=per_traj_norm_eps,
-        )
-        log_loss_vs_ur(
-            writer,
-            epoch,
-            loss_by_ur,
-            tag="val/loss_vs_ur",
-            title="Validation loss vs U_r",
-        )
+        if log_loss_vs_ur_map:
+            loss_by_ur = _per_ur_loss_map_hnn(
+                model=model,
+                loader=val_loader,
+                device=device,
+                non_blocking=(device.type == "cuda"),
+                force_reg=float(loss_cfg.force_reg),
+                force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
+                use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+                force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
+                amp_enabled=amp_enabled,
+                amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
+                per_traj_norm_eps=per_traj_norm_eps,
+            )
+            log_loss_vs_ur(
+                writer,
+                epoch,
+                loss_by_ur,
+                tag="val/loss_vs_ur",
+                title="Validation loss vs U_r",
+            )
 
     rollout_by_ur: dict[float, list[float]] = {}
     if do_rollout:
@@ -457,6 +459,7 @@ def _run_vpinn_validation(
     data_cfg = cfg.data
     vp = dict(cfg.vpinn or {})
     rollout_val_substeps = int(vp.get("rollout_val_substeps", 1))
+    log_loss_vs_ur_map = bool(getattr(cfg.monitoring, "log_loss_vs_ur_map", True))
     if rollout_val_substeps < 1:
         raise ValueError("vpinn.rollout_val_substeps must be >= 1.")
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
@@ -629,35 +632,36 @@ def _run_vpinn_validation(
         if force_map is not None:
             for k_name, v_value in force_map.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)
-        loss_by_ur = _per_ur_loss_map_vpinn(
-            model=model,
-            loader=val_loader,
-            device=device,
-            non_blocking=(device.type == "cuda"),
-            dt=dt,
-            m=m,
-            c=c,
-            k=k,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            use_force_loss=bool(vp.get("use_force_loss", True)),
-            use_weak_loss=bool(vp.get("use_weak_loss", True)),
-            rollout_force_steps=int(vp.get("rollout_force_steps", 0)),
-            rollout_substeps=rollout_val_substeps,
-            expect_scale=return_scale,
-            expect_f0=(force_representation == "coefficient"),
-            amp_enabled=amp_enabled,
-            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-            per_traj_norm_eps=per_traj_norm_eps,
-        )
-        log_loss_vs_ur(
-            writer,
-            epoch,
-            loss_by_ur,
-            tag="val/loss_vs_ur",
-            title="Validation loss vs U_r",
-        )
+        if log_loss_vs_ur_map:
+            loss_by_ur = _per_ur_loss_map_vpinn(
+                model=model,
+                loader=val_loader,
+                device=device,
+                non_blocking=(device.type == "cuda"),
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                w=w,
+                wdot=wdot,
+                alpha=alpha,
+                use_force_loss=bool(vp.get("use_force_loss", True)),
+                use_weak_loss=bool(vp.get("use_weak_loss", True)),
+                rollout_force_steps=int(vp.get("rollout_force_steps", 0)),
+                rollout_substeps=rollout_val_substeps,
+                expect_scale=return_scale,
+                expect_f0=(force_representation == "coefficient"),
+                amp_enabled=amp_enabled,
+                amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
+                per_traj_norm_eps=per_traj_norm_eps,
+            )
+            log_loss_vs_ur(
+                writer,
+                epoch,
+                loss_by_ur,
+                tag="val/loss_vs_ur",
+                title="Validation loss vs U_r",
+            )
 
     if do_rollout:
         sampled_indices = _sample_one_vpinn_traj_per_ur(val_trajs, seed=int(epoch) + 1)
