@@ -3,7 +3,7 @@ import warnings
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -2587,6 +2587,83 @@ def rollout_model(
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
             state = model.step_rk4(state, t, dt, reduced_velocity=rv_tensor)
+
+    y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
+    p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()
+    y_pred_norm = y_samples_arr / D
+    p_pred_norm = (p_samples_arr / m_eff) / (np.sqrt(k / m_eff) * D)
+    force_total_arr = torch.stack(force_total).detach().cpu().numpy()
+    force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
+    force_model_arr = torch.stack(force_model).detach().cpu().numpy()
+    hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
+    return {
+        "y_norm": y_pred_norm,
+        "p_norm": p_pred_norm,
+        "force_total": force_total_arr,
+        "force_drag": force_drag_arr,
+        "force_model": force_model_arr,
+        "hamiltonian_model": hamiltonian_model_arr,
+    }
+
+
+def rollout_model_with_progress(
+    model: PHVIV,
+    y0: torch.Tensor,
+    vel: torch.Tensor,
+    reduced_velocity: torch.Tensor | np.ndarray | float,
+    m_eff: float,
+    dt: float,
+    t: np.ndarray,
+    D: float,
+    k: float,
+    device: torch.device,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+    callback_every: int = 1,
+) -> dict[str, np.ndarray]:
+    """
+    Same as rollout_model, but optionally emits progress callbacks.
+
+    progress_callback(completed, total) is called every `callback_every` steps and
+    on the final step.
+    """
+    every = max(1, int(callback_every))
+    total_steps = int(len(t))
+
+    p0 = vel[0] * m_eff
+    state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
+    rv_val = reduced_velocity
+    if torch.is_tensor(rv_val):
+        rv_val = float(rv_val.reshape(-1)[0].detach().cpu())
+    else:
+        rv_val = float(np.asarray(rv_val).reshape(-1)[0])
+    rv_tensor = torch.tensor(rv_val, device=device)
+    y_samples: list[torch.Tensor] = []
+    p_samples: list[torch.Tensor] = []
+    force_total: list[torch.Tensor] = []
+    force_drag: list[torch.Tensor] = []
+    force_model: list[torch.Tensor] = []
+    hamiltonian_model_vals: list[torch.Tensor] = []
+    with torch.no_grad():
+        for step_idx in range(total_steps):
+            y_samples.append(state[0, 0].detach())
+            p_samples.append(state[0, 1].detach())
+            model_force = model.learned_force(state, reduced_velocity=rv_tensor).squeeze().detach()
+            if model.include_physical_drag:
+                drag_force = model.drag_force(state).squeeze().detach()
+            else:
+                drag_force = model_force.new_tensor(0.0)
+            total_force = model.u_theta(state, reduced_velocity=rv_tensor).squeeze().detach()
+            H_val = model.H(state).detach()
+            force_model.append(model_force)
+            force_drag.append(drag_force)
+            force_total.append(total_force)
+            hamiltonian_model_vals.append(H_val)
+            state = model.step_rk4(state, t, dt, reduced_velocity=rv_tensor)
+
+            completed = step_idx + 1
+            if progress_callback is not None and (completed % every == 0 or completed == total_steps):
+                progress_callback(completed, total_steps)
 
     y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
     p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()
