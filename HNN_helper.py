@@ -1638,14 +1638,26 @@ class PHVIV(nn.Module):
         g_vec = self.G.squeeze(-1)
         return u * g_vec
 
-    def g(
+    def _g_and_force(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
-    ):
-        gH = self.grad_H(x)                         # (..., 2)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute state derivative and total force using a single force-network call.
+        """
+        force = self.u_theta(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        g_vec = self.G.squeeze(-1)
+        forcing_term = force * g_vec
+
+        gH = self.grad_H(x)  # (..., 2)
         JgH = torch.matmul(gH, self.J.T)
         if self.discover_damping:
             zeta = torch.sigmoid(self.zeta_raw) * self.max_damping_ratio
@@ -1653,12 +1665,23 @@ class PHVIV(nn.Module):
         else:
             c_eff = self.fixed_c
         damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
-        return (JgH - damping_term) + self.f(
+        dz = (JgH - damping_term) + forcing_term
+        return dz, force
+
+    def g(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ):
+        dz, _force = self._g_and_force(
             x,
             reduced_velocity=reduced_velocity,
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
+        return dz
 
     def step_euler(self, x, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         return x + dt * self.g(x, reduced_velocity=reduced_velocity)
@@ -1695,20 +1718,16 @@ class PHVIV(nn.Module):
         Perform one Runge-Kutta 4 integration step and return both the next state
         and the averaged force over the step.
         """
-        k1 = self.g(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
-        force1 = self.u_theta(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        k1, force1 = self._g_and_force(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x2 = x + 0.5 * dt * k1
-        k2 = self.g(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
-        force2 = self.u_theta(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        k2, force2 = self._g_and_force(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x3 = x + 0.5 * dt * k2
-        k3 = self.g(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
-        force3 = self.u_theta(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        k3, force3 = self._g_and_force(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x4 = x + dt * k3
-        k4 = self.g(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
-        force4 = self.u_theta(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        k4, force4 = self._g_and_force(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
