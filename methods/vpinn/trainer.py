@@ -55,6 +55,8 @@ from HNN_helper import (
 )
 from architectures import ODEPirateNet, TemporalConvForceNet
 
+_MISSING_METADATA_WARNED: set[str] = set()
+
 
 class ForceMLP(nn.Module):
     def __init__(
@@ -836,11 +838,56 @@ def _try_load_metadata_map(meta_path: Path) -> Optional[dict[str, float]]:
     try:
         return _load_metadata_map(meta_path)
     except Exception as exc:
-        warnings.warn(
-            f"Could not load metadata file '{meta_path}'. "
-            f"Falling back to U_r-based F0 conversion. Reason: {type(exc).__name__}: {exc}"
-        )
+        key = str(meta_path)
+        if key not in _MISSING_METADATA_WARNED:
+            _MISSING_METADATA_WARNED.add(key)
+            warnings.warn(
+                f"Could not load metadata file '{meta_path}'. "
+                f"Falling back to U_r-based F0 conversion. Reason: {type(exc).__name__}: {exc}"
+            )
         return None
+
+
+def _finite_std_or_one(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return 1.0
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 1.0
+    std = float(np.std(finite))
+    if not np.isfinite(std) or std <= 0.0:
+        return 1.0
+    return std
+
+
+def _safe_rel_rmse(pred: np.ndarray, target: np.ndarray, denom: float) -> float:
+    p = np.asarray(pred, dtype=np.float64).reshape(-1)
+    t = np.asarray(target, dtype=np.float64).reshape(-1)
+    n = int(min(p.size, t.size))
+    if n <= 0:
+        return float("nan")
+    p = p[:n]
+    t = t[:n]
+    if not np.all(np.isfinite(p)) or not np.all(np.isfinite(t)):
+        return float("inf")
+    diff = p - t
+    if not np.all(np.isfinite(diff)):
+        return float("inf")
+    scale = float(np.max(np.abs(diff)))
+    if not np.isfinite(scale):
+        return float("inf")
+    if scale == 0.0:
+        rmse = 0.0
+    else:
+        rmse = scale * float(np.sqrt(np.mean((diff / scale) ** 2)))
+    denom = float(denom)
+    if not np.isfinite(denom) or denom <= 0.0:
+        denom = 1.0
+    out = rmse / denom
+    if not np.isfinite(out):
+        return float("inf")
+    return float(out)
 
 
 def _f0_from_reduced_velocity(
@@ -1938,29 +1985,24 @@ def _log_rollout_validation(
     x_true = x_eval_t[:, 0].detach().cpu().numpy()
     f_true = f_eval_t[:, 0].detach().cpu().numpy()
 
-    disp_std = float(np.std(x_true))
-    if disp_std <= 0.0:
-        disp_std = 1.0
-    rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
+    disp_std = _finite_std_or_one(x_true)
+    rel_rmse_y = _safe_rel_rmse(x_pred, x_true, disp_std)
     metrics: dict[str, float] = {}
     if include_disp_nrmse:
         metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_y
 
-    force_std = float(np.std(f_true))
-    if force_std <= 0.0:
-        force_std = 1.0
+    force_std = _finite_std_or_one(f_true)
     if f0_eval_t is not None:
-        f0_np = f0_eval_t[:, 0].detach().cpu().numpy()
-        f_true_force = f_true * f0_np
-        f_pred_force = f_pred * f0_np
-        force_std = float(np.std(f_true_force))
-        if force_std <= 0.0:
-            force_std = 1.0
-        rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
+        f0_np = np.asarray(f0_eval_t[:, 0].detach().cpu().numpy(), dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            f_true_force = np.asarray(f_true, dtype=np.float64) * f0_np
+            f_pred_force = np.asarray(f_pred, dtype=np.float64) * f0_np
+        force_std = _finite_std_or_one(f_true_force)
+        rel_rmse_force = _safe_rel_rmse(f_pred_force, f_true_force, force_std)
         if include_force_nrmse:
             metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
     else:
-        rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
+        rel_rmse_force = _safe_rel_rmse(f_pred, f_true, force_std)
         if include_force_nrmse:
             metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
 
@@ -1968,34 +2010,34 @@ def _log_rollout_validation(
         f_on_data_full = _vpinn_force_on_trajectory(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
         f_on_data = f_on_data_full[val_start_idx:]
     if f0_eval_t is not None:
-        f0_np = f0_eval_t[:, 0].detach().cpu().numpy()
-        f_on_data_force = f_on_data * f0_np
-        f_true_force = f_true * f0_np
-        force_std = float(np.std(f_true_force))
-        if force_std <= 0.0:
-            force_std = 1.0
-        rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data_force - f_true_force) ** 2))) / force_std
+        f0_np = np.asarray(f0_eval_t[:, 0].detach().cpu().numpy(), dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            f_on_data_force = np.asarray(f_on_data, dtype=np.float64) * f0_np
+            f_true_force = np.asarray(f_true, dtype=np.float64) * f0_np
+        force_std = _finite_std_or_one(f_true_force)
+        rel_rmse_force_on_data = _safe_rel_rmse(f_on_data_force, f_true_force, force_std)
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
     else:
-        rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
+        rel_rmse_force_on_data = _safe_rel_rmse(f_on_data, f_true, force_std)
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
     if log_extra_metrics:
-        freq_true = dominant_frequency(x_true, dt)
-        freq_pred = dominant_frequency(x_pred, dt)
-        freq_rel = abs(relative_error(freq_pred, freq_true))
-        if np.isfinite(freq_rel):
-            metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(freq_rel)
+        if np.all(np.isfinite(x_true)) and np.all(np.isfinite(x_pred)):
+            freq_true = dominant_frequency(x_true, dt)
+            freq_pred = dominant_frequency(x_pred, dt)
+            freq_rel = abs(relative_error(freq_pred, freq_true))
+            if np.isfinite(freq_rel):
+                metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(freq_rel)
 
-        amp_true = mean_displacement_amplitude(x_true)
-        amp_pred = mean_displacement_amplitude(x_pred)
-        amp_rel = abs(relative_error(amp_pred, amp_true))
-        if np.isfinite(amp_rel):
-            metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel)
+            amp_true = mean_displacement_amplitude(x_true)
+            amp_pred = mean_displacement_amplitude(x_pred)
+            amp_rel = abs(relative_error(amp_pred, amp_true))
+            if np.isfinite(amp_rel):
+                metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel)
 
-        disp_spec_err = spectral_relative_error(x_true, x_pred, dt)
-        if np.isfinite(disp_spec_err):
-            metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
+            disp_spec_err = spectral_relative_error(x_true, x_pred, dt)
+            if np.isfinite(disp_spec_err):
+                metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
 
         if f0_eval_t is not None:
             force_true_for_spec = f_true_force
@@ -2003,9 +2045,10 @@ def _log_rollout_validation(
         else:
             force_true_for_spec = f_true
             force_pred_for_spec = f_pred
-        force_spec_err = spectral_relative_error(force_true_for_spec, force_pred_for_spec, dt)
-        if np.isfinite(force_spec_err):
-            metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
+        if np.all(np.isfinite(force_true_for_spec)) and np.all(np.isfinite(force_pred_for_spec)):
+            force_spec_err = spectral_relative_error(force_true_for_spec, force_pred_for_spec, dt)
+            if np.isfinite(force_spec_err):
+                metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
 
     if log_metrics:
         for metric_name, metric_value in metrics.items():
