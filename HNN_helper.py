@@ -24,6 +24,10 @@ FORCE_ROLLOUT_NRMSE_KEY = "Force rollout NRMSE"
 FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
 FORCE_ROLLOUT_NRMSE_COEFF_KEY = "Force rollout NRMSE (coeff)"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
+DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
+MEAN_DISP_AMP_REL_ERROR_KEY = "Mean displacement amplitude relative error"
+DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
+FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error"
 
 @dataclass
 class DataConfig:
@@ -177,6 +181,8 @@ class MonitoringConfig:
     async_validation_max_concurrent: int = 1
     async_validation_do_losses: bool = True
     async_validation_do_rollout: bool = True
+    rollout_include_disp_nrmse: bool = True
+    rollout_include_force_nrmse: bool = True
 
 @dataclass
 class LoggingConfig:
@@ -325,6 +331,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "print_every_epochs",
         "log_component_grad_norms",
         "log_extra_validation_metrics",
+        "rollout_include_disp_nrmse",
+        "rollout_include_force_nrmse",
     }
 
     for key, value in legacy_training.items():
@@ -414,6 +422,8 @@ def log_validation_epoch(
     hamiltonian_data: np.ndarray | None,
     *,
     log_extra_metrics: bool = False,
+    include_disp_nrmse: bool = True,
+    include_force_nrmse: bool = True,
     log_metrics: bool = True,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
@@ -445,6 +455,8 @@ def log_validation_epoch(
         k=k,
         device=device,
         log_extra_metrics=log_extra_metrics,
+        include_disp_nrmse=include_disp_nrmse,
+        include_force_nrmse=include_force_nrmse,
         rollout=rollout,
     )
     if torch.is_tensor(reduced_velocity):
@@ -510,6 +522,8 @@ def compute_validation_metrics(
     k: float,
     device: torch.device,
     log_extra_metrics: bool = False,
+    include_disp_nrmse: bool = True,
+    include_force_nrmse: bool = True,
     rollout: dict[str, np.ndarray] | None = None,
 ) -> dict[str, float]:
     if rollout is None:
@@ -531,7 +545,8 @@ def compute_validation_metrics(
     if disp_std_raw <= 0.0:
         disp_std_raw = 1.0
     rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
-    metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
+    if include_disp_nrmse:
+        metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
     force_target = np.asarray(force_data).reshape(-1)
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
@@ -543,17 +558,8 @@ def compute_validation_metrics(
         if force_std <= 0.0:
             force_std = 1.0
         rel_rmse_force_total = rmse_force / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
-        if log_extra_metrics:
-            force_model_aligned = force_total_pred[:min_len]
-            force_true_aligned = force_target[:min_len]
-            half_idx_force = force_true_aligned.size // 2
-            force_true_half = force_true_aligned[half_idx_force:]
-            force_model_half = force_model_aligned[half_idx_force:]
-            if force_true_half.size > 0 and force_model_half.size > 0:
-                spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
-                if np.isfinite(spectral_rel_err):
-                    metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
+        if include_force_nrmse:
+            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
     with torch.no_grad():
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
@@ -569,6 +575,26 @@ def compute_validation_metrics(
             force_std_data = 1.0
         rel_rmse_force_on_data = rmse_force_data / force_std_data
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
+    if log_extra_metrics:
+        freq_true = dominant_frequency(y_data_raw, dt)
+        freq_pred = dominant_frequency(y_pred_raw, dt)
+        freq_rel = abs(relative_error(freq_pred, freq_true))
+        if np.isfinite(freq_rel):
+            metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(freq_rel)
+
+        amp_true = mean_displacement_amplitude(y_data_raw)
+        amp_pred = mean_displacement_amplitude(y_pred_raw)
+        amp_rel = abs(relative_error(amp_pred, amp_true))
+        if np.isfinite(amp_rel):
+            metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel)
+
+        disp_spec_err = spectral_relative_error(y_data_raw, y_pred_raw, dt)
+        if np.isfinite(disp_spec_err):
+            metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
+
+        force_spec_err = spectral_relative_error(force_target, force_total_pred, dt)
+        if np.isfinite(force_spec_err):
+            metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
     return metrics
 
 
@@ -750,6 +776,18 @@ def relative_error(model_value: float, true_value: float, eps: float = 1e-12) ->
     if denom <= eps:
         return float("nan")
     return float((model_value - true_value) / (denom + eps))
+
+
+def mean_displacement_amplitude(signal: np.ndarray) -> float:
+    """
+    Mean oscillation amplitude estimate from a displacement signal.
+    Uses half peak-to-peak around the sample range after finite filtering.
+    """
+    arr = np.asarray(signal, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return float("nan")
+    return float(0.5 * (np.max(arr) - np.min(arr)))
 
 
 def spectral_relative_error(
@@ -2509,6 +2547,10 @@ def log_final_rollout_errors_vs_ur(
         (DISP_ROLLOUT_NRMSE_KEY, DISP_ROLLOUT_NRMSE_KEY),
         (FORCE_ROLLOUT_NRMSE_KEY, FORCE_ROLLOUT_NRMSE_KEY),
         (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
+        (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
+        (MEAN_DISP_AMP_REL_ERROR_KEY, MEAN_DISP_AMP_REL_ERROR_KEY),
+        (DISP_SPECTRAL_SHAPE_ERROR_KEY, DISP_SPECTRAL_SHAPE_ERROR_KEY),
+        (FORCE_SPECTRAL_SHAPE_ERROR_KEY, FORCE_SPECTRAL_SHAPE_ERROR_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
     for ur_val, metrics in pairs:

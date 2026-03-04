@@ -351,6 +351,8 @@ def _validate_if_needed(
     middle_time_plot,
     hamiltonian_data,
     log_extra_validation_metrics: bool,
+    rollout_include_disp_nrmse: bool,
+    rollout_include_force_nrmse: bool,
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -401,9 +403,27 @@ def _validate_if_needed(
         )
 
     if val_series_raw is not None and val_sequences is not None:
+        total = min(len(val_series_raw), len(val_sequences))
+        by_ur: dict[float, list[int]] = {}
+        for idx in range(total):
+            ur_np = np.asarray(val_series_raw[idx][5], dtype=float).reshape(-1)
+            if ur_np.size == 0 or not np.isfinite(ur_np[0]):
+                continue
+            ur_key = float(np.round(float(ur_np[0]), 6))
+            by_ur.setdefault(ur_key, []).append(idx)
+        if not by_ur:
+            return
+        rng = np.random.default_rng(int(epoch) + 1)
+        selected_indices: list[int] = []
+        for ur_key in sorted(by_ur):
+            candidates = np.asarray(by_ur[ur_key], dtype=int)
+            selected_indices.append(int(rng.choice(candidates)))
+
         metrics_sum: dict[str, float] = {}
         count = 0
-        for series_raw, sequence in zip(val_series_raw, val_sequences):
+        for idx in selected_indices:
+            series_raw = val_series_raw[idx]
+            sequence = val_sequences[idx]
             y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
             y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
             if force_np is None:
@@ -422,6 +442,8 @@ def _validate_if_needed(
                 k=k,
                 device=device,
                 log_extra_metrics=log_extra_validation_metrics,
+                include_disp_nrmse=rollout_include_disp_nrmse,
+                include_force_nrmse=rollout_include_force_nrmse,
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -429,11 +451,13 @@ def _validate_if_needed(
         if count > 0:
             for name, total in metrics_sum.items():
                 writer.add_scalar(f"val/{name}", total / float(count), epoch + 1)
+        if not selected_indices:
+            return
         if cycle_validation_rollout:
             step = max(0, (epoch + 1) // max(1, int(rollout_every_epochs)) - 1)
-            rollout_idx = step % len(val_series_raw)
+            rollout_idx = selected_indices[step % len(selected_indices)]
         else:
-            rollout_idx = 0
+            rollout_idx = selected_indices[0]
         series_raw = val_series_raw[rollout_idx]
         sequence = val_sequences[rollout_idx]
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
@@ -459,6 +483,8 @@ def _validate_if_needed(
             middle_time_plot,
             hamiltonian_data,
             log_extra_metrics=log_extra_validation_metrics,
+            include_disp_nrmse=rollout_include_disp_nrmse,
+            include_force_nrmse=rollout_include_force_nrmse,
             log_metrics=False,
         )
         return
@@ -481,6 +507,8 @@ def _validate_if_needed(
         middle_time_plot,
         hamiltonian_data,
         log_extra_metrics=log_extra_validation_metrics,
+        include_disp_nrmse=rollout_include_disp_nrmse,
+        include_force_nrmse=rollout_include_force_nrmse,
     )
 
 
@@ -497,6 +525,8 @@ def _log_final_rollouts_all(
     device: torch.device,
     middle_time_plot,
     log_extra_validation_metrics: bool,
+    rollout_include_disp_nrmse: bool,
+    rollout_include_force_nrmse: bool,
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
@@ -543,6 +573,8 @@ def _log_final_rollouts_all(
             middle_time_plot,
             None,
             log_extra_metrics=log_extra_validation_metrics,
+            include_disp_nrmse=rollout_include_disp_nrmse,
+            include_force_nrmse=rollout_include_force_nrmse,
             log_metrics=False,
             tag_prefix="final_val/rollout",
             step=step_idx,
@@ -1074,6 +1106,8 @@ def train(config: Config, config_name: str) -> None:
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
+    rollout_include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
+    rollout_include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
@@ -1357,6 +1391,8 @@ def train(config: Config, config_name: str) -> None:
                 middle_time_plot=middle_time_plot,
                 hamiltonian_data=hamiltonian_data,
                 log_extra_validation_metrics=log_extra_validation_metrics,
+                rollout_include_disp_nrmse=rollout_include_disp_nrmse,
+                rollout_include_force_nrmse=rollout_include_force_nrmse,
                 force_reg=force_reg,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
@@ -1383,6 +1419,8 @@ def train(config: Config, config_name: str) -> None:
             device=device,
             middle_time_plot=middle_time_plot,
             log_extra_validation_metrics=log_extra_validation_metrics,
+            rollout_include_disp_nrmse=rollout_include_disp_nrmse,
+            rollout_include_force_nrmse=rollout_include_force_nrmse,
         )
         if used > 0 and avg_metrics:
             summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]

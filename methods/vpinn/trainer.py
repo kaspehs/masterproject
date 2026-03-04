@@ -29,21 +29,29 @@ from core.runtime import (
 )
 from HNN_helper import (
     Config,
+    DOMINANT_FREQ_REL_ERROR_KEY,
+    DISP_SPECTRAL_SHAPE_ERROR_KEY,
     DISP_ROLLOUT_NRMSE_KEY,
+    FORCE_SPECTRAL_SHAPE_ERROR_KEY,
     FORCE_MAPPING_NRMSE_KEY,
     FORCE_ROLLOUT_NRMSE_KEY,
     GradNormBalancer,
+    MEAN_DISP_AMP_REL_ERROR_KEY,
     Residual,
     compute_velocity_numpy,
     create_window_mask,
     create_zoom_mask,
+    dominant_frequency,
     format_loss_vs_ur_text,
     log_final_rollout_errors_vs_ur,
     log_loss_vs_ur,
     log_displacement_plots,
     log_force_plots,
+    mean_displacement_amplitude,
+    relative_error,
     resolve_middle_time_plot,
     resample_uniform_series,
+    spectral_relative_error,
 )
 from architectures import ODEPirateNet, TemporalConvForceNet
 
@@ -1842,7 +1850,11 @@ def _log_rollout_validation(
     rollout_substeps: int = 1,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
+    log_extra_metrics: bool = False,
+    include_disp_nrmse: bool = True,
+    include_force_nrmse: bool = True,
     log_metrics: bool = True,
+    log_plots: bool = True,
     title_suffix: str = "",
 ) -> dict[str, float]:
     x_true_t = traj["x"].to(device)
@@ -1930,9 +1942,9 @@ def _log_rollout_validation(
     if disp_std <= 0.0:
         disp_std = 1.0
     rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
-    metrics: dict[str, float] = {DISP_ROLLOUT_NRMSE_KEY: rel_rmse_y}
-    if log_metrics:
-        writer.add_scalar(f"val/{DISP_ROLLOUT_NRMSE_KEY}", rel_rmse_y, epoch)
+    metrics: dict[str, float] = {}
+    if include_disp_nrmse:
+        metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_y
 
     force_std = float(np.std(f_true))
     if force_std <= 0.0:
@@ -1945,14 +1957,12 @@ def _log_rollout_validation(
         if force_std <= 0.0:
             force_std = 1.0
         rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
+        if include_force_nrmse:
+            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
     else:
         rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
+        if include_force_nrmse:
+            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
 
     with torch.no_grad():
         f_on_data_full = _vpinn_force_on_trajectory(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
@@ -1970,46 +1980,106 @@ def _log_rollout_validation(
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
-    y_true_norm = x_true / float(D)
-    y_pred_norm = x_pred / float(D)
-    freq = float(torch.sqrt(k[0] / m[0]).detach().cpu())
-    denom = float(freq * float(D)) if freq > 0 else 1.0
-    p_pred_norm = v_pred / denom
+    if log_extra_metrics:
+        freq_true = dominant_frequency(x_true, dt)
+        freq_pred = dominant_frequency(x_pred, dt)
+        freq_rel = abs(relative_error(freq_pred, freq_true))
+        if np.isfinite(freq_rel):
+            metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(freq_rel)
 
-    zoom_mask = create_zoom_mask(t_np)
-    middle_mask = create_window_mask(t_np, middle_time_plot)
-    middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
-    ur_val = float(ur_eval_t[0, 0].detach().cpu().item())
-    log_displacement_plots(
-        writer,
-        epoch,
-        t_np,
-        y_true_norm,
-        y_pred_norm,
-        p_pred_norm,
-        zoom_mask,
-        middle_mask,
-        middle_window,
-        reduced_velocity=ur_val,
-        tag_prefix=tag_prefix,
-        step=step,
-        title_suffix=title_suffix,
-    )
-    log_force_plots(
-        writer,
-        epoch,
-        t_np,
-        f_pred,
-        f_true,
-        zoom_mask,
-        middle_mask,
-        middle_window,
-        reduced_velocity=ur_val,
-        tag_prefix=tag_prefix,
-        step=step,
-        title_suffix=title_suffix,
-    )
+        amp_true = mean_displacement_amplitude(x_true)
+        amp_pred = mean_displacement_amplitude(x_pred)
+        amp_rel = abs(relative_error(amp_pred, amp_true))
+        if np.isfinite(amp_rel):
+            metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel)
+
+        disp_spec_err = spectral_relative_error(x_true, x_pred, dt)
+        if np.isfinite(disp_spec_err):
+            metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
+
+        if f0_eval_t is not None:
+            force_true_for_spec = f_true_force
+            force_pred_for_spec = f_pred_force
+        else:
+            force_true_for_spec = f_true
+            force_pred_for_spec = f_pred
+        force_spec_err = spectral_relative_error(force_true_for_spec, force_pred_for_spec, dt)
+        if np.isfinite(force_spec_err):
+            metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
+
+    if log_metrics:
+        for metric_name, metric_value in metrics.items():
+            writer.add_scalar(f"val/{metric_name}", float(metric_value), epoch)
+
+    if log_plots:
+        y_true_norm = x_true / float(D)
+        y_pred_norm = x_pred / float(D)
+        freq = float(torch.sqrt(k[0] / m[0]).detach().cpu())
+        denom = float(freq * float(D)) if freq > 0 else 1.0
+        p_pred_norm = v_pred / denom
+
+        zoom_mask = create_zoom_mask(t_np)
+        middle_mask = create_window_mask(t_np, middle_time_plot)
+        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
+        ur_val = float(ur_eval_t[0, 0].detach().cpu().item())
+        log_displacement_plots(
+            writer,
+            epoch,
+            t_np,
+            y_true_norm,
+            y_pred_norm,
+            p_pred_norm,
+            zoom_mask,
+            middle_mask,
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
+        log_force_plots(
+            writer,
+            epoch,
+            t_np,
+            f_pred,
+            f_true,
+            zoom_mask,
+            middle_mask,
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
     return metrics
+
+
+def _sample_one_traj_per_ur(
+    trajs: Sequence[dict[str, Any]],
+    *,
+    seed: int,
+) -> list[int]:
+    by_ur: dict[float, list[int]] = {}
+    for idx, traj in enumerate(trajs):
+        ur_obj = traj.get("ur", None)
+        if ur_obj is None:
+            continue
+        if torch.is_tensor(ur_obj):
+            ur_arr = np.asarray(ur_obj.detach().cpu(), dtype=float).reshape(-1)
+        else:
+            ur_arr = np.asarray(ur_obj, dtype=float).reshape(-1)
+        if ur_arr.size == 0 or not np.isfinite(ur_arr[0]):
+            continue
+        ur_key = float(np.round(float(ur_arr[0]), 6))
+        by_ur.setdefault(ur_key, []).append(idx)
+    if not by_ur:
+        return []
+    rng = np.random.default_rng(int(seed))
+    selected: list[int] = []
+    for ur_key in sorted(by_ur):
+        candidates = np.asarray(by_ur[ur_key], dtype=int)
+        selected.append(int(rng.choice(candidates)))
+    return selected
 
 
 def train(config: Config, config_name: str) -> None:
@@ -2020,6 +2090,9 @@ def train(config: Config, config_name: str) -> None:
     training_cfg = config.training
     optim_cfg = config.optim
     monitoring_cfg = config.monitoring
+    log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
+    rollout_include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
+    rollout_include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
 
     window_M = int(vp.get("window_M", 50))
     stride = int(vp.get("stride", 1))
@@ -2654,17 +2727,17 @@ def train(config: Config, config_name: str) -> None:
             candidates = val_trajs if val_trajs else train_trajs
             if not candidates:
                 continue
-            if cycle_validation_rollout:
-                step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
-                rollout_idx = step % len(candidates)
-            else:
-                rollout_idx = 0
-            for traj in candidates[rollout_idx : rollout_idx + 1]:
-                _log_rollout_validation(
+            sampled_indices = _sample_one_traj_per_ur(candidates, seed=int(epoch) + 1)
+            if not sampled_indices:
+                continue
+            metrics_sum: dict[str, float] = {}
+            metrics_count: dict[str, int] = {}
+            for idx in sampled_indices:
+                metrics = _log_rollout_validation(
                     writer=writer,
                     epoch=epoch,
                     model=model,
-                    traj=traj,
+                    traj=candidates[idx],
                     dt=dt,
                     m=m,
                     c=c,
@@ -2673,7 +2746,44 @@ def train(config: Config, config_name: str) -> None:
                     middle_time_plot=middle_time_plot,
                     device=device,
                     rollout_substeps=rollout_val_substeps,
+                    log_extra_metrics=log_extra_validation_metrics,
+                    include_disp_nrmse=rollout_include_disp_nrmse,
+                    include_force_nrmse=rollout_include_force_nrmse,
+                    log_metrics=False,
+                    log_plots=False,
                 )
+                for name, value in metrics.items():
+                    if not np.isfinite(value):
+                        continue
+                    metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                    metrics_count[name] = metrics_count.get(name, 0) + 1
+            for name, total in metrics_sum.items():
+                denom = max(1, int(metrics_count.get(name, 0)))
+                writer.add_scalar(f"val/{name}", total / float(denom), epoch)
+            if cycle_validation_rollout:
+                step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
+                plot_idx = sampled_indices[step % len(sampled_indices)]
+            else:
+                plot_idx = sampled_indices[0]
+            _log_rollout_validation(
+                writer=writer,
+                epoch=epoch,
+                model=model,
+                traj=candidates[plot_idx],
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                D=D_val,
+                middle_time_plot=middle_time_plot,
+                device=device,
+                rollout_substeps=rollout_val_substeps,
+                log_extra_metrics=log_extra_validation_metrics,
+                include_disp_nrmse=rollout_include_disp_nrmse,
+                include_force_nrmse=rollout_include_force_nrmse,
+                log_metrics=False,
+                log_plots=True,
+            )
 
     if final_rollout_all_validation and val_trajs:
         print("Final validation rollout (all trajectories) started.")
@@ -2708,6 +2818,9 @@ def train(config: Config, config_name: str) -> None:
                 rollout_substeps=rollout_val_substeps,
                 tag_prefix="final_val/rollout",
                 step=idx,
+                log_extra_metrics=log_extra_validation_metrics,
+                include_disp_nrmse=rollout_include_disp_nrmse,
+                include_force_nrmse=rollout_include_force_nrmse,
                 log_metrics=False,
                 title_suffix=f" [final {idx+1}/{len(selected_trajs)}]",
             )

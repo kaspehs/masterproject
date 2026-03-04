@@ -41,7 +41,7 @@ from methods.vpinn.trainer import (
     _configured_validation_history_len,
     _force_mapping_nrmse_over_trajs,
     _is_tcn_force_model,
-    _load_metadata_map,
+    _try_load_metadata_map,
     _tcn_history_len,
     _vpinn_force_sequence,
     ScaledForceWrapper,
@@ -72,6 +72,56 @@ def _rollout_index(epoch: int, rollout_every: int, num_series: int, cycle: bool)
         return 0
     step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
     return int(step % num_series)
+
+
+def _sample_one_hnn_series_per_ur(
+    val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]],
+    *,
+    seed: int,
+) -> list[int]:
+    by_ur: dict[float, list[int]] = {}
+    for idx, series_raw in enumerate(val_series_raw):
+        ur_np = np.asarray(series_raw[5], dtype=float).reshape(-1)
+        if ur_np.size == 0 or not np.isfinite(ur_np[0]):
+            continue
+        ur_key = float(np.round(float(ur_np[0]), 6))
+        by_ur.setdefault(ur_key, []).append(idx)
+    if not by_ur:
+        return []
+    rng = np.random.default_rng(int(seed))
+    selected: list[int] = []
+    for ur_key in sorted(by_ur):
+        candidates = np.asarray(by_ur[ur_key], dtype=int)
+        selected.append(int(rng.choice(candidates)))
+    return selected
+
+
+def _sample_one_vpinn_traj_per_ur(
+    trajs: list[dict[str, Any]],
+    *,
+    seed: int,
+) -> list[int]:
+    by_ur: dict[float, list[int]] = {}
+    for idx, traj in enumerate(trajs):
+        ur_obj = traj.get("ur", None)
+        if ur_obj is None:
+            continue
+        if torch.is_tensor(ur_obj):
+            ur_arr = np.asarray(ur_obj.detach().cpu(), dtype=float).reshape(-1)
+        else:
+            ur_arr = np.asarray(ur_obj, dtype=float).reshape(-1)
+        if ur_arr.size == 0 or not np.isfinite(ur_arr[0]):
+            continue
+        ur_key = float(np.round(float(ur_arr[0]), 6))
+        by_ur.setdefault(ur_key, []).append(idx)
+    if not by_ur:
+        return []
+    rng = np.random.default_rng(int(seed))
+    selected: list[int] = []
+    for ur_key in sorted(by_ur):
+        candidates = np.asarray(by_ur[ur_key], dtype=int)
+        selected.append(int(rng.choice(candidates)))
+    return selected
 
 
 def _load_checkpoint(path: Path) -> tuple[dict[str, Any], Any, str]:
@@ -251,9 +301,14 @@ def _run_hnn_validation(
 
     rollout_by_ur: dict[float, list[float]] = {}
     if do_rollout:
+        sampled_indices = _sample_one_hnn_series_per_ur(val_series_raw, seed=int(epoch) + 1)
+        if not sampled_indices:
+            return
         metrics_sum: dict[str, float] = {}
         count = 0
-        for series_raw, sequence in zip(val_series_raw, val_sequences):
+        for idx in sampled_indices:
+            series_raw = val_series_raw[idx]
+            sequence = val_sequences[idx]
             y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
             y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
             metrics = compute_validation_metrics(
@@ -270,6 +325,8 @@ def _run_hnn_validation(
                 k=k,
                 device=device,
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+                include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
+                include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -290,7 +347,8 @@ def _run_hnn_validation(
                 title=f"{FORCE_ROLLOUT_NRMSE_KEY} vs U_r",
             )
 
-        rollout_idx = _rollout_index(epoch, rollout_every, len(val_series_raw), cycle_rollout)
+        rollout_rel_idx = _rollout_index(epoch, rollout_every, len(sampled_indices), cycle_rollout)
+        rollout_idx = sampled_indices[rollout_rel_idx]
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[rollout_idx]
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[rollout_idx]
         log_validation_epoch(
@@ -312,6 +370,8 @@ def _run_hnn_validation(
             getattr(data_cfg, "middle_time_plot", [0.0, 1.0]),
             hamiltonian_data,
             log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+            include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
+            include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
             log_metrics=False,
         )
     else:
@@ -396,7 +456,7 @@ def _run_vpinn_validation(
             meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
         else:
             meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+        f0_lookup = _try_load_metadata_map(meta_path)
     val_history_context = _configured_validation_history_len(cfg)
 
     for path in sources:
@@ -412,6 +472,8 @@ def _run_vpinn_validation(
             f0_lookup=f0_lookup,
             rho=float(getattr(cfg.model, "rho", 1000.0)),
             D=float(getattr(cfg.model, "D", 0.1)),
+            m_eff=float(_m_eff_from_model_cfg(cfg.model)),
+            k=float(getattr(cfg.model, "k", 1218.0)),
             preserve_prefix_for_history=(val_history_context > 0),
             min_history_context=val_history_context,
         )
@@ -559,7 +621,42 @@ def _run_vpinn_validation(
         )
 
     if do_rollout:
-        rollout_idx = _rollout_index(epoch, rollout_every, len(val_trajs), cycle_rollout)
+        sampled_indices = _sample_one_vpinn_traj_per_ur(val_trajs, seed=int(epoch) + 1)
+        if not sampled_indices:
+            return
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
+        for idx in sampled_indices:
+            metrics = _log_rollout_validation(
+                writer=writer,
+                epoch=epoch,
+                model=model,
+                traj=val_trajs[idx],
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                D=float(getattr(cfg.model, "D", 1.0)),
+                middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
+                device=device,
+                rollout_substeps=rollout_val_substeps,
+                log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+                include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
+                include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
+                log_metrics=False,
+                log_plots=False,
+            )
+            for name, value in metrics.items():
+                if not np.isfinite(value):
+                    continue
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for name, total in metrics_sum.items():
+            denom = max(1, int(metrics_count.get(name, 0)))
+            writer.add_scalar(f"val/{name}", total / float(denom), epoch)
+
+        rollout_rel_idx = _rollout_index(epoch, rollout_every, len(sampled_indices), cycle_rollout)
+        rollout_idx = sampled_indices[rollout_rel_idx]
         _log_rollout_validation(
             writer=writer,
             epoch=epoch,
@@ -573,6 +670,11 @@ def _run_vpinn_validation(
             middle_time_plot=resolve_middle_time_plot(data_cfg, vp, method_name="vpinn"),
             device=device,
             rollout_substeps=rollout_val_substeps,
+            log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+            include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
+            include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
+            log_metrics=False,
+            log_plots=True,
         )
 
 

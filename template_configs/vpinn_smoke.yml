@@ -105,6 +105,12 @@ monitoring:
   # Rollout validation plots (dynamics check)
   rollout_every_epochs: 20
   rollout_max_trajectories: 1
+  # Toggle rollout NRMSE validation metrics.
+  rollout_include_disp_nrmse: true
+  rollout_include_force_nrmse: true
+  # Extra rollout metrics: dominant frequency relative error, amplitude relative error,
+  # displacement/force spectral shape errors.
+  log_extra_validation_metrics: true
   cycle_validation_rollout: true
   final_rollout_all_validation: true
   async_validation: true
