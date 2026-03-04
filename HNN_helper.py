@@ -2598,12 +2598,12 @@ def preprocess_timeseries(
     t: np.ndarray,
     y: np.ndarray,
     force: np.ndarray,
-    hamiltonian: np.ndarray,
+    hamiltonian: np.ndarray | None,
     data_cfg: DataConfig,
     velocity: np.ndarray | None = None,
     *,
     cut_start_seconds: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, float]:
     """
     Apply optional trimming and uniform decimation to time-series arrays.
     """
@@ -2611,6 +2611,8 @@ def preprocess_timeseries(
         return t, y, force, hamiltonian, velocity, float("nan")
     if velocity is not None and np.asarray(velocity).shape[0] != t.shape[0]:
         raise ValueError("Velocity array must have the same length as the time vector.")
+    if hamiltonian is not None and np.asarray(hamiltonian).shape[0] != t.shape[0]:
+        raise ValueError("Hamiltonian array must have the same length as the time vector when provided.")
     mask = np.ones_like(t, dtype=bool)
     if cut_start_seconds is None:
         cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
@@ -2623,7 +2625,7 @@ def preprocess_timeseries(
     t_proc = t[mask]
     y_proc = y[mask]
     f_proc = force[mask]
-    h_proc = hamiltonian[mask]
+    h_proc = None if hamiltonian is None else np.asarray(hamiltonian)[mask]
     v_proc = None if velocity is None else np.asarray(velocity)[mask]
     step_requested = max(1, int(data_cfg.reduction_factor if data_cfg.reduce_time else 1))
     # Keep at least two samples after decimation whenever trimming left >=2 samples.
@@ -2638,7 +2640,8 @@ def preprocess_timeseries(
         t_proc = t_proc[::step]
         y_proc = y_proc[::step]
         f_proc = f_proc[::step]
-        h_proc = h_proc[::step]
+        if h_proc is not None:
+            h_proc = h_proc[::step]
         if v_proc is not None:
             v_proc = v_proc[::step]
     if t_proc.size < 2:
