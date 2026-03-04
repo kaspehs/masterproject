@@ -826,21 +826,25 @@ class TemporalConvForceNet(nn.Module):
         dropout: float = 0.0,
         activation: str = "gelu",
         history_len: int = 64,
+        dilation_start: int = 1,
     ) -> None:
         super().__init__()
         hidden = int(hidden_channels)
         depth = int(levels)
+        dilation0 = int(dilation_start)
         if hidden < 1:
             raise ValueError("hidden_channels must be >= 1")
         if depth < 1:
             raise ValueError("levels must be >= 1")
         if int(history_len) < 1:
             raise ValueError("history_len must be >= 1")
+        if dilation0 < 1:
+            raise ValueError("dilation_start must be >= 1")
 
         blocks: list[nn.Module] = []
         in_ch = int(input_size)
         for i in range(depth):
-            dilation = 2**i
+            dilation = dilation0 * (2**i)
             blocks.append(
                 _TemporalResidualBlock(
                     in_channels=in_ch,

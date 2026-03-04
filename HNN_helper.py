@@ -79,6 +79,7 @@ def _default_tcn_kwargs() -> dict[str, Any]:
     return {
         "hidden": 128,
         "levels": 4,
+        "dilation_start": 1,
         "kernel_size": 3,
         "dropout": 0.0,
         "activation": "gelu",
@@ -257,6 +258,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         legacy_tcn["hidden"] = architecture_cfg.pop("tcn_hidden")
     if "tcn_levels" in architecture_cfg:
         legacy_tcn["levels"] = architecture_cfg.pop("tcn_levels")
+    if "tcn_dilation_start" in architecture_cfg:
+        legacy_tcn["dilation_start"] = architecture_cfg.pop("tcn_dilation_start")
     if "tcn_kernel_size" in architecture_cfg:
         legacy_tcn["kernel_size"] = architecture_cfg.pop("tcn_kernel_size")
     if "tcn_dropout" in architecture_cfg:
@@ -865,6 +868,7 @@ class PHVIV(nn.Module):
             tcn_cfg.update(tcn_kwargs)
         self.tcn_hidden = int(tcn_cfg.get("hidden", 128))
         self.tcn_levels = max(1, int(tcn_cfg.get("levels", 4)))
+        self.tcn_dilation_start = max(1, int(tcn_cfg.get("dilation_start", 1)))
         self.tcn_kernel_size = max(1, int(tcn_cfg.get("kernel_size", 3)))
         self.tcn_dropout = float(tcn_cfg.get("dropout", 0.0))
         self.tcn_activation = str(tcn_cfg.get("activation", "gelu"))
@@ -966,6 +970,7 @@ class PHVIV(nn.Module):
                 output_size=1,
                 hidden_channels=self.tcn_hidden,
                 levels=self.tcn_levels,
+                dilation_start=self.tcn_dilation_start,
                 kernel_size=self.tcn_kernel_size,
                 dropout=self.tcn_dropout,
                 activation=self.tcn_activation,
@@ -979,6 +984,7 @@ class PHVIV(nn.Module):
                 output_size=self.tcn_head_input_dim,
                 hidden_channels=self.tcn_hidden,
                 levels=self.tcn_levels,
+                dilation_start=self.tcn_dilation_start,
                 kernel_size=self.tcn_kernel_size,
                 dropout=self.tcn_dropout,
                 activation=self.tcn_activation,

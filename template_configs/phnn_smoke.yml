@@ -56,6 +56,8 @@ architecture:
     enabled: false
     use_as_backbone: false
     hidden: 128
+    # First block dilation. Full stack becomes: dilation_start * [1, 2, 4, ...].
+    dilation_start: 1
     levels: 4
     kernel_size: 3
     dropout: 0.0
