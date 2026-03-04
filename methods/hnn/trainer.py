@@ -685,7 +685,17 @@ def _log_final_rollouts_all(
 
 
 def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
-    return [proc for proc in processes if proc.poll() is None]
+    alive: list[subprocess.Popen] = []
+    for proc in processes:
+        rc = proc.poll()
+        if rc is None:
+            alive.append(proc)
+            continue
+        if rc != 0:
+            print(f"[ASYNC-VALIDATION][ERROR] Worker pid={proc.pid} exited with code {rc}.")
+        else:
+            print(f"[ASYNC-VALIDATION][OK] Worker pid={proc.pid} finished successfully.")
+    return alive
 
 
 def _launch_async_validation(
@@ -1560,6 +1570,12 @@ def train(config: Config, config_name: str) -> None:
                 "final_val/loss_vs_ur_text",
                 format_loss_vs_ur_text(final_loss_by_ur, title="Final validation loss vs U_r"),
                 epochs,
+            )
+    if async_validation:
+        async_processes = _prune_async_processes(async_processes)
+        if async_processes:
+            print(
+                f"[ASYNC-VALIDATION][INFO] {len(async_processes)} worker(s) still running at shutdown."
             )
 
     models_dir = Path("models")
