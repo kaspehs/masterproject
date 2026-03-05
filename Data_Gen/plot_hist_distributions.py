@@ -1,6 +1,6 @@
 """
-Plot overlaid histograms for generated time-series (displacement or force).
-Each series is shown in a different colour on the same axes for easy comparison.
+Plot grouped histograms for generated time-series (displacement or force).
+One subplot is created per mean-U_r group.
 """
 
 from __future__ import annotations
@@ -12,18 +12,24 @@ import numpy as np
 
 
 CONFIG = {
-    "series_dir": Path(__file__).parent / "generated_series_Ur_long",
+    "series_dir": Path(__file__).parent / "generated_series_from_mat_velocity",
     # If series_dir has train/val/test subfolders, select which to include.
     "splits": ["train", "val", "test"],
     # Optional time trim (seconds from series start)
-    "cut_start_seconds": 25.0,
+    "cut_start_seconds": 0.0,
     # Reduced velocity filtering (use one of: list or range; None disables)
-    "ur_include": [12.0],  # e.g. [2.0, 4.0, 6.0]
+    "ur_include": None,  # e.g. [2.0, 4.0, 6.0]
     "ur_range": None,    # e.g. (2.0, 6.0)
     "ur_tol": 1e-3,
+    # Group series by close mean reduced velocity and produce one histogram per group.
+    # A series with mean U_r is assigned to key round(U_r / ur_group_width) * ur_group_width.
+    "ur_group_width": 1.0,
     # Histogram settings
-    "field": "disp",  # "disp" or "force"
+    "field": "force",  # "disp" or "force"
     "bins": 100,
+    # Subplot grid for grouped histograms (all groups in one figure).
+    # Example: 4 columns gives a 4xN layout.
+    "subplot_cols": 4,
     "save": None,  # e.g. Path("figs/hist.png")
 }
 
@@ -42,14 +48,14 @@ def _collect_series_files(series_dir: Path, splits: list[str]) -> list[Path]:
     return sorted(series_dir.glob("*.npz"))
 
 
-def _extract_ur(arr: np.lib.npyio.NpzFile) -> float | None:
+def _extract_ur_mean(arr: np.lib.npyio.NpzFile) -> float | None:
     if "U_r" in arr:
         ur = np.asarray(arr["U_r"], dtype=float)
         if ur.ndim == 0:
             return float(ur)
         ur_flat = ur.reshape(-1)
         if ur_flat.size > 0:
-            return float(ur_flat[0])
+            return float(np.mean(ur_flat))
     return None
 
 
@@ -90,7 +96,7 @@ def load_series(
     series = []
     for path in files:
         arr = np.load(path)
-        ur_val = _extract_ur(arr)
+        ur_val = _extract_ur_mean(arr)
         if not _ur_allowed(ur_val, ur_include=ur_include, ur_range=ur_range, ur_tol=ur_tol):
             continue
         time = np.asarray(arr["a"])
@@ -114,59 +120,109 @@ def load_series(
                 "time": time,
                 "disp": disp,
                 "force": force,
-                "ur": ur_val,
+                "ur_mean": ur_val,
             }
         )
     return series
 
 
-def plot_hist(series, field: str, bins: int, save_path: Path | None):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    all_values = np.concatenate([entry[field] for entry in series if entry[field] is not None])
-    bin_edges = np.linspace(all_values.min(), all_values.max(), bins + 1)
-    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    width = bin_edges[1] - bin_edges[0]
-    tol = float(CONFIG.get("ur_tol", 1e-3))
-    ur_keys = []
+def _group_series_by_ur_mean(series, *, group_width: float, ur_tol: float) -> list[tuple[float, list[dict]]]:
+    if group_width <= 0.0:
+        raise ValueError("ur_group_width must be > 0.")
+    groups: dict[float, list[dict]] = {}
     for entry in series:
-        ur_val = entry.get("ur", None)
+        ur_val = entry.get("ur_mean", None)
         if ur_val is None:
-            ur_keys.append(None)
-        else:
-            tol_val = tol if tol > 0.0 else 1e-6
-            key = float(np.round(float(ur_val) / tol_val) * tol_val)
-            ur_keys.append(key)
-    unique_keys = sorted({k for k in ur_keys if k is not None})
-    palette = plt.cm.viridis(np.linspace(0, 1, max(len(unique_keys), 1)))
-    color_map = {key: palette[i] for i, key in enumerate(unique_keys)}
-    default_color = (0.4, 0.4, 0.4, 0.7)
-    cumulative = np.zeros_like(centers)
-    for entry, key in zip(series, ur_keys):
-        color = color_map.get(key, default_color)
-        values = entry[field]
-        if values is None:
             continue
-        counts, _ = np.histogram(values, bins=bin_edges)
-        ax.bar(
-            centers,
-            counts,
-            width=width,
-            bottom=cumulative,
-            color=color,
-            alpha=0.8,
+        # Robust keying for floating values.
+        step = float(group_width)
+        key = float(np.round(float(ur_val) / step) * step)
+        merged_key = None
+        for existing in groups:
+            if abs(existing - key) <= max(float(ur_tol), 1e-12):
+                merged_key = existing
+                break
+        if merged_key is None:
+            merged_key = key
+            groups[merged_key] = []
+        groups[merged_key].append(entry)
+    return sorted(groups.items(), key=lambda kv: kv[0])
+
+
+def _plot_hist_one_group(
+    ax,
+    group_key: float,
+    entries: list[dict],
+    *,
+    field: str,
+    bins: int,
+    group_width: float,
+):
+    valid = [e for e in entries if e.get(field) is not None]
+    if not valid:
+        ax.set_visible(False)
+        return
+    all_values = np.concatenate([np.asarray(e[field], dtype=float).reshape(-1) for e in valid])
+    if all_values.size == 0:
+        ax.set_visible(False)
+        return
+
+    bin_edges = np.linspace(all_values.min(), all_values.max(), bins + 1)
+    colors = plt.cm.viridis(np.linspace(0.1, 0.95, max(len(valid), 2)))
+
+    for idx, entry in enumerate(valid):
+        values = np.asarray(entry[field], dtype=float).reshape(-1)
+        ax.hist(
+            values,
+            bins=bin_edges,
+            alpha=0.35,
+            color=colors[idx % len(colors)],
             label=entry["path"].stem,
+            edgecolor="none",
         )
-        cumulative += counts
-    ax.set_xlabel(field)
+
+    lo = float(group_key) - 0.5 * float(group_width)
+    hi = float(group_key) + 0.5 * float(group_width)
     ax.set_ylabel("Count")
-    ax.set_title(f"Stacked histogram of {field} across series")
+    ax.set_title(f"{field} histogram for mean U_r in [{lo:.3f}, {hi:.3f})")
     ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize="small")
+
+
+def plot_hist(series, field: str, bins: int, save_path: Path | None):
+    group_width = float(CONFIG.get("ur_group_width", 0.5))
+    ur_tol = float(CONFIG.get("ur_tol", 1e-3))
+    grouped = _group_series_by_ur_mean(series, group_width=group_width, ur_tol=ur_tol)
+    if not grouped:
+        raise ValueError("No series remained after U_r filtering/grouping.")
+
+    n_groups = len(grouped)
+    ncols = int(max(1, CONFIG.get("subplot_cols", 4)))
+    nrows = int(np.ceil(n_groups / ncols))
+    fig_width = max(4.0 * ncols, 10.0)
+    fig_height = max(2.8 * nrows, 4.0)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height), squeeze=False, sharex=True)
+    axes_flat = axes.ravel()
+
+    for ax, (key, entries) in zip(axes_flat, grouped):
+        _plot_hist_one_group(
+            ax,
+            key,
+            entries,
+            field=field,
+            bins=bins,
+            group_width=group_width,
+        )
+    for ax in axes_flat[n_groups:]:
+        ax.set_visible(False)
+    for idx, ax in enumerate(axes_flat[:n_groups]):
+        if idx // ncols == (nrows - 1):
+            ax.set_xlabel(field)
     fig.tight_layout()
+
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=200)
-        print(f"Saved histogram to {save_path}")
+        print(f"Saved histogram figure to {save_path}")
     else:
         plt.show()
     plt.close(fig)
