@@ -56,7 +56,6 @@ class ModelConfig:
     U: float = 0.65
     damping_c: float = 1e-4
     max_damping_ratio: float = 0.2
-    include_physical_drag: bool = False
     force_output: str = "force"  # "force", "coefficient", or "two_head_vivana"
     learn_hamiltonian: bool = False
     discover_damping: bool = False
@@ -226,6 +225,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
     method = raw.get("method", "hnn")
     data_cfg = raw.get("data", {}) or {}
     model_cfg = raw.get("model", {}) or {}
+    # Legacy model key no longer used.
+    model_cfg.pop("include_physical_drag", None)
     architecture_cfg = dict(raw.get("architecture", {}) or {})
     smoothing_cfg = raw.get("smoothing", {}) or {}
     training_cfg = dict(raw.get("training", {}) or {})
@@ -913,7 +914,6 @@ class PHVIV(nn.Module):
         max_damping_ratio=0.2,
         discover_damping: bool = False,
         damping_c: float | None = None,
-        include_physical_drag: bool = True,
         force_output: str = "force",
         learn_hamiltonian: bool = False,
         use_pirate_force: bool = False,
@@ -943,7 +943,6 @@ class PHVIV(nn.Module):
         self.q_scale = q_scale
         self.p_scale = p_scale
         self.discover_damping = bool(discover_damping)
-        self.include_physical_drag = bool(include_physical_drag)
         force_output = str(force_output).strip().lower()
         if force_output not in {"force", "coefficient", "two_head_vivana"}:
             raise ValueError("force_output must be one of: force, coefficient, two_head_vivana")
@@ -1139,10 +1138,6 @@ class PHVIV(nn.Module):
             self.register_buffer("fixed_c", torch.tensor(damping_c, dtype=torch.float32))
             self.fixed_damping_ratio = float(damping_c / (2.0 * (self.k * self.m) ** 0.5))
             self.zeta_raw = None
-        #Learable drag coefficient
-        self.log_Cd = nn.Parameter(torch.log(torch.tensor(1.2)))  # start at ~1.2
-
-
         self.register_buffer("J", torch.tensor([[0.0, 1.0],
                                                 [-1.0, 0.0]]))
         self.register_buffer("G", torch.tensor([[0.0],
@@ -1165,7 +1160,6 @@ class PHVIV(nn.Module):
         structural_mass = float(cfg.get("structural_mass", 16.79))
         max_damping_ratio = float(cfg.get("max_damping_ratio", 0.2))
         discover_damping = bool(cfg.get("discover_damping", False))
-        include_physical_drag = bool(cfg.get("include_physical_drag", False))
         force_output = str(cfg.get("force_output", "force")).strip().lower()
         learn_hamiltonian = bool(cfg.get("learn_hamiltonian", False))
         use_pirate_force = bool(cfg.get("use_pirate_force", False))
@@ -1216,7 +1210,6 @@ class PHVIV(nn.Module):
             max_damping_ratio=max_damping_ratio,
             discover_damping=discover_damping,
             damping_c=damping_c,
-            include_physical_drag=include_physical_drag,
             force_output=force_output,
             learn_hamiltonian=learn_hamiltonian,
             use_pirate_force=use_pirate_force,
@@ -1302,20 +1295,6 @@ class PHVIV(nn.Module):
         R[..., 1, 1] = c_eff
         return R
     
-    def drag_force(self, x):
-        """
-        Morison-like cross-flow drag: Fd = -0.5 * rho * D * Cd * |v| * v
-        x: (..., 2)
-        returns: (..., 1)
-        """
-        v = x[..., 1] / self.m
-        U = torch.full_like(v, self.U)
-        Cd = torch.exp(self.log_Cd)  # keep it positive
-        rel_vel = torch.sqrt(v**2 + U**2)
-        Fd = -0.5 * self.rho * self.D * Cd * torch.abs(rel_vel) * v
-        return Fd.unsqueeze(-1)
-
-
     def _base_features(self, x):
         if self.use_feature_engineering:
             return self.feature_engineering(x)
@@ -1527,10 +1506,12 @@ class PHVIV(nn.Module):
             raise ValueError(
                 f"two_head_vivana expects force head output with last dim=2, got shape {tuple(raw.shape)}."
             )
-        # Coefficients per term: [drag_like, vortex_like].
-        coeff = self._maybe_bound_force_coeff(raw)
-        c_drag = coeff[..., 0:1]
-        c_vortex = coeff[..., 1:2]
+        # Coefficients per term: [drag_magnitude, vortex_like].
+        # Constrain drag magnitude to [0, Cmax] and apply an explicit minus sign
+        # in force_drag so the drag term is always dissipative.
+        cmax = self.force_coefficient_c_max.to(device=raw.device, dtype=raw.dtype)
+        c_drag = cmax * torch.sigmoid(raw[..., 0:1])
+        c_vortex = self._maybe_bound_force_coeff(raw[..., 1:2])
 
         # State x = [q, p], with velocity dy = p / m.
         dy = x[..., 1:2] / float(self.m)
@@ -1539,9 +1520,9 @@ class PHVIV(nn.Module):
         pref = 0.5 * float(self.rho) * float(self.D)
 
         # Requested scaling:
-        #   F_drag_like   ~ |V_rel| * dy
-        #   F_vortex_like ~ |V_rel| * U
-        force_drag = pref * c_drag * v_rel * dy
+        #   F_drag_like   ~ -|V_rel| * dy  (always dissipative)
+        #   F_vortex_like ~  |V_rel| * U
+        force_drag = -pref * c_drag * v_rel * dy
         force_vortex = pref * c_vortex * v_rel * u_flow
         return force_drag + force_vortex, c_drag, c_vortex
 
@@ -1621,11 +1602,6 @@ class PHVIV(nn.Module):
         coeff = raw * self.k * self.D / f0
         return self._maybe_bound_force_coeff(coeff)
 
-    def drag_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        drag = self.drag_force(x)
-        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=drag, state=x)
-        return drag / f0
-
     def u_theta_coeff(
         self,
         x,
@@ -1639,8 +1615,6 @@ class PHVIV(nn.Module):
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
-        if self.include_physical_drag:
-            coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
         return coeff
 
     def u_theta_coeff_sequence(
@@ -1648,10 +1622,7 @@ class PHVIV(nn.Module):
         x: torch.Tensor,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     ) -> torch.Tensor:
-        coeff = self.learned_force_coeff_sequence(x, reduced_velocity=reduced_velocity)
-        if self.include_physical_drag:
-            coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
-        return coeff
+        return self.learned_force_coeff_sequence(x, reduced_velocity=reduced_velocity)
 
     def u_theta1(
         self,
@@ -1666,20 +1637,6 @@ class PHVIV(nn.Module):
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
-    
-    def u_theta2(
-        self,
-        x,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        z_hist: torch.Tensor | None = None,
-        ur_hist: torch.Tensor | None = None,
-    ):
-        return self.u_theta1(
-            x,
-            reduced_velocity=reduced_velocity,
-            z_hist=z_hist,
-            ur_hist=ur_hist,
-        ) + self.drag_force(x)
     
     def u_theta(
         self,
@@ -1697,12 +1654,7 @@ class PHVIV(nn.Module):
             )
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff, state=x)
             return coeff * f0
-        return self.u_theta2(
-            x,
-            reduced_velocity=reduced_velocity,
-            z_hist=z_hist,
-            ur_hist=ur_hist,
-        ) if self.include_physical_drag else self.u_theta1(
+        return self.u_theta1(
             x,
             reduced_velocity=reduced_velocity,
             z_hist=z_hist,
@@ -1718,10 +1670,7 @@ class PHVIV(nn.Module):
             coeff = self.u_theta_coeff_sequence(x, reduced_velocity=reduced_velocity)
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff, state=x)
             return coeff * f0
-        total = self.learned_force_sequence(x, reduced_velocity=reduced_velocity)
-        if self.include_physical_drag:
-            total = total + self.drag_force(x)
-        return total
+        return self.learned_force_sequence(x, reduced_velocity=reduced_velocity)
 
     def u_theta_on_trajectory(
         self,
@@ -3647,10 +3596,7 @@ def rollout_model(
             force_model_t = model.learned_force_sequence(z_pred, reduced_velocity=rv_seq)
         else:
             force_model_t = model.learned_force(z_pred, reduced_velocity=rv_seq)
-        if model.include_physical_drag:
-            force_drag_t = force_total_t - force_model_t
-        else:
-            force_drag_t = torch.zeros_like(force_total_t)
+        force_drag_t = torch.zeros_like(force_total_t)
         hamiltonian_model_t = model.H(z_pred)
 
     y_samples_arr = z_pred[0, :, 0].detach().cpu().numpy()

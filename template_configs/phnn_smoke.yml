@@ -22,7 +22,6 @@ model:
   U: 0.65
   damping_c: 1e-4
   max_damping_ratio: 0.2
-  include_physical_drag: false
   force_output: coefficient
   # If enabled (with force_output=coefficient), apply:
   # C <- C_max * tanh(C / C_max)
