@@ -158,10 +158,6 @@ hnn: # file or compute
   train_include_ur: null
   train_exclude_ur: []
   train_ur_filter_tol: 1e-6
-  # Per-trajectory normalization (PHNN): scale losses by per-trajectory RMS force.
-  # Options: none | force_rms
-  per_traj_norm: none
-  per_traj_norm_eps: 1e-8
 pinn: {}
 
 #For running all config files

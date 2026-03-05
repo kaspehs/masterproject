@@ -38,7 +38,6 @@ from HNN_helper import (
     resolve_middle_time_plot,
 )
 from methods.vpinn.trainer import (
-    _apply_per_traj_scale,
     _configured_validation_history_len,
     _force_mapping_nrmse_over_trajs,
     _is_tcn_force_model,
@@ -157,14 +156,13 @@ def _run_hnn_validation(
     data_cfg = cfg.data
     hnn_cfg = dict(cfg.hnn or {})
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
-    per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
+    # Per-trajectory normalization has been removed; keep epsilon only for
+    # backward-compatible loss helper signatures.
+    per_traj_norm_eps = 1e-8
     log_loss_vs_ur_map = bool(getattr(cfg.monitoring, "log_loss_vs_ur_map", True))
     rollout_include_force_mapping_nrmse = bool(
         getattr(cfg.monitoring, "rollout_include_force_mapping_nrmse", True)
     )
-    if per_traj_norm not in {"none", "force_rms"}:
-        raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
 
     if bool(getattr(data_cfg, "use_generated_train_series", False)):
@@ -262,8 +260,6 @@ def _run_hnn_validation(
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
-        per_traj_norm=per_traj_norm,
-        per_traj_norm_eps=per_traj_norm_eps,
         history_len=history_context,
     )
 
@@ -586,28 +582,12 @@ def _run_vpinn_validation(
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
-    per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
-    if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
-        raise ValueError("vpinn.per_traj_norm must be one of: none, force_rms, residual_rms.")
-    if per_traj_norm != "none":
-        _apply_per_traj_scale(
-            val_trajs,
-            mode=per_traj_norm,
-            dt=dt,
-            m=m,
-            c=c,
-            k=k,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            window_M=int(vp.get("window_M", 50)),
-            stride=int(vp.get("stride", 1)),
-            eps=per_traj_norm_eps,
-        )
+    # Per-trajectory normalization has been removed; keep epsilon only for
+    # backward-compatible validation helper signatures.
+    per_traj_norm_eps = 1e-8
 
     history_context = _tcn_history_len(model) if _is_tcn_force_model(model) else 0
-    return_scale = per_traj_norm != "none"
+    return_scale = False
     val_dataset = WindowDataset(
         val_trajs,
         window_intervals=int(vp.get("window_M", 50)),

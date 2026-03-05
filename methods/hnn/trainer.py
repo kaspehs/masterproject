@@ -68,6 +68,8 @@ def _train_one_epoch(
     force_data_loss_sum = torch.zeros((), device=device)
     grad_norm_sum = torch.zeros((), device=device)
     avg_force_sum = torch.zeros((), device=device)
+    avg_drag_coeff_sum = torch.zeros((), device=device)
+    avg_vortex_coeff_sum = torch.zeros((), device=device)
     res_grad_component_sum = torch.zeros((), device=device)
     force_grad_component_sum = torch.zeros((), device=device)
     gradnorm_res_weight_sum = torch.zeros((), device=device)
@@ -76,6 +78,7 @@ def _train_one_epoch(
     gradnorm_weight_count = 0
 
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
+    use_two_head_vivana = bool(getattr(model, "use_two_head_vivana", False))
     use_tcn_force = bool(getattr(model, "is_tcn_force_model", False))
     for batch in train_loader:
         z_hist = None
@@ -163,6 +166,17 @@ def _train_one_epoch(
                         z_hist=z_hist,
                         ur_hist=ur_hist,
                     )
+                if use_two_head_vivana:
+                    with torch.no_grad():
+                        avg_drag_coeff, avg_vortex_coeff = model.avg_drag_vortex_coeff(
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
             else:
                 per_res = model.res_loss_per_sample(
                     z_i,
@@ -196,6 +210,19 @@ def _train_one_epoch(
                 denom = scale * scale + float(per_traj_norm_eps)
                 res_loss = torch.mean(per_res / denom)
                 avg_force = torch.mean(per_force / denom)
+                if use_two_head_vivana:
+                    with torch.no_grad():
+                        per_drag_coeff, per_vortex_coeff = model.avg_drag_vortex_coeff_per_sample(
+                            z_i,
+                            t_i,
+                            z_next,
+                            t_next,
+                            reduced_velocity=ur_i,
+                            z_hist=z_hist,
+                            ur_hist=ur_hist,
+                        )
+                        avg_drag_coeff = torch.mean(per_drag_coeff / denom)
+                        avg_vortex_coeff = torch.mean(per_vortex_coeff / denom)
             base_force_loss = avg_force
             if use_force_data_loss:
                 if f_i is None or f_next is None:
@@ -300,6 +327,9 @@ def _train_one_epoch(
         force_loss_sum = force_loss_sum + base_force_loss.detach().float()
         force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
         avg_force_sum = avg_force_sum + avg_force.detach().float()
+        if use_two_head_vivana:
+            avg_drag_coeff_sum = avg_drag_coeff_sum + avg_drag_coeff.detach().float()
+            avg_vortex_coeff_sum = avg_vortex_coeff_sum + avg_vortex_coeff.detach().float()
 
     denom = float(max(batch_count, 1))
     metrics: dict[str, float] = {
@@ -312,6 +342,9 @@ def _train_one_epoch(
         "mean_res_grad_component": float((res_grad_component_sum / denom).detach().cpu()),
         "mean_force_grad_component": float((force_grad_component_sum / denom).detach().cpu()),
     }
+    if use_two_head_vivana:
+        metrics["mean_drag_coeff"] = float((avg_drag_coeff_sum / denom).detach().cpu())
+        metrics["mean_vortex_coeff"] = float((avg_vortex_coeff_sum / denom).detach().cpu())
     if gradnorm_weight_count > 0:
         metrics["mean_gradnorm_weight_residual"] = float(
             (gradnorm_res_weight_sum / float(gradnorm_weight_count)).detach().cpu()
@@ -1165,10 +1198,9 @@ def train(config: Config, config_name: str) -> None:
     model_cfg = config.model
     smoothing_cfg = config.smoothing
     hnn_cfg = dict(config.hnn or {})
-    per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
-    if per_traj_norm not in {"none", "force_rms"}:
-        raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
+    # Per-trajectory normalization has been removed; keep epsilon only for
+    # backward-compatible loss helper signatures.
+    per_traj_norm_eps = 1e-8
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
     train_include_ur = _as_float_list(hnn_cfg.get("train_include_ur"), key="hnn.train_include_ur")
     train_exclude_ur = _as_float_list(hnn_cfg.get("train_exclude_ur"), key="hnn.train_exclude_ur")
@@ -1286,8 +1318,6 @@ def train(config: Config, config_name: str) -> None:
         smoothing_cfg=smoothing_cfg,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        per_traj_norm=per_traj_norm,
-        per_traj_norm_eps=per_traj_norm_eps,
         history_len=history_context,
     )
 
@@ -1324,8 +1354,6 @@ def train(config: Config, config_name: str) -> None:
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
-                per_traj_norm=per_traj_norm,
-                per_traj_norm_eps=per_traj_norm_eps,
                 history_len=history_context,
             )
 
@@ -1428,6 +1456,10 @@ def train(config: Config, config_name: str) -> None:
             "grad_norm": mean_grad_norm,
             "avg_force": mean_force,
         }
+        if "mean_drag_coeff" in epoch_metrics:
+            train_metrics["avg_drag_coeff"] = float(epoch_metrics["mean_drag_coeff"])
+        if "mean_vortex_coeff" in epoch_metrics:
+            train_metrics["avg_vortex_coeff"] = float(epoch_metrics["mean_vortex_coeff"])
         if log_component_grad_norms:
             train_metrics["grad_norm_residual_comp"] = mean_res_grad_component
             train_metrics["grad_norm_force_comp"] = mean_force_grad_component
@@ -1443,13 +1475,22 @@ def train(config: Config, config_name: str) -> None:
             log_training_metrics(writer, epoch, train_metrics)
         print_this_epoch = (epoch % print_every_epochs) == 0 or epoch == (epochs - 1)
         if print_this_epoch:
+            coeff_suffix = ""
+            if "mean_drag_coeff" in epoch_metrics and "mean_vortex_coeff" in epoch_metrics:
+                coeff_suffix = (
+                    f", c_drag={float(epoch_metrics['mean_drag_coeff']):.4e}, "
+                    f"c_vortex={float(epoch_metrics['mean_vortex_coeff']):.4e}"
+                )
             if use_force_data_loss:
                 print(
                     f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
-                    f"force={mean_force_loss:.4e}, data={mean_force_data_loss:.4e}"
+                    f"force={mean_force_loss:.4e}, data={mean_force_data_loss:.4e}{coeff_suffix}"
                 )
             else:
-                print(f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, force={mean_force_loss:.4e}")
+                print(
+                    f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
+                    f"force={mean_force_loss:.4e}{coeff_suffix}"
+                )
 
         should_validate = rollout_every_epochs > 0 and (
             (epoch + 1) % int(rollout_every_epochs) == 0 or epoch == (epochs - 1)

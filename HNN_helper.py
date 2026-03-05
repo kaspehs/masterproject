@@ -500,6 +500,14 @@ def log_validation_epoch(
     t_force = t_plot[:n_force]
     force_pred_plot = force_pred_plot[:n_force]
     force_true_plot = force_true_plot[:n_force]
+    drag_coeff_pred_plot: np.ndarray | None = None
+    vortex_coeff_pred_plot: np.ndarray | None = None
+    if "drag_coeff_pred" in rollout and "vortex_coeff_pred" in rollout:
+        drag_coeff_pred = np.asarray(rollout["drag_coeff_pred"], dtype=float).reshape(-1)
+        vortex_coeff_pred = np.asarray(rollout["vortex_coeff_pred"], dtype=float).reshape(-1)
+        if drag_coeff_pred.size >= n_force and vortex_coeff_pred.size >= n_force:
+            drag_coeff_pred_plot = drag_coeff_pred[:n_force]
+            vortex_coeff_pred_plot = vortex_coeff_pred[:n_force]
 
     zoom_mask = create_zoom_mask(t_plot)
     middle_mask = create_window_mask(t_plot, middle_time_plot)
@@ -557,6 +565,8 @@ def log_validation_epoch(
         zoom_mask_force,
         middle_mask_force,
         middle_time_plot,
+        drag_coeff_pred=drag_coeff_pred_plot,
+        vortex_coeff_pred=vortex_coeff_pred_plot,
         reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
         step=step,
@@ -1495,13 +1505,7 @@ class PHVIV(nn.Module):
         cmax = self.force_coefficient_c_max.to(device=coeff.device, dtype=coeff.dtype)
         return cmax * torch.tanh(coeff / cmax)
 
-    def _two_head_vivana_force_from_raw(
-        self,
-        raw: torch.Tensor,
-        *,
-        x: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _two_head_vivana_coeff_from_raw(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if raw.shape[-1] != 2:
             raise ValueError(
                 f"two_head_vivana expects force head output with last dim=2, got shape {tuple(raw.shape)}."
@@ -1512,6 +1516,16 @@ class PHVIV(nn.Module):
         cmax = self.force_coefficient_c_max.to(device=raw.device, dtype=raw.dtype)
         c_drag = cmax * torch.sigmoid(raw[..., 0:1])
         c_vortex = self._maybe_bound_force_coeff(raw[..., 1:2])
+        return c_drag, c_vortex
+
+    def _two_head_vivana_force_from_raw(
+        self,
+        raw: torch.Tensor,
+        *,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        c_drag, c_vortex = self._two_head_vivana_coeff_from_raw(raw)
 
         # State x = [q, p], with velocity dy = p / m.
         dy = x[..., 1:2] / float(self.m)
@@ -2076,6 +2090,70 @@ class PHVIV(nn.Module):
             ur_hist=ur_hist,
         )
 
+    def avg_drag_vortex_coeff(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_two_head_vivana:
+            raise ValueError("avg_drag_vortex_coeff requires force_output='two_head_vivana'.")
+        if self.loss_discretization == "implicit_euler":
+            return self.avg_drag_vortex_coeff_Euler(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
+        return self.avg_drag_vortex_coeff_SRK4(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+
+    def avg_drag_vortex_coeff_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_two_head_vivana:
+            raise ValueError("avg_drag_vortex_coeff_per_sample requires force_output='two_head_vivana'.")
+        if self.loss_discretization == "implicit_euler":
+            return self.avg_drag_vortex_coeff_Euler_per_sample(
+                zi,
+                ti,
+                zin,
+                tin,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+            )
+        return self.avg_drag_vortex_coeff_SRK4_per_sample(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+
     def _pair_dt(self, ti: torch.Tensor | None, tin: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor:
         if ti is None or tin is None:
             return like.new_full((like.shape[0], 1), float(self.dt))
@@ -2222,6 +2300,47 @@ class PHVIV(nn.Module):
             ur_hist=ur_hist,
         )
         return torch.linalg.norm(force_coeff, ord=1, dim=1)
+
+    def avg_drag_vortex_coeff_Euler(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        drag_per, vortex_per = self.avg_drag_vortex_coeff_Euler_per_sample(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        return torch.mean(drag_per), torch.mean(vortex_per)
+
+    def avg_drag_vortex_coeff_Euler_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        z_mean = 0.5 * (zin + zi)
+        raw = self._force_net_raw(
+            z_mean,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        c_drag, c_vortex = self._two_head_vivana_coeff_from_raw(raw)
+        return torch.sum(torch.abs(c_drag), dim=1), torch.sum(torch.abs(c_vortex), dim=1)
 
 
     def res_loss_SRK4(
@@ -2446,6 +2565,58 @@ class PHVIV(nn.Module):
         f1c = f1 / f0
         f2c = f2 / f0
         return 0.5 * torch.sum(torch.abs(f1c), dim=1) + 0.5 * torch.sum(torch.abs(f2c), dim=1)
+
+    def avg_drag_vortex_coeff_SRK4(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        drag_per, vortex_per = self.avg_drag_vortex_coeff_SRK4_per_sample(
+            zi,
+            ti,
+            zin,
+            tin,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        return torch.mean(drag_per), torch.mean(vortex_per)
+
+    def avg_drag_vortex_coeff_SRK4_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        b = math.sqrt(3.0) / 6.0
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+        raw1 = self._force_net_raw(
+            z_a_plus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        raw2 = self._force_net_raw(
+            z_a_minus,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        c_drag1, c_vortex1 = self._two_head_vivana_coeff_from_raw(raw1)
+        c_drag2, c_vortex2 = self._two_head_vivana_coeff_from_raw(raw2)
+        drag_per = 0.5 * torch.sum(torch.abs(c_drag1), dim=1) + 0.5 * torch.sum(torch.abs(c_drag2), dim=1)
+        vortex_per = 0.5 * torch.sum(torch.abs(c_vortex1), dim=1) + 0.5 * torch.sum(torch.abs(c_vortex2), dim=1)
+        return drag_per, vortex_per
     
     def feature_engineering(self, z):
         q_scaled = z[..., 0] / self.nn_q_scale
@@ -2532,6 +2703,8 @@ def log_force_plots(
     zoom_mask,
     middle_mask,
     middle_window,
+    drag_coeff_pred: np.ndarray | None = None,
+    vortex_coeff_pred: np.ndarray | None = None,
     reduced_velocity: float | None = None,
     *,
     tag_prefix: str = "val/rollout",
@@ -2543,6 +2716,10 @@ def log_force_plots(
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
     ax_full.plot(t, force_coeff_true, label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_full.plot(t, force_coeff_pred, label="C_F (pred)", color="tab:purple")
+    if drag_coeff_pred is not None:
+        ax_full.plot(t, drag_coeff_pred, label="C_drag (pred)", color="tab:green", linestyle="--")
+    if vortex_coeff_pred is not None:
+        ax_full.plot(t, vortex_coeff_pred, label="C_vortex (pred)", color="tab:red", linestyle=":")
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("C_F")
     ax_full.grid(True, alpha=0.3)
@@ -2560,6 +2737,10 @@ def log_force_plots(
 
     ax_zoom.plot(t[zoom_mask], force_coeff_true[zoom_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_zoom.plot(t[zoom_mask], force_coeff_pred[zoom_mask], label="C_F (pred)", color="tab:purple")
+    if drag_coeff_pred is not None:
+        ax_zoom.plot(t[zoom_mask], drag_coeff_pred[zoom_mask], label="C_drag (pred)", color="tab:green", linestyle="--")
+    if vortex_coeff_pred is not None:
+        ax_zoom.plot(t[zoom_mask], vortex_coeff_pred[zoom_mask], label="C_vortex (pred)", color="tab:red", linestyle=":")
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("C_F")
     ax_zoom.grid(True, alpha=0.3)
@@ -2569,6 +2750,22 @@ def log_force_plots(
     mid_start, mid_end = middle_window
     ax_middle.plot(t[middle_mask], force_coeff_true[middle_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_middle.plot(t[middle_mask], force_coeff_pred[middle_mask], label="C_F (pred)", color="tab:purple")
+    if drag_coeff_pred is not None:
+        ax_middle.plot(
+            t[middle_mask],
+            drag_coeff_pred[middle_mask],
+            label="C_drag (pred)",
+            color="tab:green",
+            linestyle="--",
+        )
+    if vortex_coeff_pred is not None:
+        ax_middle.plot(
+            t[middle_mask],
+            vortex_coeff_pred[middle_mask],
+            label="C_vortex (pred)",
+            color="tab:red",
+            linestyle=":",
+        )
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("C_F")
     ax_middle.grid(True, alpha=0.3)
@@ -2981,8 +3178,6 @@ def build_dataloader_from_series(
     pin_memory: bool = False,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
-    per_traj_norm: str = "none",
-    per_traj_norm_eps: float = 1e-8,
     history_len: int = 0,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
@@ -2990,9 +3185,6 @@ def build_dataloader_from_series(
     sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     datasets: list[TensorDataset | ConcatDataset] = []
     min_length: int | None = None
-    per_traj_norm = str(per_traj_norm).strip().lower()
-    if per_traj_norm not in {"none", "force_rms"}:
-        raise ValueError("per_traj_norm must be one of: none, force_rms.")
     for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
         y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
             y_np,
@@ -3017,16 +3209,6 @@ def build_dataloader_from_series(
             if force_arr.shape[0] != y_tensor.shape[0]:
                 raise ValueError("Force array must have the same length as displacement.")
             force_tensor = torch.from_numpy(np.ascontiguousarray(force_arr)).float()
-        traj_scale: float | None = None
-        if per_traj_norm == "force_rms":
-            if force_np is None:
-                traj_scale = 1.0
-            else:
-                force_arr = np.asarray(force_np, dtype=float)
-                rms = float(np.sqrt(np.mean(force_arr**2)))
-                if not np.isfinite(rms) or rms <= 0.0:
-                    rms = 1.0
-                traj_scale = rms
         sequence_tensors.append((y_tensor, vel_tensor, t_tensor, ur_tensor))
         datasets.append(
             build_dataset(
@@ -3036,7 +3218,6 @@ def build_dataloader_from_series(
                 t_tensor,
                 reduced_velocity=ur_tensor,
                 force_tensor=force_tensor,
-                traj_scale=traj_scale,
                 history_len=history_len,
             )
         )
@@ -3597,6 +3778,11 @@ def rollout_model(
         else:
             force_model_t = model.learned_force(z_pred, reduced_velocity=rv_seq)
         force_drag_t = torch.zeros_like(force_total_t)
+        drag_coeff_t: torch.Tensor | None = None
+        vortex_coeff_t: torch.Tensor | None = None
+        if bool(getattr(model, "use_two_head_vivana", False)):
+            raw_force_seq = model._force_net_raw_sequence(z_pred, reduced_velocity=rv_seq)
+            drag_coeff_t, vortex_coeff_t = model._two_head_vivana_coeff_from_raw(raw_force_seq)
         hamiltonian_model_t = model.H(z_pred)
 
     y_samples_arr = z_pred[0, :, 0].detach().cpu().numpy()
@@ -3607,7 +3793,7 @@ def rollout_model(
     force_drag_arr = force_drag_t[0, :, 0].detach().cpu().numpy()
     force_model_arr = force_model_t[0, :, 0].detach().cpu().numpy()
     hamiltonian_model_arr = hamiltonian_model_t[0, :].detach().cpu().numpy()
-    return {
+    result = {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
         "force_total": force_total_arr,
@@ -3615,3 +3801,7 @@ def rollout_model(
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
     }
+    if drag_coeff_t is not None and vortex_coeff_t is not None:
+        result["drag_coeff_pred"] = drag_coeff_t[0, :, 0].detach().cpu().numpy()
+        result["vortex_coeff_pred"] = vortex_coeff_t[0, :, 0].detach().cpu().numpy()
+    return result

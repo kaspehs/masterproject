@@ -2221,10 +2221,9 @@ def train(config: Config, config_name: str) -> None:
         else:
             meta_path = Path(config.data.file).resolve().parent / "metadata.json"
         f0_lookup = _try_load_metadata_map(meta_path)
-    per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
-    if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
-        raise ValueError("vpinn.per_traj_norm must be one of: none, force_rms, residual_rms.")
+    # Per-trajectory normalization has been removed; keep epsilon only for
+    # backward-compatible validation helper signatures.
+    per_traj_norm_eps = 1e-8
     if not (use_force_loss or use_weak_loss):
         raise ValueError("vpinn must enable at least one of: use_force_loss, use_weak_loss.")
 
@@ -2387,44 +2386,13 @@ def train(config: Config, config_name: str) -> None:
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
-    if per_traj_norm != "none":
-        _apply_per_traj_scale(
-            train_trajs,
-            mode=per_traj_norm,
-            dt=dt,
-            m=m,
-            c=c,
-            k=k,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            window_M=window_M,
-            stride=stride,
-            eps=per_traj_norm_eps,
-        )
-        if val_trajs:
-            _apply_per_traj_scale(
-                val_trajs,
-                mode=per_traj_norm,
-                dt=dt,
-                m=m,
-                c=c,
-                k=k,
-                w=w,
-                wdot=wdot,
-                alpha=alpha,
-                window_M=window_M,
-                stride=stride,
-                eps=per_traj_norm_eps,
-            )
-
     history_context = _tcn_history_len(model) if _is_tcn_force_model(model) else 0
     if history_context > 0:
         print(
             f"VPINN TCN context enabled: each loaded window has M+T+1 samples "
             f"(M={window_M}, T={history_context})."
         )
-    return_scale = per_traj_norm != "none"
+    return_scale = False
     train_dataset = WindowDataset(
         train_trajs,
         window_intervals=window_M,
@@ -2527,7 +2495,7 @@ def train(config: Config, config_name: str) -> None:
         gradnorm_count = 0
         batches = 0
 
-        expect_scale = per_traj_norm != "none"
+        expect_scale = False
         expect_f0 = use_force_coeff
         for step, batch in enumerate(train_loader):
             if len(batch) == 4:
