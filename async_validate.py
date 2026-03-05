@@ -536,6 +536,14 @@ def _run_vpinn_validation(
     input_dim = 2 * d + 1
     output_dim = d
     base_model = _build_force_model(cfg, input_dim=input_dim, output_dim=output_dim).to(device)
+    bound_force_coefficient = bool(vp.get("bound_force_coefficient", False)) and bool(force_representation == "coefficient")
+    force_coefficient_c_max = float(vp.get("force_coefficient_c_max", 5.0))
+    if not np.isfinite(force_coefficient_c_max) or force_coefficient_c_max <= 0.0:
+        raise ValueError(
+            f"vpinn.force_coefficient_c_max must be finite and > 0, got {force_coefficient_c_max}"
+        )
+    setattr(base_model, "bound_force_coefficient", bound_force_coefficient)
+    setattr(base_model, "force_coefficient_c_max", force_coefficient_c_max)
     # Keep validation backward-compatible with older checkpoints/configs:
     # scaling must be explicitly enabled, otherwise state_dict keys won't match.
     use_input_scaling = bool(vp.get("use_input_scaling", False))
@@ -554,6 +562,8 @@ def _run_vpinn_validation(
             ur_scale=ur_scale,
             f_scale=f_scale,
         )
+        setattr(model, "bound_force_coefficient", bound_force_coefficient)
+        setattr(model, "force_coefficient_c_max", force_coefficient_c_max)
     else:
         model = base_model
     _load_state(model, ckpt["model_state"])

@@ -7,8 +7,8 @@ data:
   cut_start_seconds: 5.0
   cut_start_seconds_train: 45.0
   cut_start_seconds_val: 45.0
-  reduce_time: true
-  reduction_factor: 100
+  reduce_time: false
+  reduction_factor: 1
   middle_time_plot: [15, 17]
   use_generated_train_series: true
   train_series_dir: Data_Gen/generated_series_Ur
@@ -24,6 +24,10 @@ model:
   max_damping_ratio: 0.2
   include_physical_drag: false
   force_output: coefficient
+  # If enabled (with force_output=coefficient), apply:
+  # C <- C_max * tanh(C / C_max)
+  bound_force_coefficient: false
+  force_coefficient_c_max: 5.0
   learn_hamiltonian: false
   discover_damping: false
   use_pirate_force: false

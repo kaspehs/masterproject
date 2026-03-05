@@ -380,6 +380,26 @@ def _tcn_history_len(model: nn.Module) -> int:
     return max(0, int(getattr(base, "history_len", 0)))
 
 
+def _force_coefficient_bound_cfg(model: nn.Module) -> tuple[bool, float]:
+    base = _unwrap_force_model(model)
+    enabled = bool(getattr(base, "bound_force_coefficient", False))
+    cmax = float(getattr(base, "force_coefficient_c_max", 5.0))
+    if not enabled:
+        enabled = bool(getattr(model, "bound_force_coefficient", False))
+        cmax = float(getattr(model, "force_coefficient_c_max", cmax))
+    return enabled, cmax
+
+
+def _maybe_bound_force_coefficient(model: nn.Module, values: torch.Tensor) -> torch.Tensor:
+    enabled, cmax = _force_coefficient_bound_cfg(model)
+    if not enabled:
+        return values
+    if not np.isfinite(cmax) or cmax <= 0.0:
+        raise ValueError(f"force_coefficient_c_max must be finite and > 0, got {cmax}")
+    cmax_t = values.new_tensor(float(cmax))
+    return cmax_t * torch.tanh(values / cmax_t)
+
+
 def _configured_validation_history_len(config: Config) -> int:
     """
     Resolve TCN history requirement from config (without constructing the model).
@@ -424,9 +444,10 @@ def _vpinn_force_sequence(
         out = model(inp)
         if out.ndim != 3:
             raise ValueError("TCN force model must return shape (B, T, d).")
-        return out
+        return _maybe_bound_force_coefficient(model, out)
     flat = inp.reshape(B * T, -1)
-    return model(flat).reshape(B, T, d)
+    out = model(flat).reshape(B, T, d)
+    return _maybe_bound_force_coefficient(model, out)
 
 
 def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor, ur: torch.Tensor) -> torch.Tensor:
@@ -2264,6 +2285,14 @@ def train(config: Config, config_name: str) -> None:
     output_dim = d
     model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim)
     model = model.to(device)
+    bound_force_coefficient = bool(vp.get("bound_force_coefficient", False)) and bool(use_force_coeff)
+    force_coefficient_c_max = float(vp.get("force_coefficient_c_max", 5.0))
+    if not np.isfinite(force_coefficient_c_max) or force_coefficient_c_max <= 0.0:
+        raise ValueError(f"vpinn.force_coefficient_c_max must be finite and > 0, got {force_coefficient_c_max}")
+    setattr(model, "bound_force_coefficient", bound_force_coefficient)
+    setattr(model, "force_coefficient_c_max", force_coefficient_c_max)
+    if bound_force_coefficient:
+        print(f"VPINN coefficient bound enabled: C_max={force_coefficient_c_max:g} (tanh bound).")
 
     use_input_scaling = bool(vp.get("use_input_scaling", False))
     if use_input_scaling:
@@ -2284,6 +2313,8 @@ def train(config: Config, config_name: str) -> None:
             ur_scale=ur_scale,
             f_scale=f_scale,
         )
+        setattr(model, "bound_force_coefficient", bound_force_coefficient)
+        setattr(model, "force_coefficient_c_max", force_coefficient_c_max)
         print(
             f"VPINN scaling enabled: x/D (D={x_scale:g}), v/(sqrt(k/m)D), U_r/{ur_scale:g}, "
             f"f_scale=kD."

@@ -70,6 +70,9 @@ class ModelConfig:
     q_scale: float | None = None
     p_scale: float | None = None
     ur_scale: float | None = None
+    # Optional coefficient bounding: C <- C_max * tanh(C / C_max)
+    bound_force_coefficient: bool = False
+    force_coefficient_c_max: float = 5.0
 
 def _default_residual_kwargs() -> dict[str, Any]:
     return {"hidden": 128, "layers": 2, "activation": "gelu"}
@@ -893,6 +896,8 @@ class PHVIV(nn.Module):
         use_feature_engineering: bool = False,
         use_reduced_velocity: bool = True,
         ur_scale: float | None = None,
+        bound_force_coefficient: bool = False,
+        force_coefficient_c_max: float = 5.0,
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
@@ -920,6 +925,11 @@ class PHVIV(nn.Module):
         self.learn_hamiltonian = bool(learn_hamiltonian)
         self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
+        self.bound_force_coefficient = bool(bound_force_coefficient)
+        cmax = float(force_coefficient_c_max)
+        if not np.isfinite(cmax) or cmax <= 0.0:
+            raise ValueError(f"force_coefficient_c_max must be finite and > 0, got {cmax}")
+        self.register_buffer("force_coefficient_c_max", torch.tensor(cmax, dtype=torch.float32))
         ur_scale_val = 1.0 if ur_scale is None else float(ur_scale)
         if not np.isfinite(ur_scale_val) or ur_scale_val == 0.0:
             raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
@@ -1135,6 +1145,8 @@ class PHVIV(nn.Module):
         fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
+        bound_force_coefficient = bool(cfg.get("bound_force_coefficient", False))
+        force_coefficient_c_max = float(cfg.get("force_coefficient_c_max", 5.0))
         physics_loss_discretization = str(cfg.get("physics_loss_discretization", "srk4"))
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
@@ -1185,6 +1197,8 @@ class PHVIV(nn.Module):
             use_feature_engineering=use_feature_engineering,
             use_reduced_velocity=use_reduced_velocity,
             ur_scale=ur_scale,
+            bound_force_coefficient=bound_force_coefficient,
+            force_coefficient_c_max=force_coefficient_c_max,
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
@@ -1436,6 +1450,12 @@ class PHVIV(nn.Module):
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
         return self.u_net(features)
 
+    def _maybe_bound_force_coeff(self, coeff: torch.Tensor) -> torch.Tensor:
+        if not self.bound_force_coefficient:
+            return coeff
+        cmax = self.force_coefficient_c_max.to(device=coeff.device, dtype=coeff.dtype)
+        return cmax * torch.tanh(coeff / cmax)
+
     def learned_force_coeff(
         self,
         x,
@@ -1450,9 +1470,10 @@ class PHVIV(nn.Module):
             ur_hist=ur_hist,
         )
         if self.force_output == "coefficient":
-            return raw
+            return self._maybe_bound_force_coeff(raw)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
-        return raw * self.k * self.D / f0
+        coeff = raw * self.k * self.D / f0
+        return self._maybe_bound_force_coeff(coeff)
 
     def learned_force(
         self,
@@ -1469,7 +1490,8 @@ class PHVIV(nn.Module):
         )
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
-            return raw * f0
+            coeff = self._maybe_bound_force_coeff(raw)
+            return coeff * f0
         return raw * self.k * self.D
 
     def learned_force_sequence(
@@ -1480,7 +1502,8 @@ class PHVIV(nn.Module):
         raw = self._force_net_raw_sequence(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
-            return raw * f0
+            coeff = self._maybe_bound_force_coeff(raw)
+            return coeff * f0
         return raw * self.k * self.D
 
     def learned_force_coeff_sequence(
@@ -1490,9 +1513,10 @@ class PHVIV(nn.Module):
     ) -> torch.Tensor:
         raw = self._force_net_raw_sequence(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
-            return raw
+            return self._maybe_bound_force_coeff(raw)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
-        return raw * self.k * self.D / f0
+        coeff = raw * self.k * self.D / f0
+        return self._maybe_bound_force_coeff(coeff)
 
     def drag_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         drag = self.drag_force(x)

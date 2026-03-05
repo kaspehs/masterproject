@@ -8,8 +8,8 @@ data:
   cut_start_seconds_val: 45.0
   use_generated_train_series: true
   train_series_dir: Data_Gen/generated_series_Ur_60
-  reduce_time: true
-  reduction_factor: 100
+  reduce_time: false
+  reduction_factor: 1
 
 model:
   rho: 1000.0
@@ -190,3 +190,7 @@ vpinn:
 
   # Force representation: "force" (default) or "coefficient" (C = F/F0).
   force_representation: coefficient
+  # If enabled (with force_representation=coefficient), apply:
+  # C <- C_max * tanh(C / C_max)
+  bound_force_coefficient: false
+  force_coefficient_c_max: 5.0
