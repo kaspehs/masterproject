@@ -15,9 +15,11 @@
 /Data_Gen/generated_series_Ur_40
 /Data_Gen/generated_series_Ur_60
 /Data_Gen/groundtruth_runs_100hz
+/Experimental_Data/eval_models
 __pycache__/
 *.pyc
 *.npz
 *.png
 *.json
 *.mat
+*.xlsx
