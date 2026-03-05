@@ -160,6 +160,9 @@ def _run_hnn_validation(
     per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
     log_loss_vs_ur_map = bool(getattr(cfg.monitoring, "log_loss_vs_ur_map", True))
+    rollout_include_force_mapping_nrmse = bool(
+        getattr(cfg.monitoring, "rollout_include_force_mapping_nrmse", True)
+    )
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
@@ -358,6 +361,7 @@ def _run_hnn_validation(
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
                 include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
                 include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
+                include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
                 validation_start_idx=val_start_idx,
             )
             for name, value in metrics.items():
@@ -412,35 +416,43 @@ def _run_hnn_validation(
             log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
             include_disp_nrmse=bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True)),
             include_force_nrmse=bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True)),
+            include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
             log_metrics=False,
             validation_start_idx=val_start_idx,
         )
     else:
-        force_map_sum = 0.0
-        count = 0
-        for series_raw, sequence in zip(val_series_raw, val_sequences):
-            _y_np, _t_np, _dt_value, _vel_np, force_np, _ur_np = series_raw
-            if force_np is None:
-                continue
-            y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
-            z_true = torch.stack((y_tensor, vel_tensor * m_eff), dim=1).to(device=device)
-            rv = ur_tensor.to(device=device)
-            with torch.no_grad():
-                force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
-            force_target = np.asarray(force_np).reshape(-1)
-            min_len = min(force_on_data.shape[0], force_target.shape[0])
-            if min_len <= 0:
-                continue
-            force_pred = force_on_data[:min_len]
-            force_true = force_target[:min_len]
-            rmse = float(np.sqrt(np.mean((force_pred - force_true) ** 2)))
-            force_std = float(np.std(force_true))
-            if force_std <= 0.0:
-                force_std = 1.0
-            force_map_sum += rmse / force_std
-            count += 1
-        if count > 0:
-            writer.add_scalar(f"val/{FORCE_MAPPING_NRMSE_KEY}", force_map_sum / float(count), epoch)
+        if rollout_include_force_mapping_nrmse:
+            force_map_sum = 0.0
+            count = 0
+            for series_raw, sequence in zip(val_series_raw, val_sequences):
+                _y_np, _t_np, _dt_value, _vel_np, force_np, _ur_np = series_raw
+                if force_np is None:
+                    continue
+                y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
+                z_true = torch.stack((y_tensor, vel_tensor * m_eff), dim=1).to(device=device)
+                rv = ur_tensor.to(device=device)
+                with torch.no_grad():
+                    force_on_data = (
+                        model.u_theta_on_trajectory(z_true, reduced_velocity=rv)
+                        .squeeze(-1)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                force_target = np.asarray(force_np).reshape(-1)
+                min_len = min(force_on_data.shape[0], force_target.shape[0])
+                if min_len <= 0:
+                    continue
+                force_pred = force_on_data[:min_len]
+                force_true = force_target[:min_len]
+                rmse = float(np.sqrt(np.mean((force_pred - force_true) ** 2)))
+                force_std = float(np.std(force_true))
+                if force_std <= 0.0:
+                    force_std = 1.0
+                force_map_sum += rmse / force_std
+                count += 1
+            if count > 0:
+                writer.add_scalar(f"val/{FORCE_MAPPING_NRMSE_KEY}", force_map_sum / float(count), epoch)
 
 
 def _run_vpinn_validation(
@@ -881,7 +893,7 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(
                             z_mid,
                             reduced_velocity=ur_i,
@@ -1066,7 +1078,7 @@ def _per_ur_loss_map_hnn(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(
                             z_mid,
                             reduced_velocity=ur_i,

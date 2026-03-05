@@ -205,7 +205,7 @@ def _train_one_epoch(
                 z_mid = 0.5 * (z_i + z_next)
                 f_mid = 0.5 * (f_i + f_next)
                 if force_output_coeff:
-                    f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                    f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                     f_pred = model.u_theta_coeff(
                         z_mid,
                         reduced_velocity=ur_i,
@@ -354,6 +354,7 @@ def _validate_if_needed(
     log_loss_vs_ur_map: bool,
     rollout_include_disp_nrmse: bool,
     rollout_include_force_nrmse: bool,
+    rollout_include_force_mapping_nrmse: bool,
     validation_start_seconds: float,
     history_context: int,
     force_reg: float,
@@ -475,6 +476,7 @@ def _validate_if_needed(
                 log_extra_metrics=log_extra_validation_metrics,
                 include_disp_nrmse=rollout_include_disp_nrmse,
                 include_force_nrmse=rollout_include_force_nrmse,
+                include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
                 validation_start_idx=val_start_idx,
             )
             for name, value in metrics.items():
@@ -525,6 +527,7 @@ def _validate_if_needed(
             log_extra_metrics=log_extra_validation_metrics,
             include_disp_nrmse=rollout_include_disp_nrmse,
             include_force_nrmse=rollout_include_force_nrmse,
+            include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
             log_metrics=False,
             validation_start_idx=val_start_idx,
         )
@@ -575,6 +578,7 @@ def _validate_if_needed(
         log_extra_metrics=log_extra_validation_metrics,
         include_disp_nrmse=rollout_include_disp_nrmse,
         include_force_nrmse=rollout_include_force_nrmse,
+        include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
         validation_start_idx=val_start_idx,
     )
 
@@ -594,6 +598,7 @@ def _log_final_rollouts_all(
     log_extra_validation_metrics: bool,
     rollout_include_disp_nrmse: bool,
     rollout_include_force_nrmse: bool,
+    rollout_include_force_mapping_nrmse: bool,
     validation_start_seconds: float,
     history_context: int,
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
@@ -661,6 +666,7 @@ def _log_final_rollouts_all(
             log_extra_metrics=log_extra_validation_metrics,
             include_disp_nrmse=rollout_include_disp_nrmse,
             include_force_nrmse=rollout_include_force_nrmse,
+            include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
             log_metrics=False,
             tag_prefix="final_val/rollout",
             step=step_idx,
@@ -900,7 +906,7 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(
                             z_mid,
                             reduced_velocity=ur_i,
@@ -1056,7 +1062,7 @@ def _per_ur_loss_map_hnn(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(
                             z_mid,
                             reduced_velocity=ur_i,
@@ -1206,6 +1212,9 @@ def train(config: Config, config_name: str) -> None:
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
     rollout_include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
     rollout_include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
+    rollout_include_force_mapping_nrmse = bool(
+        getattr(monitoring_cfg, "rollout_include_force_mapping_nrmse", True)
+    )
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
@@ -1496,6 +1505,7 @@ def train(config: Config, config_name: str) -> None:
                 log_loss_vs_ur_map=log_loss_vs_ur_map,
                 rollout_include_disp_nrmse=rollout_include_disp_nrmse,
                 rollout_include_force_nrmse=rollout_include_force_nrmse,
+                rollout_include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
                 validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
                 history_context=history_context,
                 force_reg=force_reg,
@@ -1530,6 +1540,7 @@ def train(config: Config, config_name: str) -> None:
             log_extra_validation_metrics=log_extra_validation_metrics,
             rollout_include_disp_nrmse=rollout_include_disp_nrmse,
             rollout_include_force_nrmse=rollout_include_force_nrmse,
+            rollout_include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
             validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
             history_context=history_context,
         )

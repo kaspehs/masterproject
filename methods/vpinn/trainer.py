@@ -921,25 +921,43 @@ def _safe_rel_rmse(pred: np.ndarray, target: np.ndarray, denom: float) -> float:
     return float(out)
 
 
-def _f0_from_reduced_velocity(
+def _u_from_reduced_velocity(
     ur_val: float,
     *,
-    rho: float,
     D: float,
     m_eff: float,
     k: float,
 ) -> float:
     ur = float(ur_val)
     if not np.isfinite(ur):
-        raise ValueError(f"Invalid reduced velocity value for F0 conversion: {ur}")
+        raise ValueError(f"Invalid reduced velocity value for U conversion: {ur}")
     if m_eff <= 0.0 or k <= 0.0:
-        raise ValueError(f"Invalid model parameters for F0 conversion: m_eff={m_eff}, k={k}")
+        raise ValueError(f"Invalid model parameters for U conversion: m_eff={m_eff}, k={k}")
     fn_hz = math.sqrt(float(k) / float(m_eff)) / (2.0 * math.pi)
     U_val = ur * float(fn_hz) * float(D)
-    f0 = 0.5 * float(rho) * float(D) * (float(U_val) ** 2)
-    if not np.isfinite(f0) or f0 <= 0.0:
-        raise ValueError(f"Invalid F0 from U_r conversion: {f0}")
-    return float(f0)
+    if not np.isfinite(U_val):
+        raise ValueError(f"Invalid U from U_r conversion: {U_val}")
+    return float(U_val)
+
+
+def _f0_series_from_u_and_velocity(
+    *,
+    u_ref: float,
+    velocity: np.ndarray,
+    rho: float,
+    D: float,
+) -> np.ndarray:
+    v = np.asarray(velocity, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError(f"velocity must be 2D, got shape {v.shape}")
+    if not np.isfinite(u_ref):
+        raise ValueError(f"Invalid reference U for F0 conversion: {u_ref}")
+    with np.errstate(over="ignore", invalid="ignore"):
+        f0 = 0.5 * float(rho) * float(D) * (float(u_ref) ** 2 + v ** 2)
+    if not np.all(np.isfinite(f0)):
+        raise ValueError("Invalid instantaneous F0 values (non-finite).")
+    f0 = np.clip(f0, 1e-12, None)
+    return np.asarray(f0, dtype=np.float64)
 
 
 def _normalize_ur_filter(values: Any, *, key: str) -> np.ndarray | None:
@@ -1166,26 +1184,28 @@ def _load_trajectory(
     force_representation = str(force_representation).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
-    f0_val = None
+    f0_series_np: Optional[np.ndarray] = None
     if force_representation == "coefficient":
         if f0_lookup is not None and path.name in f0_lookup:
             U_val = float(f0_lookup[path.name])
-            f0_val = 0.5 * float(rho) * float(D) * float(U_val) ** 2
         else:
             if f0_lookup is not None and path.name not in f0_lookup:
                 warnings.warn(
                     f"Metadata missing U for '{path.name}'. Falling back to U_r-based F0 conversion."
                 )
-            f0_val = _f0_from_reduced_velocity(
+            U_val = _u_from_reduced_velocity(
                 ur_val,
-                rho=float(rho),
                 D=float(D),
                 m_eff=float(m_eff),
                 k=float(k),
             )
-        if not np.isfinite(f0_val) or f0_val <= 0.0:
-            raise ValueError(f"Invalid F0 for '{path.name}': {f0_val}")
-        f_meas = f_meas / float(f0_val)
+        f0_series_np = _f0_series_from_u_and_velocity(
+            u_ref=float(U_val),
+            velocity=np.asarray(v, dtype=np.float64),
+            rho=float(rho),
+            D=float(D),
+        )
+        f_meas = f_meas / f0_series_np
 
     ur_series = np.full((t.shape[0], 1), float(ur_val), dtype=np.float32)
     traj = {
@@ -1198,9 +1218,8 @@ def _load_trajectory(
         # First timestep included in validation targets (prefix before this can be used as TCN history).
         "val_start_idx": int(validation_start_idx),
     }
-    if f0_val is not None:
-        f0_series = np.full((t.shape[0], 1), float(f0_val), dtype=np.float32)
-        traj["f0"] = torch.from_numpy(f0_series)
+    if f0_series_np is not None:
+        traj["f0"] = torch.from_numpy(np.asarray(f0_series_np, dtype=np.float32))
     return traj, dt
 
 

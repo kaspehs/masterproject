@@ -127,8 +127,10 @@ monitoring:
   cycle_validation_rollout: true
   final_rollout_all_validation: true
   # Toggle rollout NRMSE validation metrics.
-  rollout_include_disp_nrmse: true
-  rollout_include_force_nrmse: true
+  rollout_include_disp_nrmse: false
+  rollout_include_force_nrmse: false
+  # Toggle force-mapping NRMSE validation metric (and its extra compute).
+  rollout_include_force_mapping_nrmse: true
   # Disable to skip per-U_r loss-map pass/logging.
   log_loss_vs_ur_map: true
   # Extra rollout metrics: dominant frequency relative error, amplitude relative error,
