@@ -26,7 +26,7 @@ model:
   force_output: coefficient
   # If enabled (with force_output=coefficient), apply:
   # C <- C_max * tanh(C / C_max)
-  bound_force_coefficient: false
+  bound_force_coefficient: true
   force_coefficient_c_max: 5.0
   learn_hamiltonian: false
   discover_damping: false

@@ -57,7 +57,7 @@ class ModelConfig:
     damping_c: float = 1e-4
     max_damping_ratio: float = 0.2
     include_physical_drag: bool = False
-    force_output: str = "force"  # "force" or "coefficient"
+    force_output: str = "force"  # "force", "coefficient", or "two_head_vivana"
     learn_hamiltonian: bool = False
     discover_damping: bool = False
     use_pirate_force: bool = False
@@ -945,9 +945,10 @@ class PHVIV(nn.Module):
         self.discover_damping = bool(discover_damping)
         self.include_physical_drag = bool(include_physical_drag)
         force_output = str(force_output).strip().lower()
-        if force_output not in {"force", "coefficient"}:
-            raise ValueError("force_output must be one of: force, coefficient")
+        if force_output not in {"force", "coefficient", "two_head_vivana"}:
+            raise ValueError("force_output must be one of: force, coefficient, two_head_vivana")
         self.force_output = force_output
+        self.use_two_head_vivana = self.force_output == "two_head_vivana"
         self.loss_discretization = "srk4"
         self.set_loss_discretization(physics_loss_discretization)
         self.learn_hamiltonian = bool(learn_hamiltonian)
@@ -1029,6 +1030,7 @@ class PHVIV(nn.Module):
         self.use_pirate_force = net_type == "pirate"
         self.use_tcn_force = net_type == "tcn"
         self.residual_net = net_type == "residual"
+        self.force_raw_dim = 2 if self.use_two_head_vivana else 1
         tcn_mode_requested = self.use_tcn_force or self.use_tcn_backbone
         if self.use_fourier_features:
             if self.fourier_features < 1:
@@ -1052,7 +1054,7 @@ class PHVIV(nn.Module):
                 head_cfg = dict(pirate_cfg)
                 pirate_args = {
                     "input_size": int(in_features),
-                    "output_size": 1,
+                    "output_size": int(self.force_raw_dim),
                     "depth": int(head_cfg.pop("depth", head_cfg.pop("pirate_layers", 2))),
                     "fourier_features": int(head_cfg.pop("fourier_features", 64)),
                     "sigma": float(head_cfg.pop("sigma", 1.0)),
@@ -1065,7 +1067,7 @@ class PHVIV(nn.Module):
                 layers = [nn.Linear(int(in_features), self.residual_hidden)]
                 for _ in range(self.residual_layers):
                     layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
-                layers.append(nn.Linear(self.residual_hidden, 1))
+                layers.append(nn.Linear(self.residual_hidden, int(self.force_raw_dim)))
                 return nn.Sequential(*layers)
             if key == "mlp":
                 mlp_layers: list[nn.Module] = []
@@ -1075,14 +1077,14 @@ class PHVIV(nn.Module):
                     mlp_layers.append(nn.Linear(head_in, self.mlp_hidden))
                     mlp_layers.append(mlp_act_cls())
                     head_in = self.mlp_hidden
-                mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
+                mlp_layers.append(nn.Linear(self.mlp_hidden, int(self.force_raw_dim)))
                 return nn.Sequential(*mlp_layers)
             raise ValueError(f"Unsupported PHNN force head type '{head_net_type}'.")
 
         if self.use_tcn_force:
             self.u_net = TemporalConvForceNet(
                 input_size=force_in_features,
-                output_size=1,
+                output_size=int(self.force_raw_dim),
                 hidden_channels=self.tcn_hidden,
                 levels=self.tcn_levels,
                 dilation_start=self.tcn_dilation_start,
@@ -1398,6 +1400,21 @@ class PHVIV(nn.Module):
         f0 = 0.5 * float(self.rho) * float(self.D) * speed_sq
         return torch.clamp(f0, min=1e-12)
 
+    def _flow_speed_from_reduced_velocity(
+        self,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None,
+        *,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
+        if rv_raw is None:
+            return like.new_full(like.shape[:-1] + (1,), float(self.U))
+        omega_n = torch.sqrt(
+            torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
+        )
+        f_n = omega_n / (2.0 * math.pi)
+        return rv_raw * f_n * float(self.D)
+
     def _force_features(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         base_features = self._base_features(x)
         if self.use_reduced_velocity:
@@ -1499,6 +1516,35 @@ class PHVIV(nn.Module):
         cmax = self.force_coefficient_c_max.to(device=coeff.device, dtype=coeff.dtype)
         return cmax * torch.tanh(coeff / cmax)
 
+    def _two_head_vivana_force_from_raw(
+        self,
+        raw: torch.Tensor,
+        *,
+        x: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if raw.shape[-1] != 2:
+            raise ValueError(
+                f"two_head_vivana expects force head output with last dim=2, got shape {tuple(raw.shape)}."
+            )
+        # Coefficients per term: [drag_like, vortex_like].
+        coeff = self._maybe_bound_force_coeff(raw)
+        c_drag = coeff[..., 0:1]
+        c_vortex = coeff[..., 1:2]
+
+        # State x = [q, p], with velocity dy = p / m.
+        dy = x[..., 1:2] / float(self.m)
+        u_flow = self._flow_speed_from_reduced_velocity(reduced_velocity, like=dy)
+        v_rel = torch.sqrt(torch.clamp(u_flow**2 + dy**2, min=1e-12))
+        pref = 0.5 * float(self.rho) * float(self.D)
+
+        # Requested scaling:
+        #   F_drag_like   ~ |V_rel| * dy
+        #   F_vortex_like ~ |V_rel| * U
+        force_drag = pref * c_drag * v_rel * dy
+        force_vortex = pref * c_vortex * v_rel * u_flow
+        return force_drag + force_vortex, c_drag, c_vortex
+
     def learned_force_coeff(
         self,
         x,
@@ -1512,6 +1558,10 @@ class PHVIV(nn.Module):
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
+        if self.use_two_head_vivana:
+            total_force, _, _ = self._two_head_vivana_force_from_raw(raw, x=x, reduced_velocity=reduced_velocity)
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=total_force, state=x)
+            return total_force / f0
         if self.force_output == "coefficient":
             return self._maybe_bound_force_coeff(raw)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
@@ -1531,6 +1581,9 @@ class PHVIV(nn.Module):
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
+        if self.use_two_head_vivana:
+            total_force, _, _ = self._two_head_vivana_force_from_raw(raw, x=x, reduced_velocity=reduced_velocity)
+            return total_force
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
             coeff = self._maybe_bound_force_coeff(raw)
@@ -1543,6 +1596,9 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     ) -> torch.Tensor:
         raw = self._force_net_raw_sequence(x, reduced_velocity=reduced_velocity)
+        if self.use_two_head_vivana:
+            total_force, _, _ = self._two_head_vivana_force_from_raw(raw, x=x, reduced_velocity=reduced_velocity)
+            return total_force
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
             coeff = self._maybe_bound_force_coeff(raw)
@@ -1555,6 +1611,10 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     ) -> torch.Tensor:
         raw = self._force_net_raw_sequence(x, reduced_velocity=reduced_velocity)
+        if self.use_two_head_vivana:
+            total_force, _, _ = self._two_head_vivana_force_from_raw(raw, x=x, reduced_velocity=reduced_velocity)
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=total_force, state=x)
+            return total_force / f0
         if self.force_output == "coefficient":
             return self._maybe_bound_force_coeff(raw)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)

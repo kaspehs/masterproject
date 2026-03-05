@@ -194,5 +194,5 @@ vpinn:
   force_representation: coefficient
   # If enabled (with force_representation=coefficient), apply:
   # C <- C_max * tanh(C / C_max)
-  bound_force_coefficient: false
+  bound_force_coefficient: true
   force_coefficient_c_max: 5.0
