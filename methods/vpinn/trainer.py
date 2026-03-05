@@ -2467,6 +2467,17 @@ def train(config: Config, config_name: str) -> None:
         else None
     )
 
+    train_instances = int(len(train_dataset))
+    train_steps_per_epoch = (train_instances + batch_size - 1) // batch_size
+    val_instances = int(len(val_dataset)) if val_dataset is not None else 0
+    train_traj_count = int(len(train_trajs))
+    val_traj_count = int(len(val_trajs)) if val_trajs else 0
+    print(
+        f"VPINN data summary: train trajectories={train_traj_count}, train instances={train_instances}, "
+        f"val trajectories={val_traj_count}, val instances={val_instances}."
+    )
+    print(f"VPINN optimization summary: batch_size={batch_size}, steps_per_epoch={train_steps_per_epoch}.")
+
     log_every = int(getattr(monitoring_cfg, "log_every_epochs", 1))
     print_every = int(getattr(monitoring_cfg, "print_every_epochs", 1))
     validate_every = int(getattr(monitoring_cfg, "validate_every_epochs", 1))

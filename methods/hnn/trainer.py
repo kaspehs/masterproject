@@ -1329,6 +1329,17 @@ def train(config: Config, config_name: str) -> None:
                 history_len=history_context,
             )
 
+    train_instances = int(len(train_loader.dataset))
+    train_steps_per_epoch = (train_instances + batch_size - 1) // batch_size
+    val_instances = int(len(val_loader.dataset)) if val_loader is not None else 0
+    train_traj_count = int(len(train_series_raw))
+    val_traj_count = int(len(val_series_raw)) if val_series_raw is not None else 0
+    print(
+        f"PHNN data summary: train trajectories={train_traj_count}, train instances={train_instances}, "
+        f"val trajectories={val_traj_count}, val instances={val_instances}."
+    )
+    print(f"PHNN optimization summary: batch_size={batch_size}, steps_per_epoch={train_steps_per_epoch}.")
+
     if use_generated_train_series:
         y_data_t, val_vel, _t_tensor, val_ur = eval_y_tensor, eval_vel_tensor, eval_t_tensor, eval_ur_tensor
     else:
