@@ -1202,6 +1202,11 @@ def train(config: Config, config_name: str) -> None:
     # backward-compatible loss helper signatures.
     per_traj_norm_eps = 1e-8
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
+    filter_too_short_series = bool(hnn_cfg.get("filter_too_short_series", False))
+    min_required_samples_raw = hnn_cfg.get("min_required_samples")
+    min_required_samples = None if min_required_samples_raw is None else int(min_required_samples_raw)
+    if min_required_samples is not None and min_required_samples < 2:
+        raise ValueError("hnn.min_required_samples must be >= 2 when provided.")
     train_include_ur = _as_float_list(hnn_cfg.get("train_include_ur"), key="hnn.train_include_ur")
     train_exclude_ur = _as_float_list(hnn_cfg.get("train_exclude_ur"), key="hnn.train_exclude_ur")
     train_ur_filter_tol = float(hnn_cfg.get("train_ur_filter_tol", 1e-6))
@@ -1319,6 +1324,8 @@ def train(config: Config, config_name: str) -> None:
         num_workers=num_workers,
         pin_memory=pin_memory,
         history_len=history_context,
+        filter_too_short_series=filter_too_short_series,
+        min_required_samples=min_required_samples,
     )
 
     val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] | None = None
@@ -1355,6 +1362,8 @@ def train(config: Config, config_name: str) -> None:
                 num_workers=num_workers,
                 pin_memory=pin_memory,
                 history_len=history_context,
+                filter_too_short_series=filter_too_short_series,
+                min_required_samples=min_required_samples,
             )
 
     train_instances = int(len(train_loader.dataset))

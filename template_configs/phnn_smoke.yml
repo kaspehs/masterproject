@@ -158,6 +158,12 @@ hnn: # file or compute
   train_include_ur: null
   train_exclude_ur: []
   train_ur_filter_tol: 1e-6
+  # Optional: skip too-short trajectories before dataloader build.
+  # Useful for TCN runs when some generated series are shorter than history_len+2.
+  filter_too_short_series: false
+  # Optional absolute minimum sequence length; effective requirement is
+  # max(min_required_samples, history_len+2). Set null to use history-based requirement only.
+  min_required_samples: null
 pinn: {}
 
 #For running all config files

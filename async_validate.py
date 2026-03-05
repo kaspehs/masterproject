@@ -156,6 +156,11 @@ def _run_hnn_validation(
     data_cfg = cfg.data
     hnn_cfg = dict(cfg.hnn or {})
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
+    filter_too_short_series = bool(hnn_cfg.get("filter_too_short_series", False))
+    min_required_samples_raw = hnn_cfg.get("min_required_samples")
+    min_required_samples = None if min_required_samples_raw is None else int(min_required_samples_raw)
+    if min_required_samples is not None and min_required_samples < 2:
+        raise ValueError("hnn.min_required_samples must be >= 2 when provided.")
     # Per-trajectory normalization has been removed; keep epsilon only for
     # backward-compatible loss helper signatures.
     per_traj_norm_eps = 1e-8
@@ -261,6 +266,8 @@ def _run_hnn_validation(
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
         history_len=history_context,
+        filter_too_short_series=filter_too_short_series,
+        min_required_samples=min_required_samples,
     )
 
     if do_losses:

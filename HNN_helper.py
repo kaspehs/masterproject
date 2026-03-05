@@ -1651,6 +1651,32 @@ class PHVIV(nn.Module):
             z_hist=z_hist,
             ur_hist=ur_hist,
         )
+
+    def _force_with_coeff_parts(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        z_hist: torch.Tensor | None = None,
+        ur_hist: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        raw = self._force_net_raw(
+            x,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
+        if self.use_two_head_vivana:
+            total_force, c_drag, c_vortex = self._two_head_vivana_force_from_raw(
+                raw,
+                x=x,
+                reduced_velocity=reduced_velocity,
+            )
+            return total_force, c_drag, c_vortex
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
+            coeff = self._maybe_bound_force_coeff(raw)
+            return coeff * f0, None, None
+        return raw * self.k * self.D, None, None
     
     def u_theta(
         self,
@@ -1734,11 +1760,12 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_coeff_parts: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """
         Compute state derivative and total force using a single force-network call.
         """
-        force = self.u_theta(
+        force, c_drag, c_vortex = self._force_with_coeff_parts(
             x,
             reduced_velocity=reduced_velocity,
             z_hist=z_hist,
@@ -1756,6 +1783,8 @@ class PHVIV(nn.Module):
             c_eff = self.fixed_c
         damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
         dz = (JgH - damping_term) + forcing_term
+        if return_coeff_parts:
+            return dz, force, c_drag, c_vortex
         return dz, force
 
     def g(
@@ -1803,24 +1832,69 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         z_hist: torch.Tensor | None = None,
         ur_hist: torch.Tensor | None = None,
+        return_coeff_parts: bool = False,
     ):
         """
         Perform one Runge-Kutta 4 integration step and return both the next state
         and the averaged force over the step.
         """
-        k1, force1 = self._g_and_force(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        if return_coeff_parts:
+            k1, force1, c_drag1, c_vortex1 = self._g_and_force(
+                x,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+                return_coeff_parts=True,
+            )
+        else:
+            k1, force1 = self._g_and_force(x, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x2 = x + 0.5 * dt * k1
-        k2, force2 = self._g_and_force(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        if return_coeff_parts:
+            k2, force2, c_drag2, c_vortex2 = self._g_and_force(
+                x2,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+                return_coeff_parts=True,
+            )
+        else:
+            k2, force2 = self._g_and_force(x2, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x3 = x + 0.5 * dt * k2
-        k3, force3 = self._g_and_force(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        if return_coeff_parts:
+            k3, force3, c_drag3, c_vortex3 = self._g_and_force(
+                x3,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+                return_coeff_parts=True,
+            )
+        else:
+            k3, force3 = self._g_and_force(x3, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x4 = x + dt * k3
-        k4, force4 = self._g_and_force(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
+        if return_coeff_parts:
+            k4, force4, c_drag4, c_vortex4 = self._g_and_force(
+                x4,
+                reduced_velocity=reduced_velocity,
+                z_hist=z_hist,
+                ur_hist=ur_hist,
+                return_coeff_parts=True,
+            )
+        else:
+            k4, force4 = self._g_and_force(x4, reduced_velocity=reduced_velocity, z_hist=z_hist, ur_hist=ur_hist)
 
         x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
+        if return_coeff_parts:
+            if self.use_two_head_vivana:
+                c_drag_avg = (c_drag1 + 2.0 * c_drag2 + 2.0 * c_drag3 + c_drag4) / 6.0
+                c_vortex_avg = (c_vortex1 + 2.0 * c_vortex2 + 2.0 * c_vortex3 + c_vortex4) / 6.0
+            else:
+                c_drag_avg = None
+                c_vortex_avg = None
+            return x_next, force_avg, c_drag_avg, c_vortex_avg
         return x_next, force_avg
 
     def rollout(
@@ -1831,6 +1905,7 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         z_hist_init: torch.Tensor | None = None,
         ur_hist_init: torch.Tensor | None = None,
+        record_coeff_parts: bool = False,
     ):
         """
         z0: (B, state_dim)    starting state from data
@@ -1838,6 +1913,7 @@ class PHVIV(nn.Module):
         returns:
         Z_pred: (B, K+1, state_dim)  predictions incl. z0
         F_hist: (B, K+1, 1)          optional, learned force per step
+        C_drag_hist/C_vortex_hist: optional coefficient traces when record_coeff_parts=True
         """
         B = z0.shape[0]
         state_dim = z0.shape[-1]
@@ -1845,6 +1921,8 @@ class PHVIV(nn.Module):
 
         Z_pred = [z0]
         F_hist = []
+        C_drag_hist = []
+        C_vortex_hist = []
 
         z = z0
         history_len = int(self.history_len) + 1 if self.is_tcn_force_model else 0
@@ -1873,16 +1951,33 @@ class PHVIV(nn.Module):
                     rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=z[..., :1])
                     assert rv_raw is not None
                     ur_hist = rv_raw.unsqueeze(1).repeat(1, history_len, 1)
+        initial_force, initial_c_drag, initial_c_vortex = self._force_with_coeff_parts(
+            z,
+            reduced_velocity=reduced_velocity,
+            z_hist=z_hist,
+            ur_hist=ur_hist,
+        )
         for k in range(K):
             t = t_seq[:, k]
-            z, Fk = self.rk4_step(
-                z,
-                t,
-                dt,
-                reduced_velocity=reduced_velocity,
-                z_hist=z_hist,
-                ur_hist=ur_hist,
-            )
+            if record_coeff_parts:
+                z, Fk, c_drag_k, c_vortex_k = self.rk4_step(
+                    z,
+                    t,
+                    dt,
+                    reduced_velocity=reduced_velocity,
+                    z_hist=z_hist,
+                    ur_hist=ur_hist,
+                    return_coeff_parts=True,
+                )
+            else:
+                z, Fk = self.rk4_step(
+                    z,
+                    t,
+                    dt,
+                    reduced_velocity=reduced_velocity,
+                    z_hist=z_hist,
+                    ur_hist=ur_hist,
+                )
             if self.is_tcn_force_model and z_hist is not None:
                 z_hist = torch.cat([z_hist[:, 1:, :], z.unsqueeze(1)], dim=1)
                 if ur_hist is not None:
@@ -1891,13 +1986,24 @@ class PHVIV(nn.Module):
                     ur_hist = torch.cat([ur_hist[:, 1:, :], rv_raw.unsqueeze(1)], dim=1)
             Z_pred.append(z)
             F_hist.append(Fk)
+            if record_coeff_parts and self.use_two_head_vivana:
+                assert c_drag_k is not None and c_vortex_k is not None
+                C_drag_hist.append(c_drag_k)
+                C_vortex_hist.append(c_vortex_k)
 
         Z_pred = torch.stack(Z_pred, dim=1)            # (B,K+1,D)
         if F_hist:
-            initial_force = self.u_theta(z0, reduced_velocity=reduced_velocity)
             F_hist = torch.stack([initial_force] + F_hist, dim=1)
         else:
             F_hist = None
+        if record_coeff_parts:
+            if self.use_two_head_vivana and C_drag_hist and C_vortex_hist:
+                c_drag_hist = torch.stack([initial_c_drag] + C_drag_hist, dim=1)
+                c_vortex_hist = torch.stack([initial_c_vortex] + C_vortex_hist, dim=1)
+            else:
+                c_drag_hist = None
+                c_vortex_hist = None
+            return Z_pred, F_hist, c_drag_hist, c_vortex_hist
         return Z_pred, F_hist
 
     @staticmethod
@@ -3179,13 +3285,25 @@ def build_dataloader_from_series(
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
     history_len: int = 0,
+    filter_too_short_series: bool = False,
+    min_required_samples: int | None = None,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
         raise ValueError("series_data must contain at least one (y, t, dt, vel, force, U_r) tuple.")
     sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     datasets: list[TensorDataset | ConcatDataset] = []
     min_length: int | None = None
-    for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
+    required_len = int(history_len) + 2 if int(history_len) > 0 else 2
+    if min_required_samples is not None:
+        required_len = max(required_len, int(min_required_samples))
+    if required_len < 2:
+        required_len = 2
+    skipped_short: list[tuple[int, int]] = []
+    for idx, (y_np, t_np, dt_value, vel_np, force_np, ur_np) in enumerate(series_data):
+        seq_len_raw = int(np.asarray(y_np, dtype=float).reshape(-1).shape[0])
+        if bool(filter_too_short_series) and seq_len_raw < required_len:
+            skipped_short.append((idx, seq_len_raw))
+            continue
         y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
             y_np,
             t_np,
@@ -3223,6 +3341,18 @@ def build_dataloader_from_series(
         )
         seq_len = y_tensor.shape[0]
         min_length = seq_len if min_length is None else min(min_length, seq_len)
+    if skipped_short:
+        details = ", ".join([f"idx={i}:len={n}" for i, n in skipped_short[:8]])
+        suffix = " ..." if len(skipped_short) > 8 else ""
+        print(
+            f"Filtered out {len(skipped_short)} short time series before dataloader build "
+            f"(required_len={required_len}): {details}{suffix}"
+        )
+    if not datasets:
+        raise ValueError(
+            "No usable time series remain after short-series filtering. "
+            f"required_len={required_len}, original_count={len(series_data)}."
+        )
     dataset = combine_datasets(datasets)
     loader_kwargs: dict[str, object] = {
         "dataset": dataset,
@@ -3757,14 +3887,28 @@ def rollout_model(
         ur_hist_init = rv_tensor.unsqueeze(1).expand(1, history_len + 1, 1).contiguous()
 
     with torch.no_grad():
-        z_pred, f_hist = model.rollout(
-            z0,
-            t_seq,
-            dt,
-            reduced_velocity=rv_tensor,
-            z_hist_init=z_hist_init,
-            ur_hist_init=ur_hist_init,
-        )
+        use_two_head_vivana = bool(getattr(model, "use_two_head_vivana", False))
+        if use_two_head_vivana:
+            z_pred, f_hist, c_drag_hist, c_vortex_hist = model.rollout(
+                z0,
+                t_seq,
+                dt,
+                reduced_velocity=rv_tensor,
+                z_hist_init=z_hist_init,
+                ur_hist_init=ur_hist_init,
+                record_coeff_parts=True,
+            )
+        else:
+            z_pred, f_hist = model.rollout(
+                z0,
+                t_seq,
+                dt,
+                reduced_velocity=rv_tensor,
+                z_hist_init=z_hist_init,
+                ur_hist_init=ur_hist_init,
+            )
+            c_drag_hist = None
+            c_vortex_hist = None
         if f_hist is None:
             force_total_t = model.u_theta_sequence(
                 z_pred,
@@ -3778,11 +3922,8 @@ def rollout_model(
         else:
             force_model_t = model.learned_force(z_pred, reduced_velocity=rv_seq)
         force_drag_t = torch.zeros_like(force_total_t)
-        drag_coeff_t: torch.Tensor | None = None
-        vortex_coeff_t: torch.Tensor | None = None
-        if bool(getattr(model, "use_two_head_vivana", False)):
-            raw_force_seq = model._force_net_raw_sequence(z_pred, reduced_velocity=rv_seq)
-            drag_coeff_t, vortex_coeff_t = model._two_head_vivana_coeff_from_raw(raw_force_seq)
+        drag_coeff_t = c_drag_hist
+        vortex_coeff_t = c_vortex_hist
         hamiltonian_model_t = model.H(z_pred)
 
     y_samples_arr = z_pred[0, :, 0].detach().cpu().numpy()
