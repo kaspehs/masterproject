@@ -3,11 +3,11 @@ method: vpinn
 data:
   # Use the same training-series setup as `HNNrunconfigs/pirate_smoke.yml`.
   file: data.npz
-  cut_start_seconds: 2.0
-  cut_start_seconds_train: 45.0
-  cut_start_seconds_val: 45.0
+  cut_start_seconds: 0.0
+  cut_start_seconds_train: 0.0
+  cut_start_seconds_val: 3.0
   use_generated_train_series: true
-  train_series_dir: Data_Gen/generated_series_Ur_60
+  train_series_dir: Experimental_Data/CF_corrected_v3
   reduce_time: false
   reduction_factor: 1
 
@@ -28,7 +28,7 @@ smoothing:
 architecture:
   # Used when `vpinn.use_architecture_config: true`
   # Options: residual | mlp | pirate | tcn
-  force_net_type: residual
+  force_net_type: tcn
   residual_kwargs:
     hidden: 128
     layers: 3
@@ -41,19 +41,19 @@ architecture:
     # If true (and force_net_type is residual/mlp/pirate), run TCN first and then
     # feed its per-timestep features into that head network.
     enabled: false
-    hidden: 128
+    hidden: 16
     # First block dilation. Full stack becomes: dilation_start * [1, 2, 4, ...].
-    dilation_start: 1
+    dilation_start: 8
     # Output feature width from TCN backbone into the head network.
     # Defaults to `hidden` if omitted.
-    head_input_dim: 128
-    levels: 4
-    kernel_size: 3
+    #head_input_dim: 
+    levels: 2
+    kernel_size: 5
     dropout: 0.0
     activation: gelu
     # Number of previous timesteps used as left context.
     # Defaults to vpinn.window_M if omitted.
-    history_len: 64
+    history_len: 200
   pirate_force_kwargs:
     depth: 2
     fourier_features: 64
@@ -62,9 +62,9 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 8192
+  batch_size: 1024
   max_grad_norm: 10000.0
-  epochs: 2000
+  epochs: 200
 
 optim:
   lr: 0.001
@@ -98,12 +98,12 @@ logging:
 
 monitoring:
   # Logging / validation cadence
-  log_every_epochs: 10
-  print_every_epochs: 50
-  validate_every_epochs: 20
+  log_every_epochs: 5
+  print_every_epochs: 10
+  validate_every_epochs: 10
 
   # Rollout validation plots (dynamics check)
-  rollout_every_epochs: 20
+  rollout_every_epochs: 10
   rollout_max_trajectories: 1
   # Toggle rollout NRMSE validation metrics.
   rollout_include_disp_nrmse: false
@@ -111,7 +111,7 @@ monitoring:
   # Toggle force-mapping NRMSE validation metric.
   rollout_include_force_mapping_nrmse: true
   # Disable to skip per-U_r loss-map pass/logging.
-  log_loss_vs_ur_map: true
+  log_loss_vs_ur_map: false
   # Extra rollout metrics: dominant frequency relative error, amplitude relative error,
   # displacement/force spectral shape errors.
   log_extra_validation_metrics: true
@@ -135,7 +135,7 @@ vpinn:
   gradnorm_min_weight: 0.001
   gradnorm_max_weight: 1000.0
   gradnorm_update_every_steps: 10
-  window_M: 10
+  window_M: 100
   stride: 2
   val_fraction: 0.0
   split_seed: 0

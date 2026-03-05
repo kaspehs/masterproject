@@ -4,14 +4,14 @@ data:
   file: data.npz
   steadystate: false
   steadystate_time_threshold: 10.0
-  cut_start_seconds: 5.0
-  cut_start_seconds_train: 45.0
-  cut_start_seconds_val: 45.0
+  cut_start_seconds: 0.0
+  cut_start_seconds_train: 3.0
+  cut_start_seconds_val: 3.0
   reduce_time: false
   reduction_factor: 1
   middle_time_plot: [15, 17]
   use_generated_train_series: true
-  train_series_dir: Data_Gen/generated_series_Ur
+  train_series_dir: Experimental_Data/CF_corrected_v3
 
 model:
   rho: 1000.0
@@ -45,7 +45,7 @@ smoothing:
 
 architecture:
   # Options: residual | mlp | pirate | tcn
-  force_net_type: residual
+  force_net_type: tcn
   residual_kwargs:
     hidden: 128
     layers: 3
@@ -59,18 +59,18 @@ architecture:
     # residual/mlp/pirate head (when force_net_type is not "tcn").
     enabled: false
     use_as_backbone: false
-    hidden: 128
+    hidden: 16
     # First block dilation. Full stack becomes: dilation_start * [1, 2, 4, ...].
-    dilation_start: 1
-    levels: 4
-    kernel_size: 3
+    dilation_start: 8
+    levels: 2
+    kernel_size: 5
     dropout: 0.0
     activation: gelu
     # Output feature width from TCN backbone before pointwise head.
     # If null, defaults to `hidden`.
     head_input_dim: null
     # Number of previous timesteps used as left context in PHNN force evaluation.
-    history_len: 64
+    history_len: 200
   pirate_force_kwargs:
     depth: 2
     fourier_features: 64
@@ -79,9 +79,9 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 8192
-  max_grad_norm: 10000.0
-  epochs: 2000
+  batch_size: 1024
+  max_grad_norm: 5.0
+  epochs: 200
 
 optim:
   lr: 0.001
@@ -102,10 +102,10 @@ loss:
   force_reg_on_coeff: true
   use_force_data_loss: false
   force_data_weight: 1.0
-  use_gradnorm: false
+  use_gradnorm: true
   gradnorm_alpha: 0.9
-  gradnorm_min_weight: 0.2
-  gradnorm_max_weight: 5.0
+  gradnorm_min_weight: 0.001
+  gradnorm_max_weight: 1000.0
 
 runtime:
   device: cuda
@@ -121,8 +121,8 @@ compile:
   compile_mode: reduce-overhead
 
 monitoring:
-  rollout_every_epochs: 20
-  validate_every_epochs: 20
+  rollout_every_epochs: 10
+  validate_every_epochs: 10
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
   final_rollout_all_validation: true
@@ -132,12 +132,12 @@ monitoring:
   # Toggle force-mapping NRMSE validation metric (and its extra compute).
   rollout_include_force_mapping_nrmse: true
   # Disable to skip per-U_r loss-map pass/logging.
-  log_loss_vs_ur_map: true
+  log_loss_vs_ur_map: false
   # Extra rollout metrics: dominant frequency relative error, amplitude relative error,
   # displacement/force spectral shape errors.
   log_extra_validation_metrics: true
-  log_every_epochs: 10
-  print_every_epochs: 50
+  log_every_epochs: 5
+  print_every_epochs: 10
   log_component_grad_norms: false
   async_validation: true
   async_validation_device: cpu
