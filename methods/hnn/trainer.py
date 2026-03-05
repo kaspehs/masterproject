@@ -158,7 +158,7 @@ def _train_one_epoch(
                 z_mid = 0.5 * (z_i + z_next)
                 f_mid = 0.5 * (f_i + f_next)
                 if force_output_coeff:
-                    f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                    f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                     f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                     f_mid = f_mid / f0
                 else:
@@ -703,7 +703,7 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:
@@ -828,7 +828,7 @@ def _per_ur_loss_map_hnn(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:

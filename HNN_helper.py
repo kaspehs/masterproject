@@ -434,19 +434,46 @@ def log_validation_epoch(
         title_suffix=title_suffix,
     )
     with torch.no_grad():
-        rv_tensor = torch.tensor([[reduced_velocity_scalar]], dtype=torch.float32)
-        like = torch.ones((1, 1), dtype=torch.float32)
-        force_scale = float(model._force_scale_from_reduced_velocity(rv_tensor, like=like).reshape(-1)[0].detach().cpu())
-    if not np.isfinite(force_scale) or force_scale <= 0.0:
-        force_scale = 1.0
+        z_true_plot = torch.stack((y_data_t, val_vel * float(m_eff)), dim=1).to(
+            device=device, non_blocking=(device.type == "cuda")
+        )
+        rv_plot = reduced_velocity
+        if not torch.is_tensor(rv_plot):
+            rv_plot = torch.as_tensor(rv_plot, dtype=z_true_plot.dtype)
+        rv_plot = rv_plot.to(device=z_true_plot.device, dtype=z_true_plot.dtype)
+        f0_plot_t = model._force_scale_from_reduced_velocity(
+            rv_plot,
+            like=z_true_plot[..., :1],
+            state=z_true_plot,
+        ).squeeze(-1).detach().cpu().numpy()
+    f0_plot_t = np.asarray(f0_plot_t, dtype=float).reshape(-1)
+    f0_plot_t = np.clip(np.nan_to_num(f0_plot_t, nan=1.0, posinf=1.0, neginf=1.0), 1e-12, None)
+    force_pred = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
+    force_true = np.asarray(force_data, dtype=float).reshape(-1)
+    plot_len = int(min(force_pred.size, force_true.size, f0_plot_t.size))
+    if plot_len <= 0:
+        plot_len = int(min(force_pred.size, force_true.size))
+        if plot_len <= 0:
+            plot_len = int(min(force_pred.size, force_true.size, len(t)))
+        force_coeff_pred_plot = force_pred[:plot_len]
+        force_coeff_true_plot = force_true[:plot_len]
+        t_force_plot = np.asarray(t, dtype=float)[:plot_len]
+    else:
+        force_coeff_pred_plot = force_pred[:plot_len] / f0_plot_t[:plot_len]
+        force_coeff_true_plot = force_true[:plot_len] / f0_plot_t[:plot_len]
+        t_force_plot = np.asarray(t, dtype=float)[:plot_len]
+    if t_force_plot.size == 0:
+        return metrics
+    zoom_mask_force = create_zoom_mask(t_force_plot)
+    middle_mask_force = create_window_mask(t_force_plot, middle_time_plot)
     log_force_plots(
         writer,
         epoch,
-        t,
-        np.asarray(rollout["force_total"]) / force_scale,
-        np.asarray(force_data) / force_scale,
-        zoom_mask,
-        middle_mask,
+        t_force_plot,
+        force_coeff_pred_plot,
+        force_coeff_true_plot,
+        zoom_mask_force,
+        middle_mask_force,
         middle_time_plot,
         reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
@@ -1092,17 +1119,27 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None,
         *,
         like: torch.Tensor,
+        state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
         if rv_raw is None:
-            f0 = 0.5 * float(self.rho) * float(self.D) * float(self.U) ** 2
-            return like.new_full(like.shape[:-1] + (1,), float(f0))
-        omega_n = torch.sqrt(
-            torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
-        )
-        f_n = omega_n / (2.0 * math.pi)
-        U = rv_raw * f_n * float(self.D)
-        f0 = 0.5 * float(self.rho) * float(self.D) * (U ** 2)
+            u_flow = like.new_full(like.shape[:-1] + (1,), float(self.U))
+        else:
+            omega_n = torch.sqrt(
+                torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
+            )
+            f_n = omega_n / (2.0 * math.pi)
+            u_flow = rv_raw * f_n * float(self.D)
+
+        if state is None:
+            dy = torch.zeros_like(u_flow)
+        else:
+            dy = state[..., 1:2] / float(self.m)
+            if dy.shape[:-1] != u_flow.shape[:-1]:
+                dy = dy.expand(u_flow.shape[:-1] + (1,))
+            dy = dy.to(device=u_flow.device, dtype=u_flow.dtype)
+
+        f0 = 0.5 * float(self.rho) * float(self.D) * (u_flow**2 + dy**2)
         return torch.clamp(f0, min=1e-12)
 
     def _force_features(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
@@ -1121,19 +1158,19 @@ class PHVIV(nn.Module):
         raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
             return raw
-        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
         return raw * self.k * self.D / f0
 
     def learned_force(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
-            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw)
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
             return raw * f0
         return raw * self.k * self.D
 
     def drag_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         drag = self.drag_force(x)
-        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=drag)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=drag, state=x)
         return drag / f0
 
     def u_theta_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
@@ -1151,7 +1188,7 @@ class PHVIV(nn.Module):
     def u_theta(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         if self.force_output == "coefficient":
             coeff = self.u_theta_coeff(x, reduced_velocity=reduced_velocity)
-            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff)
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff, state=x)
             return coeff * f0
         return self.u_theta2(x, reduced_velocity=reduced_velocity) if self.include_physical_drag else self.u_theta1(
             x, reduced_velocity=reduced_velocity
@@ -1289,7 +1326,11 @@ class PHVIV(nn.Module):
         res = dz - self.g(z_mean, reduced_velocity=reduced_velocity)
         res_scaled = res / self.res_scale
         if self.force_output == "coefficient":
-            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            f0 = self._force_scale_from_reduced_velocity(
+                reduced_velocity,
+                like=res_scaled[..., 1:2],
+                state=z_mean,
+            )
             res_scaled = res_scaled.clone()
             res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
         loss = torch.mean(torch.sum(res_scaled**2, dim=1))
@@ -1338,7 +1379,11 @@ class PHVIV(nn.Module):
         # scale like before, but for time-derivatives
         res_scaled = res / self.res_scale
         if self.force_output == "coefficient":
-            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            f0 = self._force_scale_from_reduced_velocity(
+                reduced_velocity,
+                like=res_scaled[..., 1:2],
+                state=z_mid,
+            )
             res_scaled = res_scaled.clone()
             res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
 
@@ -1370,7 +1415,11 @@ class PHVIV(nn.Module):
         res = dz_fd - dz_model
         res_scaled = res / self.res_scale
         if self.force_output == "coefficient":
-            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=res_scaled[..., 1:2])
+            f0 = self._force_scale_from_reduced_velocity(
+                reduced_velocity,
+                like=res_scaled[..., 1:2],
+                state=z_mid,
+            )
             res_scaled = res_scaled.clone()
             res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
         return torch.sum(res_scaled**2, dim=1)
@@ -1412,7 +1461,7 @@ class PHVIV(nn.Module):
 
         f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
         f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
-        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1, state=z_a_plus)
 
         f1c = f1 / f0
         f2c = f2 / f0
@@ -1428,7 +1477,7 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
         f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
         f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
-        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1)
+        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1, state=z_a_plus)
         f1c = f1 / f0
         f2c = f2 / f0
         return 0.5 * torch.sum(torch.abs(f1c), dim=1) + 0.5 * torch.sum(torch.abs(f2c), dim=1)

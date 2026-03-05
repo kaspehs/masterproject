@@ -39,7 +39,6 @@ from HNN_helper import (
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
     _force_mapping_nrmse_over_trajs,
-    _load_metadata_map,
     ScaledForceWrapper,
     WindowDataset,
     _as_diag_param,
@@ -417,14 +416,8 @@ def _run_vpinn_validation(
     if dt_target is None:
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)
     dt_target = None if dt_target is None else float(dt_target)
-
-    f0_lookup = None
-    if force_representation == "coefficient":
-        if bool(getattr(data_cfg, "use_generated_train_series", False)):
-            meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
-        else:
-            meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
-        f0_lookup = _load_metadata_map(meta_path)
+    coeff_k = float(getattr(cfg.model, "k", 1218.0))
+    coeff_m_eff = float(_m_eff_from_model_cfg(cfg.model))
 
     for path in sources:
         traj, dt = _load_trajectory(
@@ -436,9 +429,10 @@ def _run_vpinn_validation(
             reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
             cut_start_seconds=cut_start_seconds,
             force_representation=force_representation,
-            f0_lookup=f0_lookup,
             rho=float(getattr(cfg.model, "rho", 1000.0)),
             D=float(getattr(cfg.model, "D", 0.1)),
+            k=coeff_k,
+            m_eff=coeff_m_eff,
         )
         if dt_ref is None:
             dt_ref = dt
@@ -685,7 +679,7 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if getattr(model, "force_output", "force") == "coefficient":
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:
@@ -828,7 +822,7 @@ def _per_ur_loss_map_hnn(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:
