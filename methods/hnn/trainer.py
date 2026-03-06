@@ -295,6 +295,8 @@ def _validate_if_needed(
     writer: SummaryWriter,
     epoch: int,
     rollout_every_epochs: int,
+    validate_now: bool,
+    rollout_now: bool,
     model: PHVIV,
     y_data_t: torch.Tensor,
     val_vel: torch.Tensor,
@@ -330,11 +332,9 @@ def _validate_if_needed(
     per_traj_norm_eps: float,
     force_reg_on_coeff: bool,
 ) -> None:
-    if rollout_every_epochs <= 0:
+    if not validate_now and not rollout_now:
         return
-    if (epoch + 1) % int(rollout_every_epochs) != 0:
-        return
-    if val_loader is not None:
+    if validate_now and val_loader is not None:
         val_loss_metrics = _evaluate_val_losses(
             model=model,
             loader=val_loader,
@@ -374,6 +374,9 @@ def _validate_if_needed(
             tag="val/loss_vs_ur",
             title="Validation loss vs U_r",
         )
+
+    if not rollout_now:
+        return
 
     if val_series_raw is not None and val_sequences is not None:
         metrics_sum: dict[str, float] = {}
@@ -584,13 +587,49 @@ def _log_final_rollouts_all(
     return averaged, used, ur_values, metrics_list
 
 
-def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
-    return [proc for proc in processes if proc.poll() is None]
+def _reap_async_processes(
+    processes: list[dict[str, Any]],
+    *,
+    wait: bool = False,
+) -> list[dict[str, Any]]:
+    active: list[dict[str, Any]] = []
+    for job in processes:
+        proc: subprocess.Popen = job["proc"]
+        if wait:
+            return_code = proc.wait()
+        else:
+            return_code = proc.poll()
+            if return_code is None:
+                active.append(job)
+                continue
+
+        start_time = float(job.get("start_time", time.perf_counter()))
+        elapsed = time.perf_counter() - start_time
+        epoch = int(job.get("epoch", -1))
+        ckpt_path = Path(job.get("checkpoint_path", ""))
+
+        if return_code == 0:
+            print(
+                f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s"
+            )
+        else:
+            print(
+                f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
+                f"after {elapsed:.2f}s"
+            )
+
+        if ckpt_path.exists() and return_code == 0:
+            try:
+                ckpt_path.unlink()
+            except OSError:
+                pass
+
+    return active
 
 
 def _launch_async_validation(
     *,
-    processes: list[subprocess.Popen],
+    processes: list[dict[str, Any]],
     max_concurrent: int,
     checkpoint_path: Path,
     epoch: int,
@@ -604,8 +643,8 @@ def _launch_async_validation(
     rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
-) -> list[subprocess.Popen]:
-    processes = _prune_async_processes(processes)
+) -> list[dict[str, Any]]:
+    processes = _reap_async_processes(processes, wait=False)
     if max_concurrent > 0 and len(processes) >= max_concurrent:
         return processes
     script_path = Path(__file__).resolve().parents[2] / "async_validate.py"
@@ -642,7 +681,20 @@ def _launch_async_validation(
     ]
     if rollout_target_ur is not None:
         args.extend(["--rollout-target-ur", str(float(rollout_target_ur))])
-    processes.append(subprocess.Popen(args, env=env))
+    epoch_num = int(epoch + 1)
+    proc = subprocess.Popen(args, env=env)
+    processes.append(
+        {
+            "proc": proc,
+            "epoch": epoch_num,
+            "start_time": time.perf_counter(),
+            "checkpoint_path": str(checkpoint_path),
+        }
+    )
+    print(
+        f"[async-val] epoch {epoch_num}: launched "
+        f"(losses={int(bool(do_losses))}, rollout={int(bool(do_rollout))})"
+    )
     return processes
 
 
@@ -1010,6 +1062,7 @@ def train(config: Config, config_name: str) -> None:
         raise ValueError("loss.symmetry_norm must be one of: l1, l2.")
 
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
+    validate_every_epochs = int(getattr(monitoring_cfg, "validate_every_epochs", rollout_every_epochs))
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
     rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
     rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
@@ -1133,7 +1186,7 @@ def train(config: Config, config_name: str) -> None:
         run_name_override=getattr(config.logging, "run_name", None),
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
-    async_processes: list[subprocess.Popen] = []
+    async_processes: list[dict[str, Any]] = []
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
         async_dir.mkdir(parents=True, exist_ok=True)
@@ -1240,11 +1293,14 @@ def train(config: Config, config_name: str) -> None:
                     f"force={mean_force_loss:.4e}, sym={mean_sym_loss:.4e}"
                 )
 
-        should_validate = rollout_every_epochs > 0 and (
+        should_validate_losses = validate_every_epochs > 0 and (
+            (epoch + 1) % int(validate_every_epochs) == 0 or epoch == (epochs - 1)
+        )
+        should_validate_rollout = rollout_every_epochs > 0 and (
             (epoch + 1) % int(rollout_every_epochs) == 0 or epoch == (epochs - 1)
         )
-        if async_validation and should_validate and (async_do_losses or async_do_rollout):
-            async_processes = _prune_async_processes(async_processes)
+        if async_validation and (should_validate_losses or should_validate_rollout) and (async_do_losses or async_do_rollout):
+            async_processes = _reap_async_processes(async_processes, wait=False)
             state_source = model
             if hasattr(model, "_orig_mod"):
                 state_source = getattr(model, "_orig_mod")
@@ -1273,14 +1329,16 @@ def train(config: Config, config_name: str) -> None:
                 cycle_validation_rollout=cycle_validation_rollout,
                 rollout_target_ur=rollout_target_ur,
                 rollout_target_ur_tol=rollout_target_ur_tol,
-                do_losses=async_do_losses,
-                do_rollout=async_do_rollout,
+                do_losses=async_do_losses and should_validate_losses,
+                do_rollout=async_do_rollout and should_validate_rollout,
             )
         elif not async_validation:
             _validate_if_needed(
                 writer=writer,
                 epoch=epoch,
                 rollout_every_epochs=rollout_every_epochs,
+                validate_now=should_validate_losses,
+                rollout_now=should_validate_rollout,
                 model=model,
                 y_data_t=y_data_t,
                 val_vel=val_vel,
@@ -1316,6 +1374,10 @@ def train(config: Config, config_name: str) -> None:
                 per_traj_norm_eps=per_traj_norm_eps,
                 force_reg_on_coeff=force_reg_on_coeff,
             )
+
+    if async_validation and async_processes:
+        print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
+        async_processes = _reap_async_processes(async_processes, wait=True)
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
 
