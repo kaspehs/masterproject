@@ -140,6 +140,47 @@ def _load_state(model: torch.nn.Module, state: dict[str, Any]) -> None:
     model.load_state_dict(state, strict=False)
 
 
+def _validation_start_index_for_series(
+    series_t: np.ndarray,
+    series_dt: float,
+    *,
+    validation_start_seconds: float,
+    history_context: int,
+    label: str,
+    auto_shift_for_history: bool,
+) -> int:
+    t_arr = np.asarray(series_t, dtype=float).reshape(-1)
+    if t_arr.size < 2:
+        raise ValueError(f"{label}: not enough samples to validate.")
+    t0 = float(t_arr[0])
+    start_s = max(0.0, float(validation_start_seconds))
+    start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
+    hist = max(0, int(history_context))
+    if hist > 0 and start_idx < hist:
+        available_s = float(start_idx * float(series_dt))
+        needed_s = float(hist * float(series_dt))
+        if not auto_shift_for_history:
+            raise ValueError(
+                f"{label}: validation start at t={t0 + start_s:.6g}s (index={start_idx}) is too early for "
+                f"TCN history_len={hist}. Need at least {needed_s:.6g}s "
+                f"({hist} samples) before validation start, but only {available_s:.6g}s are available."
+            )
+        shifted_idx = hist
+        if (int(t_arr.size) - shifted_idx) < 2:
+            raise ValueError(
+                f"{label}: auto-shifted validation start to satisfy TCN history_len={hist}, "
+                "but too few samples remain for rollout."
+            )
+        print(
+            f"[WARN] {label}: validation start index {start_idx} is too early for TCN history_len={hist}; "
+            f"auto-shifting to index {shifted_idx}."
+        )
+        start_idx = shifted_idx
+    if (int(t_arr.size) - start_idx) < 2:
+        raise ValueError(f"{label}: too few validation samples after validation start.")
+    return start_idx
+
+
 def _run_hnn_validation(
     *,
     ckpt: dict[str, Any],
@@ -167,6 +208,9 @@ def _run_hnn_validation(
     log_loss_vs_ur_map = bool(getattr(cfg.monitoring, "log_loss_vs_ur_map", True))
     rollout_include_force_mapping_nrmse = bool(
         getattr(cfg.monitoring, "rollout_include_force_mapping_nrmse", True)
+    )
+    auto_shift_validation_start_for_history = bool(
+        getattr(cfg.monitoring, "validation_auto_shift_for_history", True)
     )
     loss_cfg = cfg.loss
 
@@ -311,25 +355,6 @@ def _run_hnn_validation(
 
     rollout_by_ur: dict[float, list[float]] = {}
     if do_rollout:
-        def _validation_start_index_for_series(series_t: np.ndarray, series_dt: float, *, label: str) -> int:
-            t_arr = np.asarray(series_t, dtype=float).reshape(-1)
-            if t_arr.size < 2:
-                raise ValueError(f"{label}: not enough samples to validate.")
-            t0 = float(t_arr[0])
-            start_s = max(0.0, float(val_cut))
-            start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
-            if history_context > 0 and start_idx < int(history_context):
-                available_s = float(start_idx * series_dt)
-                needed_s = float(int(history_context) * series_dt)
-                raise ValueError(
-                    f"{label}: validation start at t={t0 + start_s:.6g}s (index={start_idx}) is too early for "
-                    f"TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
-                    f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
-                )
-            if (int(t_arr.size) - start_idx) < 2:
-                raise ValueError(f"{label}: too few validation samples after validation start.")
-            return start_idx
-
         sampled_indices = _sample_one_hnn_series_per_ur(val_series_raw, seed=int(epoch) + 1)
         if not sampled_indices:
             return
@@ -343,7 +368,10 @@ def _run_hnn_validation(
             val_start_idx = _validation_start_index_for_series(
                 np.asarray(t_np),
                 float(dt_value),
+                validation_start_seconds=val_cut,
+                history_context=history_context,
                 label=f"validation series #{idx}",
+                auto_shift_for_history=auto_shift_validation_start_for_history,
             )
             t_eval = np.asarray(t_np)[val_start_idx:]
             y_eval = np.asarray(y_np)[val_start_idx:]
@@ -393,7 +421,10 @@ def _run_hnn_validation(
         val_start_idx = _validation_start_index_for_series(
             np.asarray(t_np),
             float(dt_value),
+            validation_start_seconds=val_cut,
+            history_context=history_context,
             label=f"validation series #{rollout_idx}",
+            auto_shift_for_history=auto_shift_validation_start_for_history,
         )
         t_eval = np.asarray(t_np)[val_start_idx:]
         y_eval = np.asarray(y_np)[val_start_idx:]

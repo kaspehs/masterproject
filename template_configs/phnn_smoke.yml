@@ -99,6 +99,13 @@ loss:
   physics_loss_discretization: srk4
   force_reg: 0.0001
   force_reg_on_coeff: true
+  # Optional RK4 trajectory rollout loss (disabled when weight<=0 or horizon<=0).
+  # When GradNorm is enabled, this acts as a post-GradNorm multiplier.
+  rollout_loss_weight: 0.0
+  rollout_horizon: 10
+  rollout_every_steps: 1
+  # 0 => use current training batch size for rollout-loss windows.
+  rollout_batch_size: 0
   use_force_data_loss: false
   force_data_weight: 1.0
   use_gradnorm: false
@@ -135,6 +142,9 @@ monitoring:
   # Extra rollout metrics: dominant frequency relative error, amplitude relative error,
   # displacement/force spectral shape errors.
   log_extra_validation_metrics: true
+  # If validation cut is earlier than required TCN history context,
+  # shift validation start to history_len instead of raising an error.
+  validation_auto_shift_for_history: true
   log_every_epochs: 10
   print_every_epochs: 50
   log_component_grad_norms: false

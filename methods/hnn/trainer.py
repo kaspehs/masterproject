@@ -42,6 +42,174 @@ from HNN_helper import (
 )
 
 
+def _validation_start_index_for_series(
+    series_t: np.ndarray,
+    series_dt: float,
+    *,
+    validation_start_seconds: float,
+    history_context: int,
+    label: str,
+    auto_shift_for_history: bool,
+) -> int:
+    t_arr = np.asarray(series_t, dtype=float).reshape(-1)
+    if t_arr.size < 2:
+        raise ValueError(f"{label}: not enough samples to validate.")
+    t0 = float(t_arr[0])
+    start_s = max(0.0, float(validation_start_seconds))
+    start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
+    hist = max(0, int(history_context))
+    if hist > 0 and start_idx < hist:
+        available_s = float(start_idx * float(series_dt))
+        needed_s = float(hist * float(series_dt))
+        if not auto_shift_for_history:
+            raise ValueError(
+                f"{label}: validation start at t={t0 + start_s:.6g}s (index={start_idx}) is too early for "
+                f"TCN history_len={hist}. Need at least {needed_s:.6g}s "
+                f"({hist} samples) before validation start, but only {available_s:.6g}s are available."
+            )
+        shifted_idx = hist
+        if (int(t_arr.size) - shifted_idx) < 2:
+            raise ValueError(
+                f"{label}: auto-shifted validation start to satisfy TCN history_len={hist}, "
+                "but too few samples remain for rollout."
+            )
+        print(
+            f"[WARN] {label}: validation start index {start_idx} is too early for TCN history_len={hist}; "
+            f"auto-shifting to index {shifted_idx}."
+        )
+        start_idx = shifted_idx
+    if (int(t_arr.size) - start_idx) < 2:
+        raise ValueError(f"{label}: too few validation samples after validation start.")
+    return start_idx
+
+
+def _prepare_rollout_sampling_pool(
+    train_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+    *,
+    m_eff: float,
+    rollout_horizon: int,
+    history_context: int,
+) -> tuple[list[dict[str, Any]], np.ndarray, int]:
+    window = int(rollout_horizon) + 1
+    hist = max(0, int(history_context))
+    pool: list[dict[str, Any]] = []
+    counts: list[float] = []
+    total_windows = 0
+    for seq_idx, (y_seq, vel_seq, t_seq, ur_seq) in enumerate(train_sequences):
+        z_seq = torch.stack((y_seq, vel_seq * float(m_eff)), dim=1).float().contiguous()
+        t_seq_cpu = t_seq.float().contiguous()
+        ur_seq_cpu = ur_seq.float().reshape(-1, 1).contiguous()
+        if int(z_seq.shape[0]) != int(t_seq_cpu.shape[0]):
+            raise ValueError(f"train sequence #{seq_idx}: state/time length mismatch.")
+        if int(ur_seq_cpu.shape[0]) != int(z_seq.shape[0]):
+            raise ValueError(f"train sequence #{seq_idx}: reduced velocity length mismatch.")
+        start_min = hist
+        start_max = int(z_seq.shape[0]) - window
+        if start_max < start_min:
+            continue
+        num_starts = int(start_max - start_min + 1)
+        pool.append(
+            {
+                "z": z_seq,
+                "t": t_seq_cpu,
+                "ur": ur_seq_cpu,
+                "start_min": start_min,
+                "start_max": start_max,
+                "num_starts": num_starts,
+            }
+        )
+        counts.append(float(num_starts))
+        total_windows += num_starts
+    if not pool or total_windows <= 0:
+        raise ValueError(
+            "Rollout loss is enabled, but no valid rollout windows are available. "
+            f"rollout_horizon={int(rollout_horizon)}, history_context={hist}."
+        )
+    probs = np.asarray(counts, dtype=float)
+    probs = probs / float(np.sum(probs))
+    return pool, probs, total_windows
+
+
+def _sample_rollout_batch(
+    *,
+    pool: list[dict[str, Any]],
+    probs: np.ndarray,
+    rollout_horizon: int,
+    batch_size: int,
+    history_context: int,
+    rng: np.random.Generator,
+    device: torch.device,
+    non_blocking: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if batch_size <= 0:
+        raise ValueError("rollout batch_size must be positive.")
+    horizon = int(rollout_horizon)
+    window = horizon + 1
+    hist = max(0, int(history_context))
+    if len(pool) == 1:
+        chosen = np.zeros((int(batch_size),), dtype=np.int64)
+    else:
+        chosen = rng.choice(len(pool), size=int(batch_size), replace=True, p=probs)
+
+    z0_list: list[torch.Tensor] = []
+    t_seq_list: list[torch.Tensor] = []
+    z_target_list: list[torch.Tensor] = []
+    ur0_list: list[torch.Tensor] = []
+    z_hist_list: list[torch.Tensor] = []
+    ur_hist_list: list[torch.Tensor] = []
+
+    for choice in np.asarray(chosen, dtype=np.int64).reshape(-1):
+        item = pool[int(choice)]
+        start_min = int(item["start_min"])
+        start_max = int(item["start_max"])
+        if start_max < start_min:
+            continue
+        if start_max == start_min:
+            start_idx = start_min
+        else:
+            start_idx = int(rng.integers(start_min, start_max + 1))
+        end_idx = start_idx + window
+        z_seq = item["z"][start_idx:end_idx]
+        t_seq = item["t"][start_idx:end_idx]
+        ur_seq = item["ur"][start_idx:end_idx]
+        if int(z_seq.shape[0]) != window:
+            continue
+        z_hist = None
+        ur_hist = None
+        if hist > 0:
+            hist_start = start_idx - hist
+            z_hist = item["z"][hist_start : start_idx + 1]
+            ur_hist = item["ur"][hist_start : start_idx + 1]
+            if int(z_hist.shape[0]) != (hist + 1) or int(ur_hist.shape[0]) != (hist + 1):
+                continue
+        z0_list.append(z_seq[0])
+        t_seq_list.append(t_seq)
+        z_target_list.append(z_seq)
+        ur0_list.append(ur_seq[0])
+        if hist > 0:
+            assert z_hist is not None and ur_hist is not None
+            z_hist_list.append(z_hist)
+            ur_hist_list.append(ur_hist)
+
+    if not z0_list:
+        raise ValueError("Failed to sample rollout windows for rollout loss.")
+
+    z0_batch = torch.stack(z0_list, dim=0).to(device=device, non_blocking=non_blocking)
+    t_seq_batch = torch.stack(t_seq_list, dim=0).to(device=device, non_blocking=non_blocking)
+    z_target_batch = torch.stack(z_target_list, dim=0).to(device=device, non_blocking=non_blocking)
+    ur0_batch = torch.stack(ur0_list, dim=0).to(device=device, non_blocking=non_blocking)
+    if ur0_batch.ndim == 1:
+        ur0_batch = ur0_batch.unsqueeze(1)
+    z_hist_batch = None
+    ur_hist_batch = None
+    if hist > 0:
+        if not z_hist_list or not ur_hist_list:
+            raise ValueError("TCN rollout loss sampling failed to provide history windows.")
+        z_hist_batch = torch.stack(z_hist_list, dim=0).to(device=device, non_blocking=non_blocking)
+        ur_hist_batch = torch.stack(ur_hist_list, dim=0).to(device=device, non_blocking=non_blocking)
+    return z0_batch, t_seq_batch, z_target_batch, ur0_batch, z_hist_batch, ur_hist_batch
+
+
 def _train_one_epoch(
     *,
     model: torch.nn.Module,
@@ -60,12 +228,21 @@ def _train_one_epoch(
     log_component_grad_norms: bool,
     per_traj_norm_eps: float,
     force_reg_on_coeff: bool,
+    rollout_loss_weight: float,
+    rollout_horizon: int,
+    rollout_every_steps: int,
+    rollout_batch_size: int,
+    rollout_dt: float,
+    rollout_sampling_pool: list[dict[str, Any]] | None,
+    rollout_sampling_probs: np.ndarray | None,
+    rollout_rng: np.random.Generator | None,
 ) -> dict[str, float]:
     batch_count = 0
     loss_sum = torch.zeros((), device=device)
     res_loss_sum = torch.zeros((), device=device)
     force_loss_sum = torch.zeros((), device=device)
     force_data_loss_sum = torch.zeros((), device=device)
+    rollout_loss_sum = torch.zeros((), device=device)
     grad_norm_sum = torch.zeros((), device=device)
     avg_force_sum = torch.zeros((), device=device)
     avg_drag_coeff_sum = torch.zeros((), device=device)
@@ -75,12 +252,21 @@ def _train_one_epoch(
     gradnorm_res_weight_sum = torch.zeros((), device=device)
     gradnorm_force_weight_sum = torch.zeros((), device=device)
     gradnorm_data_weight_sum = torch.zeros((), device=device) if use_force_data_loss else None
+    gradnorm_rollout_weight_sum = torch.zeros((), device=device)
     gradnorm_weight_count = 0
+    rollout_loss_count = 0
+    use_rollout_loss = (
+        float(rollout_loss_weight) > 0.0
+        and int(rollout_horizon) > 0
+        and rollout_sampling_pool is not None
+        and rollout_sampling_probs is not None
+        and rollout_rng is not None
+    )
 
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     use_two_head_vivana = bool(getattr(model, "use_two_head_vivana", False))
     use_tcn_force = bool(getattr(model, "is_tcn_force_model", False))
-    for batch in train_loader:
+    for step_idx, batch in enumerate(train_loader):
         z_hist = None
         ur_hist = None
         if not use_tcn_force:
@@ -253,27 +439,63 @@ def _train_one_epoch(
                 data_force_loss = torch.mean(per_data)
             else:
                 data_force_loss = res_loss.new_tensor(0.0)
+            rollout_loss = res_loss.new_tensor(0.0)
+            rollout_computed = False
+            rollout_schedule_hit = (step_idx % max(1, int(rollout_every_steps))) == 0
+            rollout_required_for_gradnorm = (gradnorm_balancer is not None) and use_rollout_loss
+            if use_rollout_loss and (rollout_schedule_hit or rollout_required_for_gradnorm):
+                effective_rollout_batch = (
+                    int(rollout_batch_size) if int(rollout_batch_size) > 0 else int(z_i.shape[0])
+                )
+                z0_roll, t_roll, z_target_roll, ur_roll, z_hist_roll, ur_hist_roll = _sample_rollout_batch(
+                    pool=rollout_sampling_pool,
+                    probs=rollout_sampling_probs,
+                    rollout_horizon=int(rollout_horizon),
+                    batch_size=max(1, int(effective_rollout_batch)),
+                    history_context=int(getattr(model, "history_len", 0)) if use_tcn_force else 0,
+                    rng=rollout_rng,
+                    device=device,
+                    non_blocking=non_blocking,
+                )
+                z_roll_pred, _f_roll = model.rollout(
+                    z0_roll,
+                    t_roll,
+                    float(rollout_dt),
+                    reduced_velocity=ur_roll,
+                    z_hist_init=z_hist_roll,
+                    ur_hist_init=ur_hist_roll,
+                )
+                # Ignore the initial point (k=0) because it is clamped to the same z0.
+                per_roll = torch.mean((z_roll_pred[:, 1:, :] - z_target_roll[:, 1:, :]) ** 2, dim=(1, 2))
+                rollout_loss = torch.mean(per_roll)
+                rollout_computed = True
 
             if gradnorm_balancer is not None:
-                weights = gradnorm_balancer.update(
-                    {
-                        "residual": res_loss.float(),
-                        "force": base_force_loss.float(),
-                        "data": data_force_loss.float() if use_force_data_loss else res_loss.float(),
-                    }
-                )
+                gradnorm_losses = {
+                    "residual": res_loss.float(),
+                    "force": base_force_loss.float(),
+                }
+                if use_force_data_loss:
+                    gradnorm_losses["data"] = data_force_loss.float()
+                if use_rollout_loss:
+                    gradnorm_losses["rollout"] = rollout_loss.float()
+                weights = gradnorm_balancer.update(gradnorm_losses)
                 res_weight = weights["residual"]
                 force_weight = weights["force"]
                 data_weight = weights.get("data", res_loss.new_tensor(1.0))
+                rollout_weight = weights.get("rollout", res_loss.new_tensor(1.0))
                 gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
                 gradnorm_force_weight_sum = gradnorm_force_weight_sum + force_weight
                 if gradnorm_data_weight_sum is not None:
                     gradnorm_data_weight_sum = gradnorm_data_weight_sum + data_weight
+                if use_rollout_loss:
+                    gradnorm_rollout_weight_sum = gradnorm_rollout_weight_sum + rollout_weight
                 gradnorm_weight_count += 1
             else:
                 res_weight = res_loss.new_tensor(1.0)
                 force_weight = res_loss.new_tensor(1.0)
                 data_weight = res_loss.new_tensor(1.0)
+                rollout_weight = res_loss.new_tensor(1.0)
 
             # GradNorm balances raw branch losses first; user multipliers are applied after.
             # This makes force_reg behave as a post-GradNorm scaling of the force branch.
@@ -284,7 +506,9 @@ def _train_one_epoch(
             force_loss = float(force_reg) * base_force_loss
             weighted_force = float(force_reg) * gradnorm_weighted_force
             weighted_data = float(force_data_weight) * gradnorm_weighted_data
-            loss = (gradnorm_weighted_res + weighted_force + weighted_data).float()
+            # rollout_loss_weight acts as a post-GradNorm scalar when GradNorm is enabled.
+            weighted_rollout = float(rollout_loss_weight) * rollout_weight * rollout_loss
+            loss = (gradnorm_weighted_res + weighted_force + weighted_data + weighted_rollout).float()
 
         if log_component_grad_norms and scaler.is_enabled():
             raise ValueError(
@@ -326,6 +550,9 @@ def _train_one_epoch(
         # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
         force_loss_sum = force_loss_sum + base_force_loss.detach().float()
         force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
+        if rollout_computed:
+            rollout_loss_sum = rollout_loss_sum + rollout_loss.detach().float()
+            rollout_loss_count += 1
         avg_force_sum = avg_force_sum + avg_force.detach().float()
         if use_two_head_vivana:
             avg_drag_coeff_sum = avg_drag_coeff_sum + avg_drag_coeff.detach().float()
@@ -345,6 +572,8 @@ def _train_one_epoch(
     if use_two_head_vivana:
         metrics["mean_drag_coeff"] = float((avg_drag_coeff_sum / denom).detach().cpu())
         metrics["mean_vortex_coeff"] = float((avg_vortex_coeff_sum / denom).detach().cpu())
+    if rollout_loss_count > 0:
+        metrics["mean_rollout_loss"] = float((rollout_loss_sum / float(rollout_loss_count)).detach().cpu())
     if gradnorm_weight_count > 0:
         metrics["mean_gradnorm_weight_residual"] = float(
             (gradnorm_res_weight_sum / float(gradnorm_weight_count)).detach().cpu()
@@ -355,6 +584,10 @@ def _train_one_epoch(
         if gradnorm_data_weight_sum is not None:
             metrics["mean_gradnorm_weight_data"] = float(
                 (gradnorm_data_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            )
+        if use_rollout_loss:
+            metrics["mean_gradnorm_weight_rollout"] = float(
+                (gradnorm_rollout_weight_sum / float(gradnorm_weight_count)).detach().cpu()
             )
     return metrics
 
@@ -390,6 +623,7 @@ def _validate_if_needed(
     rollout_include_force_mapping_nrmse: bool,
     validation_start_seconds: float,
     history_context: int,
+    auto_shift_validation_start_for_history: bool,
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -398,25 +632,6 @@ def _validate_if_needed(
     per_traj_norm_eps: float,
     force_reg_on_coeff: bool,
 ) -> None:
-    def _validation_start_index_for_series(series_t: np.ndarray, series_dt: float, *, label: str) -> int:
-        t_arr = np.asarray(series_t, dtype=float).reshape(-1)
-        if t_arr.size < 2:
-            raise ValueError(f"{label}: not enough samples to validate.")
-        t0 = float(t_arr[0])
-        start_s = max(0.0, float(validation_start_seconds))
-        start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
-        if history_context > 0 and start_idx < int(history_context):
-            available_s = float(start_idx * series_dt)
-            needed_s = float(int(history_context) * series_dt)
-            raise ValueError(
-                f"{label}: validation start at t={t0 + start_s:.6g}s (index={start_idx}) is too early for "
-                f"TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
-                f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
-            )
-        if (int(t_arr.size) - start_idx) < 2:
-            raise ValueError(f"{label}: too few validation samples after validation start.")
-        return start_idx
-
     if rollout_every_epochs <= 0:
         return
     if (epoch + 1) % int(rollout_every_epochs) != 0:
@@ -488,7 +703,10 @@ def _validate_if_needed(
             val_start_idx = _validation_start_index_for_series(
                 np.asarray(t_np),
                 float(dt_value),
+                validation_start_seconds=validation_start_seconds,
+                history_context=history_context,
                 label=f"validation series #{idx}",
+                auto_shift_for_history=auto_shift_validation_start_for_history,
             )
             t_eval = np.asarray(t_np)[val_start_idx:]
             y_eval = np.asarray(y_np)[val_start_idx:]
@@ -534,7 +752,10 @@ def _validate_if_needed(
         val_start_idx = _validation_start_index_for_series(
             np.asarray(t_np),
             float(dt_value),
+            validation_start_seconds=validation_start_seconds,
+            history_context=history_context,
             label=f"validation series #{rollout_idx}",
+            auto_shift_for_history=auto_shift_validation_start_for_history,
         )
         t_eval = np.asarray(t_np)[val_start_idx:]
         y_eval = np.asarray(y_np)[val_start_idx:]
@@ -571,21 +792,14 @@ def _validate_if_needed(
     force_eval = np.asarray(force_data)
     if history_context > 0:
         t_arr = np.asarray(t, dtype=float).reshape(-1)
-        if t_arr.size < 2:
-            raise ValueError("validation series: not enough samples to validate.")
-        t0 = float(t_arr[0])
-        start_s = max(0.0, float(validation_start_seconds))
-        val_start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
-        if val_start_idx < int(history_context):
-            available_s = float(val_start_idx * dt)
-            needed_s = float(int(history_context) * dt)
-            raise ValueError(
-                f"validation series: validation start at t={t0 + start_s:.6g}s (index={val_start_idx}) is too early "
-                f"for TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
-                f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
-            )
-        if (int(t_arr.size) - val_start_idx) < 2:
-            raise ValueError("validation series: too few validation samples after validation start.")
+        val_start_idx = _validation_start_index_for_series(
+            t_arr,
+            float(dt),
+            validation_start_seconds=validation_start_seconds,
+            history_context=history_context,
+            label="validation series",
+            auto_shift_for_history=auto_shift_validation_start_for_history,
+        )
         t_eval = t_arr[val_start_idx:]
         y_eval = np.asarray(y_data)[val_start_idx:]
         force_eval = np.asarray(force_data)[val_start_idx:]
@@ -634,6 +848,7 @@ def _log_final_rollouts_all(
     rollout_include_force_mapping_nrmse: bool,
     validation_start_seconds: float,
     history_context: int,
+    auto_shift_validation_start_for_history: bool,
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
@@ -661,19 +876,14 @@ def _log_final_rollouts_all(
             continue
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[idx]
         t_arr = np.asarray(t_np, dtype=float).reshape(-1)
-        t0 = float(t_arr[0])
-        start_s = max(0.0, float(validation_start_seconds))
-        val_start_idx = int(np.searchsorted(t_arr, t0 + start_s, side="left"))
-        if history_context > 0 and val_start_idx < int(history_context):
-            available_s = float(val_start_idx * float(dt_value))
-            needed_s = float(int(history_context) * float(dt_value))
-            raise ValueError(
-                f"validation series #{idx}: validation start at t={t0 + start_s:.6g}s (index={val_start_idx}) "
-                f"is too early for TCN history_len={int(history_context)}. Need at least {needed_s:.6g}s "
-                f"({int(history_context)} samples) before validation start, but only {available_s:.6g}s are available."
-            )
-        if (int(t_arr.size) - val_start_idx) < 2:
-            raise ValueError(f"validation series #{idx}: too few validation samples after validation start.")
+        val_start_idx = _validation_start_index_for_series(
+            t_arr,
+            float(dt_value),
+            validation_start_seconds=validation_start_seconds,
+            history_context=history_context,
+            label=f"validation series #{idx}",
+            auto_shift_for_history=auto_shift_validation_start_for_history,
+        )
         t_eval = t_arr[val_start_idx:]
         y_eval = np.asarray(y_np)[val_start_idx:]
         force_eval = np.asarray(force_np)[val_start_idx:]
@@ -1239,6 +1449,18 @@ def train(config: Config, config_name: str) -> None:
     force_reg_on_coeff = bool(getattr(loss_cfg, "force_reg_on_coeff", False))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+    rollout_loss_weight = float(getattr(loss_cfg, "rollout_loss_weight", 0.0))
+    rollout_horizon = int(getattr(loss_cfg, "rollout_horizon", 0))
+    rollout_every_steps = int(getattr(loss_cfg, "rollout_every_steps", 1))
+    rollout_batch_size = int(getattr(loss_cfg, "rollout_batch_size", 0))
+    if rollout_horizon < 0:
+        raise ValueError("loss.rollout_horizon must be >= 0.")
+    if rollout_loss_weight > 0.0 and rollout_horizon < 1:
+        raise ValueError("loss.rollout_horizon must be >= 1 when loss.rollout_loss_weight > 0.")
+    if rollout_every_steps < 1:
+        raise ValueError("loss.rollout_every_steps must be >= 1.")
+    if rollout_batch_size < 0:
+        raise ValueError("loss.rollout_batch_size must be >= 0.")
 
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
@@ -1251,6 +1473,9 @@ def train(config: Config, config_name: str) -> None:
     rollout_include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
     rollout_include_force_mapping_nrmse = bool(
         getattr(monitoring_cfg, "rollout_include_force_mapping_nrmse", True)
+    )
+    auto_shift_validation_start_for_history = bool(
+        getattr(monitoring_cfg, "validation_auto_shift_for_history", True)
     )
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
@@ -1277,6 +1502,8 @@ def train(config: Config, config_name: str) -> None:
     history_context = int(getattr(model, "history_len", 0)) if bool(getattr(model, "is_tcn_force_model", False)) else 0
     if history_context > 0:
         print(f"PHNN TCN context enabled: history_len={history_context}")
+        if auto_shift_validation_start_for_history:
+            print("PHNN validation start handling: auto-shift enabled for TCN history context.")
     print(f"PHNN physics loss discretization: {model.loss_discretization}")
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
     try:
@@ -1402,12 +1629,15 @@ def train(config: Config, config_name: str) -> None:
         scheduler_cfg=scheduler_cfg,
         epochs=epochs,
     )
+    use_rollout_loss = float(rollout_loss_weight) > 0.0 and int(rollout_horizon) > 0
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(loss_cfg.use_gradnorm):
         names = ["residual", "force"]
         if use_force_data_loss:
             names.append("data")
+        if use_rollout_loss:
+            names.append("rollout")
         gradnorm_balancer = GradNormBalancer(
             model,
             names,
@@ -1420,6 +1650,30 @@ def train(config: Config, config_name: str) -> None:
     amp_enabled, amp_dtype, scaler = setup_amp(
         device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype)
     )
+    rollout_sampling_pool: list[dict[str, Any]] | None = None
+    rollout_sampling_probs: np.ndarray | None = None
+    rollout_total_windows = 0
+    rollout_rng: np.random.Generator | None = None
+    if use_rollout_loss:
+        rollout_sampling_pool, rollout_sampling_probs, rollout_total_windows = _prepare_rollout_sampling_pool(
+            train_sequences,
+            m_eff=float(m_eff),
+            rollout_horizon=int(rollout_horizon),
+            history_context=int(history_context),
+        )
+        rollout_rng = np.random.default_rng()
+        effective_rollout_batch = int(rollout_batch_size) if int(rollout_batch_size) > 0 else int(batch_size)
+        print(
+            "PHNN rollout loss enabled: "
+            f"weight={rollout_loss_weight:g}, horizon={int(rollout_horizon)}, "
+            f"every_steps={int(rollout_every_steps)}, rollout_batch_size={effective_rollout_batch}, "
+            f"valid_windows={int(rollout_total_windows)}."
+        )
+        if gradnorm_balancer is not None:
+            print(
+                "PHNN GradNorm: rollout branch enabled. "
+                f"rollout_loss_weight={rollout_loss_weight:g} is applied after GradNorm balancing."
+            )
 
     for epoch in range(epochs):
         if use_lr_scheduler:
@@ -1443,6 +1697,14 @@ def train(config: Config, config_name: str) -> None:
             log_component_grad_norms=log_component_grad_norms,
             per_traj_norm_eps=per_traj_norm_eps,
             force_reg_on_coeff=force_reg_on_coeff,
+            rollout_loss_weight=rollout_loss_weight,
+            rollout_horizon=rollout_horizon,
+            rollout_every_steps=rollout_every_steps,
+            rollout_batch_size=rollout_batch_size,
+            rollout_dt=dt,
+            rollout_sampling_pool=rollout_sampling_pool,
+            rollout_sampling_probs=rollout_sampling_probs,
+            rollout_rng=rollout_rng,
         )
 
         mean_loss = epoch_metrics["mean_loss"]
@@ -1469,6 +1731,8 @@ def train(config: Config, config_name: str) -> None:
             train_metrics["avg_drag_coeff"] = float(epoch_metrics["mean_drag_coeff"])
         if "mean_vortex_coeff" in epoch_metrics:
             train_metrics["avg_vortex_coeff"] = float(epoch_metrics["mean_vortex_coeff"])
+        if "mean_rollout_loss" in epoch_metrics:
+            train_metrics["loss_rollout"] = float(epoch_metrics["mean_rollout_loss"])
         if log_component_grad_norms:
             train_metrics["grad_norm_residual_comp"] = mean_res_grad_component
             train_metrics["grad_norm_force_comp"] = mean_force_grad_component
@@ -1478,6 +1742,8 @@ def train(config: Config, config_name: str) -> None:
             train_metrics["gradnorm_weight_reg"] = float(epoch_metrics["mean_gradnorm_weight_force"])
         if "mean_gradnorm_weight_data" in epoch_metrics:
             train_metrics["gradnorm_weight_data"] = float(epoch_metrics["mean_gradnorm_weight_data"])
+        if "mean_gradnorm_weight_rollout" in epoch_metrics:
+            train_metrics["gradnorm_weight_rollout"] = float(epoch_metrics["mean_gradnorm_weight_rollout"])
 
         log_this_epoch = (epoch % log_every_epochs) == 0 or epoch == (epochs - 1)
         if log_this_epoch:
@@ -1569,6 +1835,7 @@ def train(config: Config, config_name: str) -> None:
                 rollout_include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
                 validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
                 history_context=history_context,
+                auto_shift_validation_start_for_history=auto_shift_validation_start_for_history,
                 force_reg=force_reg,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
@@ -1604,6 +1871,7 @@ def train(config: Config, config_name: str) -> None:
             rollout_include_force_mapping_nrmse=rollout_include_force_mapping_nrmse,
             validation_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
             history_context=history_context,
+            auto_shift_validation_start_for_history=auto_shift_validation_start_for_history,
         )
         if used > 0 and avg_metrics:
             summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]

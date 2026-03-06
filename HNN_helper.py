@@ -141,6 +141,11 @@ class LossConfig:
     # PHNN only: "srk4" (default) or "implicit_euler"
     physics_loss_discretization: str = "srk4"
     force_reg_on_coeff: bool = False
+    # Optional PHNN trajectory rollout loss (RK4): disabled when weight<=0 or horizon<=0.
+    rollout_loss_weight: float = 0.0
+    rollout_horizon: int = 0
+    rollout_every_steps: int = 1
+    rollout_batch_size: int = 0
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
     gradnorm_eps: float = 1e-8
@@ -317,6 +322,10 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "force_reg",
         "physics_loss_discretization",
         "force_reg_on_coeff",
+        "rollout_loss_weight",
+        "rollout_horizon",
+        "rollout_every_steps",
+        "rollout_batch_size",
         "use_gradnorm",
         "gradnorm_alpha",
         "gradnorm_eps",
