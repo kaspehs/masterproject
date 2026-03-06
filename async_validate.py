@@ -228,6 +228,9 @@ def _run_hnn_validation(
         per_traj_norm_eps=per_traj_norm_eps,
     )
 
+    num_loss_scalars_written = 0
+    num_rollout_scalars_written = 0
+
     if do_losses:
         amp_enabled = bool(cfg.precision.use_amp) and device.type == "cuda"
         symmetry_weight = float(getattr(loss_cfg, "symmetry_weight", 0.0))
@@ -250,7 +253,12 @@ def _run_hnn_validation(
             per_traj_norm_eps=per_traj_norm_eps,
         )
         for name, value in loss_metrics.items():
-            writer.add_scalar(f"val/{name}", value, epoch)
+            value_f = float(value)
+            if not np.isfinite(value_f):
+                print(f"[async-val] epoch {epoch}: skipping non-finite loss metric '{name}'={value_f}")
+                continue
+            writer.add_scalar(f"val/{name}", value_f, epoch)
+            num_loss_scalars_written += 1
         loss_by_ur = _per_ur_loss_map_hnn(
             model=model,
             loader=val_loader,
@@ -311,7 +319,12 @@ def _run_hnn_validation(
             count += 1
         if count > 0:
             for name, total in metrics_sum.items():
-                writer.add_scalar(f"val/{name}", total / float(count), epoch)
+                value_f = float(total / float(count))
+                if not np.isfinite(value_f):
+                    print(f"[async-val] epoch {epoch}: skipping non-finite rollout metric '{name}'={value_f}")
+                    continue
+                writer.add_scalar(f"val/{name}", value_f, epoch)
+                num_rollout_scalars_written += 1
 
         ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
         rollout_idx = _rollout_index(
@@ -349,6 +362,13 @@ def _run_hnn_validation(
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
         )
+
+    writer.add_scalar("val/async_hnn_loss_metric_count", float(num_loss_scalars_written), epoch)
+    writer.add_scalar("val/async_hnn_rollout_metric_count", float(num_rollout_scalars_written), epoch)
+    print(
+        f"[async-val] epoch {epoch}: HNN scalar writes "
+        f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
+    )
 
 
 def _run_vpinn_validation(
