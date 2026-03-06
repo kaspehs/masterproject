@@ -550,50 +550,6 @@ def compute_validation_metrics(
             noise_scale=rollout_noise_scale,
         )
     metrics: dict[str, float] = {}
-<<<<<<< HEAD
-    y_pred_raw = rollout["y_norm"] * D
-    disp_std_raw = float(np.std(y_data_raw))
-    if disp_std_raw <= 0.0:
-        disp_std_raw = 1.0
-    if include_disp_nrmse:
-        rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
-        metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
-    dom_freq_true = dominant_frequency(y_data_raw, dt)
-    dom_freq_pred = dominant_frequency(y_pred_raw, dt)
-    dom_freq_rel_error = abs(relative_error(dom_freq_pred, dom_freq_true))
-    if np.isfinite(dom_freq_rel_error):
-        metrics[DOMINANT_FREQ_REL_ERROR_KEY] = float(dom_freq_rel_error)
-    amp_true = mean_displacement_amplitude(y_data_raw)
-    amp_pred = mean_displacement_amplitude(y_pred_raw)
-    amp_rel_error = abs(relative_error(amp_pred, amp_true))
-    if np.isfinite(amp_rel_error):
-        metrics[MEAN_DISP_AMP_REL_ERROR_KEY] = float(amp_rel_error)
-    force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
-    force_target = np.asarray(force_data).reshape(-1)
-    min_len = min(force_total_pred.shape[0], force_target.shape[0])
-    if min_len > 0:
-        disp_model_aligned = np.asarray(y_pred_raw[:min_len], dtype=float)
-        disp_true_aligned = np.asarray(y_data_raw[:min_len], dtype=float)
-        if disp_true_aligned.size > 0 and disp_model_aligned.size > 0:
-            disp_spec_err = spectral_relative_error(disp_true_aligned, disp_model_aligned, dt)
-            if np.isfinite(disp_spec_err):
-                metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spec_err)
-        if include_force_nrmse:
-            rmse_force = float(
-                np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
-            )
-            force_std = float(np.std(force_target[:min_len]))
-            if force_std <= 0.0:
-                force_std = 1.0
-            rel_rmse_force_total = rmse_force / force_std
-            metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
-        force_model_aligned = force_total_pred[:min_len]
-        force_true_aligned = force_target[:min_len]
-        if force_true_aligned.size > 0 and force_model_aligned.size > 0:
-            spectral_rel_err = spectral_relative_error(force_true_aligned, force_model_aligned, dt)
-            if np.isfinite(spectral_rel_err):
-                metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(spectral_rel_err)
-=======
     if force_data is None:
         return metrics
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
@@ -609,7 +565,6 @@ def compute_validation_metrics(
             spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
             if np.isfinite(spectral_rel_err):
                 metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     with torch.no_grad():
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
