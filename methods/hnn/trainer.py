@@ -468,8 +468,6 @@ def _validate_if_needed(
             middle_time_plot,
             hamiltonian_data,
             log_extra_metrics=log_extra_validation_metrics,
-            include_disp_nrmse=include_disp_nrmse,
-            include_force_nrmse=include_force_nrmse,
             log_metrics=False,
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
@@ -561,8 +559,6 @@ def _log_final_rollouts_all(
             middle_time_plot,
             None,
             log_extra_metrics=log_extra_validation_metrics,
-            include_disp_nrmse=include_disp_nrmse,
-            include_force_nrmse=include_force_nrmse,
             log_metrics=False,
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
@@ -1021,8 +1017,6 @@ def train(config: Config, config_name: str) -> None:
     print_every_epochs = max(1, int(monitoring_cfg.print_every_epochs))
     log_component_grad_norms = bool(monitoring_cfg.log_component_grad_norms)
     log_extra_validation_metrics = bool(getattr(monitoring_cfg, "log_extra_validation_metrics", False))
-    include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
-    include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))

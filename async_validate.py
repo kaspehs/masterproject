@@ -24,7 +24,6 @@ if str(ROOT) not in sys.path:
 
 from HNN_helper import (
     PHVIV,
-    FORCE_MAPPING_NRMSE_KEY,
     build_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
@@ -345,39 +344,11 @@ def _run_hnn_validation(
             getattr(data_cfg, "middle_time_plot", [0.0, 1.0]),
             hamiltonian_data,
             log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
-            include_disp_nrmse=include_disp_nrmse,
-            include_force_nrmse=include_force_nrmse,
             log_metrics=False,
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
         )
-    else:
-        force_map_sum = 0.0
-        count = 0
-        for series_raw, sequence in zip(val_series_raw, val_sequences):
-            _y_np, _t_np, _dt_value, _vel_np, force_np, _ur_np = series_raw
-            if force_np is None:
-                continue
-            y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
-            z_true = torch.stack((y_tensor, vel_tensor * m_eff), dim=1).to(device=device)
-            rv = ur_tensor.to(device=device)
-            with torch.no_grad():
-                force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
-            force_target = np.asarray(force_np).reshape(-1)
-            min_len = min(force_on_data.shape[0], force_target.shape[0])
-            if min_len <= 0:
-                continue
-            force_pred = force_on_data[:min_len]
-            force_true = force_target[:min_len]
-            rmse = float(np.sqrt(np.mean((force_pred - force_true) ** 2)))
-            force_std = float(np.std(force_true))
-            if force_std <= 0.0:
-                force_std = 1.0
-            force_map_sum += rmse / force_std
-            count += 1
-        if count > 0:
-            writer.add_scalar(f"val/{FORCE_MAPPING_NRMSE_KEY}", force_map_sum / float(count), epoch)
 
 
 def _run_vpinn_validation(
@@ -585,8 +556,6 @@ def _run_vpinn_validation(
         )
 
     if do_rollout:
-        include_disp_nrmse = bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True))
-        include_force_nrmse = bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True))
         ur_values_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
         sampled_metric_indices = sample_one_index_per_ur(ur_values_all, seed=int(epoch) + 1)
         metrics_sum: dict[str, float] = {}
@@ -606,8 +575,6 @@ def _run_vpinn_validation(
                 device=device,
                 log_metrics=False,
                 log_plots=False,
-                include_disp_nrmse=include_disp_nrmse,
-                include_force_nrmse=include_force_nrmse,
             )
             for name, value in metrics.items():
                 if not np.isfinite(float(value)):
@@ -642,8 +609,6 @@ def _run_vpinn_validation(
             device=device,
             log_metrics=False,
             log_plots=True,
-            include_disp_nrmse=include_disp_nrmse,
-            include_force_nrmse=include_force_nrmse,
         )
 
 

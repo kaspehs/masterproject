@@ -1550,8 +1550,6 @@ def _log_rollout_validation(
     step: int | None = None,
     log_metrics: bool = True,
     log_plots: bool = True,
-    include_disp_nrmse: bool = True,
-    include_force_nrmse: bool = True,
     title_suffix: str = "",
 ) -> dict[str, float]:
     x_true_t = traj["x"].to(device)
@@ -1906,8 +1904,6 @@ def train(config: Config, config_name: str) -> None:
     rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
     rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
-    include_disp_nrmse = bool(getattr(monitoring_cfg, "rollout_include_disp_nrmse", True))
-    include_force_nrmse = bool(getattr(monitoring_cfg, "rollout_include_force_nrmse", True))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
@@ -2266,8 +2262,6 @@ def train(config: Config, config_name: str) -> None:
                     device=device,
                     log_metrics=False,
                     log_plots=False,
-                    include_disp_nrmse=include_disp_nrmse,
-                    include_force_nrmse=include_force_nrmse,
                 )
                 for name, value in metrics.items():
                     if not np.isfinite(float(value)):
@@ -2320,8 +2314,6 @@ def train(config: Config, config_name: str) -> None:
                     device=device,
                     log_metrics=False,
                     log_plots=True,
-                    include_disp_nrmse=include_disp_nrmse,
-                    include_force_nrmse=include_force_nrmse,
                 )
 
     if final_rollout_all_validation and val_trajs:
@@ -2357,8 +2349,6 @@ def train(config: Config, config_name: str) -> None:
                 tag_prefix="final_val/rollout",
                 step=idx,
                 log_metrics=False,
-                include_disp_nrmse=include_disp_nrmse,
-                include_force_nrmse=include_force_nrmse,
                 title_suffix=f" [final {idx+1}/{len(selected_trajs)}]",
             )
             if metrics:
