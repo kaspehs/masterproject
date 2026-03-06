@@ -25,6 +25,8 @@ FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
 DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
 DISP_STD_REL_ERROR_KEY = "Displacement std relative error"
+# Backward-compat: VPINN still imports this legacy key name.
+MEAN_DISP_AMP_REL_ERROR_KEY = DISP_STD_REL_ERROR_KEY
 DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
 FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error"
 
