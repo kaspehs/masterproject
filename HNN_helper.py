@@ -24,7 +24,7 @@ from architectures import FourierFeatures, ODEPirateNet
 FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
 DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
-MEAN_DISP_AMP_REL_ERROR_KEY = "Mean displacement amplitude relative error"
+DISP_STD_REL_ERROR_KEY = "Displacement std relative error"
 DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
 FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error"
 
@@ -543,21 +543,49 @@ def compute_validation_metrics(
             noise_scale=rollout_noise_scale,
         )
     metrics: dict[str, float] = {}
-    if force_data is None:
-        return metrics
-    force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
-    force_target = np.asarray(force_data).reshape(-1)
-    min_len = min(force_total_pred.shape[0], force_target.shape[0])
-    if log_extra_metrics and min_len > 0:
-        force_model_aligned = force_total_pred[:min_len]
-        force_true_aligned = force_target[:min_len]
-        half_idx_force = force_true_aligned.size // 2
-        force_true_half = force_true_aligned[half_idx_force:]
-        force_model_half = force_model_aligned[half_idx_force:]
-        if force_true_half.size > 0 and force_model_half.size > 0:
-            spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
-            if np.isfinite(spectral_rel_err):
-                metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
+
+    y_pred_norm = np.asarray(rollout["y_norm"], dtype=float).reshape(-1)
+    y_true = np.asarray(y_data_raw, dtype=float).reshape(-1)
+    y_pred = y_pred_norm * float(D)
+    min_len_y = min(y_pred.shape[0], y_true.shape[0])
+    if min_len_y > 1:
+        y_pred_aligned = y_pred[:min_len_y]
+        y_true_aligned = y_true[:min_len_y]
+
+        true_dom = dominant_frequency(y_true_aligned, dt)
+        pred_dom = dominant_frequency(y_pred_aligned, dt)
+        dom_rel = relative_error(pred_dom, true_dom)
+        if np.isfinite(dom_rel):
+            metrics[DOMINANT_FREQ_REL_ERROR_KEY] = abs(float(dom_rel))
+
+        true_std = float(np.std(y_true_aligned))
+        pred_std = float(np.std(y_pred_aligned))
+        std_rel = relative_error(pred_std, true_std)
+        if np.isfinite(std_rel):
+            metrics[DISP_STD_REL_ERROR_KEY] = abs(float(std_rel))
+
+        half_idx_disp = min_len_y // 2
+        y_true_half = y_true_aligned[half_idx_disp:]
+        y_pred_half = y_pred_aligned[half_idx_disp:]
+        if y_true_half.size > 0 and y_pred_half.size > 0:
+            disp_spectral_err = spectral_relative_error(y_true_half, y_pred_half, dt)
+            if np.isfinite(disp_spectral_err):
+                metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spectral_err)
+
+    if force_data is not None:
+        force_total_pred = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
+        force_target = np.asarray(force_data, dtype=float).reshape(-1)
+        min_len_force = min(force_total_pred.shape[0], force_target.shape[0])
+        if min_len_force > 1:
+            force_pred_aligned = force_total_pred[:min_len_force]
+            force_true_aligned = force_target[:min_len_force]
+            half_idx_force = min_len_force // 2
+            force_true_half = force_true_aligned[half_idx_force:]
+            force_pred_half = force_pred_aligned[half_idx_force:]
+            if force_true_half.size > 0 and force_pred_half.size > 0:
+                force_spectral_err = spectral_relative_error(force_true_half, force_pred_half, dt)
+                if np.isfinite(force_spectral_err):
+                    metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spectral_err)
     return metrics
 
 
@@ -1905,7 +1933,7 @@ def log_final_rollout_errors_vs_ur(
 
     series = [
         (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
-        (MEAN_DISP_AMP_REL_ERROR_KEY, MEAN_DISP_AMP_REL_ERROR_KEY),
+        (DISP_STD_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
         (DISP_SPECTRAL_SHAPE_ERROR_KEY, DISP_SPECTRAL_SHAPE_ERROR_KEY),
         (FORCE_SPECTRAL_SHAPE_ERROR_KEY, FORCE_SPECTRAL_SHAPE_ERROR_KEY),
     ]
