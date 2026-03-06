@@ -275,12 +275,6 @@ def _run_hnn_validation(
             title="Validation loss vs U_r",
         )
 
-<<<<<<< HEAD
-    rollout_by_ur: dict[float, list[float]] = {}
-    include_disp_nrmse = bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True))
-    include_force_nrmse = bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True))
-=======
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
@@ -309,14 +303,9 @@ def _run_hnn_validation(
                 k=k,
                 device=device,
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
-<<<<<<< HEAD
-                include_disp_nrmse=include_disp_nrmse,
-                include_force_nrmse=include_force_nrmse,
-=======
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -437,31 +426,8 @@ def _run_vpinn_validation(
     if dt_target is None:
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)
     dt_target = None if dt_target is None else float(dt_target)
-<<<<<<< HEAD
-
-    f0_lookup = None
-    fn_hz = None
-    if force_representation == "coefficient":
-        m_eff_cfg = _m_eff_from_model_cfg(cfg.model)
-        k_cfg = float(getattr(cfg.model, "k", 1218.0))
-        if m_eff_cfg > 0.0 and k_cfg > 0.0:
-            fn_hz = float(np.sqrt(k_cfg / m_eff_cfg) / (2.0 * np.pi))
-        if bool(getattr(data_cfg, "use_generated_train_series", False)):
-            meta_path = Path(data_cfg.train_series_dir) / "metadata.json"
-        else:
-            meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
-        try:
-            f0_lookup = _load_metadata_map(meta_path)
-        except FileNotFoundError:
-            f0_lookup = None
-            print(
-                f"Warning: metadata file '{meta_path}' not found. "
-                "Falling back to U_r-based F0 conversion."
-            )
-=======
     coeff_k = float(getattr(cfg.model, "k", 1218.0))
     coeff_m_eff = float(_m_eff_from_model_cfg(cfg.model))
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 
     for path in sources:
         traj, dt = _load_trajectory(
@@ -475,12 +441,8 @@ def _run_vpinn_validation(
             force_representation=force_representation,
             rho=float(getattr(cfg.model, "rho", 1000.0)),
             D=float(getattr(cfg.model, "D", 0.1)),
-<<<<<<< HEAD
-            fn_hz=fn_hz,
-=======
             k=coeff_k,
             m_eff=coeff_m_eff,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
         )
         if dt_ref is None:
             dt_ref = dt

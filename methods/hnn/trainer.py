@@ -317,14 +317,9 @@ def _validate_if_needed(
     middle_time_plot,
     hamiltonian_data,
     log_extra_validation_metrics: bool,
-<<<<<<< HEAD
-    include_disp_nrmse: bool,
-    include_force_nrmse: bool,
-=======
     rollout_stochastic: bool,
     rollout_noise_scale: float,
     rollout_seed: int | None,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -410,14 +405,9 @@ def _validate_if_needed(
                 k=k,
                 device=device,
                 log_extra_metrics=log_extra_validation_metrics,
-<<<<<<< HEAD
-                include_disp_nrmse=include_disp_nrmse,
-                include_force_nrmse=include_force_nrmse,
-=======
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -505,14 +495,9 @@ def _validate_if_needed(
         middle_time_plot,
         hamiltonian_data,
         log_extra_metrics=log_extra_validation_metrics,
-<<<<<<< HEAD
-        include_disp_nrmse=include_disp_nrmse,
-        include_force_nrmse=include_force_nrmse,
-=======
         rollout_stochastic=rollout_stochastic,
         rollout_noise_scale=rollout_noise_scale,
         rollout_seed=rollout_seed,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     )
 
 
@@ -529,14 +514,9 @@ def _log_final_rollouts_all(
     device: torch.device,
     middle_time_plot,
     log_extra_validation_metrics: bool,
-<<<<<<< HEAD
-    include_disp_nrmse: bool,
-    include_force_nrmse: bool,
-=======
     rollout_stochastic: bool,
     rollout_noise_scale: float,
     rollout_seed: int | None,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
@@ -1329,14 +1309,9 @@ def train(config: Config, config_name: str) -> None:
                 middle_time_plot=middle_time_plot,
                 hamiltonian_data=hamiltonian_data,
                 log_extra_validation_metrics=log_extra_validation_metrics,
-<<<<<<< HEAD
-                include_disp_nrmse=include_disp_nrmse,
-                include_force_nrmse=include_force_nrmse,
-=======
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
                 force_reg=force_reg,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
@@ -1365,14 +1340,9 @@ def train(config: Config, config_name: str) -> None:
             device=device,
             middle_time_plot=middle_time_plot,
             log_extra_validation_metrics=log_extra_validation_metrics,
-<<<<<<< HEAD
-            include_disp_nrmse=include_disp_nrmse,
-            include_force_nrmse=include_force_nrmse,
-=======
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
->>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
         )
         if used > 0 and avg_metrics:
             summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]
