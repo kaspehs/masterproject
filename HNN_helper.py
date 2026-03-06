@@ -19,10 +19,7 @@ except ImportError:
 
 from architectures import FourierFeatures, ODEPirateNet
 
-DISP_ROLLOUT_NRMSE_KEY = "Disp rollout NRMSE"
-FORCE_ROLLOUT_NRMSE_KEY = "Force rollout NRMSE"
 FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
-FORCE_ROLLOUT_NRMSE_COEFF_KEY = "Force rollout NRMSE (coeff)"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
 
 @dataclass
@@ -514,34 +511,19 @@ def compute_validation_metrics(
             device,
         )
     metrics: dict[str, float] = {}
-    y_pred_raw = rollout["y_norm"] * D
-    disp_std_raw = float(np.std(y_data_raw))
-    if disp_std_raw <= 0.0:
-        disp_std_raw = 1.0
-    rel_rmse_disp = float(np.sqrt(np.mean((y_pred_raw - y_data_raw) ** 2))) / disp_std_raw
-    metrics[DISP_ROLLOUT_NRMSE_KEY] = rel_rmse_disp
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
     force_target = np.asarray(force_data).reshape(-1)
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
-    if min_len > 0:
-        rmse_force = float(
-            np.sqrt(np.mean((force_total_pred[:min_len] - force_target[:min_len]) ** 2))
-        )
-        force_std = float(np.std(force_target[:min_len]))
-        if force_std <= 0.0:
-            force_std = 1.0
-        rel_rmse_force_total = rmse_force / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force_total
-        if log_extra_metrics:
-            force_model_aligned = force_total_pred[:min_len]
-            force_true_aligned = force_target[:min_len]
-            half_idx_force = force_true_aligned.size // 2
-            force_true_half = force_true_aligned[half_idx_force:]
-            force_model_half = force_model_aligned[half_idx_force:]
-            if force_true_half.size > 0 and force_model_half.size > 0:
-                spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
-                if np.isfinite(spectral_rel_err):
-                    metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
+    if log_extra_metrics and min_len > 0:
+        force_model_aligned = force_total_pred[:min_len]
+        force_true_aligned = force_target[:min_len]
+        half_idx_force = force_true_aligned.size // 2
+        force_true_half = force_true_aligned[half_idx_force:]
+        force_model_half = force_model_aligned[half_idx_force:]
+        if force_true_half.size > 0 and force_model_half.size > 0:
+            spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
+            if np.isfinite(spectral_rel_err):
+                metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
     with torch.no_grad():
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
@@ -1762,8 +1744,6 @@ def log_final_rollout_errors_vs_ur(
     metrics_all = [p[1] for p in pairs]
 
     series = [
-        (DISP_ROLLOUT_NRMSE_KEY, DISP_ROLLOUT_NRMSE_KEY),
-        (FORCE_ROLLOUT_NRMSE_KEY, FORCE_ROLLOUT_NRMSE_KEY),
         (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}

@@ -17,8 +17,6 @@ from tensorboard.util import tensor_util
 
 
 DEFAULT_METRICS = (
-    "Disp rollout NRMSE",
-    "Force rollout NRMSE",
     "Force mapping NRMSE",
 )
 

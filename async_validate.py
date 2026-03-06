@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
 from HNN_helper import (
     PHVIV,
     FORCE_MAPPING_NRMSE_KEY,
-    FORCE_ROLLOUT_NRMSE_KEY,
     build_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
@@ -268,7 +267,6 @@ def _run_hnn_validation(
             title="Validation loss vs U_r",
         )
 
-    rollout_by_ur: dict[float, list[float]] = {}
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
@@ -292,22 +290,10 @@ def _run_hnn_validation(
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-            if FORCE_ROLLOUT_NRMSE_KEY in metrics:
-                ur_val = float(np.asarray(_ur_np).reshape(-1)[0])
-                rollout_by_ur.setdefault(ur_val, []).append(float(metrics[FORCE_ROLLOUT_NRMSE_KEY]))
             count += 1
         if count > 0:
             for name, total in metrics_sum.items():
                 writer.add_scalar(f"val/{name}", total / float(count), epoch)
-        if rollout_by_ur:
-            rollout_mean = {float(np.round(k, 6)): float(np.mean(v)) for k, v in rollout_by_ur.items()}
-            log_loss_vs_ur(
-                writer,
-                epoch,
-                {FORCE_ROLLOUT_NRMSE_KEY: rollout_mean},
-                tag=f"val/{FORCE_ROLLOUT_NRMSE_KEY}_vs_U_r",
-                title=f"{FORCE_ROLLOUT_NRMSE_KEY} vs U_r",
-            )
 
         ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
         rollout_idx = _rollout_index(

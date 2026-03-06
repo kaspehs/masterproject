@@ -29,9 +29,7 @@ from core.runtime import (
 )
 from HNN_helper import (
     Config,
-    DISP_ROLLOUT_NRMSE_KEY,
     FORCE_MAPPING_NRMSE_KEY,
-    FORCE_ROLLOUT_NRMSE_KEY,
     GradNormBalancer,
     Residual,
     compute_velocity_numpy,
@@ -1496,33 +1494,7 @@ def _log_rollout_validation(
     x_true = x_true_t[:, 0].detach().cpu().numpy()
     f_true = f_true_t[:, 0].detach().cpu().numpy()
 
-    disp_std = float(np.std(x_true))
-    if disp_std <= 0.0:
-        disp_std = 1.0
-    rel_rmse_y = float(np.sqrt(np.mean((x_pred - x_true) ** 2))) / disp_std
-    metrics: dict[str, float] = {DISP_ROLLOUT_NRMSE_KEY: rel_rmse_y}
-    if log_metrics:
-        writer.add_scalar(f"val/{DISP_ROLLOUT_NRMSE_KEY}", rel_rmse_y, epoch)
-
-    force_std = float(np.std(f_true))
-    if force_std <= 0.0:
-        force_std = 1.0
-    if f0_true_t is not None:
-        f0_np = f0_true_t[:, 0].detach().cpu().numpy()
-        f_true_force = f_true * f0_np
-        f_pred_force = f_pred * f0_np
-        force_std = float(np.std(f_true_force))
-        if force_std <= 0.0:
-            force_std = 1.0
-        rel_rmse_force = float(np.sqrt(np.mean((f_pred_force - f_true_force) ** 2))) / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
-    else:
-        rel_rmse_force = float(np.sqrt(np.mean((f_pred - f_true) ** 2))) / force_std
-        metrics[FORCE_ROLLOUT_NRMSE_KEY] = rel_rmse_force
-        if log_metrics:
-            writer.add_scalar(f"val/{FORCE_ROLLOUT_NRMSE_KEY}", rel_rmse_force, epoch)
+    metrics: dict[str, float] = {}
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
@@ -1536,6 +1508,9 @@ def _log_rollout_validation(
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data_force - f_true_force) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
     else:
+        force_std = float(np.std(f_true))
+        if force_std <= 0.0:
+            force_std = 1.0
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
