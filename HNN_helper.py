@@ -172,8 +172,6 @@ class MonitoringConfig:
     async_validation_max_concurrent: int = 1
     async_validation_do_losses: bool = True
     async_validation_do_rollout: bool = True
-    rollout_include_disp_nrmse: bool = True
-    rollout_include_force_nrmse: bool = True
 
 @dataclass
 class LoggingConfig:
@@ -297,8 +295,6 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "log_extra_validation_metrics",
         "rollout_use_excluded_ur",
         "rollout_target_ur_tol",
-        "rollout_include_disp_nrmse",
-        "rollout_include_force_nrmse",
     }
 
     for key, value in legacy_training.items():
@@ -334,6 +330,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
     # Back-compat key: `rollout_every_epoch` -> `rollout_every_epochs`
     if "rollout_every_epochs" not in monitoring_cfg and "rollout_every_epoch" in monitoring_cfg:
         monitoring_cfg["rollout_every_epochs"] = monitoring_cfg.pop("rollout_every_epoch")
+    # Removed monitoring toggles: keep old configs loadable by ignoring stale keys.
+    monitoring_cfg.pop("rollout_include_disp_nrmse", None)
+    monitoring_cfg.pop("rollout_include_force_nrmse", None)
     monitoring = MonitoringConfig(**monitoring_cfg)
     logging = LoggingConfig(**logging_cfg)
     return Config(
@@ -388,8 +387,6 @@ def log_validation_epoch(
     hamiltonian_data: np.ndarray | None,
     *,
     log_extra_metrics: bool = False,
-    include_disp_nrmse: bool = True,
-    include_force_nrmse: bool = True,
     log_metrics: bool = True,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
@@ -427,8 +424,6 @@ def log_validation_epoch(
         k=k,
         device=device,
         log_extra_metrics=log_extra_metrics,
-        include_disp_nrmse=include_disp_nrmse,
-        include_force_nrmse=include_force_nrmse,
         rollout=rollout,
         rollout_stochastic=rollout_stochastic,
         rollout_noise_scale=rollout_noise_scale,
@@ -526,8 +521,6 @@ def compute_validation_metrics(
     k: float,
     device: torch.device,
     log_extra_metrics: bool = False,
-    include_disp_nrmse: bool = True,
-    include_force_nrmse: bool = True,
     rollout: dict[str, np.ndarray] | None = None,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
@@ -565,24 +558,6 @@ def compute_validation_metrics(
             spectral_rel_err = spectral_relative_error(force_true_half, force_model_half, dt)
             if np.isfinite(spectral_rel_err):
                 metrics["force_spectral_rel_error_second_half"] = spectral_rel_err
-    with torch.no_grad():
-        z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
-        z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
-        if torch.is_tensor(reduced_velocity):
-            rv = reduced_velocity.to(device=device, non_blocking=(device.type == "cuda"))
-        else:
-            rv = torch.as_tensor(reduced_velocity, dtype=z_true.dtype, device=device)
-        force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
-    min_len_data = min(force_on_data.shape[0], force_target.shape[0])
-    if min_len_data > 0:
-        force_data_pred = force_on_data[:min_len_data]
-        force_data_true = force_target[:min_len_data]
-        rmse_force_data = float(np.sqrt(np.mean((force_data_pred - force_data_true) ** 2)))
-        force_std_data = float(np.std(force_data_true))
-        if force_std_data <= 0.0:
-            force_std_data = 1.0
-        rel_rmse_force_on_data = rmse_force_data / force_std_data
-        metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
     return metrics
 
 
@@ -1923,7 +1898,6 @@ def log_final_rollout_errors_vs_ur(
     metrics_all = [p[1] for p in pairs]
 
     series = [
-        (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
         (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
         (MEAN_DISP_AMP_REL_ERROR_KEY, MEAN_DISP_AMP_REL_ERROR_KEY),
         (DISP_SPECTRAL_SHAPE_ERROR_KEY, DISP_SPECTRAL_SHAPE_ERROR_KEY),
@@ -1987,31 +1961,6 @@ def log_final_rollout_errors_vs_ur(
     plt.tight_layout()
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
-
-    # Also log average Force mapping NRMSE vs reduced velocity (grouped by U_r).
-    force_key = FORCE_MAPPING_NRMSE_KEY
-    grouped: dict[float, list[float]] = {}
-    for ur_val, metrics in pairs:
-        if force_key not in metrics:
-            continue
-        y_val = float(metrics[force_key])
-        if not np.isfinite(y_val) or y_val <= 0.0:
-            continue
-        grouped.setdefault(float(ur_val), []).append(y_val)
-    if grouped:
-        xs = sorted(grouped.keys())
-        ys = [float(np.mean(grouped[x])) for x in xs]
-        fig2, ax2 = plt.subplots(1, 1, figsize=(6, 4))
-        ax2.plot(xs, ys, marker="o", label=f"Avg {FORCE_MAPPING_NRMSE_KEY}")
-        ax2.set_xlabel("Reduced velocity (U_r)")
-        ax2.set_ylabel("Error")
-        ax2.set_yscale("log")
-        ax2.set_title(f"Avg {FORCE_MAPPING_NRMSE_KEY} vs U_r")
-        ax2.grid(True, alpha=0.3)
-        ax2.legend(loc="best")
-        plt.tight_layout()
-        writer.add_figure(f"final_val/{FORCE_MAPPING_NRMSE_KEY}_avg_vs_U_r", fig2, epoch)
-        plt.close(fig2)
 
 def preprocess_timeseries(
     t: np.ndarray,
