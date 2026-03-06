@@ -1,110 +1,128 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import sys
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import savgol_filter
 
 try:
-    import Experimental_Data.plot_extracted_channels as extracted
-    import Experimental_Data.analyze_experimental_data as analysis
-except ModuleNotFoundError as exc:
-    if getattr(exc, "name", "") != "Experimental_Data":
-        raise
-    # Support direct execution: python3 Experimental_Data/phase_analysis.py
+    from Experimental_Data.script_helpers import (
+        filter_excluded_tests as _filter_excluded_tests_common,
+        import_analysis_and_extracted,
+        resolve_existing_dir as _resolve_existing_dir_common,
+    )
+except ModuleNotFoundError:
     current_dir = Path(__file__).resolve().parent
     if str(current_dir) not in sys.path:
         sys.path.insert(0, str(current_dir))
-    import plot_extracted_channels as extracted
-    import analyze_experimental_data as analysis
+    from script_helpers import (
+        filter_excluded_tests as _filter_excluded_tests_common,
+        import_analysis_and_extracted,
+        resolve_existing_dir as _resolve_existing_dir_common,
+    )
+
+analysis, extracted, _USED_EXTRACTED_FALLBACK = import_analysis_and_extracted(
+    __file__,
+    allow_extracted_fallback=True,
+    print_fallback_message=False,
+)
+if _USED_EXTRACTED_FALLBACK and __name__ == "__main__":
+    if type(extracted).__name__ == "_StandaloneExtractedFallback":
+        print(
+            "phase_analysis: 'plot_extracted_channels.py' and "
+            "'analyze_experimental_data.py' not found; "
+            "using standalone MAT-processing fallback."
+        )
+    else:
+        print(
+            "phase_analysis: 'plot_extracted_channels.py' not found; "
+            "using analyze_experimental_data fallback for processing/derivatives."
+        )
 
 
-# Input (single source of truth in analyze_experimental_data.py)
-# Supported sources here are raw sets because phase_analysis relies on
-# extracted._process_file(), which reads raw channel names.
-PHASE_MAT_SOURCE = "crossflow_raw"  # one of: crossflow_raw, crossflow, combined
-_phase_source = str(PHASE_MAT_SOURCE).strip().lower()
-if _phase_source == "combined":
-    MAT_FILES = list(analysis.MAT_FILES_COMBINED_RAW)
-elif _phase_source in {"crossflow_raw", "crossflow"}:
-    MAT_FILES = list(analysis.MAT_FILES_CROSSFLOW_RAW)
-else:
-    raise ValueError("PHASE_MAT_SOURCE must be one of: crossflow_raw, crossflow, combined")
+# Input selection (folder-only).
+PHASE_MAT_DIR = Path("CrossFlow/RawData")
+PHASE_MAT_DIR_PATTERN = "*.mat"
+PHASE_MAT_DIR_RECURSIVE = False
 
 # Exclude files by test number parsed from filename, e.g. test3009.mat -> 3009.
 EXCLUDE_TEST_NUMBERS: list[int] = [3009, 3002]
 
-# Keep data-loading behavior aligned with the channel-extraction script.
-DATA_VARIABLE = extracted.DATA_VARIABLE
-USE_RELATIVE_TIME = extracted.USE_RELATIVE_TIME
-PLOT_FIRST_SECONDS = extracted.PLOT_FIRST_SECONDS
+# Data-variable selection for phase input MAT files.
+# Avoid inheriting analysis/extracted DATA_VARIABLE blindly, because that may be
+# configured for a different source than the selected folder.
+_phase_data_variable_default = "data"
+PHASE_DATA_VARIABLE_OVERRIDE: str | None = None  # e.g. "data_corrected"
+DATA_VARIABLE = (
+    str(PHASE_DATA_VARIABLE_OVERRIDE)
+    if PHASE_DATA_VARIABLE_OVERRIDE is not None
+    else str(_phase_data_variable_default)
+)
+# Time-window settings are owned by this script only.
+USE_RELATIVE_TIME = True
 
 # Phase-drift settings
 PHASE_WINDOW_SECONDS = 20.0
 PHASE_WINDOW_OVERLAP = 0.5  # in [0, 1)
-PHASE_FREQ_MIN_HZ = 0.1
+PHASE_FREQ_MIN_HZ = 0.2
 PHASE_FREQ_MAX_HZ = 5.0
 PHASE_MAX_LAG_SECONDS = 2.0
-# Lag estimation mode: "phase" (recommended) or "xcorr" (legacy).
-LAG_ESTIMATION_METHOD = "phase"
-# When using phase-derived lag, unwrap lag by adding integer periods for continuity.
+# Lag is estimated from phase/frequency in each window.
+# Unwrap by period keeps lag continuity across consecutive windows.
 LAG_UNWRAP_BY_PERIOD = True
-LAG_USE_SUBSAMPLE_PEAK = True
-LAG_APPLY_SMOOTHING = True
-LAG_MEDIAN_WINDOW = 5  # odd integer
-LAG_ZERO_PHASE_WINDOW = 7  # odd integer
 
 # Displacement correction settings
 PHASE_CORRECTION_ENABLED = True
 PHASE_CORRECTION_MODE = "common"  # "common" or "individual"
-PHASE_CORRECTION_SIGN = "auto"  # "auto", +1, or -1
+PHASE_CORRECTION_SIGN = 1  # "auto", +1, or -1
 PHASE_CORRECTION_REMOVE_INITIAL_OFFSET = True
 PHASE_COMMON_LAG_POLYORDER = 1
+# In common-mode lag evaluation:
+# - False: clip evaluation to fitted relative-time span
+# - True: extrapolate polynomial beyond fitted span
+PHASE_COMMON_LAG_EXTRAPOLATE = True
 # Optional zero-phase smoothing around the warp step to reduce correction noise.
 # Set to odd integer > 1 to enable.
 PHASE_CORRECTION_PRE_SMOOTH_WINDOW = 1
 # Post-correction Savitzky-Golay smoothing (applied after time-warp correction).
 # Set window <= 1 to disable.
-PHASE_CORRECTION_POST_SAVGOL_WINDOW = 21
+PHASE_CORRECTION_POST_SAVGOL_WINDOW = 51
 PHASE_CORRECTION_POST_SAVGOL_POLYORDER = 3
+PLOT_COMMON_LAG_POLY_IN_BEFORE_PLOT = True
 # Optional plotting window for pre/post displacement figure.
 # Interpreted in the displayed time base (`result['t']`), i.e. relative or absolute
 # depending on USE_RELATIVE_TIME.
 # Example: (390.0, 400.0)
-DISPLACEMENT_PLOT_TIME_WINDOW: tuple[float, float] | list[float] | None = [390, 400]
+DISPLACEMENT_PLOT_TIME_WINDOW: tuple[float, float] | list[float] | None = [395, 399]
 PLOT_CORRECTED_DISPLACEMENT = True
+PLOT_CORRECTED_DISPLACEMENT_FULL = False
 PLOT_CORRECTED_ACCELERATION = True
+# Corrected acceleration must come from Savitzky-Golay derivatives.
+# If unavailable, raise an error (no gradient fallback).
+REQUIRE_SAVGOL_FOR_CORRECTED_ACCELERATION = True
+EXPORT_PHASE_PLOTS = False
+PHASE_PLOT_BEFORE_SAVE_PATH: Path | None = Path('/Users/kasperslagstad/Desktop/Master-Thesis/Images/EDA/ExperimentalData/before_phase_corrected.png')
+PHASE_PLOT_AFTER_SAVE_PATH: Path | None = Path('/Users/kasperslagstad/Desktop/Master-Thesis/Images/EDA/ExperimentalData/after_phase_corrected.png')
+PHASE_PLOT_SAVE_DPI = 300
+PHASE_DOT_MARKERS = True
+PHASE_DOT_MARKER_SIZE = 2.2
+PHASE_DOT_MAX_POINTS = 250
+
+# Key timeseries view: U_r, Fy2-Fy1, and displacement, each with a rotated
+# (horizontal) histogram panel at the right side.
+PLOT_KEY_TIMESERIES_WITH_END_HIST = False
+PLOT_KEY_TIMESERIES_FOR_ALL_FILES = False
+KEY_TIMESERIES_FILE_INDEX = 0
+KEY_TIMESERIES_HIST_BINS = 60
+KEY_TIMESERIES_FIG_WIDTH = 12.0
+KEY_TIMESERIES_FIG_HEIGHT = 7.5
 
 
 def _wrap_phase_deg(phase_rad: np.ndarray) -> np.ndarray:
     return np.rad2deg((phase_rad + np.pi) % (2.0 * np.pi) - np.pi)
-
-
-def _quadratic_peak_offset(y_prev: float, y_mid: float, y_next: float) -> float:
-    denom = (y_prev - 2.0 * y_mid + y_next)
-    if abs(denom) < 1e-12:
-        return 0.0
-    offset = 0.5 * (y_prev - y_next) / denom
-    return float(np.clip(offset, -1.0, 1.0))
-
-
-def _rolling_median(x: np.ndarray, window: int) -> np.ndarray:
-    arr = np.asarray(x, dtype=float).reshape(-1)
-    w = max(1, int(window))
-    if w % 2 == 0:
-        w += 1
-    if arr.size < 3 or w <= 1:
-        return arr.copy()
-    half = w // 2
-    out = np.empty_like(arr)
-    for i in range(arr.size):
-        lo = max(0, i - half)
-        hi = min(arr.size, i + half + 1)
-        out[i] = float(np.median(arr[lo:hi]))
-    return out
 
 
 def _zero_phase_boxcar(x: np.ndarray, window: int) -> np.ndarray:
@@ -151,14 +169,6 @@ def _savgol_smooth_1d(values: np.ndarray, *, window: int, polyorder: int) -> np.
     return savgol_filter(arr, window_length=int(w), polyorder=int(p), mode="interp")
 
 
-def _stabilize_lag_seconds(lag_seconds: np.ndarray) -> np.ndarray:
-    lag = np.asarray(lag_seconds, dtype=float).reshape(-1)
-    if lag.size < 3:
-        return lag
-    med = _rolling_median(lag, int(LAG_MEDIAN_WINDOW))
-    return _zero_phase_boxcar(med, int(LAG_ZERO_PHASE_WINDOW))
-
-
 def _lag_derivative_per_second(t_seconds: np.ndarray, lag_seconds: np.ndarray) -> np.ndarray:
     t = np.asarray(t_seconds, dtype=float).reshape(-1)
     lag = np.asarray(lag_seconds, dtype=float).reshape(-1)
@@ -171,26 +181,22 @@ def _lag_derivative_per_second(t_seconds: np.ndarray, lag_seconds: np.ndarray) -
     return np.gradient(lag, t)
 
 
-def _extract_test_number(path: Path) -> int | None:
-    stem = str(path.stem).lower()
-    match = re.search(r"test(\d+)", stem)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
-    excluded_raw = list(EXCLUDE_TEST_NUMBERS)
-    if not excluded_raw:
-        return paths
-    excluded = {int(v) for v in excluded_raw}
-    kept: list[Path] = []
-    for p in paths:
-        test_no = _extract_test_number(Path(p))
-        if test_no is not None and test_no in excluded:
-            continue
-        kept.append(Path(p))
-    return kept
+    return _filter_excluded_tests_common([Path(p) for p in paths], EXCLUDE_TEST_NUMBERS)
+
+
+def _resolve_existing_dir(path_like: Path | str) -> Path:
+    return _resolve_existing_dir_common(path_like, script_file=__file__)
+
+
+def _resolve_phase_input_files() -> tuple[list[Path], str]:
+    mat_dir = _resolve_existing_dir(PHASE_MAT_DIR)
+    pattern = str(PHASE_MAT_DIR_PATTERN) if str(PHASE_MAT_DIR_PATTERN).strip() else "*.mat"
+    if bool(PHASE_MAT_DIR_RECURSIVE):
+        files = sorted(mat_dir.rglob(pattern))
+    else:
+        files = sorted(mat_dir.glob(pattern))
+    return [Path(p) for p in files], f"folder: {mat_dir} (pattern='{pattern}', recursive={bool(PHASE_MAT_DIR_RECURSIVE)})"
 
 
 def _phase_drift_diagnostics(
@@ -258,40 +264,15 @@ def _phase_drift_diagnostics(
         phase_xy = float(np.angle(X[k]) - np.angle(Y[k]))
         phase_wrapped = float((phase_xy + np.pi) % (2.0 * np.pi) - np.pi)
 
-        lag_method = str(LAG_ESTIMATION_METHOD).strip().lower()
-        if lag_method == "phase":
-            if f_dom <= 0.0:
-                continue
-            lag_s = float(phase_wrapped / (2.0 * np.pi * f_dom))
-            if bool(LAG_UNWRAP_BY_PERIOD) and prev_lag_s is not None:
-                period = 1.0 / f_dom
-                if np.isfinite(period) and period > 0.0:
-                    lag_s = float(lag_s + round((prev_lag_s - lag_s) / period) * period)
-            if max_lag is not None:
-                lag_s = float(np.clip(lag_s, -float(max_lag) * dt, float(max_lag) * dt))
-        elif lag_method == "xcorr":
-            xzn = xw / sx
-            yzn = yw / sy
-            corr = np.correlate(xzn, yzn, mode="full")
-            lags = np.arange(-yzn.size + 1, xzn.size, dtype=int)
-            if max_lag is not None:
-                keep = np.abs(lags) <= int(max_lag)
-                corr = corr[keep]
-                lags = lags[keep]
-            if corr.size == 0:
-                continue
-            i_peak = int(np.argmax(corr))
-            if bool(LAG_USE_SUBSAMPLE_PEAK) and 0 < i_peak < (corr.size - 1):
-                frac = _quadratic_peak_offset(
-                    float(corr[i_peak - 1]),
-                    float(corr[i_peak]),
-                    float(corr[i_peak + 1]),
-                )
-            else:
-                frac = 0.0
-            lag_s = float((float(lags[i_peak]) + float(frac)) * dt)
-        else:
-            raise ValueError("LAG_ESTIMATION_METHOD must be one of: phase, xcorr")
+        if f_dom <= 0.0:
+            continue
+        lag_s = float(phase_wrapped / (2.0 * np.pi * f_dom))
+        if bool(LAG_UNWRAP_BY_PERIOD) and prev_lag_s is not None:
+            period = 1.0 / f_dom
+            if np.isfinite(period) and period > 0.0:
+                lag_s = float(lag_s + round((prev_lag_s - lag_s) / period) * period)
+        if max_lag is not None:
+            lag_s = float(np.clip(lag_s, -float(max_lag) * dt, float(max_lag) * dt))
 
         phase_deg = float(_wrap_phase_deg(np.array([phase_xy]))[0])
         if not (np.isfinite(phase_deg) and np.isfinite(lag_s) and np.isfinite(f_dom)):
@@ -304,8 +285,6 @@ def _phase_drift_diagnostics(
         prev_lag_s = lag_s
 
     lag_arr = np.asarray(lag_seconds, dtype=float)
-    if bool(LAG_APPLY_SMOOTHING):
-        lag_arr = _stabilize_lag_seconds(lag_arr)
 
     return (
         np.asarray(t_centers, dtype=float),
@@ -322,6 +301,77 @@ def _select_channel(result: dict[str, object], channel_name: str) -> np.ndarray:
         if str(name) == channel_name:
             return np.asarray(values, dtype=float)
     raise KeyError(f"Missing channel '{channel_name}' in result for {result['label']}.")
+
+
+def _plot_key_timeseries_with_end_hist(result: dict[str, object]) -> None:
+    label = str(result["label"])
+    t = np.asarray(result["t"], dtype=float).reshape(-1)
+    mask = np.asarray(result["mask"], dtype=bool).reshape(-1)
+    n = min(t.size, mask.size)
+    if n < 2:
+        return
+    t = t[:n]
+    mask = mask[:n]
+
+    if not np.any(mask):
+        return
+
+    series_defs = [
+        ("Reduced velocity U_r (-)", "Reduced velocity U_r (-)"),
+        ("Fy2 - Fy1 (scaled LB/LA, N)", "Fy2 - Fy1 (scaled LB/LA, [N])"),
+        ("Displacement y (m)", "Displacement y [m]"),
+    ]
+
+    fig, axes = plt.subplots(
+        3,
+        2,
+        figsize=(KEY_TIMESERIES_FIG_WIDTH, KEY_TIMESERIES_FIG_HEIGHT),
+        sharex="col",
+        gridspec_kw={"width_ratios": [5.5, 1.3]},
+    )
+    axes = np.asarray(axes)
+    colors = ["tab:blue", "tab:orange", "tab:green"]
+
+    for i, (channel_name, y_label) in enumerate(series_defs):
+        values = _select_channel(result, channel_name)
+        values = np.asarray(values, dtype=float).reshape(-1)
+        m = min(values.size, t.size, mask.size)
+        t_use = t[:m]
+        mask_use = mask[:m]
+        v_use = values[:m]
+        x = t_use[mask_use]
+        y = v_use[mask_use]
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        if x.size == 0:
+            continue
+
+        ax_ts = axes[i, 0]
+        ax_hist = axes[i, 1]
+        color = colors[i % len(colors)]
+
+        ax_ts.plot(x, y, color=color, linewidth=1.0)
+        ax_ts.grid(True)
+        ax_ts.set_ylabel(y_label)
+
+        ax_hist.hist(
+            y,
+            bins=int(KEY_TIMESERIES_HIST_BINS),
+            orientation="horizontal",
+            color=color,
+            alpha=0.55,
+            edgecolor="none",
+        )
+        ax_hist.grid(True, axis="y", alpha=0.35)
+        ax_hist.set_ylim(ax_ts.get_ylim())
+        ax_hist.set_xlabel("count")
+
+    axes[0, 0].set_title("Timeseries")
+    axes[0, 1].set_title("Histogram (rotated)")
+    axes[-1, 0].set_xlabel("Time [s]" if USE_RELATIVE_TIME else "Time")
+    fig.suptitle(f"U_r, Fy2-Fy1, and displacement with end histograms: {label}", fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
 
 
 def _run_phase_analysis(
@@ -394,6 +444,15 @@ def _collect_phase_series(
     return phase_by_label
 
 
+def _has_any_valid_phase_windows(
+    phase_by_label: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+) -> bool:
+    for tc, _, _, _ in phase_by_label.values():
+        if np.asarray(tc, dtype=float).size >= 2:
+            return True
+    return False
+
+
 def _fit_common_lag_model(
     phase_by_label: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
 ) -> tuple[np.ndarray, float, float]:
@@ -430,7 +489,10 @@ def _evaluate_lag_curve(
             raise ValueError("Common lag model is required when PHASE_CORRECTION_MODE='common'.")
         coeff, rel_t_min, rel_t_max = common_model
         rel_t = t - float(t[0])
-        rel_t_eval = np.clip(rel_t, rel_t_min, rel_t_max)
+        if bool(PHASE_COMMON_LAG_EXTRAPOLATE):
+            rel_t_eval = rel_t
+        else:
+            rel_t_eval = np.clip(rel_t, rel_t_min, rel_t_max)
         lag_eval = np.polyval(coeff, rel_t_eval)
     elif mode == "individual":
         if tc.size == 0 or lag_s.size == 0:
@@ -596,6 +658,9 @@ def _print_phase_before_after_summary(
 def _plot_corrected_displacement(
     results: list[dict[str, object]],
     corrected_disp_by_label: dict[str, np.ndarray],
+    *,
+    time_window: tuple[float, float] | list[float] | None = None,
+    title_suffix: str = "",
 ) -> None:
     if not corrected_disp_by_label:
         return
@@ -613,13 +678,13 @@ def _plot_corrected_displacement(
         label = str(result["label"])
         t = np.asarray(result["t"], dtype=float)
         mask = np.asarray(result["mask"], dtype=bool)
-        if DISPLACEMENT_PLOT_TIME_WINDOW is None:
+        if time_window is None:
             plot_mask = np.asarray(mask, dtype=bool)
         else:
-            if len(DISPLACEMENT_PLOT_TIME_WINDOW) != 2:
-                raise ValueError("DISPLACEMENT_PLOT_TIME_WINDOW must have exactly two values: (start, end).")
-            t0 = float(DISPLACEMENT_PLOT_TIME_WINDOW[0])
-            t1 = float(DISPLACEMENT_PLOT_TIME_WINDOW[1])
+            if len(time_window) != 2:
+                raise ValueError("time_window must have exactly two values: (start, end).")
+            t0 = float(time_window[0])
+            t1 = float(time_window[1])
             t_lo = min(t0, t1)
             t_hi = max(t0, t1)
             plot_mask = (t >= t_lo) & (t <= t_hi)
@@ -632,49 +697,48 @@ def _plot_corrected_displacement(
             ax = axes_arr[i]
             ax.set_title(f"{label} (no samples in plot window)")
             ax.grid(True)
-            ax.set_xlabel("Time (s)" if USE_RELATIVE_TIME else "Time")
-            ax.set_ylabel("Displacement y (m)")
+            ax.set_xlabel("Time [s]" if USE_RELATIVE_TIME else "Time")
+            ax.set_ylabel("Displacement y [m]")
             continue
-        marker_step = max(1, int(np.ceil(max(t_plot.size, 1) / 120.0)))
         ax = axes_arr[i]
         ax.plot(
             t_plot,
             y_plot,
             linestyle=":",
-            marker="x",
-            markevery=marker_step,
-            markersize=3.0,
             linewidth=1.0,
             alpha=0.85,
+            color="tab:blue",
+            marker=None,
             label="Original y",
         )
         ax.plot(
             t_plot,
             y_corr_plot,
             linestyle="-",
-            marker="o",
-            markevery=marker_step,
-            markersize=3.0,
             linewidth=1.05,
             alpha=0.95,
+            color="black",
+            marker=None,
             label="Corrected y",
         )
         ax.set_title(label)
         ax.grid(True)
-        ax.set_xlabel("Time (s)" if USE_RELATIVE_TIME else "Time")
-        ax.set_ylabel("Displacement y (m)")
+        ax.set_xlabel("Time [s]" if USE_RELATIVE_TIME else "Time")
+        ax.set_ylabel("Displacement y [m]")
         if i == 0:
             ax.legend(loc="best", fontsize="small")
 
     for i in range(n, axes_arr.size):
         axes_arr[i].axis("off")
 
-    if DISPLACEMENT_PLOT_TIME_WINDOW is None:
+    if time_window is None:
         fig_title = "Displacement before/after phase-drift correction"
     else:
-        t0 = float(DISPLACEMENT_PLOT_TIME_WINDOW[0])
-        t1 = float(DISPLACEMENT_PLOT_TIME_WINDOW[1])
+        t0 = float(time_window[0])
+        t1 = float(time_window[1])
         fig_title = f"Displacement before/after phase-drift correction [{min(t0, t1):g}, {max(t0, t1):g}]"
+    if str(title_suffix).strip():
+        fig_title = f"{fig_title} {str(title_suffix).strip()}"
     fig.suptitle(fig_title, fontsize=12)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
 
@@ -713,10 +777,27 @@ def _plot_corrected_acceleration(
         y_corr = np.asarray(corrected_disp_by_label[label], dtype=float)
         dt = float(result["dt"])
         try:
-            _, acc_corr, _ = extracted._compute_derivatives(y_corr, dt=dt)
-        except Exception:
-            vel_corr = np.gradient(y_corr, dt)
-            acc_corr = np.gradient(vel_corr, dt)
+            deriv_out = extracted._compute_derivatives(y_corr, dt=dt)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{label}: corrected acceleration requires Savitzky-Golay derivatives, "
+                f"but derivative computation failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not (isinstance(deriv_out, tuple) and len(deriv_out) >= 2):
+            raise RuntimeError(f"{label}: unexpected derivative return format: {type(deriv_out).__name__}")
+        acc_corr = np.asarray(deriv_out[1], dtype=float)
+        deriv_meta = deriv_out[2] if len(deriv_out) >= 3 else {}
+        mode = ""
+        if isinstance(deriv_meta, dict):
+            mode = str(deriv_meta.get("mode", "")).strip().lower()
+
+        if bool(REQUIRE_SAVGOL_FOR_CORRECTED_ACCELERATION) and "savgol" not in mode:
+            raise RuntimeError(
+                f"{label}: corrected acceleration requires Savitzky-Golay derivatives; "
+                f"got derivative mode='{mode or 'unknown'}'. "
+                "Enable the Savitzky-Golay derivative backend before plotting corrected acceleration."
+            )
 
         acc_raw = _select_channel(result, "Acceleration y_ddot (m/s^2)")
 
@@ -727,38 +808,48 @@ def _plot_corrected_acceleration(
             ax = axes_arr[i]
             ax.set_title(f"{label} (no samples in plot window)")
             ax.grid(True)
-            ax.set_xlabel("Time (s)" if USE_RELATIVE_TIME else "Time")
-            ax.set_ylabel("Acceleration y_ddot (m/s^2)")
+            ax.set_xlabel("Time [s]" if USE_RELATIVE_TIME else "Time")
+            ax.set_ylabel("Acceleration y_ddot [m/s^2]")
             continue
 
-        marker_step = max(1, int(np.ceil(max(t_plot.size, 1) / 120.0)))
         ax = axes_arr[i]
         ax.plot(
             t_plot,
             acc_raw_plot,
             linestyle=":",
-            marker="x",
-            markevery=marker_step,
-            markersize=3.0,
             linewidth=1.0,
             alpha=0.85,
+            color="tab:blue",
+            marker=None,
             label="Original y_ddot",
         )
         ax.plot(
             t_plot,
             acc_corr_plot,
             linestyle="-",
-            marker="o",
-            markevery=marker_step,
-            markersize=3.0,
             linewidth=1.05,
             alpha=0.95,
+            color="black",
+            marker=None,
             label="Corrected y_ddot",
         )
+        # Keep y-scale focused on corrected acceleration (not raw spikes).
+        finite_corr = np.asarray(acc_corr_plot, dtype=float)
+        finite_corr = finite_corr[np.isfinite(finite_corr)]
+        if finite_corr.size > 0:
+            y_min = float(np.min(finite_corr))
+            y_max = float(np.max(finite_corr))
+            if y_max > y_min:
+                pad = 0.08 * (y_max - y_min)
+                ax.set_ylim(y_min - pad, y_max + pad)
+            else:
+                base = abs(y_max) if y_max != 0.0 else 1.0
+                pad = 0.1 * base
+                ax.set_ylim(y_min - pad, y_max + pad)
         ax.set_title(label)
         ax.grid(True)
-        ax.set_xlabel("Time (s)" if USE_RELATIVE_TIME else "Time")
-        ax.set_ylabel("Acceleration y_ddot (m/s^2)")
+        ax.set_xlabel("Time [s]" if USE_RELATIVE_TIME else "Time")
+        ax.set_ylabel("Acceleration y_ddot [m/s^2]")
         if i == 0:
             ax.legend(loc="best", fontsize="small")
 
@@ -780,12 +871,15 @@ def _plot_phase_drift_all(
     *,
     disp_overrides: dict[str, np.ndarray] | None = None,
     title_suffix: str = "",
+    save_path: Path | str | None = None,
+    common_lag_model: tuple[np.ndarray, float, float] | None = None,
 ) -> None:
     fig_phase, (ax_py, ax_f, ax_l, ax_dl) = plt.subplots(
         4, 1, figsize=(extracted.FIGURE_WIDTH, 8.8), sharex=True
     )
     plotted = False
 
+    poly_legend_added = False
     for result in results:
         label = str(result["label"])
         disp_override = None if disp_overrides is None else disp_overrides.get(label)
@@ -795,11 +889,46 @@ def _plot_phase_drift_all(
             print(f"{label}: phase-drift summary{title_suffix} (vs y): insufficient valid windows.")
             continue
 
-        ax_py.plot(tc, ph_deg, marker="o", markersize=2.8, linewidth=1.0, label=label)
-        ax_l.plot(tc, lag_s, marker="o", markersize=2.8, linewidth=1.0, label=label)
-        ax_f.plot(tc, f_dom, marker="o", markersize=2.8, linewidth=1.0, label=label)
+        marker = None
+        markersize = None
+        markevery = None
+        if bool(PHASE_DOT_MARKERS):
+            marker = "o"
+            markersize = float(PHASE_DOT_MARKER_SIZE)
+            markevery = max(1, int(np.ceil(tc.size / max(1, int(PHASE_DOT_MAX_POINTS)))))
+
+        ax_py.plot(
+            tc, ph_deg, linewidth=1.0, label=label, marker=marker, markersize=markersize, markevery=markevery
+        )
+        ax_l.plot(
+            tc, lag_s, linewidth=1.0, label=label, marker=marker, markersize=markersize, markevery=markevery
+        )
+        if common_lag_model is not None and tc.size >= 2:
+            coeff, rel_t_min, rel_t_max = common_lag_model
+            rel_tc = np.asarray(tc, dtype=float) - float(tc[0])
+            if bool(PHASE_COMMON_LAG_EXTRAPOLATE):
+                rel_eval = rel_tc
+            else:
+                rel_eval = np.clip(rel_tc, rel_t_min, rel_t_max)
+            lag_poly = np.polyval(coeff, rel_eval)
+            poly_label = "Common lag polynomial fit" if not poly_legend_added else None
+            ax_l.plot(
+                tc,
+                np.asarray(lag_poly, dtype=float),
+                linestyle="--",
+                linewidth=1.2,
+                color="black",
+                alpha=0.9,
+                label=poly_label,
+            )
+            poly_legend_added = True
+        ax_f.plot(
+            tc, f_dom, linewidth=1.0, label=label, marker=marker, markersize=markersize, markevery=markevery
+        )
         dlag_dt = _lag_derivative_per_second(tc, lag_s)
-        ax_dl.plot(tc, dlag_dt, marker="o", markersize=2.4, linewidth=1.0, label=label)
+        ax_dl.plot(
+            tc, dlag_dt, linewidth=1.0, label=label, marker=marker, markersize=markersize, markevery=markevery
+        )
         plotted = True
 
         if tc.size >= 2:
@@ -820,51 +949,57 @@ def _plot_phase_drift_all(
     ax_f.grid(True)
     ax_py.grid(True)
     ax_dl.grid(True)
-    ax_l.set_ylabel("Lag at max corr (s)")
-    ax_f.set_ylabel("Dominant f (Hz)")
-    ax_py.set_ylabel("Phase diff (deg)")
-    ax_dl.set_ylabel("d(lag)/dt (s/s)")
-    ax_dl.set_xlabel("Time (s)" if USE_RELATIVE_TIME else "Time")
+    ax_l.set_ylabel("Lag [s]")
+    ax_f.set_ylabel("Dominant f [Hz]")
+    ax_py.set_ylabel("Phase diff [deg]")
+    ax_dl.set_ylabel("d(lag)/dt [s/s]")
+    ax_dl.set_xlabel("Time [s]" if USE_RELATIVE_TIME else "Time")
     suffix = f" {title_suffix}" if title_suffix else ""
-    ax_py.set_title(f"Sliding-window phase: (Fy2 - Fy1) relative to displacement{suffix}")
-    lag_method = str(LAG_ESTIMATION_METHOD).strip().lower()
-    if lag_method == "phase":
-        ax_l.set_title("Sliding-window lag derived from phase/frequency")
-    else:
-        ax_l.set_title("Sliding-window lag from cross-correlation")
+    ax_py.set_title(f"Phase between spring force and displacement{suffix}")
+    ax_l.set_title("Sliding-window lag derived from phase/frequency")
     ax_f.set_title("Dominant frequency used for phase estimate")
     ax_dl.set_title("Sliding-window lag drift rate")
     ax_py.axhline(0.0, color="black", linewidth=0.9, alpha=0.7)
     handles, labels = ax_py.get_legend_handles_labels()
     if handles:
-        ncols = min(4, max(1, len(labels)))
         fig_phase.legend(
             handles,
             labels,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 0.995),
-            ncol=ncols,
+            loc="center left",
+            bbox_to_anchor=(0.86, 0.5),
+            ncol=1,
             fontsize="small",
             frameon=True,
         )
-        fig_phase.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+        fig_phase.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
     else:
         fig_phase.tight_layout()
 
+    if bool(EXPORT_PHASE_PLOTS) and save_path is not None:
+        out_path = Path(save_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_phase.savefig(out_path, dpi=int(PHASE_PLOT_SAVE_DPI), bbox_inches="tight")
+        print(f"Saved phase plot: {out_path} (dpi={int(PHASE_PLOT_SAVE_DPI)})")
+
 
 def main() -> None:
-    if not MAT_FILES:
-        raise ValueError("MAT_FILES is empty.")
-
     # Ensure phase script can override these settings from the extraction script.
     extracted.DATA_VARIABLE = DATA_VARIABLE
     extracted.USE_RELATIVE_TIME = USE_RELATIVE_TIME
-    extracted.PLOT_FIRST_SECONDS = PLOT_FIRST_SECONDS
+    # Unify Savitzky-Golay settings across corrected-signal smoothing and derivatives.
+    if hasattr(extracted, "DERIV_SAVGOL_WINDOW"):
+        extracted.DERIV_SAVGOL_WINDOW = int(PHASE_CORRECTION_POST_SAVGOL_WINDOW)
+    if hasattr(extracted, "DERIV_SAVGOL_POLYORDER"):
+        extracted.DERIV_SAVGOL_POLYORDER = int(PHASE_CORRECTION_POST_SAVGOL_POLYORDER)
 
-    mat_files = [Path(p) for p in MAT_FILES]
+    mat_files, source_desc = _resolve_phase_input_files()
+    if not mat_files:
+        raise ValueError("No MAT files selected for phase analysis.")
     mat_files = _filter_excluded_tests(mat_files)
     if not mat_files:
         raise ValueError("No MAT files left after applying EXCLUDE_TEST_NUMBERS.")
+    print(f"Phase analysis file source: {source_desc}")
+    print(f"Phase analysis selected {len(mat_files)} file(s) after exclusions.")
     missing = [p for p in mat_files if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Missing MAT file(s): {missing}")
@@ -872,20 +1007,80 @@ def main() -> None:
     results: list[dict[str, object]] = []
     for mat_file in mat_files:
         result = extracted._process_file(mat_file)
+        # Phase analysis always uses full available series in this script.
+        t_arr = np.asarray(result["t"], dtype=float).reshape(-1)
+        result["mask"] = np.ones(t_arr.size, dtype=bool)
         results.append(result)
 
-    _plot_phase_drift_all(results)
+    if bool(PLOT_KEY_TIMESERIES_WITH_END_HIST):
+        if bool(PLOT_KEY_TIMESERIES_FOR_ALL_FILES):
+            for result in results:
+                _plot_key_timeseries_with_end_hist(result)
+        else:
+            idx = int(KEY_TIMESERIES_FILE_INDEX)
+            if not (0 <= idx < len(results)):
+                raise IndexError(f"KEY_TIMESERIES_FILE_INDEX={idx} out of range for {len(results)} files.")
+            _plot_key_timeseries_with_end_hist(results[idx])
 
+    phase_before: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None = None
+    common_lag_model_before: tuple[np.ndarray, float, float] | None = None
     if bool(PHASE_CORRECTION_ENABLED):
         phase_before = _collect_phase_series(results)
-        corrected_disp = _build_corrected_displacement(results, phase_before)
-        phase_after = _collect_phase_series(results, disp_overrides=corrected_disp)
-        _print_phase_before_after_summary(phase_before, phase_after)
-        if bool(PLOT_CORRECTED_DISPLACEMENT):
-            _plot_corrected_displacement(results, corrected_disp)
-        if bool(PLOT_CORRECTED_ACCELERATION):
-            _plot_corrected_acceleration(results, corrected_disp)
-        _plot_phase_drift_all(results, disp_overrides=corrected_disp, title_suffix="(corrected displacement)")
+        if (
+            bool(PLOT_COMMON_LAG_POLY_IN_BEFORE_PLOT)
+            and str(PHASE_CORRECTION_MODE).strip().lower() == "common"
+            and _has_any_valid_phase_windows(phase_before)
+        ):
+            try:
+                common_lag_model_before = _fit_common_lag_model(phase_before)
+            except Exception as exc:
+                warnings.warn(f"Could not fit common lag model for before-plot overlay: {exc}")
+
+    _plot_phase_drift_all(
+        results,
+        save_path=PHASE_PLOT_BEFORE_SAVE_PATH,
+        common_lag_model=common_lag_model_before,
+    )
+
+    if bool(PHASE_CORRECTION_ENABLED):
+        if phase_before is None:
+            phase_before = _collect_phase_series(results)
+        if not _has_any_valid_phase_windows(phase_before):
+            warnings.warn(
+                "Skipping phase correction: no valid phase windows were found "
+                "(adjust PHASE_WINDOW_SECONDS or signal quality)."
+            )
+        else:
+            try:
+                corrected_disp = _build_corrected_displacement(results, phase_before)
+            except Exception as exc:
+                warnings.warn(f"Skipping phase correction due to error: {type(exc).__name__}: {exc}")
+                corrected_disp = None
+
+            if corrected_disp is not None:
+                phase_after = _collect_phase_series(results, disp_overrides=corrected_disp)
+                _print_phase_before_after_summary(phase_before, phase_after)
+                if bool(PLOT_CORRECTED_DISPLACEMENT):
+                    _plot_corrected_displacement(
+                        results,
+                        corrected_disp,
+                        time_window=DISPLACEMENT_PLOT_TIME_WINDOW,
+                    )
+                    if bool(PLOT_CORRECTED_DISPLACEMENT_FULL) and DISPLACEMENT_PLOT_TIME_WINDOW is not None:
+                        _plot_corrected_displacement(
+                            results,
+                            corrected_disp,
+                            time_window=None,
+                            title_suffix="(full interval)",
+                        )
+                if bool(PLOT_CORRECTED_ACCELERATION):
+                    _plot_corrected_acceleration(results, corrected_disp)
+                _plot_phase_drift_all(
+                    results,
+                    disp_overrides=corrected_disp,
+                    title_suffix="(corrected displacement)",
+                    save_path=PHASE_PLOT_AFTER_SAVE_PATH,
+                )
     plt.show()
 
 

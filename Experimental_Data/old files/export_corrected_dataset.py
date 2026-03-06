@@ -40,7 +40,7 @@ CHUNK_LENGTH_SECONDS = 60.0
 # If <= 0, uses CHUNK_LENGTH_SECONDS (non-overlapping chunks).
 CHUNK_STRIDE_SECONDS = 0.0
 # If True, include one last tail chunk ending at the last sample when possible.
-INCLUDE_TAIL_CHUNK = False
+INCLUDE_TAIL_CHUNK = True
 MIN_CHUNK_SAMPLES = 256
 
 # Split stratification knobs.
@@ -58,12 +58,20 @@ CHUNK_USE_GLOBAL_MEAN_UR = True
 # Kinematics are computed using the same derivative routine as phase-analysis
 # plotting (plot_extracted_channels._compute_derivatives).
 
-# Exporting only the same plotted analysis window can be useful when
-# PLOT_FIRST_SECONDS is used in phase/diagnostic scripts.
+# Exporting only the same active phase-analysis mask window can be useful.
 USE_PHASE_MASK_WINDOW = True
+# For corrected-dataset export, force a common linear lag model with extrapolation
+# so correction is applied over full record duration (including times beyond the
+# fitting window, e.g. > 980 s).
+FORCE_COMMON_LINEAR_LAG_EXTRAPOLATION = True
+# Optional additional end-trim used only for NPZ export path
+# (downsampling/chunking + saved NPZ chunks). Corrected MAT export remains untrimmed.
+NPZ_TRIM_START_SECONDS = float(getattr(analysis, "TRIM_START_SECONDS", 0.0))
+NPZ_TRIM_END_SECONDS = float(getattr(analysis, "TRIM_END_SECONDS", 0.0))
 
 # Exclude files by test number parsed from filename.
-# By default, mirror phase-analysis exclusion unless overridden here.
+# These are additional exclusions applied after phase-analysis selection/exclusion.
+# By default, mirror phase-analysis exclusion (idempotent if identical).
 EXCLUDE_TEST_NUMBERS: list[int] = list(getattr(phase, "EXCLUDE_TEST_NUMBERS", []))
 
 # Calculated-force knobs:
@@ -133,13 +141,30 @@ def _filter_excluded_tests(paths: list[Path]) -> list[Path]:
 
 
 def _resolve_mat_files() -> list[Path]:
-    mat_files = [Path(p) for p in list(phase.MAT_FILES)]
+    source_desc = "phase.MAT_FILES (fallback)"
+    if hasattr(phase, "_resolve_phase_input_files"):
+        phase_files, phase_source_desc = phase._resolve_phase_input_files()
+        mat_files = [Path(p) for p in phase_files]
+        source_desc = str(phase_source_desc)
+    else:
+        mat_files = [Path(p) for p in list(phase.MAT_FILES)]
+
+    # Always apply the same exclusion step as phase_analysis first.
+    if hasattr(phase, "_filter_excluded_tests"):
+        mat_files = phase._filter_excluded_tests(mat_files)
+
+    # Optional additional export-specific exclusions.
     mat_files = _filter_excluded_tests(mat_files)
+
     if not mat_files:
-        raise ValueError("No MAT files selected (check phase.MAT_FILES and EXCLUDE_TEST_NUMBERS).")
+        raise ValueError(
+            "No MAT files selected (check phase file selection settings and EXCLUDE_TEST_NUMBERS)."
+        )
     missing = [p for p in mat_files if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Missing MAT file(s): {missing}")
+    print(f"Export source files: {source_desc}")
+    print(f"Export selected {len(mat_files)} file(s) after exclusions.")
     return mat_files
 
 
@@ -152,6 +177,7 @@ def _flow_and_ur_for_result(
     mat_file: Path,
     t_result: np.ndarray,
     mask_result: np.ndarray,
+    apply_mask_window: bool,
 ) -> tuple[np.ndarray, float, float, float]:
     data, channel_names = analysis._load_data_matrix(mat_file, phase.DATA_VARIABLE)
     time = analysis._select_column(data, channel_names, ["Time"], 0, role="time")
@@ -170,7 +196,7 @@ def _flow_and_ur_for_result(
     mask = mask[:n2]
     flow_arr = flow_arr[:n2]
 
-    if bool(USE_PHASE_MASK_WINDOW):
+    if bool(apply_mask_window):
         flow_used = flow_arr[mask]
     else:
         flow_used = flow_arr
@@ -600,7 +626,10 @@ def _export_corrected_mat(
 def main() -> None:
     phase.extracted.DATA_VARIABLE = phase.DATA_VARIABLE
     phase.extracted.USE_RELATIVE_TIME = phase.USE_RELATIVE_TIME
-    phase.extracted.PLOT_FIRST_SECONDS = phase.PLOT_FIRST_SECONDS
+    if bool(FORCE_COMMON_LINEAR_LAG_EXTRAPOLATION):
+        phase.PHASE_CORRECTION_MODE = "common"
+        phase.PHASE_COMMON_LAG_POLYORDER = 1
+        phase.PHASE_COMMON_LAG_EXTRAPOLATE = True
 
     mat_files = _resolve_mat_files()
     results: list[dict[str, object]] = []
@@ -638,18 +667,37 @@ def main() -> None:
         y_corr_full = y_corr.copy()
         y_dot_corr_full = y_dot_corr.copy()
         f_calc_full = f_calc.copy()
-
+        trim_mask = analysis._time_trim_mask(
+            t,
+            role=f"{mat_path.name}: export time trim",
+            trim_start_seconds=float(NPZ_TRIM_START_SECONDS),
+            trim_end_seconds=float(NPZ_TRIM_END_SECONDS),
+        )
+        export_mask = np.ones_like(mask, dtype=bool)
         if bool(USE_PHASE_MASK_WINDOW):
-            t = t[mask]
-            f_calc = f_calc[mask]
-            y_corr = y_corr[mask]
-            y_dot_corr = y_dot_corr[mask]
-            y_ddot_corr = y_ddot_corr[mask]
+            export_mask &= np.asarray(mask, dtype=bool)
+        if bool(float(NPZ_TRIM_START_SECONDS) > 0.0 or float(NPZ_TRIM_END_SECONDS) > 0.0):
+            export_mask &= np.asarray(trim_mask, dtype=bool)
+
+        if int(np.count_nonzero(export_mask)) < 2:
+            warnings.warn(
+                f"{mat_path.name}: skipping source after mask/trim "
+                f"(remaining samples={int(np.count_nonzero(export_mask))})."
+            )
+            continue
+
+        if not np.all(export_mask):
+            t = t[export_mask]
+            f_calc = f_calc[export_mask]
+            y_corr = y_corr[export_mask]
+            y_dot_corr = y_dot_corr[export_mask]
+            y_ddot_corr = y_ddot_corr[export_mask]
 
         flow_used, ur_mean, ur_std, u_mean = _flow_and_ur_for_result(
             mat_file=mat_path,
             t_result=np.asarray(result["t"], dtype=float),
-            mask_result=np.asarray(result["mask"], dtype=bool),
+            mask_result=np.asarray(export_mask, dtype=bool),
+            apply_mask_window=True,
         )
 
         ur_series = flow_used / (float(analysis.FN) * float(analysis.D))
@@ -763,6 +811,7 @@ def main() -> None:
     if bool(EXPORT_CORRECTED_MAT):
         for source in prepared_sources:
             mat_path = Path(source["mat_path"])
+            # Always export corrected MAT from full untrimmed source arrays.
             corrected_mat_path = _export_corrected_mat(
                 source_mat_path=mat_path,
                 split_name="all",
@@ -832,7 +881,15 @@ def main() -> None:
                 "phase_correction_mode": str(phase.PHASE_CORRECTION_MODE),
                 "phase_window_seconds": float(phase.PHASE_WINDOW_SECONDS),
                 "phase_window_overlap": float(phase.PHASE_WINDOW_OVERLAP),
-                "phase_lag_method": str(phase.LAG_ESTIMATION_METHOD),
+                "phase_lag_method": str(getattr(phase, "LAG_ESTIMATION_METHOD", "phase")),
+                "phase_common_lag_polyorder": int(phase.PHASE_COMMON_LAG_POLYORDER),
+                "phase_common_lag_extrapolate": bool(getattr(phase, "PHASE_COMMON_LAG_EXTRAPOLATE", False)),
+                "force_common_linear_lag_extrapolation": bool(FORCE_COMMON_LINEAR_LAG_EXTRAPOLATION),
+                "npz_trim_start_seconds_setting": float(NPZ_TRIM_START_SECONDS),
+                "npz_trim_end_seconds_setting": float(NPZ_TRIM_END_SECONDS),
+                # Backward-compatible keys:
+                "trim_start_seconds_setting": float(NPZ_TRIM_START_SECONDS),
+                "trim_end_seconds_setting": float(NPZ_TRIM_END_SECONDS),
                 "force_fy1_mult": float(FORCE_FY1_MULT),
                 "force_fy2_mult": float(FORCE_FY2_MULT),
                 "force_global_sign": float(FORCE_GLOBAL_SIGN),

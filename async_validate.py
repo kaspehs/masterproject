@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
 from HNN_helper import (
     PHVIV,
     FORCE_MAPPING_NRMSE_KEY,
-    FORCE_ROLLOUT_NRMSE_KEY,
     build_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
@@ -40,7 +39,6 @@ from HNN_helper import (
 from methods.vpinn.trainer import (
     _apply_per_traj_scale,
     _force_mapping_nrmse_over_trajs,
-    _load_metadata_map,
     ScaledForceWrapper,
     WindowDataset,
     _as_diag_param,
@@ -125,6 +123,12 @@ def _run_hnn_validation(
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
     per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
+    rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
+    rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
+    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
+        raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
+    rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
+    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
@@ -143,7 +147,8 @@ def _run_hnn_validation(
     with np.load(data_path) as data:
         t = np.asarray(data["a"])
         y_data = np.asarray(data["b"])
-        F_data = np.asarray(data["c"])
+        has_force_data = "c" in data
+        F_data = np.asarray(data["c"]) if has_force_data else np.zeros_like(y_data)
         H_data = np.asarray(data["d"]) if "d" in data else np.zeros_like(y_data)
         if "U_r" not in data:
             raise KeyError(f"{data_path} is missing reduced velocity 'U_r'.")
@@ -189,8 +194,8 @@ def _run_hnn_validation(
             velocity_source=velocity_source,
             eval_velocity=vel_data,
             eval_reduced_velocity=reduced_velocity,
-            require_force=True,
-            eval_force=F_data,
+            require_force=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            eval_force=(F_data if has_force_data else None),
             cut_start_seconds=val_cut,
         )
     else:
@@ -206,8 +211,8 @@ def _run_hnn_validation(
             velocity_source=velocity_source,
             eval_velocity=vel_data,
             eval_reduced_velocity=reduced_velocity,
-            require_force=True,
-            eval_force=F_data,
+            require_force=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            eval_force=(F_data if has_force_data else None),
             cut_start_seconds=val_cut,
         )
 
@@ -270,9 +275,12 @@ def _run_hnn_validation(
             title="Validation loss vs U_r",
         )
 
+<<<<<<< HEAD
     rollout_by_ur: dict[float, list[float]] = {}
     include_disp_nrmse = bool(getattr(cfg.monitoring, "rollout_include_disp_nrmse", True))
     include_force_nrmse = bool(getattr(cfg.monitoring, "rollout_include_force_nrmse", True))
+=======
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
@@ -301,27 +309,21 @@ def _run_hnn_validation(
                 k=k,
                 device=device,
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+<<<<<<< HEAD
                 include_disp_nrmse=include_disp_nrmse,
                 include_force_nrmse=include_force_nrmse,
+=======
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-            if FORCE_ROLLOUT_NRMSE_KEY in metrics:
-                ur_val = float(np.asarray(_ur_np).reshape(-1)[0])
-                rollout_by_ur.setdefault(ur_val, []).append(float(metrics[FORCE_ROLLOUT_NRMSE_KEY]))
             count += 1
         if count > 0:
             for name, total in metrics_sum.items():
                 writer.add_scalar(f"val/{name}", total / float(count), epoch)
-        if rollout_by_ur:
-            rollout_mean = {float(np.round(k, 6)): float(np.mean(v)) for k, v in rollout_by_ur.items()}
-            log_loss_vs_ur(
-                writer,
-                epoch,
-                {FORCE_ROLLOUT_NRMSE_KEY: rollout_mean},
-                tag=f"val/{FORCE_ROLLOUT_NRMSE_KEY}_vs_U_r",
-                title=f"{FORCE_ROLLOUT_NRMSE_KEY} vs U_r",
-            )
 
         ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
         rollout_idx = _rollout_index(
@@ -357,6 +359,9 @@ def _run_hnn_validation(
             include_disp_nrmse=include_disp_nrmse,
             include_force_nrmse=include_force_nrmse,
             log_metrics=False,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
         )
     else:
         force_map_sum = 0.0
@@ -432,6 +437,7 @@ def _run_vpinn_validation(
     if dt_target is None:
         dt_target = _infer_dt_target_from_data_cfg(data_cfg)
     dt_target = None if dt_target is None else float(dt_target)
+<<<<<<< HEAD
 
     f0_lookup = None
     fn_hz = None
@@ -452,6 +458,10 @@ def _run_vpinn_validation(
                 f"Warning: metadata file '{meta_path}' not found. "
                 "Falling back to U_r-based F0 conversion."
             )
+=======
+    coeff_k = float(getattr(cfg.model, "k", 1218.0))
+    coeff_m_eff = float(_m_eff_from_model_cfg(cfg.model))
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 
     for path in sources:
         traj, dt = _load_trajectory(
@@ -463,10 +473,14 @@ def _run_vpinn_validation(
             reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
             cut_start_seconds=cut_start_seconds,
             force_representation=force_representation,
-            f0_lookup=f0_lookup,
             rho=float(getattr(cfg.model, "rho", 1000.0)),
             D=float(getattr(cfg.model, "D", 0.1)),
+<<<<<<< HEAD
             fn_hz=fn_hz,
+=======
+            k=coeff_k,
+            m_eff=coeff_m_eff,
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
         )
         if dt_ref is None:
             dt_ref = dt
@@ -750,7 +764,7 @@ def _evaluate_val_losses(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if getattr(model, "force_output", "force") == "coefficient":
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:
@@ -893,7 +907,7 @@ def _per_ur_loss_map_hnn(
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
-                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid)
+                        f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
                         f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:

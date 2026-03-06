@@ -29,12 +29,14 @@ from core.runtime import (
 )
 from HNN_helper import (
     Config,
+<<<<<<< HEAD
     DOMINANT_FREQ_REL_ERROR_KEY,
     DISP_SPECTRAL_SHAPE_ERROR_KEY,
     DISP_ROLLOUT_NRMSE_KEY,
     FORCE_SPECTRAL_SHAPE_ERROR_KEY,
+=======
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     FORCE_MAPPING_NRMSE_KEY,
-    FORCE_ROLLOUT_NRMSE_KEY,
     GradNormBalancer,
     MEAN_DISP_AMP_REL_ERROR_KEY,
     Residual,
@@ -767,10 +769,14 @@ def _load_trajectory(
     reduction_factor: int,
     cut_start_seconds: float,
     force_representation: str,
-    f0_lookup: Optional[dict[str, float]],
     rho: float,
     D: float,
+<<<<<<< HEAD
     fn_hz: Optional[float],
+=======
+    k: float,
+    m_eff: float,
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 ) -> tuple[dict[str, Any], float]:
     t, x, f_meas, v_file, ur_series = _read_timeseries_npz(path)
     t, x, f_meas, v_file, ur_series = _maybe_reduce_time(
@@ -834,8 +840,9 @@ def _load_trajectory(
     force_representation = str(force_representation).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
-    f0_val = None
+    f0_series = None
     if force_representation == "coefficient":
+<<<<<<< HEAD
         if f0_lookup is not None and path.name in f0_lookup:
             U_val = float(f0_lookup[path.name])
         else:
@@ -852,6 +859,22 @@ def _load_trajectory(
         if not np.isfinite(f0_val) or f0_val <= 0.0:
             raise ValueError(f"Invalid F0 for '{path.name}': {f0_val}")
         f_meas = f_meas / float(f0_val)
+=======
+        if not np.isfinite(float(k)) or not np.isfinite(float(m_eff)) or float(m_eff) <= 0.0:
+            raise ValueError(f"Invalid (k, m_eff)=({k}, {m_eff}) for coefficient conversion.")
+        omega_n = math.sqrt(float(k) / float(m_eff))
+        f_n = omega_n / (2.0 * math.pi)
+        ur_series_f = np.asarray(ur_series, dtype=float).reshape(-1)
+        u_series = ur_series_f * f_n * float(D)
+        v_arr = np.asarray(v, dtype=float)
+        v_sq = np.sum(v_arr * v_arr, axis=1)
+        speed_sq = u_series * u_series + v_sq
+        f0_series = 0.5 * float(rho) * float(D) * speed_sq
+        if not np.all(np.isfinite(f0_series)):
+            raise ValueError(f"Invalid non-finite F0 values for '{path.name}'.")
+        f0_series = np.clip(f0_series, 1e-12, None)
+        f_meas = f_meas / f0_series.reshape(-1, 1)
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 
     if ur_series.shape[0] != t.shape[0]:
         raise ValueError(f"{path.name}: U_r length {ur_series.shape[0]} does not match time {t.shape[0]}.")
@@ -864,9 +887,8 @@ def _load_trajectory(
         "f": torch.from_numpy(f_meas.astype(np.float32)),
         "ur": torch.from_numpy(ur_series),
     }
-    if f0_val is not None:
-        f0_series = np.full((t.shape[0], 1), float(f0_val), dtype=np.float32)
-        traj["f0"] = torch.from_numpy(f0_series)
+    if f0_series is not None:
+        traj["f0"] = torch.from_numpy(np.asarray(f0_series, dtype=np.float32).reshape(-1, 1))
     return traj, dt
 
 
@@ -989,6 +1011,7 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
     if train_ur_filter_tol < 0.0:
         raise ValueError("vpinn.train_ur_filter_tol must be non-negative.")
 
+<<<<<<< HEAD
     f0_lookup: Optional[dict[str, float]] = None
     fn_hz: Optional[float] = None
     if force_representation == "coefficient":
@@ -1001,6 +1024,10 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
         else:
             meta_path = Path(data_cfg.file).resolve().parent / "metadata.json"
         f0_lookup = _try_load_metadata_map(meta_path)
+=======
+    coeff_k = float(getattr(config.model, "k", 1218.0))
+    coeff_m_eff = float(_m_eff_from_model_cfg(config.model))
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 
     if data_cfg.use_generated_train_series:
         series_dir = Path(data_cfg.train_series_dir)
@@ -1081,10 +1108,14 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             reduction_factor=1,
             cut_start_seconds=train_cut_start_seconds,
             force_representation=force_representation,
-            f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+<<<<<<< HEAD
             fn_hz=fn_hz,
+=======
+            k=coeff_k,
+            m_eff=coeff_m_eff,
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
         )
         if dt_ref is None:
             dt_ref = dt
@@ -1101,10 +1132,14 @@ def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[di
             reduction_factor=1,
             cut_start_seconds=val_cut_start_seconds,
             force_representation=force_representation,
-            f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+<<<<<<< HEAD
             fn_hz=fn_hz,
+=======
+            k=coeff_k,
+            m_eff=coeff_m_eff,
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
         )
         if dt_ref is None:
             dt_ref = dt
@@ -1611,6 +1646,7 @@ def _log_rollout_validation(
     f_true = f_true_t[:, 0].detach().cpu().numpy()
 
     metrics: dict[str, float] = {}
+<<<<<<< HEAD
     if include_disp_nrmse:
         disp_std = float(np.std(x_true))
         if disp_std <= 0.0:
@@ -1673,6 +1709,8 @@ def _log_rollout_validation(
             metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spec_err)
             if log_metrics:
                 writer.add_scalar(f"val/{FORCE_SPECTRAL_SHAPE_ERROR_KEY}", float(force_spec_err), epoch)
+=======
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 
     with torch.no_grad():
         f_on_data = _vpinn_force(model, x_true_t, v_true_t, ur_true_t)[:, 0].detach().cpu().numpy()
@@ -1686,6 +1724,9 @@ def _log_rollout_validation(
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data_force - f_true_force) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
     else:
+        force_std = float(np.std(f_true))
+        if force_std <= 0.0:
+            force_std = 1.0
         rel_rmse_force_on_data = float(np.sqrt(np.mean((f_on_data - f_true) ** 2))) / force_std
         metrics[FORCE_MAPPING_NRMSE_KEY] = rel_rmse_force_on_data
 
@@ -1758,6 +1799,7 @@ def train(config: Config, config_name: str) -> None:
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
     use_force_coeff = force_representation == "coefficient"
+<<<<<<< HEAD
     f0_lookup: Optional[dict[str, float]] = None
     fn_hz: Optional[float] = None
     if use_force_coeff:
@@ -1770,6 +1812,10 @@ def train(config: Config, config_name: str) -> None:
         else:
             meta_path = Path(config.data.file).resolve().parent / "metadata.json"
         f0_lookup = _try_load_metadata_map(meta_path)
+=======
+    coeff_k = float(getattr(config.model, "k", 1218.0))
+    coeff_m_eff = float(_m_eff_from_model_cfg(config.model))
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
     per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
     if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
@@ -1824,10 +1870,14 @@ def train(config: Config, config_name: str) -> None:
             reduction_factor=val_reduction_factor,
             cut_start_seconds=cut_start_seconds,
             force_representation=force_representation,
-            f0_lookup=f0_lookup,
             rho=float(getattr(config.model, "rho", 1000.0)),
             D=float(getattr(config.model, "D", 0.1)),
+<<<<<<< HEAD
             fn_hz=fn_hz,
+=======
+            k=coeff_k,
+            m_eff=coeff_m_eff,
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
         )
         if val_dt != dt:
             raise ValueError(f"Validation data dt={val_dt} does not match training dt={dt}.")

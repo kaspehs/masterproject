@@ -15,7 +15,10 @@
 /Data_Gen/generated_series_Ur_40
 /Data_Gen/generated_series_Ur_60
 /Data_Gen/groundtruth_runs_100hz
+<<<<<<< HEAD
 /Experimental_Data/CF_corrected
+=======
+>>>>>>> 19814f3a4965562237583d2c8795dd2f1ad036a3
 /Experimental_Data/eval_models
 __pycache__/
 *.pyc
@@ -23,3 +26,4 @@ __pycache__/
 *.png
 *.json
 *.mat
+*.xlsx

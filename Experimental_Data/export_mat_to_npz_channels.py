@@ -10,8 +10,8 @@ from scipy.signal import savgol_filter
 
 
 # Paths / selection
-INPUT_DIR = Path("Experimental_Data/CrossFlow/RawData")
-OUTPUT_DIR = Path("Experimental_Data/npz_exports")
+INPUT_DIR = Path("Experimental_Data/CrossFlow/CleanedCorrectedSmoothedData")
+OUTPUT_DIR = Path("Experimental_Data/npz_exports_v2")
 INPUT_GLOB = "*.mat"  # Use "*.mat" for measurement files.
 DATA_VARIABLE = "data"  # Set to None to auto-detect first 2D numeric dataset.
 OVERWRITE = True
@@ -20,10 +20,10 @@ OVERWRITE = True
 # - "flat": one output file per source MAT file in OUTPUT_DIR.
 # - "split": split each MAT file into fixed-length chunks, then write to train/val/test subfolders.
 EXPORT_LAYOUT = "split"  # one of: flat, split
-SPLIT_CHUNK_SECONDS = 60.0
-TRAIN_FRACTION = 0.7
+SPLIT_CHUNK_SECONDS = 20.0
+TRAIN_FRACTION = 0.8
 VAL_FRACTION = 0.2
-TEST_FRACTION = 0.1
+TEST_FRACTION = 0.0
 SPLIT_SEED = 0
 
 # Physical / setup constants
@@ -34,8 +34,10 @@ FN = 1.119  # Natural frequency (Hz)
 LB = 2.37  # Length between spring location and top end (m)
 LA = 4.21 + 0.5  # Length between cylinder center and top end (m)
 
-# CF force channel choice: "fy1", "fy2", "sum", "diff"
-CF_FORCE_MODE = "fy1"
+# Hydrodynamic-force model: Fy2 - Fy1 + (m + ma) * ddy
+# Set these two masses for your rig/setup.
+MASS_M = 16.79
+ADDED_MASS_MA = D**2/4*np.pi*L*RHO
 ZERO_MEAN_CF_CHANNELS = True
 
 # Exported reduced-velocity channel mode:
@@ -135,6 +137,55 @@ def _extract_channel_names_from_raw(raw: dict) -> list[str] | None:
     return names
 
 
+def _coerce_numeric_vector(value: object) -> np.ndarray | None:
+    arr = np.asarray(value)
+    if arr.size == 0 or not np.issubdtype(arr.dtype, np.number):
+        return None
+    return np.asarray(arr, dtype=float).reshape(-1)
+
+
+def _load_corrected_kinematics_hdf5(mat_file: Path) -> dict[str, np.ndarray]:
+    try:
+        import h5py  # type: ignore
+    except Exception:
+        return {}
+    out: dict[str, np.ndarray] = {}
+    keys = ("y_corrected", "dy_corrected", "ddy_corrected")
+    with h5py.File(mat_file, "r") as f:
+        for key in keys:
+            obj = f.get(key, None)
+            if obj is None:
+                continue
+            if not isinstance(obj, h5py.Dataset):
+                continue
+            vec = _coerce_numeric_vector(np.array(obj))
+            if vec is not None:
+                out[key] = vec
+    return out
+
+
+def _load_corrected_kinematics(mat_file: Path) -> dict[str, np.ndarray]:
+    keys = ("y_corrected", "dy_corrected", "ddy_corrected")
+    try:
+        raw = loadmat(mat_file, squeeze_me=True)
+    except NotImplementedError:
+        return _load_corrected_kinematics_hdf5(mat_file)
+    except ValueError as exc:
+        if "Unknown mat file type" in str(exc):
+            return _load_corrected_kinematics_hdf5(mat_file)
+        raise
+    except OSError:
+        return _load_corrected_kinematics_hdf5(mat_file)
+    out: dict[str, np.ndarray] = {}
+    for key in keys:
+        if key not in raw:
+            continue
+        vec = _coerce_numeric_vector(raw[key])
+        if vec is not None:
+            out[key] = vec
+    return out
+
+
 def _load_data_matrix_hdf5(mat_file: Path, variable_name: str | None) -> tuple[np.ndarray, list[str] | None]:
     try:
         import h5py  # type: ignore
@@ -200,17 +251,11 @@ def _load_data_matrix(mat_file: Path, variable_name: str | None) -> tuple[np.nda
     raise ValueError(f"No 2D numeric matrix found in {mat_file}.")
 
 
-def _build_cf_force(fy1: np.ndarray, fy2: np.ndarray, mode: str) -> np.ndarray:
-    key = str(mode).strip().lower()
-    if key == "fy1":
-        return fy1
-    if key == "fy2":
-        return fy2
-    if key == "sum":
-        return fy1 + fy2
-    if key == "diff":
-        return fy1 - fy2
-    raise ValueError("CF_FORCE_MODE must be one of: fy1, fy2, sum, diff")
+def _build_hydrodynamic_force(fy1: np.ndarray, fy2: np.ndarray, ddy: np.ndarray) -> np.ndarray:
+    inertia_mass = float(MASS_M) + float(ADDED_MASS_MA)
+    return (np.asarray(fy2, dtype=float) - np.asarray(fy1, dtype=float)) + inertia_mass * np.asarray(
+        ddy, dtype=float
+    )
 
 
 def _select_column(
@@ -285,7 +330,12 @@ def _build_reduced_velocity_channel(flow_speed: np.ndarray) -> tuple[np.ndarray,
     return ur_export, ur_inst
 
 
-def _extract_channels(data: np.ndarray, channel_names: list[str] | None) -> dict[str, np.ndarray | float]:
+def _extract_channels(
+    data: np.ndarray,
+    channel_names: list[str] | None,
+    *,
+    corrected_kinematics: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray | float | bool]:
     if data.shape[1] < 25:
         raise ValueError(f"Expected at least 25 columns, got shape {data.shape}")
 
@@ -312,14 +362,50 @@ def _extract_channels(data: np.ndarray, channel_names: list[str] | None) -> dict
         fy_spr2 = fy_spr2 - np.mean(fy_spr2)
 
     f_drag = (fx_chain - fx_spr) * LB / LA
-    fy1 = fy_spr1 * LB / LA
-    fy2 = fy_spr2 * LB / LA
-    cf_force = _build_cf_force(fy1, fy2, CF_FORCE_MODE)
-
     flow_filled = _fill_nonfinite_1d(flow, role="flow speed")
+
+    if corrected_kinematics is None:
+        raise ValueError("Missing corrected kinematics dictionary for strict export mode.")
+
+    y_vec = corrected_kinematics.get("y_corrected")
+    dy_vec = corrected_kinematics.get("dy_corrected")
+    ddy_vec = corrected_kinematics.get("ddy_corrected")
+    missing: list[str] = []
+    if y_vec is None or y_vec.size == 0:
+        missing.append("y_corrected")
+    if dy_vec is None or dy_vec.size == 0:
+        missing.append("dy_corrected")
+    if ddy_vec is None or ddy_vec.size == 0:
+        missing.append("ddy_corrected")
+    if missing:
+        raise ValueError(
+            "Missing required corrected channel(s): "
+            + ", ".join(missing)
+            + ". This exporter is configured to never fallback to gradients."
+        )
+
+    y = _fill_nonfinite_1d(np.asarray(y_vec, dtype=float), role="y_corrected")
+    dy_corr = _fill_nonfinite_1d(np.asarray(dy_vec, dtype=float), role="dy_corrected")
+    ddy_corr = _fill_nonfinite_1d(np.asarray(ddy_vec, dtype=float), role="ddy_corrected")
+
+    series_lengths = [time.size, flow_filled.size, y.size, fx_chain.size, fx_spr.size, fy_spr1.size, fy_spr2.size]
+    series_lengths.append(dy_corr.size)
+    series_lengths.append(ddy_corr.size)
+    n = int(min(series_lengths))
+    if n < 2:
+        raise ValueError("Not enough aligned samples after selecting corrected kinematics.")
+
+    time = time[:n]
+    flow_filled = flow_filled[:n]
+    y = y[:n]
+    f_drag = f_drag[:n]
+    fy_spr1 = fy_spr1[:n]
+    fy_spr2 = fy_spr2[:n]
+    dy_corr = dy_corr[:n]
+    ddy_corr = ddy_corr[:n]
+
     ur_channel, ur_inst = _build_reduced_velocity_channel(flow_filled)
     u_mean = float(np.mean(flow_filled))
-
     q_ref = 0.5 * RHO * L * D * (u_mean**2)
     if q_ref <= 0.0:
         raise ValueError("Invalid dynamic pressure reference (non-positive).")
@@ -328,12 +414,18 @@ def _extract_channels(data: np.ndarray, channel_names: list[str] | None) -> dict
     dt = float(time[1] - time[0]) if time.size > 1 else 0.0
     if dt <= 0.0:
         raise ValueError("Time channel must have at least two increasing samples.")
-    dy = np.gradient(y, dt)
+    dy = np.asarray(dy_corr, dtype=float)
+    ddy = np.asarray(ddy_corr, dtype=float)
+
+    fy1 = fy_spr1 * LB / LA
+    fy2 = fy_spr2 * LB / LA
+    cf_force = _build_hydrodynamic_force(fy1, fy2, ddy)
 
     return {
         "time": time,
         "y": y,
         "dy": dy,
+        "ddy": ddy,
         "cf_force": cf_force,
         "drag_coeff": drag_coeff,
         "U_r": ur_channel,
@@ -343,6 +435,9 @@ def _extract_channels(data: np.ndarray, channel_names: list[str] | None) -> dict
         "ur_scalar": float(np.mean(ur_channel)),
         "ur_inst_mean": float(np.mean(ur_inst)),
         "ur_inst_std": float(np.std(ur_inst)),
+        "use_y_corrected": True,
+        "use_dy_corrected": True,
+        "use_ddy_corrected": True,
     }
 
 
@@ -424,6 +519,7 @@ def _build_payload(ch: dict[str, np.ndarray | float]) -> dict[str, np.ndarray]:
         "b": np.asarray(ch["y"], dtype=float),
         "c": np.asarray(ch["cf_force"], dtype=float),
         "e": np.asarray(ch["dy"], dtype=float),
+        "ddy": np.asarray(ch["ddy"], dtype=float),
     }
     if EXPORT_DY_CHANNEL:
         payload["dy"] = np.asarray(ch["dy"], dtype=float)
@@ -446,7 +542,8 @@ def main() -> None:
 
     for mat_path in mat_files:
         data, channel_names = _load_data_matrix(mat_path, DATA_VARIABLE)
-        ch = _extract_channels(data, channel_names)
+        corrected_kinematics = _load_corrected_kinematics(mat_path)
+        ch = _extract_channels(data, channel_names, corrected_kinematics=corrected_kinematics)
         if layout == "flat":
             out_path = OUTPUT_DIR / f"{mat_path.stem}.npz"
             if out_path.exists() and not OVERWRITE:
@@ -461,13 +558,18 @@ def main() -> None:
                     "split": "flat",
                     "chunk_index": 0,
                     "samples": int(np.asarray(ch["time"]).size),
-                    "cf_force_mode": CF_FORCE_MODE,
+                    "force_formula": "Fy2 - Fy1 + (m + ma) * ddy",
+                    "mass_m": float(MASS_M),
+                    "added_mass_ma": float(ADDED_MASS_MA),
                     "ur_channel_mode": str(UR_CHANNEL_MODE),
                     "u_mean": float(ch["u_mean"]),
                     "u_std": float(ch["u_std"]),
                     "ur_scalar": float(ch["ur_scalar"]),
                     "ur_inst_mean": float(ch["ur_inst_mean"]),
                     "ur_inst_std": float(ch["ur_inst_std"]),
+                    "used_y_corrected": bool(ch["use_y_corrected"]),
+                    "used_dy_corrected": bool(ch["use_dy_corrected"]),
+                    "used_ddy_corrected": bool(ch["use_ddy_corrected"]),
                 }
             )
             continue
@@ -498,13 +600,18 @@ def main() -> None:
                     "chunk_end_s": float(t_chunk[-1]),
                     "chunk_duration_s": float(t_chunk[-1] - t_chunk[0]),
                     "samples": int(t_chunk.size),
-                    "cf_force_mode": CF_FORCE_MODE,
+                    "force_formula": "Fy2 - Fy1 + (m + ma) * ddy",
+                    "mass_m": float(MASS_M),
+                    "added_mass_ma": float(ADDED_MASS_MA),
                     "ur_channel_mode": str(UR_CHANNEL_MODE),
                     "u_mean": float(chunk["u_mean"]),
                     "u_std": float(chunk["u_std"]),
                     "ur_scalar": float(chunk["ur_scalar"]),
                     "ur_inst_mean": float(chunk["ur_inst_mean"]),
                     "ur_inst_std": float(chunk["ur_inst_std"]),
+                    "used_y_corrected": bool(chunk["use_y_corrected"]),
+                    "used_dy_corrected": bool(chunk["use_dy_corrected"]),
+                    "used_ddy_corrected": bool(chunk["use_ddy_corrected"]),
                 }
             )
 

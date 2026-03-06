@@ -11,17 +11,17 @@ from scipy.signal import savgol_filter
 
 CONFIG = {
     # Data selection
-    "series_dir": Path(__file__).parent / "generated_series_Ur_60",
+    "series_dir": Path(__file__).parent / "generated_series_from_mat_velocity",
     # If series_dir has train/val/test subfolders, select which to include.
     "splits": ["train", "val", "test"],
     # Optional time trim (seconds from series start)
-    "cut_start_seconds": 10.0,
+    "cut_start_seconds": 0.0,
     # Reduced velocity filtering (use one of: list or range; None disables)
-    "ur_include": [2.0],  # e.g. [2.0, 4.0, 6.0]
+    "ur_include": None,  # e.g. [2.0, 4.0, 6.0]
     "ur_range": None,    # e.g. (2.0, 6.0)
     "ur_tol": 1e-3,
     # Plotting
-    "plot_timeseries": False,
+    "plot_timeseries": True,
     "plot_phase": True,
     "columns": 4,
     "save_timeseries": None,  # e.g. Path("figs/series.png")
