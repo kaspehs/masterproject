@@ -102,7 +102,12 @@ loss:
   # Optional RK4 trajectory rollout loss (disabled when weight<=0 or horizon<=0).
   # When GradNorm is enabled, this acts as a post-GradNorm multiplier.
   rollout_loss_weight: 0.0
+  # Base rollout horizon (used when schedule keys are null).
   rollout_horizon: 10
+  # Optional horizon schedule (curriculum). Null disables each override.
+  rollout_horizon_initial: null
+  rollout_horizon_final: null
+  rollout_horizon_ramp_epochs: 0
   rollout_every_steps: 1
   # 0 => use current training batch size for rollout-loss windows.
   rollout_batch_size: 0

@@ -144,6 +144,9 @@ class LossConfig:
     # Optional PHNN trajectory rollout loss (RK4): disabled when weight<=0 or horizon<=0.
     rollout_loss_weight: float = 0.0
     rollout_horizon: int = 0
+    rollout_horizon_initial: int | None = None
+    rollout_horizon_final: int | None = None
+    rollout_horizon_ramp_epochs: int = 0
     rollout_every_steps: int = 1
     rollout_batch_size: int = 0
     use_gradnorm: bool = False
@@ -325,6 +328,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "force_reg_on_coeff",
         "rollout_loss_weight",
         "rollout_horizon",
+        "rollout_horizon_initial",
+        "rollout_horizon_final",
+        "rollout_horizon_ramp_epochs",
         "rollout_every_steps",
         "rollout_batch_size",
         "use_gradnorm",

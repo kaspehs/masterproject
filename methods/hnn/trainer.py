@@ -210,6 +210,23 @@ def _sample_rollout_batch(
     return z0_batch, t_seq_batch, z_target_batch, ur0_batch, z_hist_batch, ur_hist_batch
 
 
+def _rollout_horizon_for_epoch(
+    *,
+    epoch: int,
+    base_horizon: int,
+    horizon_initial: int | None,
+    horizon_final: int | None,
+    horizon_ramp_epochs: int,
+) -> int:
+    start_h = int(base_horizon if horizon_initial is None else horizon_initial)
+    end_h = int(base_horizon if horizon_final is None else horizon_final)
+    ramp = max(0, int(horizon_ramp_epochs))
+    if ramp <= 0:
+        return end_h
+    frac = min(max(float(epoch), 0.0) / float(ramp), 1.0)
+    return int(round(start_h + frac * float(end_h - start_h)))
+
+
 def _train_one_epoch(
     *,
     model: torch.nn.Module,
@@ -1451,12 +1468,36 @@ def train(config: Config, config_name: str) -> None:
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     rollout_loss_weight = float(getattr(loss_cfg, "rollout_loss_weight", 0.0))
     rollout_horizon = int(getattr(loss_cfg, "rollout_horizon", 0))
+    rollout_horizon_initial_raw = getattr(loss_cfg, "rollout_horizon_initial", None)
+    rollout_horizon_final_raw = getattr(loss_cfg, "rollout_horizon_final", None)
+    rollout_horizon_ramp_epochs = int(getattr(loss_cfg, "rollout_horizon_ramp_epochs", 0))
+    rollout_horizon_initial = None if rollout_horizon_initial_raw is None else int(rollout_horizon_initial_raw)
+    rollout_horizon_final = None if rollout_horizon_final_raw is None else int(rollout_horizon_final_raw)
     rollout_every_steps = int(getattr(loss_cfg, "rollout_every_steps", 1))
     rollout_batch_size = int(getattr(loss_cfg, "rollout_batch_size", 0))
     if rollout_horizon < 0:
         raise ValueError("loss.rollout_horizon must be >= 0.")
-    if rollout_loss_weight > 0.0 and rollout_horizon < 1:
-        raise ValueError("loss.rollout_horizon must be >= 1 when loss.rollout_loss_weight > 0.")
+    if rollout_horizon_initial is not None and rollout_horizon_initial < 0:
+        raise ValueError("loss.rollout_horizon_initial must be >= 0 when provided.")
+    if rollout_horizon_final is not None and rollout_horizon_final < 0:
+        raise ValueError("loss.rollout_horizon_final must be >= 0 when provided.")
+    if rollout_horizon_ramp_epochs < 0:
+        raise ValueError("loss.rollout_horizon_ramp_epochs must be >= 0.")
+    if rollout_loss_weight > 0.0 and rollout_horizon_initial is not None and rollout_horizon_initial < 1:
+        raise ValueError("loss.rollout_horizon_initial must be >= 1 when loss.rollout_loss_weight > 0.")
+    if rollout_loss_weight > 0.0 and rollout_horizon_final is not None and rollout_horizon_final < 1:
+        raise ValueError("loss.rollout_horizon_final must be >= 1 when loss.rollout_loss_weight > 0.")
+    if rollout_loss_weight > 0.0:
+        max_configured_horizon = max(
+            int(rollout_horizon),
+            int(rollout_horizon_initial) if rollout_horizon_initial is not None else 0,
+            int(rollout_horizon_final) if rollout_horizon_final is not None else 0,
+        )
+        if max_configured_horizon < 1:
+            raise ValueError(
+                "Rollout loss is enabled but no valid horizon is configured. "
+                "Set loss.rollout_horizon>=1 or provide rollout_horizon_initial/final>=1."
+            )
     if rollout_every_steps < 1:
         raise ValueError("loss.rollout_every_steps must be >= 1.")
     if rollout_batch_size < 0:
@@ -1629,7 +1670,18 @@ def train(config: Config, config_name: str) -> None:
         scheduler_cfg=scheduler_cfg,
         epochs=epochs,
     )
-    use_rollout_loss = float(rollout_loss_weight) > 0.0 and int(rollout_horizon) > 0
+    use_rollout_loss = float(rollout_loss_weight) > 0.0
+    rollout_schedule_enabled = (rollout_horizon_initial is not None) or (rollout_horizon_final is not None)
+    if use_rollout_loss:
+        probe_horizon = _rollout_horizon_for_epoch(
+            epoch=0,
+            base_horizon=int(rollout_horizon),
+            horizon_initial=rollout_horizon_initial,
+            horizon_final=rollout_horizon_final,
+            horizon_ramp_epochs=rollout_horizon_ramp_epochs,
+        )
+        if int(probe_horizon) < 1:
+            raise ValueError("Rollout loss is enabled but rollout horizon schedule yields <1 at epoch 0.")
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(loss_cfg.use_gradnorm):
@@ -1654,21 +1706,25 @@ def train(config: Config, config_name: str) -> None:
     rollout_sampling_probs: np.ndarray | None = None
     rollout_total_windows = 0
     rollout_rng: np.random.Generator | None = None
+    rollout_prepared_horizon: int | None = None
     if use_rollout_loss:
-        rollout_sampling_pool, rollout_sampling_probs, rollout_total_windows = _prepare_rollout_sampling_pool(
-            train_sequences,
-            m_eff=float(m_eff),
-            rollout_horizon=int(rollout_horizon),
-            history_context=int(history_context),
-        )
         rollout_rng = np.random.default_rng()
         effective_rollout_batch = int(rollout_batch_size) if int(rollout_batch_size) > 0 else int(batch_size)
-        print(
-            "PHNN rollout loss enabled: "
-            f"weight={rollout_loss_weight:g}, horizon={int(rollout_horizon)}, "
-            f"every_steps={int(rollout_every_steps)}, rollout_batch_size={effective_rollout_batch}, "
-            f"valid_windows={int(rollout_total_windows)}."
-        )
+        if rollout_schedule_enabled:
+            start_h = int(rollout_horizon if rollout_horizon_initial is None else rollout_horizon_initial)
+            end_h = int(rollout_horizon if rollout_horizon_final is None else rollout_horizon_final)
+            print(
+                "PHNN rollout loss enabled with horizon schedule: "
+                f"weight={rollout_loss_weight:g}, horizon_start={start_h}, horizon_end={end_h}, "
+                f"ramp_epochs={int(rollout_horizon_ramp_epochs)}, every_steps={int(rollout_every_steps)}, "
+                f"rollout_batch_size={effective_rollout_batch}."
+            )
+        else:
+            print(
+                "PHNN rollout loss enabled: "
+                f"weight={rollout_loss_weight:g}, horizon={int(rollout_horizon)}, "
+                f"every_steps={int(rollout_every_steps)}, rollout_batch_size={effective_rollout_batch}."
+            )
         if gradnorm_balancer is not None:
             print(
                 "PHNN GradNorm: rollout branch enabled. "
@@ -1676,6 +1732,32 @@ def train(config: Config, config_name: str) -> None:
             )
 
     for epoch in range(epochs):
+        current_rollout_horizon = int(rollout_horizon)
+        if use_rollout_loss:
+            current_rollout_horizon = _rollout_horizon_for_epoch(
+                epoch=epoch,
+                base_horizon=int(rollout_horizon),
+                horizon_initial=rollout_horizon_initial,
+                horizon_final=rollout_horizon_final,
+                horizon_ramp_epochs=rollout_horizon_ramp_epochs,
+            )
+            if current_rollout_horizon < 1:
+                raise ValueError(
+                    f"Rollout loss enabled but scheduled rollout horizon is {current_rollout_horizon} at epoch {epoch}."
+                )
+            if rollout_prepared_horizon != current_rollout_horizon:
+                rollout_sampling_pool, rollout_sampling_probs, rollout_total_windows = _prepare_rollout_sampling_pool(
+                    train_sequences,
+                    m_eff=float(m_eff),
+                    rollout_horizon=int(current_rollout_horizon),
+                    history_context=int(history_context),
+                )
+                rollout_prepared_horizon = int(current_rollout_horizon)
+                print(
+                    f"PHNN rollout horizon update at epoch {epoch}: horizon={current_rollout_horizon}, "
+                    f"valid_windows={int(rollout_total_windows)}."
+                )
+
         if use_lr_scheduler:
             for group in opt.param_groups:
                 group["lr"] = lr_scheduler.get_lr(epoch)
@@ -1698,7 +1780,7 @@ def train(config: Config, config_name: str) -> None:
             per_traj_norm_eps=per_traj_norm_eps,
             force_reg_on_coeff=force_reg_on_coeff,
             rollout_loss_weight=rollout_loss_weight,
-            rollout_horizon=rollout_horizon,
+            rollout_horizon=current_rollout_horizon,
             rollout_every_steps=rollout_every_steps,
             rollout_batch_size=rollout_batch_size,
             rollout_dt=dt,
@@ -1727,6 +1809,8 @@ def train(config: Config, config_name: str) -> None:
             "grad_norm": mean_grad_norm,
             "avg_force": mean_force,
         }
+        if use_rollout_loss:
+            train_metrics["rollout_horizon"] = float(current_rollout_horizon)
         if "mean_drag_coeff" in epoch_metrics:
             train_metrics["avg_drag_coeff"] = float(epoch_metrics["mean_drag_coeff"])
         if "mean_vortex_coeff" in epoch_metrics:
