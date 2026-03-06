@@ -1270,7 +1270,13 @@ class PHVIV(nn.Module):
     def sigma_theta(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         raw = self._sigma_net_raw(x, reduced_velocity=reduced_velocity)
         sigma_min = self.sigma_min.to(device=raw.device, dtype=raw.dtype)
-        return sigma_min + F.softplus(raw)
+        sigma = sigma_min + F.softplus(raw)
+        if self.force_output == "coefficient":
+            # In coefficient mode, interpret sigma_net output as coefficient-scale
+            # diffusion and convert to force units using instantaneous F0.
+            f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=sigma, state=x)
+            sigma = sigma * f0
+        return sigma
 
     def learned_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
