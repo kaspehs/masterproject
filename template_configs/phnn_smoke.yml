@@ -97,26 +97,26 @@ optim:
 loss:
   # Options: srk4 (default) | implicit_euler
   physics_loss_discretization: srk4
-  force_reg: 0.0001
+  force_reg: 0.1
   force_reg_on_coeff: true
   # Optional RK4 trajectory rollout loss (disabled when weight<=0 or horizon<=0).
   # When GradNorm is enabled, this acts as a post-GradNorm multiplier.
-  rollout_loss_weight: 0.0
+  rollout_loss_weight: 1.0
   # Base rollout horizon (used when schedule keys are null).
   rollout_horizon: 10
   # Optional horizon schedule (curriculum). Null disables each override.
-  rollout_horizon_initial: null
-  rollout_horizon_final: null
-  rollout_horizon_ramp_epochs: 0
+  rollout_horizon_initial: 10
+  rollout_horizon_final: 50
+  rollout_horizon_ramp_epochs: 150
   rollout_every_steps: 1
   # 0 => use current training batch size for rollout-loss windows.
-  rollout_batch_size: 0
+  rollout_batch_size: 128
   use_force_data_loss: false
   force_data_weight: 1.0
-  use_gradnorm: false
+  use_gradnorm: true
   gradnorm_alpha: 0.9
-  gradnorm_min_weight: 0.2
-  gradnorm_max_weight: 5.0
+  gradnorm_min_weight: 0.001
+  gradnorm_max_weight: 1000.0
 
 runtime:
   device: cuda
