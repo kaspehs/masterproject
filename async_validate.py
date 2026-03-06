@@ -1086,6 +1086,12 @@ def main() -> None:
             )
         else:
             raise ValueError(f"Unsupported method '{method}'.")
+        # Heartbeat scalar: confirms this async worker wrote to TensorBoard.
+        writer.add_scalar("val/async_validation_completed", 1.0, int(args.epoch))
+        print(
+            f"[async-val] epoch {int(args.epoch)}: wrote TensorBoard heartbeat "
+            f"to {args.log_dir}"
+        )
     finally:
         writer.flush()
         writer.close()
