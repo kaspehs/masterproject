@@ -4,14 +4,14 @@ data:
   file: data.npz
   steadystate: false
   steadystate_time_threshold: 10.0
-  cut_start_seconds: 5.0
-  cut_start_seconds_train: 45.0
-  cut_start_seconds_val: 45.0
+  cut_start_seconds: 0.0
+  cut_start_seconds_train: 0.0
+  cut_start_seconds_val: 0.0
   reduce_time: true
-  reduction_factor: 100
+  reduction_factor: 8
   middle_time_plot: [15, 17]
   use_generated_train_series: true
-  train_series_dir: Data_Gen/generated_series_Ur
+  train_series_dir: Experimental_Data/CF_corrected_v3
 
 model:
   rho: 1000.0
@@ -43,14 +43,14 @@ smoothing:
   polyorder: 3
 
 architecture:
-  force_net_type: residual
+  force_net_type: mlp
   residual_kwargs:
     hidden: 128
-    layers: 3
+    layers: 2
     activation: gelu
   mlp_kwargs:
     hidden: 128
-    layers: 2
+    layers: 3
     activation: gelu
   pirate_force_kwargs:
     depth: 2
@@ -61,7 +61,7 @@ architecture:
 
 training:
   batch_size: 8192
-  max_grad_norm: 10000.0
+  max_grad_norm: 20.0
   epochs: 2000
 
 optim:
@@ -78,17 +78,17 @@ optim:
 
 loss:
   # For stochastic PHNN this regularizes diffusion (mean sigma^2), not force.
-  force_reg: 0.0001
-  force_reg_on_coeff: false
+  force_reg: 0.1
+  force_reg_on_coeff: true
   use_force_data_loss: false
-  force_data_weight: 1.0
+  force_data_weight: 0.0
   # Odd-symmetry regularization on force map: F(-z, U_r) ~= -F(z, U_r)
   symmetry_weight: 0.0
   symmetry_norm: l2
   use_gradnorm: false
   gradnorm_alpha: 0.9
-  gradnorm_min_weight: 0.2
-  gradnorm_max_weight: 5.0
+  gradnorm_min_weight: 0.001
+  gradnorm_max_weight: 1000.0
 
 runtime:
   device: cuda
@@ -112,8 +112,8 @@ monitoring:
   # will target that excluded U_r.
   rollout_use_excluded_ur: false
   rollout_target_ur_tol: 1e-6
-  rollout_include_disp_nrmse: true
-  rollout_include_force_nrmse: true
+  rollout_include_disp_nrmse: false
+  rollout_include_force_nrmse: false
   final_rollout_all_validation: true
   log_every_epochs: 10
   print_every_epochs: 50
@@ -149,6 +149,3 @@ hnn: # file or compute
   per_traj_norm: none
   per_traj_norm_eps: 1e-8
 pinn: {}
-
-#For running all config files
-#ls HNNconfigs/*.yml | xargs -P 2 -I{} python3 HNN.py --config {}
