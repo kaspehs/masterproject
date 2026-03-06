@@ -192,6 +192,7 @@ class MonitoringConfig:
     rollout_include_disp_nrmse: bool = True
     rollout_include_force_nrmse: bool = True
     rollout_include_force_mapping_nrmse: bool = True
+    validation_auto_shift_for_history: bool = True
 
 @dataclass
 class LoggingConfig:
@@ -350,6 +351,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "rollout_include_disp_nrmse",
         "rollout_include_force_nrmse",
         "rollout_include_force_mapping_nrmse",
+        "validation_auto_shift_for_history",
     }
 
     for key, value in legacy_training.items():
