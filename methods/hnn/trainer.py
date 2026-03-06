@@ -309,13 +309,16 @@ def _validate_if_needed(
     t: np.ndarray,
     y_true_norm: np.ndarray,
     y_data: np.ndarray,
-    force_data: np.ndarray,
+    force_data: np.ndarray | None,
     D: float,
     k: float,
     device: torch.device,
     middle_time_plot,
     hamiltonian_data,
     log_extra_validation_metrics: bool,
+    rollout_stochastic: bool,
+    rollout_noise_scale: float,
+    rollout_seed: int | None,
     force_reg: float,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -393,6 +396,9 @@ def _validate_if_needed(
                 k=k,
                 device=device,
                 log_extra_metrics=log_extra_validation_metrics,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -434,8 +440,6 @@ def _validate_if_needed(
         sequence = val_sequences[rollout_idx]
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
         y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
-        if force_np is None:
-            return
         log_validation_epoch(
             writer,
             epoch + 1,
@@ -456,6 +460,9 @@ def _validate_if_needed(
             hamiltonian_data,
             log_extra_metrics=log_extra_validation_metrics,
             log_metrics=False,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
         )
         return
     log_validation_epoch(
@@ -477,6 +484,9 @@ def _validate_if_needed(
         middle_time_plot,
         hamiltonian_data,
         log_extra_metrics=log_extra_validation_metrics,
+        rollout_stochastic=rollout_stochastic,
+        rollout_noise_scale=rollout_noise_scale,
+        rollout_seed=rollout_seed,
     )
 
 
@@ -493,6 +503,9 @@ def _log_final_rollouts_all(
     device: torch.device,
     middle_time_plot,
     log_extra_validation_metrics: bool,
+    rollout_stochastic: bool,
+    rollout_noise_scale: float,
+    rollout_seed: int | None,
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
@@ -516,8 +529,6 @@ def _log_final_rollouts_all(
     metrics_list: list[dict[str, float]] = []
     for step_idx, idx in enumerate(selected_indices):
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[idx]
-        if force_np is None:
-            continue
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[idx]
         ur_val = float(np.asarray(ur_tensor.detach().cpu()).reshape(-1)[0])
         metrics = log_validation_epoch(
@@ -540,6 +551,9 @@ def _log_final_rollouts_all(
             None,
             log_extra_metrics=log_extra_validation_metrics,
             log_metrics=False,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
             tag_prefix="final_val/rollout",
             step=step_idx,
             title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
@@ -913,7 +927,8 @@ def train(config: Config, config_name: str) -> None:
     data = np.load(data_path)
     t = data["a"]
     y_data = data["b"]
-    F_data = data["c"]
+    has_force_data = "c" in data
+    F_data = data["c"] if has_force_data else np.zeros_like(y_data)
     H_data = data["d"] if "d" in data else None
     if "U_r" not in data:
         raise KeyError(f"{data_path} is missing reduced velocity 'U_r'.")
@@ -943,6 +958,12 @@ def train(config: Config, config_name: str) -> None:
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
+    rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
+    rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
+    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
+        raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
+    rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
+    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
     train_include_ur = _as_float_list(hnn_cfg.get("train_include_ur"), key="hnn.train_include_ur")
     train_exclude_ur = _as_float_list(hnn_cfg.get("train_exclude_ur"), key="hnn.train_exclude_ur")
     train_ur_filter_tol = float(hnn_cfg.get("train_ur_filter_tol", 1e-6))
@@ -1034,7 +1055,7 @@ def train(config: Config, config_name: str) -> None:
         eval_velocity=vel_data,
         eval_reduced_velocity=reduced_velocity,
         require_force=use_force_data_loss,
-        eval_force=F_data,
+        eval_force=(F_data if has_force_data else None),
         cut_start_seconds=train_cut,
         include_reduced_velocity=train_include_ur,
         exclude_reduced_velocity=train_exclude_ur,
@@ -1075,8 +1096,8 @@ def train(config: Config, config_name: str) -> None:
                 velocity_source=velocity_source,
                 eval_velocity=vel_data,
                 eval_reduced_velocity=reduced_velocity,
-                require_force=True,
-                eval_force=F_data,
+                require_force=use_force_data_loss,
+                eval_force=(F_data if has_force_data else None),
                 cut_start_seconds=val_cut,
             )
             val_loader, val_sequences, _ = build_dataloader_from_series(
@@ -1109,7 +1130,7 @@ def train(config: Config, config_name: str) -> None:
         async_dir.mkdir(parents=True, exist_ok=True)
 
     y_true_norm = y_data / D
-    force_data = F_data
+    force_data = F_data if has_force_data else None
 
     opt, lr_scheduler = setup_optimizer_and_scheduler(
         model,
@@ -1273,6 +1294,9 @@ def train(config: Config, config_name: str) -> None:
                 middle_time_plot=middle_time_plot,
                 hamiltonian_data=hamiltonian_data,
                 log_extra_validation_metrics=log_extra_validation_metrics,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
                 force_reg=force_reg,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
@@ -1301,6 +1325,9 @@ def train(config: Config, config_name: str) -> None:
             device=device,
             middle_time_plot=middle_time_plot,
             log_extra_validation_metrics=log_extra_validation_metrics,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
         )
         if used > 0 and avg_metrics:
             summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]

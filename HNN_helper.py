@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -60,6 +61,8 @@ class ModelConfig:
     fourier_sigma: float = 1.0
     use_feature_engineering: bool = False
     use_reduced_velocity: bool = True
+    use_stochastic_process_noise: bool = True
+    sigma_min: float = 1e-6
     q_scale: float | None = None
     p_scale: float | None = None
     ur_scale: float | None = None
@@ -364,7 +367,7 @@ def log_validation_epoch(
     t: np.ndarray,
     y_true_norm: np.ndarray,
     y_data_raw: np.ndarray,
-    force_data: np.ndarray,
+    force_data: np.ndarray | None,
     D: float,
     k: float,
     device: torch.device,
@@ -373,6 +376,9 @@ def log_validation_epoch(
     *,
     log_extra_metrics: bool = False,
     log_metrics: bool = True,
+    rollout_stochastic: bool = False,
+    rollout_noise_scale: float = 1.0,
+    rollout_seed: int | None = None,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
@@ -388,6 +394,9 @@ def log_validation_epoch(
         D,
         k,
         device,
+        stochastic=rollout_stochastic,
+        rollout_seed=rollout_seed,
+        noise_scale=rollout_noise_scale,
     )
     metrics = compute_validation_metrics(
         model=model,
@@ -404,6 +413,9 @@ def log_validation_epoch(
         device=device,
         log_extra_metrics=log_extra_metrics,
         rollout=rollout,
+        rollout_stochastic=rollout_stochastic,
+        rollout_noise_scale=rollout_noise_scale,
+        rollout_seed=rollout_seed,
     )
     if torch.is_tensor(reduced_velocity):
         reduced_velocity_scalar = float(reduced_velocity.reshape(-1)[0].detach().cpu())
@@ -445,6 +457,8 @@ def log_validation_epoch(
         ).squeeze(-1).detach().cpu().numpy()
     f0_plot_t = np.asarray(f0_plot_t, dtype=float).reshape(-1)
     f0_plot_t = np.clip(np.nan_to_num(f0_plot_t, nan=1.0, posinf=1.0, neginf=1.0), 1e-12, None)
+    if force_data is None:
+        return metrics
     force_pred = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
     force_true = np.asarray(force_data, dtype=float).reshape(-1)
     plot_len = int(min(force_pred.size, force_true.size, f0_plot_t.size))
@@ -490,12 +504,15 @@ def compute_validation_metrics(
     dt: float,
     t: np.ndarray,
     y_data_raw: np.ndarray,
-    force_data: np.ndarray,
+    force_data: np.ndarray | None,
     D: float,
     k: float,
     device: torch.device,
     log_extra_metrics: bool = False,
     rollout: dict[str, np.ndarray] | None = None,
+    rollout_stochastic: bool = False,
+    rollout_noise_scale: float = 1.0,
+    rollout_seed: int | None = None,
 ) -> dict[str, float]:
     if rollout is None:
         rollout = rollout_model(
@@ -509,8 +526,13 @@ def compute_validation_metrics(
             D,
             k,
             device,
+            stochastic=rollout_stochastic,
+            rollout_seed=rollout_seed,
+            noise_scale=rollout_noise_scale,
         )
     metrics: dict[str, float] = {}
+    if force_data is None:
+        return metrics
     force_total_pred = np.asarray(rollout["force_total"]).reshape(-1)
     force_target = np.asarray(force_data).reshape(-1)
     min_len = min(force_total_pred.shape[0], force_target.shape[0])
@@ -527,7 +549,10 @@ def compute_validation_metrics(
     with torch.no_grad():
         z_true = torch.stack((y_data_t, val_vel * m_eff), dim=1)
         z_true = z_true.to(device=device, non_blocking=(device.type == "cuda"))
-        rv = reduced_velocity.to(device=device, non_blocking=(device.type == "cuda"))
+        if torch.is_tensor(reduced_velocity):
+            rv = reduced_velocity.to(device=device, non_blocking=(device.type == "cuda"))
+        else:
+            rv = torch.as_tensor(reduced_velocity, dtype=z_true.dtype, device=device)
         force_on_data = model.u_theta(z_true, reduced_velocity=rv).squeeze(-1).detach().cpu().numpy()
     min_len_data = min(force_on_data.shape[0], force_target.shape[0])
     if min_len_data > 0:
@@ -754,6 +779,8 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_feature_engineering: bool = False,
         use_reduced_velocity: bool = True,
+        use_stochastic_process_noise: bool = True,
+        sigma_min: float = 1e-6,
         ur_scale: float | None = None,
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
@@ -778,6 +805,11 @@ class PHVIV(nn.Module):
         self.learn_hamiltonian = bool(learn_hamiltonian)
         self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
+        self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
+        sigma_min_val = float(sigma_min)
+        if not np.isfinite(sigma_min_val) or sigma_min_val < 0.0:
+            raise ValueError(f"sigma_min must be finite and non-negative, got {sigma_min_val}")
+        self.register_buffer("sigma_min", torch.tensor(sigma_min_val, dtype=torch.float32))
         ur_scale_val = 1.0 if ur_scale is None else float(ur_scale)
         if not np.isfinite(ur_scale_val) or ur_scale_val == 0.0:
             raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
@@ -812,7 +844,7 @@ class PHVIV(nn.Module):
             torch.tensor((float(self.k) * float(self.m)) ** 0.5, dtype=torch.float32),
         )
 
-        # NN for instantaneous force u(x)
+        # NNs for instantaneous force u_theta(x) and diffusion sigma_theta(x).
         pirate_force_kwargs = pirate_force_kwargs or {}
         self.use_fourier_features = bool(use_fourier_features)
         self.fourier_features = int(fourier_features)
@@ -843,8 +875,10 @@ class PHVIV(nn.Module):
             )
             force_in_features = 2 * self.fourier_features
 
-        pirate_cfg = dict(pirate_force_kwargs) if pirate_force_kwargs is not None else {}
-        if self.use_pirate_force:
+        pirate_cfg_base = dict(pirate_force_kwargs) if pirate_force_kwargs is not None else {}
+
+        def _build_pirate_args() -> dict[str, Any]:
+            pirate_cfg = dict(pirate_cfg_base)
             pirate_args = {
                 "input_size": base_force_dim,
                 "output_size": 1,
@@ -855,14 +889,17 @@ class PHVIV(nn.Module):
                 "activation": pirate_cfg.pop("activation", "tanh"),
             }
             pirate_args.update(pirate_cfg)
-            self.u_net = ODEPirateNet(**pirate_args)
-        elif self.residual_net:
-            layers = [nn.Linear(force_in_features, self.residual_hidden)]
-            for _ in range(self.residual_layers):
-                layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
-            layers.append(nn.Linear(self.residual_hidden, 1))
-            self.u_net = nn.Sequential(*layers)
-        else:
+            return pirate_args
+
+        def _build_scalar_net() -> nn.Module:
+            if self.use_pirate_force:
+                return ODEPirateNet(**_build_pirate_args())
+            if self.residual_net:
+                layers = [nn.Linear(force_in_features, self.residual_hidden)]
+                for _ in range(self.residual_layers):
+                    layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
+                layers.append(nn.Linear(self.residual_hidden, 1))
+                return nn.Sequential(*layers)
             mlp_layers: list[nn.Module] = []
             in_features = force_in_features
             mlp_act_cls = _activation_factory(self.mlp_activation)
@@ -871,7 +908,10 @@ class PHVIV(nn.Module):
                 mlp_layers.append(mlp_act_cls())
                 in_features = self.mlp_hidden
             mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
-            self.u_net = nn.Sequential(*mlp_layers)
+            return nn.Sequential(*mlp_layers)
+
+        self.u_net = _build_scalar_net()
+        self.sigma_net = _build_scalar_net() if self.use_stochastic_process_noise else None
 
         if self.learn_hamiltonian:
             h_in_features = self.base_feature_dim
@@ -934,6 +974,8 @@ class PHVIV(nn.Module):
         fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
         use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
+        use_stochastic_process_noise = bool(cfg.get("use_stochastic_process_noise", True))
+        sigma_min = float(cfg.get("sigma_min", 1e-6))
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         arch_cfg = arch_cfg or {}
@@ -980,6 +1022,8 @@ class PHVIV(nn.Module):
             fourier_sigma=fourier_sigma,
             use_feature_engineering=use_feature_engineering,
             use_reduced_velocity=use_reduced_velocity,
+            use_stochastic_process_noise=use_stochastic_process_noise,
+            sigma_min=sigma_min,
             ur_scale=ur_scale,
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
@@ -1136,6 +1180,19 @@ class PHVIV(nn.Module):
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
         return self.u_net(features)
 
+    def _sigma_net_raw(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        if self.sigma_net is None:
+            like = x[..., :1]
+            return torch.zeros_like(like)
+        base_features = self._force_features(x, reduced_velocity=reduced_velocity)
+        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        return self.sigma_net(features)
+
+    def sigma_theta(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        raw = self._sigma_net_raw(x, reduced_velocity=reduced_velocity)
+        sigma_min = self.sigma_min.to(device=raw.device, dtype=raw.dtype)
+        return sigma_min + F.softplus(raw)
+
     def learned_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
@@ -1197,6 +1254,31 @@ class PHVIV(nn.Module):
 
     def step_rk4(self, x, t, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         x_next, _ = self.rk4_step(x, t, dt, reduced_velocity=reduced_velocity)
+        return x_next
+
+    def step_rk4_stochastic(
+        self,
+        x,
+        t,
+        dt,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        *,
+        noise: torch.Tensor | None = None,
+        noise_scale: float = 1.0,
+    ):
+        x_next, _ = self.rk4_step(x, t, dt, reduced_velocity=reduced_velocity)
+        if not self.use_stochastic_process_noise:
+            return x_next
+        sigma = self.sigma_theta(x, reduced_velocity=reduced_velocity)
+        if noise is None:
+            noise = torch.randn_like(sigma)
+        else:
+            noise = noise.to(device=x_next.device, dtype=x_next.dtype)
+            if noise.shape != sigma.shape:
+                noise = noise.view(sigma.shape)
+        dt_sqrt = math.sqrt(float(dt))
+        x_next = x_next.clone()
+        x_next[..., 1:2] = x_next[..., 1:2] + float(noise_scale) * sigma * dt_sqrt * noise
         return x_next
 
     def rk4_step(self, x, t, dt, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
@@ -1301,6 +1383,63 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     ) -> torch.Tensor:
         return self.avg_force_coeff_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
+
+    def _srk4_drift_rate(
+        self,
+        zi: torch.Tensor,
+        zin: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dt = float(self.dt)
+        b = math.sqrt(3.0) / 6.0
+        z_mid = 0.5 * (zi + zin)
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity)
+        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)
+        z_corr_minus = z_mid - b * dt * g_a_plus
+        z_corr_plus = z_mid + b * dt * g_a_minus
+        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)
+        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)
+        return 0.5 * (g1 + g2), z_mid
+
+    def _momentum_transition_stats_srk4(
+        self,
+        zi: torch.Tensor,
+        zin: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        drift_rate, _ = self._srk4_drift_rate(zi, zin, reduced_velocity=reduced_velocity)
+        dp_obs = zin[..., 1:2] - zi[..., 1:2]
+        dp_drift = float(self.dt) * drift_rate[..., 1:2]
+        innovation = dp_obs - dp_drift
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
+        var = torch.clamp((sigma * sigma) * float(self.dt), min=1e-12)
+        return innovation, sigma, var
+
+    def _stochastic_nll_per_sample(
+        self,
+        zi: torch.Tensor,
+        zin: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    ) -> torch.Tensor:
+        innovation, _sigma, var = self._momentum_transition_stats_srk4(
+            zi, zin, reduced_velocity=reduced_velocity
+        )
+        nll = 0.5 * (innovation * innovation / var + torch.log(var))
+        return nll.squeeze(-1)
+
+    def avg_diffusion_SRK4(
+        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+    ) -> torch.Tensor:
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
+        return torch.mean(torch.square(sigma))
+
+    def avg_diffusion_SRK4_per_sample(
+        self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
+    ) -> torch.Tensor:
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
+        return torch.square(sigma).squeeze(-1)
     
     def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dz = (zin-zi)/self.dt
@@ -1326,87 +1465,17 @@ class PHVIV(nn.Module):
     
 
     def res_loss_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        dt = self.dt
-        # constants from the scheme
-        a = 0.5
-        b = math.sqrt(3.0) / 6.0
-
-        # finite difference
-        dz_fd = (zin - zi) / dt              # (B, d)
-
-        # midpoint between zn and zn+1
-        z_mid = 0.5 * (zi + zin)             # (B, d)
-
-        # stage convex combos
-        z_a_plus  = (0.5 + b) * zi + (0.5 - b) * zin   # (B, d)
-        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin   # (B, d)
-
-        # stage evaluations of g
-        g_a_plus  = self.g(z_a_plus, reduced_velocity=reduced_velocity)                  # (B, d)
-        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)                 # (B, d)
-
-        # two corrected midpoints
-        z_corr_minus = z_mid - b * dt * g_a_plus      # (B, d)
-        z_corr_plus  = z_mid + b * dt * g_a_minus     # (B, d)
-
-        # final two g-evals
-        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)                     # (B, d)
-        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)                      # (B, d)
-
-        dz_model = 0.5 * g1 + 0.5 * g2                # (B, d)
-
-        # residual
-        res = dz_fd - dz_model                        # (B, d)
-
-        # scale like before, but for time-derivatives
-        res_scaled = res / self.res_scale
-        if self.force_output == "coefficient":
-            f0 = self._force_scale_from_reduced_velocity(
-                reduced_velocity,
-                like=res_scaled[..., 1:2],
-                state=z_mid,
-            )
-            res_scaled = res_scaled.clone()
-            res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
-
-        loss = torch.mean(torch.sum(res_scaled**2, dim=1))
-        return loss
+        per_sample = self._stochastic_nll_per_sample(zi, zin, reduced_velocity=reduced_velocity)
+        return torch.mean(per_sample)
 
     def res_loss_SRK4_per_sample(
         self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
     ) -> torch.Tensor:
-        dt = self.dt
-        a = 0.5
-        b = math.sqrt(3.0) / 6.0
-
-        dz_fd = (zin - zi) / dt
-        z_mid = 0.5 * (zi + zin)
-        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
-        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-
-        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity)
-        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)
-
-        z_corr_minus = z_mid - b * dt * g_a_plus
-        z_corr_plus = z_mid + b * dt * g_a_minus
-
-        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)
-        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)
-
-        dz_model = 0.5 * g1 + 0.5 * g2
-        res = dz_fd - dz_model
-        res_scaled = res / self.res_scale
-        if self.force_output == "coefficient":
-            f0 = self._force_scale_from_reduced_velocity(
-                reduced_velocity,
-                like=res_scaled[..., 1:2],
-                state=z_mid,
-            )
-            res_scaled = res_scaled.clone()
-            res_scaled[..., 1:2] = res_scaled[..., 1:2] / f0
-        return torch.sum(res_scaled**2, dim=1)
+        return self._stochastic_nll_per_sample(zi, zin, reduced_velocity=reduced_velocity)
     
     def avg_force_SRK4(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+        if self.use_stochastic_process_noise:
+            return self.avg_diffusion_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         dt = self.dt
         b = math.sqrt(3.0) / 6.0
 
@@ -1425,6 +1494,8 @@ class PHVIV(nn.Module):
     def avg_force_SRK4_per_sample(
         self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
     ) -> torch.Tensor:
+        if self.use_stochastic_process_noise:
+            return self.avg_diffusion_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
@@ -1435,6 +1506,8 @@ class PHVIV(nn.Module):
     def avg_force_coeff_SRK4(
         self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
     ):
+        if self.use_stochastic_process_noise:
+            return self.avg_diffusion_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         dt = self.dt
         b = math.sqrt(3.0) / 6.0
 
@@ -1454,6 +1527,8 @@ class PHVIV(nn.Module):
     def avg_force_coeff_SRK4_per_sample(
         self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None
     ) -> torch.Tensor:
+        if self.use_stochastic_process_noise:
+            return self.avg_diffusion_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
@@ -2462,6 +2537,10 @@ def rollout_model(
     D: float,
     k: float,
     device: torch.device,
+    *,
+    stochastic: bool = False,
+    rollout_seed: int | None = None,
+    noise_scale: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """Roll the model forward over the full time grid and return normalised traces."""
     p0 = vel[0] * m_eff
@@ -2478,6 +2557,10 @@ def rollout_model(
     force_drag: list[torch.Tensor] = []
     force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
+    generator: torch.Generator | None = None
+    if rollout_seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(rollout_seed))
     with torch.no_grad():
         for _ in range(len(t)):
             y_samples.append(state[0, 0].detach())
@@ -2493,7 +2576,24 @@ def rollout_model(
             force_drag.append(drag_force)
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
-            state = model.step_rk4(state, t, dt, reduced_velocity=rv_tensor)
+            if stochastic and getattr(model, "use_stochastic_process_noise", False):
+                noise = torch.randn(
+                    state.shape[0],
+                    1,
+                    device=state.device,
+                    dtype=state.dtype,
+                    generator=generator,
+                )
+                state = model.step_rk4_stochastic(
+                    state,
+                    t,
+                    dt,
+                    reduced_velocity=rv_tensor,
+                    noise=noise,
+                    noise_scale=noise_scale,
+                )
+            else:
+                state = model.step_rk4(state, t, dt, reduced_velocity=rv_tensor)
 
     y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
     p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()

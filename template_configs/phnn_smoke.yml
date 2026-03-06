@@ -32,6 +32,9 @@ model:
   fourier_features: 64
   fourier_sigma: 1.0
   use_feature_engineering: false
+  # Learn heteroscedastic process noise in the momentum channel (PHNN-only).
+  use_stochastic_process_noise: true
+  sigma_min: 1.0e-6
   ur_scale: 10.0
 
 smoothing:
@@ -74,8 +77,9 @@ optim:
     scheduler_type: cosine
 
 loss:
+  # For stochastic PHNN this regularizes diffusion (mean sigma^2), not force.
   force_reg: 0.0001
-  force_reg_on_coeff: true
+  force_reg_on_coeff: false
   use_force_data_loss: false
   force_data_weight: 1.0
   # Odd-symmetry regularization on force map: F(-z, U_r) ~= -F(z, U_r)
@@ -127,6 +131,12 @@ logging:
 
 hnn: # file or compute
   velocity_source: file
+  # Validation/final rollout sampling:
+  # false -> deterministic drift-only rollout
+  # true  -> stochastic momentum rollout using learned sigma_theta
+  rollout_stochastic: true
+  rollout_noise_scale: 1.0
+  rollout_seed: null
   # Optional training-only U_r filtering when using generated series.
   # Validation loading is unchanged.
   train_include_ur: null

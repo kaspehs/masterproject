@@ -122,6 +122,12 @@ def _run_hnn_validation(
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
     per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
     per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
+    rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
+    rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
+    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
+        raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
+    rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
+    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
@@ -140,7 +146,8 @@ def _run_hnn_validation(
     with np.load(data_path) as data:
         t = np.asarray(data["a"])
         y_data = np.asarray(data["b"])
-        F_data = np.asarray(data["c"])
+        has_force_data = "c" in data
+        F_data = np.asarray(data["c"]) if has_force_data else np.zeros_like(y_data)
         H_data = np.asarray(data["d"]) if "d" in data else np.zeros_like(y_data)
         if "U_r" not in data:
             raise KeyError(f"{data_path} is missing reduced velocity 'U_r'.")
@@ -186,8 +193,8 @@ def _run_hnn_validation(
             velocity_source=velocity_source,
             eval_velocity=vel_data,
             eval_reduced_velocity=reduced_velocity,
-            require_force=True,
-            eval_force=F_data,
+            require_force=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            eval_force=(F_data if has_force_data else None),
             cut_start_seconds=val_cut,
         )
     else:
@@ -203,8 +210,8 @@ def _run_hnn_validation(
             velocity_source=velocity_source,
             eval_velocity=vel_data,
             eval_reduced_velocity=reduced_velocity,
-            require_force=True,
-            eval_force=F_data,
+            require_force=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            eval_force=(F_data if has_force_data else None),
             cut_start_seconds=val_cut,
         )
 
@@ -287,6 +294,9 @@ def _run_hnn_validation(
                 k=k,
                 device=device,
                 log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
             )
             for name, value in metrics.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
@@ -327,6 +337,9 @@ def _run_hnn_validation(
             hamiltonian_data,
             log_extra_metrics=bool(getattr(cfg.monitoring, "log_extra_validation_metrics", False)),
             log_metrics=False,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
         )
     else:
         force_map_sum = 0.0
