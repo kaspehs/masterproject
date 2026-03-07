@@ -85,6 +85,11 @@ loss:
   force_reg: 0.1
   # Norm for sigma regularizer: l1 | l2
   sigma_reg_norm: l2
+  # Optional deterministic multi-step rollout loss (mean/drift only, no sigma sampling).
+  rollout_det_weight: 0.0
+  rollout_det_steps: 0
+  # Batch size for deterministic rollout loss windows (<=0 uses training.batch_size).
+  rollout_det_batch_size: 0
   # If true, mean regularizer is applied on force coefficient instead of force units.
   force_reg_on_coeff: true
   use_force_data_loss: false

@@ -27,6 +27,7 @@ from HNN_helper import (
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
     build_dataloader_from_series,
+    build_rollout_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
     log_loss_vs_ur,
@@ -88,6 +89,40 @@ def _rollout_index(
     return int(selected[step % len(selected)])
 
 
+def _deterministic_rollout_loss_from_batch(
+    *,
+    model: PHVIV,
+    batch: Any,
+    device: torch.device,
+    non_blocking: bool,
+    per_traj_norm_eps: float,
+    return_per_sample: bool = False,
+) -> torch.Tensor:
+    if len(batch) == 4:
+        z0, t_seq, z_traj, ur0 = batch
+        scale = None
+    elif len(batch) == 5:
+        z0, t_seq, z_traj, ur0, scale = batch
+    else:
+        raise ValueError("Unexpected rollout batch format.")
+    z0 = z0.to(device, non_blocking=non_blocking)
+    t_seq = t_seq.to(device, non_blocking=non_blocking)
+    z_traj = z_traj.to(device, non_blocking=non_blocking)
+    ur0 = ur0.to(device, non_blocking=non_blocking)
+    if scale is not None:
+        scale = scale.to(device, non_blocking=non_blocking).view(-1)
+
+    z_pred, _ = model.rollout(z0, t_seq, float(model.dt), reduced_velocity=ur0)
+    z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
+    err = (z_pred - z_traj) / z_scale
+    per = torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1)
+    if scale is not None:
+        per = per / (scale * scale + float(per_traj_norm_eps))
+    if return_per_sample:
+        return per
+    return torch.mean(per)
+
+
 def _load_checkpoint(path: Path) -> tuple[dict[str, Any], Any, str]:
     ckpt = torch.load(path, map_location="cpu")
     cfg_raw = ckpt.get("config", {})
@@ -133,6 +168,18 @@ def _run_hnn_validation(
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
+    rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
+    rollout_det_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
+    rollout_det_batch_size = int(cfg.training.batch_size) if rollout_det_batch_size_raw <= 0 else rollout_det_batch_size_raw
+    if rollout_det_weight < 0.0:
+        raise ValueError("loss.rollout_det_weight must be non-negative.")
+    if rollout_det_steps < 0:
+        raise ValueError("loss.rollout_det_steps must be non-negative.")
+    if rollout_det_weight > 0.0 and rollout_det_steps < 1:
+        raise ValueError("loss.rollout_det_steps must be >= 1 when loss.rollout_det_weight > 0.")
+    if rollout_det_batch_size < 1:
+        raise ValueError("loss.rollout_det_batch_size must be >= 1 after fallback resolution.")
 
     if bool(getattr(data_cfg, "use_generated_train_series", False)):
         val_dir = Path(data_cfg.train_series_dir) / "val"
@@ -231,6 +278,20 @@ def _run_hnn_validation(
         per_traj_norm=per_traj_norm,
         per_traj_norm_eps=per_traj_norm_eps,
     )
+    val_rollout_loader: Any | None = None
+    if rollout_det_weight > 0.0 and rollout_det_steps > 0:
+        val_rollout_loader, _ = build_rollout_dataloader_from_series(
+            val_series_raw,
+            m_eff=m_eff,
+            batch_size=rollout_det_batch_size,
+            device=device,
+            smoothing_cfg=cfg.smoothing,
+            rollout_steps=rollout_det_steps,
+            shuffle=False,
+            num_workers=int(num_workers),
+            pin_memory=(device.type == "cuda"),
+            per_traj_norm=per_traj_norm,
+        )
 
     num_loss_scalars_written = 0
     num_rollout_scalars_written = 0
@@ -251,12 +312,14 @@ def _run_hnn_validation(
         loss_metrics = _evaluate_val_losses(
             model=model,
             loader=val_loader,
+            rollout_loader=val_rollout_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
             force_reg=float(loss_cfg.force_reg),
             sigma_reg_norm=sigma_reg_norm,
+            rollout_det_weight=rollout_det_weight,
             force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
@@ -276,12 +339,14 @@ def _run_hnn_validation(
         loss_by_ur = _per_ur_loss_map_hnn(
             model=model,
             loader=val_loader,
+            rollout_loader=val_rollout_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
             force_reg=float(loss_cfg.force_reg),
             sigma_reg_norm=sigma_reg_norm,
+            rollout_det_weight=rollout_det_weight,
             force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
@@ -659,12 +724,14 @@ def _evaluate_val_losses(
     *,
     model: PHVIV,
     loader: Any,
+    rollout_loader: Any | None,
     device: torch.device,
     non_blocking: bool,
     mean_reg: float,
     mean_reg_norm: str,
     force_reg: float,
     sigma_reg_norm: str,
+    rollout_det_weight: float,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -682,7 +749,9 @@ def _evaluate_val_losses(
     mean_reg_sum = torch.zeros((), device=device)
     data_sum = torch.zeros((), device=device)
     sym_sum = torch.zeros((), device=device)
+    rollout_det_sum = torch.zeros((), device=device)
     batches = 0
+    rollout_iter = iter(rollout_loader) if (rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
     with torch.no_grad():
         for batch in loader:
             if len(batch) == 5:
@@ -807,6 +876,22 @@ def _evaluate_val_losses(
                     + float(force_data_weight) * data_force_loss
                     + float(symmetry_weight) * sym_loss
                 )
+                if rollout_iter is not None:
+                    try:
+                        rollout_batch = next(rollout_iter)
+                    except StopIteration:
+                        rollout_iter = iter(rollout_loader)
+                        rollout_batch = next(rollout_iter)
+                    rollout_det_loss = _deterministic_rollout_loss_from_batch(
+                        model=model,
+                        batch=rollout_batch,
+                        device=device,
+                        non_blocking=non_blocking,
+                        per_traj_norm_eps=per_traj_norm_eps,
+                    )
+                else:
+                    rollout_det_loss = res_loss.new_tensor(0.0)
+                total = total + float(rollout_det_weight) * rollout_det_loss
 
             loss_sum = loss_sum + total.detach().float()
             res_sum = res_sum + res_loss.detach().float()
@@ -814,6 +899,7 @@ def _evaluate_val_losses(
             mean_reg_sum = mean_reg_sum + mean_reg_loss.detach().float()
             data_sum = data_sum + data_force_loss.detach().float()
             sym_sum = sym_sum + sym_loss.detach().float()
+            rollout_det_sum = rollout_det_sum + rollout_det_loss.detach().float()
             batches += 1
 
     denom = float(max(batches, 1))
@@ -824,6 +910,7 @@ def _evaluate_val_losses(
         "loss_reg_mean": float((mean_reg_sum / denom).detach().cpu()),
         "loss_data": float((data_sum / denom).detach().cpu()),
         "loss_sym": float((sym_sum / denom).detach().cpu()),
+        "loss_rollout_det": float((rollout_det_sum / denom).detach().cpu()),
     }
 
 
@@ -831,12 +918,14 @@ def _per_ur_loss_map_hnn(
     *,
     model: PHVIV,
     loader: Any,
+    rollout_loader: Any | None,
     device: torch.device,
     non_blocking: bool,
     mean_reg: float,
     mean_reg_norm: str,
     force_reg: float,
     sigma_reg_norm: str,
+    rollout_det_weight: float,
     force_reg_on_coeff: bool,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -855,6 +944,7 @@ def _per_ur_loss_map_hnn(
         "loss_reg_mean": {},
         "loss_data": {},
         "loss_sym": {},
+        "loss_rollout_det": {},
     }
     with torch.no_grad():
         for batch in loader:
@@ -966,6 +1056,29 @@ def _per_ur_loss_map_hnn(
                 buckets["loss_reg_mean"].setdefault(key, []).append(float(mean_v))
                 buckets["loss_data"].setdefault(key, []).append(float(data_v))
                 buckets["loss_sym"].setdefault(key, []).append(float(sym_v))
+
+    if rollout_loader is not None and float(rollout_det_weight) > 0.0:
+        with torch.no_grad():
+            for batch in rollout_loader:
+                if len(batch) == 4:
+                    _z0, _t_seq, _z_traj, ur0 = batch
+                elif len(batch) == 5:
+                    _z0, _t_seq, _z_traj, ur0, _scale = batch
+                else:
+                    raise ValueError("Unexpected rollout batch format.")
+                per_rollout = _deterministic_rollout_loss_from_batch(
+                    model=model,
+                    batch=batch,
+                    device=device,
+                    non_blocking=non_blocking,
+                    per_traj_norm_eps=per_traj_norm_eps,
+                    return_per_sample=True,
+                )
+                ur_vals = ur0.detach().cpu().view(-1).numpy()
+                per_vals = per_rollout.detach().cpu().view(-1).numpy()
+                for u, per_v in zip(ur_vals, per_vals):
+                    key = float(np.round(float(u), 6))
+                    buckets["loss_rollout_det"].setdefault(key, []).append(float(rollout_det_weight) * float(per_v))
 
     out: dict[str, dict[float, float]] = {}
     for name, by_ur in buckets.items():

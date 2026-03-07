@@ -136,6 +136,9 @@ class LossConfig:
     mean_reg_norm: str = "l1"  # "l1" or "l2"
     force_reg: float = 1e-2
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
+    rollout_det_weight: float = 0.0
+    rollout_det_steps: int = 0
+    rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
     force_reg_on_coeff: bool = False
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
@@ -284,6 +287,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "mean_reg_norm",
         "force_reg",
         "sigma_reg_norm",
+        "rollout_det_weight",
+        "rollout_det_steps",
+        "rollout_det_batch_size",
         "force_reg_on_coeff",
         "use_gradnorm",
         "gradnorm_alpha",
@@ -2716,6 +2722,9 @@ def build_rollout_dataset(
     m_eff: float,
     t_tensor: torch.Tensor,
     rollout_steps: int,
+    *,
+    reduced_velocity: torch.Tensor,
+    traj_scale: float | None = None,
 ) -> TensorDataset:
     """
     Build sliding-window sequences matching the inputs expected by `PHVIV.rollout`
@@ -2752,7 +2761,100 @@ def build_rollout_dataset(
     t_seq_batch = torch.stack(t_seq_list, dim=0)            # (B, window)
     z_traj_batch = torch.stack(z_traj_list, dim=0)          # (B, window, 2)
 
-    return TensorDataset(z0_batch, t_seq_batch, z_traj_batch)
+    ur = reduced_velocity
+    if ur.ndim == 1:
+        ur = ur.unsqueeze(1)
+    if ur.ndim != 2 or ur.shape[1] != 1:
+        raise ValueError("Reduced velocity tensor must have shape (T,) or (T, 1).")
+    if ur.shape[0] != z.shape[0]:
+        raise ValueError("Reduced velocity tensor must match the sequence length.")
+    ur0_batch = ur[:num_windows]
+    if traj_scale is None:
+        return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch)
+    scale_tensor = torch.full((num_windows,), float(traj_scale), dtype=torch.float32)
+    return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch, scale_tensor)
+
+
+def build_rollout_dataloader_from_series(
+    series_data: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]],
+    m_eff: float,
+    batch_size: int,
+    device: torch.device,
+    smoothing_cfg: SmoothingConfig | None = None,
+    *,
+    rollout_steps: int,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    per_traj_norm: str = "none",
+) -> tuple[DataLoader, int]:
+    if rollout_steps < 1:
+        raise ValueError("rollout_steps must be at least 1.")
+    if not series_data:
+        raise ValueError("series_data must contain at least one series.")
+    per_traj_norm = str(per_traj_norm).strip().lower()
+    if per_traj_norm not in {"none", "force_rms"}:
+        raise ValueError("per_traj_norm must be one of: none, force_rms.")
+
+    datasets: list[TensorDataset | ConcatDataset] = []
+    total_windows = 0
+    for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
+        y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
+            y_np,
+            t_np,
+            dt_value,
+            m_eff,
+            device,
+            smoothing_cfg=smoothing_cfg,
+            vel_np=vel_np,
+        )
+        ur_arr = np.asarray(ur_np, dtype=float)
+        if ur_arr.ndim == 0:
+            ur_arr = np.full((y_tensor.shape[0],), float(ur_arr), dtype=float)
+        else:
+            ur_arr = ur_arr.reshape(-1)
+        if ur_arr.shape[0] != y_tensor.shape[0]:
+            raise ValueError("Reduced velocity array must have the same length as displacement.")
+        ur_tensor = torch.from_numpy(np.ascontiguousarray(ur_arr)).float()
+
+        traj_scale: float | None = None
+        if per_traj_norm == "force_rms":
+            if force_np is None:
+                traj_scale = 1.0
+            else:
+                force_arr = np.asarray(force_np, dtype=float)
+                rms = float(np.sqrt(np.mean(force_arr**2)))
+                if not np.isfinite(rms) or rms <= 0.0:
+                    rms = 1.0
+                traj_scale = rms
+
+        dataset = build_rollout_dataset(
+            y_tensor,
+            vel_tensor,
+            m_eff,
+            t_tensor,
+            int(rollout_steps),
+            reduced_velocity=ur_tensor,
+            traj_scale=traj_scale,
+        )
+        total_windows += len(dataset)
+        datasets.append(dataset)
+
+    combined = combine_datasets(datasets)
+    loader_kwargs: dict[str, object] = {
+        "dataset": combined,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+    }
+    if int(num_workers) > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+    loader = DataLoader(**loader_kwargs)
+    return loader, int(total_windows)
 
 def create_zoom_mask(t: np.ndarray, window: float = 1.0) -> np.ndarray | slice:
     mask = (t - t[0]) <= window
