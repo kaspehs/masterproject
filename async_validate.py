@@ -237,16 +237,26 @@ def _run_hnn_validation(
 
     if do_losses:
         amp_enabled = bool(cfg.precision.use_amp) and device.type == "cuda"
+        mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+        mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+        sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
         symmetry_weight = float(getattr(loss_cfg, "symmetry_weight", 0.0))
         symmetry_norm = str(getattr(loss_cfg, "symmetry_norm", "l2")).strip().lower()
         if symmetry_norm not in {"l1", "l2"}:
             raise ValueError("loss.symmetry_norm must be one of: l1, l2.")
+        if mean_reg_norm not in {"l1", "l2"}:
+            raise ValueError("loss.mean_reg_norm must be one of: l1, l2.")
+        if sigma_reg_norm not in {"l1", "l2"}:
+            raise ValueError("loss.sigma_reg_norm must be one of: l1, l2.")
         loss_metrics = _evaluate_val_losses(
             model=model,
             loader=val_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
+            mean_reg=mean_reg,
+            mean_reg_norm=mean_reg_norm,
             force_reg=float(loss_cfg.force_reg),
+            sigma_reg_norm=sigma_reg_norm,
             force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
@@ -268,7 +278,10 @@ def _run_hnn_validation(
             loader=val_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
+            mean_reg=mean_reg,
+            mean_reg_norm=mean_reg_norm,
             force_reg=float(loss_cfg.force_reg),
+            sigma_reg_norm=sigma_reg_norm,
             force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
@@ -648,7 +661,10 @@ def _evaluate_val_losses(
     loader: Any,
     device: torch.device,
     non_blocking: bool,
+    mean_reg: float,
+    mean_reg_norm: str,
     force_reg: float,
+    sigma_reg_norm: str,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -662,7 +678,8 @@ def _evaluate_val_losses(
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
     loss_sum = torch.zeros((), device=device)
     res_sum = torch.zeros((), device=device)
-    force_sum = torch.zeros((), device=device)
+    sigma_sum = torch.zeros((), device=device)
+    mean_reg_sum = torch.zeros((), device=device)
     data_sum = torch.zeros((), device=device)
     sym_sum = torch.zeros((), device=device)
     batches = 0
@@ -699,20 +716,48 @@ def _evaluate_val_losses(
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 if scale is None:
                     res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    if force_reg_on_coeff:
-                        avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    else:
-                        avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    sigma_reg_loss = model.avg_sigma_reg_SRK4(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=sigma_reg_norm,
+                    )
+                    mean_reg_loss = model.avg_mean_reg_SRK4(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=mean_reg_norm,
+                        on_coeff=force_reg_on_coeff,
+                    )
                 else:
                     per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    if force_reg_on_coeff:
-                        per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    else:
-                        per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=sigma_reg_norm,
+                    )
+                    per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=mean_reg_norm,
+                        on_coeff=force_reg_on_coeff,
+                    )
                     denom = scale * scale + float(per_traj_norm_eps)
                     res_loss = torch.mean(per_res / denom)
-                    avg_force = torch.mean(per_force / denom)
-                force_loss = float(force_reg) * avg_force
+                    sigma_reg_loss = torch.mean(per_sigma_reg / denom)
+                    mean_reg_loss = torch.mean(per_mean_reg / denom)
+                sigma_loss = float(force_reg) * sigma_reg_loss
+                mean_loss_reg = float(mean_reg) * mean_reg_loss
                 if use_force_data_loss:
                     if f_i is None or f_next is None:
                         raise ValueError(
@@ -757,14 +802,16 @@ def _evaluate_val_losses(
                     sym_loss = res_loss.new_tensor(0.0)
                 total = (
                     res_loss
-                    + force_loss
+                    + sigma_loss
+                    + mean_loss_reg
                     + float(force_data_weight) * data_force_loss
                     + float(symmetry_weight) * sym_loss
                 )
 
             loss_sum = loss_sum + total.detach().float()
             res_sum = res_sum + res_loss.detach().float()
-            force_sum = force_sum + force_loss.detach().float()
+            sigma_sum = sigma_sum + sigma_reg_loss.detach().float()
+            mean_reg_sum = mean_reg_sum + mean_reg_loss.detach().float()
             data_sum = data_sum + data_force_loss.detach().float()
             sym_sum = sym_sum + sym_loss.detach().float()
             batches += 1
@@ -773,7 +820,8 @@ def _evaluate_val_losses(
     return {
         "loss_total": float((loss_sum / denom).detach().cpu()),
         "loss_physics": float((res_sum / denom).detach().cpu()),
-        "loss_reg": float((force_sum / denom).detach().cpu()),
+        "loss_reg": float((sigma_sum / denom).detach().cpu()),
+        "loss_reg_mean": float((mean_reg_sum / denom).detach().cpu()),
         "loss_data": float((data_sum / denom).detach().cpu()),
         "loss_sym": float((sym_sum / denom).detach().cpu()),
     }
@@ -785,7 +833,10 @@ def _per_ur_loss_map_hnn(
     loader: Any,
     device: torch.device,
     non_blocking: bool,
+    mean_reg: float,
+    mean_reg_norm: str,
     force_reg: float,
+    sigma_reg_norm: str,
     force_reg_on_coeff: bool,
     use_force_data_loss: bool,
     force_data_weight: float,
@@ -801,6 +852,7 @@ def _per_ur_loss_map_hnn(
     buckets: dict[str, dict[float, list[float]]] = {
         "loss_physics": {},
         "loss_reg": {},
+        "loss_reg_mean": {},
         "loss_data": {},
         "loss_sym": {},
     }
@@ -835,30 +887,31 @@ def _per_ur_loss_map_hnn(
                 scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                if scale is None:
-                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    if force_reg_on_coeff:
-                        per_force = model.avg_force_coeff_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
-                        )
-                    else:
-                        per_force = model.avg_force_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
-                        )
-                else:
-                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    if force_reg_on_coeff:
-                        per_force = model.avg_force_coeff_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
-                        )
-                    else:
-                        per_force = model.avg_force_per_sample(
-                            z_i, t_i, z_next, t_next, reduced_velocity=ur_i
-                        )
+                per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=sigma_reg_norm,
+                )
+                per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=mean_reg_norm,
+                    on_coeff=force_reg_on_coeff,
+                )
+                if scale is not None:
                     denom = scale * scale + float(per_traj_norm_eps)
                     per_res = per_res / denom
-                    per_force = per_force / denom
-                per_reg = float(force_reg) * per_force
+                    per_sigma_reg = per_sigma_reg / denom
+                    per_mean_reg = per_mean_reg / denom
+                per_reg = float(force_reg) * per_sigma_reg
+                per_reg_mean = float(mean_reg) * per_mean_reg
 
                 if use_force_data_loss and f_i is not None and f_next is not None:
                     z_mid = 0.5 * (z_i + z_next)
@@ -901,14 +954,16 @@ def _per_ur_loss_map_hnn(
             ur_vals = ur_i.detach().cpu().view(-1).numpy()
             per_res_vals = per_res.detach().cpu().view(-1).numpy()
             per_reg_vals = per_reg.detach().cpu().view(-1).numpy()
+            per_reg_mean_vals = per_reg_mean.detach().cpu().view(-1).numpy()
             per_data_vals = per_data.detach().cpu().view(-1).numpy()
             per_sym_vals = per_sym.detach().cpu().view(-1).numpy()
-            for u, res_v, reg_v, data_v, sym_v in zip(
-                ur_vals, per_res_vals, per_reg_vals, per_data_vals, per_sym_vals
+            for u, res_v, reg_v, mean_v, data_v, sym_v in zip(
+                ur_vals, per_res_vals, per_reg_vals, per_reg_mean_vals, per_data_vals, per_sym_vals
             ):
                 key = float(np.round(u, 6))
                 buckets["loss_physics"].setdefault(key, []).append(float(res_v))
                 buckets["loss_reg"].setdefault(key, []).append(float(reg_v))
+                buckets["loss_reg_mean"].setdefault(key, []).append(float(mean_v))
                 buckets["loss_data"].setdefault(key, []).append(float(data_v))
                 buckets["loss_sym"].setdefault(key, []).append(float(sym_v))
 

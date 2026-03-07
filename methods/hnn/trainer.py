@@ -76,7 +76,10 @@ def _train_one_epoch(
     device: torch.device,
     non_blocking: bool,
     max_grad_norm: float,
+    mean_reg: float,
+    mean_reg_norm: str,
     force_reg: float,
+    sigma_reg_norm: str,
     use_force_data_loss: bool,
     force_data_weight: float,
     gradnorm_balancer: Optional[GradNormBalancer],
@@ -92,15 +95,19 @@ def _train_one_epoch(
     batch_count = 0
     loss_sum = torch.zeros((), device=device)
     res_loss_sum = torch.zeros((), device=device)
-    force_loss_sum = torch.zeros((), device=device)
+    sigma_reg_sum = torch.zeros((), device=device)
+    mean_reg_sum = torch.zeros((), device=device)
     force_data_loss_sum = torch.zeros((), device=device)
     sym_loss_sum = torch.zeros((), device=device)
     grad_norm_sum = torch.zeros((), device=device)
-    avg_force_sum = torch.zeros((), device=device)
+    avg_sigma_reg_sum = torch.zeros((), device=device)
+    avg_mean_reg_sum = torch.zeros((), device=device)
     res_grad_component_sum = torch.zeros((), device=device)
-    force_grad_component_sum = torch.zeros((), device=device)
+    sigma_grad_component_sum = torch.zeros((), device=device)
+    mean_grad_component_sum = torch.zeros((), device=device)
     gradnorm_res_weight_sum = torch.zeros((), device=device)
-    gradnorm_force_weight_sum = torch.zeros((), device=device)
+    gradnorm_sigma_weight_sum = torch.zeros((), device=device)
+    gradnorm_mean_weight_sum = torch.zeros((), device=device) if float(mean_reg) > 0.0 else None
     gradnorm_data_weight_sum = torch.zeros((), device=device) if use_force_data_loss else None
     gradnorm_weight_count = 0
 
@@ -139,20 +146,48 @@ def _train_one_epoch(
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             if scale is None:
                 res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                if force_reg_on_coeff:
-                    avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                else:
-                    avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                sigma_reg_loss = model.avg_sigma_reg_SRK4(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=sigma_reg_norm,
+                )
+                mean_reg_loss = model.avg_mean_reg_SRK4(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=mean_reg_norm,
+                    on_coeff=force_reg_on_coeff,
+                )
             else:
                 per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                if force_reg_on_coeff:
-                    per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                else:
-                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=sigma_reg_norm,
+                )
+                per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=mean_reg_norm,
+                    on_coeff=force_reg_on_coeff,
+                )
                 denom = scale * scale + float(per_traj_norm_eps)
                 res_loss = torch.mean(per_res / denom)
-                avg_force = torch.mean(per_force / denom)
-            base_force_loss = avg_force
+                sigma_reg_loss = torch.mean(per_sigma_reg / denom)
+                mean_reg_loss = torch.mean(per_mean_reg / denom)
+            base_sigma_reg_loss = sigma_reg_loss
+            base_mean_reg_loss = mean_reg_loss
             if use_force_data_loss:
                 if f_i is None or f_next is None:
                     raise ValueError(
@@ -191,37 +226,42 @@ def _train_one_epoch(
                 sym_loss = res_loss.new_tensor(0.0)
 
             if gradnorm_balancer is not None:
-                weights = gradnorm_balancer.update(
-                    {
-                        "residual": res_loss.float(),
-                        "force": base_force_loss.float(),
-                        "data": data_force_loss.float() if use_force_data_loss else res_loss.float(),
-                    }
-                )
+                loss_inputs: dict[str, torch.Tensor] = {
+                    "residual": res_loss.float(),
+                    "sigma": base_sigma_reg_loss.float(),
+                    "data": data_force_loss.float() if use_force_data_loss else res_loss.float(),
+                }
+                if float(mean_reg) > 0.0:
+                    loss_inputs["mean"] = base_mean_reg_loss.float()
+                weights = gradnorm_balancer.update(loss_inputs)
                 res_weight = weights["residual"]
-                force_weight = weights["force"]
+                sigma_weight = weights["sigma"]
+                mean_weight = weights.get("mean", res_loss.new_tensor(1.0))
                 data_weight = weights.get("data", res_loss.new_tensor(1.0))
                 gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
-                gradnorm_force_weight_sum = gradnorm_force_weight_sum + force_weight
+                gradnorm_sigma_weight_sum = gradnorm_sigma_weight_sum + sigma_weight
+                if gradnorm_mean_weight_sum is not None:
+                    gradnorm_mean_weight_sum = gradnorm_mean_weight_sum + mean_weight
                 if gradnorm_data_weight_sum is not None:
                     gradnorm_data_weight_sum = gradnorm_data_weight_sum + data_weight
                 gradnorm_weight_count += 1
             else:
                 res_weight = res_loss.new_tensor(1.0)
-                force_weight = res_loss.new_tensor(1.0)
+                sigma_weight = res_loss.new_tensor(1.0)
+                mean_weight = res_loss.new_tensor(1.0)
                 data_weight = res_loss.new_tensor(1.0)
 
             # GradNorm balances raw branch losses first; user multipliers are applied after.
-            # This makes force_reg behave as a post-GradNorm scaling of the force branch.
             gradnorm_weighted_res = res_weight * res_loss
-            gradnorm_weighted_force = force_weight * base_force_loss
+            gradnorm_weighted_sigma = sigma_weight * base_sigma_reg_loss
+            gradnorm_weighted_mean = mean_weight * base_mean_reg_loss
             gradnorm_weighted_data = data_weight * data_force_loss
 
-            force_loss = float(force_reg) * base_force_loss
-            weighted_force = float(force_reg) * gradnorm_weighted_force
+            weighted_sigma = float(force_reg) * gradnorm_weighted_sigma
+            weighted_mean = float(mean_reg) * gradnorm_weighted_mean
             weighted_data = float(force_data_weight) * gradnorm_weighted_data
             weighted_sym = float(symmetry_weight) * sym_loss
-            loss = (gradnorm_weighted_res + weighted_force + weighted_data + weighted_sym).float()
+            loss = (gradnorm_weighted_res + weighted_sigma + weighted_mean + weighted_data + weighted_sym).float()
 
         if log_component_grad_norms and scaler.is_enabled():
             raise ValueError(
@@ -233,8 +273,13 @@ def _train_one_epoch(
                 compute_model_grad_norm(model), device=device
             )
             model.zero_grad(set_to_none=True)
-            weighted_force.backward(retain_graph=True)
-            force_grad_component_sum = force_grad_component_sum + torch.as_tensor(
+            weighted_sigma.backward(retain_graph=True)
+            sigma_grad_component_sum = sigma_grad_component_sum + torch.as_tensor(
+                compute_model_grad_norm(model), device=device
+            )
+            model.zero_grad(set_to_none=True)
+            weighted_mean.backward(retain_graph=True)
+            mean_grad_component_sum = mean_grad_component_sum + torch.as_tensor(
                 compute_model_grad_norm(model), device=device
             )
             model.zero_grad(set_to_none=True)
@@ -261,30 +306,45 @@ def _train_one_epoch(
         loss_sum = loss_sum + loss.detach()
         res_loss_sum = res_loss_sum + res_loss.detach().float()
         # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
-        force_loss_sum = force_loss_sum + base_force_loss.detach().float()
+        sigma_reg_sum = sigma_reg_sum + base_sigma_reg_loss.detach().float()
+        mean_reg_sum = mean_reg_sum + base_mean_reg_loss.detach().float()
         force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
         sym_loss_sum = sym_loss_sum + sym_loss.detach().float()
-        avg_force_sum = avg_force_sum + avg_force.detach().float()
+        avg_sigma_reg_sum = avg_sigma_reg_sum + sigma_reg_loss.detach().float()
+        avg_mean_reg_sum = avg_mean_reg_sum + mean_reg_loss.detach().float()
 
     denom = float(max(batch_count, 1))
     metrics: dict[str, float] = {
         "mean_loss": float((loss_sum / denom).detach().cpu()),
         "mean_res_loss": float((res_loss_sum / denom).detach().cpu()),
-        "mean_force_loss": float((force_loss_sum / denom).detach().cpu()),
+        "mean_force_loss": float((sigma_reg_sum / denom).detach().cpu()),
+        "mean_sigma_reg_loss": float((sigma_reg_sum / denom).detach().cpu()),
+        "mean_mean_reg_loss": float((mean_reg_sum / denom).detach().cpu()),
         "mean_force_data_loss": float((force_data_loss_sum / denom).detach().cpu()),
         "mean_sym_loss": float((sym_loss_sum / denom).detach().cpu()),
         "mean_grad_norm": float((grad_norm_sum / denom).detach().cpu()),
-        "mean_force": float((avg_force_sum / denom).detach().cpu()),
+        "mean_force": float((avg_sigma_reg_sum / denom).detach().cpu()),
+        "mean_sigma_reg": float((avg_sigma_reg_sum / denom).detach().cpu()),
+        "mean_mean_reg": float((avg_mean_reg_sum / denom).detach().cpu()),
         "mean_res_grad_component": float((res_grad_component_sum / denom).detach().cpu()),
-        "mean_force_grad_component": float((force_grad_component_sum / denom).detach().cpu()),
+        "mean_force_grad_component": float((sigma_grad_component_sum / denom).detach().cpu()),
+        "mean_sigma_grad_component": float((sigma_grad_component_sum / denom).detach().cpu()),
+        "mean_mean_grad_component": float((mean_grad_component_sum / denom).detach().cpu()),
     }
     if gradnorm_weight_count > 0:
         metrics["mean_gradnorm_weight_residual"] = float(
             (gradnorm_res_weight_sum / float(gradnorm_weight_count)).detach().cpu()
         )
         metrics["mean_gradnorm_weight_force"] = float(
-            (gradnorm_force_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            (gradnorm_sigma_weight_sum / float(gradnorm_weight_count)).detach().cpu()
         )
+        metrics["mean_gradnorm_weight_sigma"] = float(
+            (gradnorm_sigma_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+        )
+        if gradnorm_mean_weight_sum is not None:
+            metrics["mean_gradnorm_weight_mean"] = float(
+                (gradnorm_mean_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            )
         if gradnorm_data_weight_sum is not None:
             metrics["mean_gradnorm_weight_data"] = float(
                 (gradnorm_data_weight_sum / float(gradnorm_weight_count)).detach().cpu()
@@ -324,7 +384,10 @@ def _validate_if_needed(
     rollout_stochastic: bool,
     rollout_noise_scale: float,
     rollout_seed: int | None,
+    mean_reg: float,
+    mean_reg_norm: str,
     force_reg: float,
+    sigma_reg_norm: str,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -342,7 +405,10 @@ def _validate_if_needed(
             loader=val_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
+            mean_reg=mean_reg,
+            mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
+            sigma_reg_norm=sigma_reg_norm,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             symmetry_weight=symmetry_weight,
@@ -359,7 +425,10 @@ def _validate_if_needed(
             loader=val_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
+            mean_reg=mean_reg,
+            mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
+            sigma_reg_norm=sigma_reg_norm,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             symmetry_weight=symmetry_weight,
@@ -716,7 +785,10 @@ def _evaluate_val_losses(
     loader: Any,
     device: torch.device,
     non_blocking: bool,
+    mean_reg: float,
+    mean_reg_norm: str,
     force_reg: float,
+    sigma_reg_norm: str,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -731,7 +803,8 @@ def _evaluate_val_losses(
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     loss_sum = torch.zeros((), device=device)
     res_sum = torch.zeros((), device=device)
-    force_sum = torch.zeros((), device=device)
+    sigma_sum = torch.zeros((), device=device)
+    mean_reg_sum = torch.zeros((), device=device)
     data_sum = torch.zeros((), device=device)
     sym_sum = torch.zeros((), device=device)
     batches = 0
@@ -768,20 +841,48 @@ def _evaluate_val_losses(
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 if scale is None:
                     res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    if force_reg_on_coeff:
-                        avg_force = model.avg_force_coeff(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    else:
-                        avg_force = model.avg_force(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    sigma_reg_loss = model.avg_sigma_reg_SRK4(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=sigma_reg_norm,
+                    )
+                    mean_reg_loss = model.avg_mean_reg_SRK4(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=mean_reg_norm,
+                        on_coeff=force_reg_on_coeff,
+                    )
                 else:
                     per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    if force_reg_on_coeff:
-                        per_force = model.avg_force_coeff_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                    else:
-                        per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=sigma_reg_norm,
+                    )
+                    per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        norm=mean_reg_norm,
+                        on_coeff=force_reg_on_coeff,
+                    )
                     denom = scale * scale + float(per_traj_norm_eps)
                     res_loss = torch.mean(per_res / denom)
-                    avg_force = torch.mean(per_force / denom)
-                force_loss = float(force_reg) * avg_force
+                    sigma_reg_loss = torch.mean(per_sigma_reg / denom)
+                    mean_reg_loss = torch.mean(per_mean_reg / denom)
+                sigma_loss = float(force_reg) * sigma_reg_loss
+                mean_loss_reg = float(mean_reg) * mean_reg_loss
                 if use_force_data_loss:
                     if f_i is None or f_next is None:
                         raise ValueError(
@@ -819,7 +920,8 @@ def _evaluate_val_losses(
                     sym_loss = res_loss.new_tensor(0.0)
                 total = (
                     res_loss
-                    + force_loss
+                    + sigma_loss
+                    + mean_loss_reg
                     + float(force_data_weight) * data_force_loss
                     + float(symmetry_weight) * sym_loss
                 )
@@ -827,7 +929,8 @@ def _evaluate_val_losses(
             loss_sum = loss_sum + total.detach().float()
             res_sum = res_sum + res_loss.detach().float()
             # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
-            force_sum = force_sum + avg_force.detach().float()
+            sigma_sum = sigma_sum + sigma_reg_loss.detach().float()
+            mean_reg_sum = mean_reg_sum + mean_reg_loss.detach().float()
             data_sum = data_sum + data_force_loss.detach().float()
             sym_sum = sym_sum + sym_loss.detach().float()
             batches += 1
@@ -838,7 +941,8 @@ def _evaluate_val_losses(
     return {
         "loss_total": float((loss_sum / denom).detach().cpu()),
         "loss_physics": float((res_sum / denom).detach().cpu()),
-        "loss_reg": float((force_sum / denom).detach().cpu()),
+        "loss_reg": float((sigma_sum / denom).detach().cpu()),
+        "loss_reg_mean": float((mean_reg_sum / denom).detach().cpu()),
         "loss_data": float((data_sum / denom).detach().cpu()),
         "loss_sym": float((sym_sum / denom).detach().cpu()),
     }
@@ -850,7 +954,10 @@ def _per_ur_loss_map_hnn(
     loader: Any,
     device: torch.device,
     non_blocking: bool,
+    mean_reg: float,
+    mean_reg_norm: str,
     force_reg: float,
+    sigma_reg_norm: str,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -866,6 +973,7 @@ def _per_ur_loss_map_hnn(
     buckets: dict[str, dict[float, list[float]]] = {
         "loss_physics": {},
         "loss_reg": {},
+        "loss_reg_mean": {},
         "loss_data": {},
         "loss_sym": {},
     }
@@ -901,16 +1009,30 @@ def _per_ur_loss_map_hnn(
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
-                if force_reg_on_coeff:
-                    per_force = model.avg_force_coeff_per_sample(
-                        z_i, t_i, z_next, t_next, reduced_velocity=ur_i
-                    )
-                else:
-                    per_force = model.avg_force_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=sigma_reg_norm,
+                )
+                per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=mean_reg_norm,
+                    on_coeff=force_reg_on_coeff,
+                )
                 if scale is not None:
                     denom = scale * scale + float(per_traj_norm_eps)
                     per_res = per_res / denom
-                    per_force = per_force / denom
+                    per_sigma_reg = per_sigma_reg / denom
+                    per_mean_reg = per_mean_reg / denom
+                per_sigma = float(force_reg) * per_sigma_reg
+                per_mean = float(mean_reg) * per_mean_reg
                 if use_force_data_loss and f_i is not None and f_next is not None:
                     z_mid = 0.5 * (z_i + z_next)
                     f_mid = 0.5 * (f_i + f_next)
@@ -944,15 +1066,17 @@ def _per_ur_loss_map_hnn(
 
             ur_vals = ur_i.detach().cpu().view(-1).numpy()
             per_res_vals = per_res.detach().cpu().view(-1).numpy()
-            per_reg_vals = per_force.detach().cpu().view(-1).numpy()
+            per_reg_vals = per_sigma.detach().cpu().view(-1).numpy()
+            per_mean_vals = per_mean.detach().cpu().view(-1).numpy()
             per_data_vals = per_data.detach().cpu().view(-1).numpy()
             per_sym_vals = per_sym.detach().cpu().view(-1).numpy()
-            for u, res_v, reg_v, data_v, sym_v in zip(
-                ur_vals, per_res_vals, per_reg_vals, per_data_vals, per_sym_vals
+            for u, res_v, reg_v, mean_v, data_v, sym_v in zip(
+                ur_vals, per_res_vals, per_reg_vals, per_mean_vals, per_data_vals, per_sym_vals
             ):
                 key = float(np.round(u, 6))
                 buckets["loss_physics"].setdefault(key, []).append(float(res_v))
                 buckets["loss_reg"].setdefault(key, []).append(float(reg_v))
+                buckets["loss_reg_mean"].setdefault(key, []).append(float(mean_v))
                 buckets["loss_data"].setdefault(key, []).append(float(data_v))
                 buckets["loss_sym"].setdefault(key, []).append(float(sym_v))
 
@@ -1065,6 +1189,9 @@ def train(config: Config, config_name: str) -> None:
     scheduler_cfg = optim_cfg.scheduler
 
     force_reg = float(loss_cfg.force_reg)
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
     force_reg_on_coeff = bool(getattr(loss_cfg, "force_reg_on_coeff", False))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
@@ -1072,6 +1199,10 @@ def train(config: Config, config_name: str) -> None:
     symmetry_norm = str(getattr(loss_cfg, "symmetry_norm", "l2")).strip().lower()
     if symmetry_norm not in {"l1", "l2"}:
         raise ValueError("loss.symmetry_norm must be one of: l1, l2.")
+    if mean_reg_norm not in {"l1", "l2"}:
+        raise ValueError("loss.mean_reg_norm must be one of: l1, l2.")
+    if sigma_reg_norm not in {"l1", "l2"}:
+        raise ValueError("loss.sigma_reg_norm must be one of: l1, l2.")
 
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
     validate_every_epochs = int(getattr(monitoring_cfg, "validate_every_epochs", rollout_every_epochs))
@@ -1216,7 +1347,9 @@ def train(config: Config, config_name: str) -> None:
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(loss_cfg.use_gradnorm):
-        names = ["residual", "force"]
+        names = ["residual", "sigma"]
+        if mean_reg > 0.0:
+            names.append("mean")
         if use_force_data_loss:
             names.append("data")
         gradnorm_balancer = GradNormBalancer(
@@ -1244,7 +1377,10 @@ def train(config: Config, config_name: str) -> None:
             device=device,
             non_blocking=non_blocking,
             max_grad_norm=max_grad_norm,
+            mean_reg=mean_reg,
+            mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
+            sigma_reg_norm=sigma_reg_norm,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             gradnorm_balancer=gradnorm_balancer,
@@ -1260,33 +1396,41 @@ def train(config: Config, config_name: str) -> None:
 
         mean_loss = epoch_metrics["mean_loss"]
         mean_res_loss = epoch_metrics["mean_res_loss"]
-        mean_force_loss = epoch_metrics["mean_force_loss"]
+        mean_sigma_reg_loss = epoch_metrics["mean_sigma_reg_loss"]
+        mean_mean_reg_loss = epoch_metrics["mean_mean_reg_loss"]
         mean_force_data_loss = epoch_metrics["mean_force_data_loss"]
         mean_sym_loss = epoch_metrics["mean_sym_loss"]
         mean_grad_norm = epoch_metrics["mean_grad_norm"]
-        mean_force = epoch_metrics["mean_force"]
+        mean_sigma_reg = epoch_metrics["mean_sigma_reg"]
+        mean_mean_reg = epoch_metrics["mean_mean_reg"]
         mean_res_grad_component = epoch_metrics["mean_res_grad_component"]
-        mean_force_grad_component = epoch_metrics["mean_force_grad_component"]
+        mean_sigma_grad_component = epoch_metrics["mean_sigma_grad_component"]
+        mean_mean_grad_component = epoch_metrics["mean_mean_grad_component"]
 
         current_lr = float(opt.param_groups[0]["lr"]) if opt.param_groups else lr
 
         train_metrics: dict[str, float] = {
             "loss_total": mean_loss,
             "loss_physics": mean_res_loss,
-            "loss_reg": mean_force_loss,
+            "loss_reg": mean_sigma_reg_loss,
+            "loss_reg_mean": mean_mean_reg_loss,
             "loss_data": mean_force_data_loss,
             "loss_sym": mean_sym_loss,
             "lr": current_lr,
             "grad_norm": mean_grad_norm,
-            "avg_force": mean_force,
+            "avg_sigma_reg": mean_sigma_reg,
+            "avg_mean_reg": mean_mean_reg,
         }
         if log_component_grad_norms:
             train_metrics["grad_norm_residual_comp"] = mean_res_grad_component
-            train_metrics["grad_norm_force_comp"] = mean_force_grad_component
+            train_metrics["grad_norm_sigma_comp"] = mean_sigma_grad_component
+            train_metrics["grad_norm_mean_comp"] = mean_mean_grad_component
         if "mean_gradnorm_weight_residual" in epoch_metrics:
             train_metrics["gradnorm_weight_physics"] = float(epoch_metrics["mean_gradnorm_weight_residual"])
         if "mean_gradnorm_weight_force" in epoch_metrics:
             train_metrics["gradnorm_weight_reg"] = float(epoch_metrics["mean_gradnorm_weight_force"])
+        if "mean_gradnorm_weight_mean" in epoch_metrics:
+            train_metrics["gradnorm_weight_mean_reg"] = float(epoch_metrics["mean_gradnorm_weight_mean"])
         if "mean_gradnorm_weight_data" in epoch_metrics:
             train_metrics["gradnorm_weight_data"] = float(epoch_metrics["mean_gradnorm_weight_data"])
 
@@ -1298,12 +1442,13 @@ def train(config: Config, config_name: str) -> None:
             if use_force_data_loss:
                 print(
                     f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
-                    f"force={mean_force_loss:.4e}, data={mean_force_data_loss:.4e}, sym={mean_sym_loss:.4e}"
+                    f"sigma_reg={mean_sigma_reg_loss:.4e}, mean_reg={mean_mean_reg_loss:.4e}, "
+                    f"data={mean_force_data_loss:.4e}, sym={mean_sym_loss:.4e}"
                 )
             else:
                 print(
                     f"Epoch {epoch}: loss={mean_loss:.4e}, res={mean_res_loss:.4e}, "
-                    f"force={mean_force_loss:.4e}, sym={mean_sym_loss:.4e}"
+                    f"sigma_reg={mean_sigma_reg_loss:.4e}, mean_reg={mean_mean_reg_loss:.4e}, sym={mean_sym_loss:.4e}"
                 )
 
         should_validate_losses = validate_every_epochs > 0 and (
@@ -1377,7 +1522,10 @@ def train(config: Config, config_name: str) -> None:
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
+                mean_reg=mean_reg,
+                mean_reg_norm=mean_reg_norm,
                 force_reg=force_reg,
+                sigma_reg_norm=sigma_reg_norm,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
                 symmetry_weight=symmetry_weight,
@@ -1430,7 +1578,10 @@ def train(config: Config, config_name: str) -> None:
             loader=val_loader,
             device=device,
             non_blocking=(device.type == "cuda"),
+            mean_reg=mean_reg,
+            mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
+            sigma_reg_norm=sigma_reg_norm,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             symmetry_weight=symmetry_weight,

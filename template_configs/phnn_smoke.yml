@@ -77,8 +77,15 @@ optim:
     scheduler_type: cosine
 
 loss:
-  # For stochastic PHNN this regularizes diffusion (mean sigma^2), not force.
+  # Mean-force regularization weight (independent of sigma regularization).
+  mean_reg: 0.0
+  # Norm for mean-force regularizer: l1 | l2
+  mean_reg_norm: l1
+  # Sigma regularization weight (for stochastic PHNN this regularizes diffusion sigma).
   force_reg: 0.1
+  # Norm for sigma regularizer: l1 | l2
+  sigma_reg_norm: l2
+  # If true, mean regularizer is applied on force coefficient instead of force units.
   force_reg_on_coeff: true
   use_force_data_loss: false
   force_data_weight: 0.0

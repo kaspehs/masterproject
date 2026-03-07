@@ -132,7 +132,10 @@ class OptimConfig:
 
 @dataclass
 class LossConfig:
+    mean_reg: float = 0.0
+    mean_reg_norm: str = "l1"  # "l1" or "l2"
     force_reg: float = 1e-2
+    sigma_reg_norm: str = "l2"  # "l1" or "l2"
     force_reg_on_coeff: bool = False
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
@@ -277,7 +280,10 @@ def parse_config(raw: dict[str, Any]) -> Config:
     legacy_training = dict(training_cfg)
     optim_keys = {"lr", "optimizer", "weight_decay", "use_lr_scheduler", "scheduler"}
     loss_keys = {
+        "mean_reg",
+        "mean_reg_norm",
         "force_reg",
+        "sigma_reg_norm",
         "force_reg_on_coeff",
         "use_gradnorm",
         "gradnorm_alpha",
@@ -1645,6 +1651,86 @@ class PHVIV(nn.Module):
     ) -> torch.Tensor:
         sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
         return torch.square(sigma).squeeze(-1)
+
+    def avg_sigma_reg_SRK4(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        *,
+        norm: str = "l2",
+    ) -> torch.Tensor:
+        per = self.avg_sigma_reg_SRK4_per_sample(
+            zi, ti, zin, tin, reduced_velocity=reduced_velocity, norm=norm
+        )
+        return torch.mean(per)
+
+    def avg_sigma_reg_SRK4_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        *,
+        norm: str = "l2",
+    ) -> torch.Tensor:
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
+        norm_key = str(norm).strip().lower()
+        if norm_key == "l1":
+            return torch.abs(sigma).squeeze(-1)
+        if norm_key == "l2":
+            return torch.square(sigma).squeeze(-1)
+        raise ValueError("sigma regularization norm must be one of: l1, l2.")
+
+    def avg_mean_reg_SRK4(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        *,
+        norm: str = "l1",
+        on_coeff: bool = False,
+    ) -> torch.Tensor:
+        per = self.avg_mean_reg_SRK4_per_sample(
+            zi, ti, zin, tin, reduced_velocity=reduced_velocity, norm=norm, on_coeff=on_coeff
+        )
+        return torch.mean(per)
+
+    def avg_mean_reg_SRK4_per_sample(
+        self,
+        zi,
+        ti,
+        zin,
+        tin,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        *,
+        norm: str = "l1",
+        on_coeff: bool = False,
+    ) -> torch.Tensor:
+        b = math.sqrt(3.0) / 6.0
+        z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
+        z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
+        if on_coeff:
+            f1 = self.u_theta_coeff(z_a_plus, reduced_velocity=reduced_velocity)
+            f2 = self.u_theta_coeff(z_a_minus, reduced_velocity=reduced_velocity)
+        else:
+            f1 = self.u_theta(z_a_plus, reduced_velocity=reduced_velocity)
+            f2 = self.u_theta(z_a_minus, reduced_velocity=reduced_velocity)
+        norm_key = str(norm).strip().lower()
+        if norm_key == "l1":
+            r1 = torch.sum(torch.abs(f1), dim=1)
+            r2 = torch.sum(torch.abs(f2), dim=1)
+        elif norm_key == "l2":
+            r1 = torch.sum(f1 * f1, dim=1)
+            r2 = torch.sum(f2 * f2, dim=1)
+        else:
+            raise ValueError("mean regularization norm must be one of: l1, l2.")
+        return 0.5 * (r1 + r2)
     
     def res_loss_Euler(self, zi, ti, zin, tin, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
         dz = (zin-zi)/self.dt
