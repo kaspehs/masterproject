@@ -1353,6 +1353,7 @@ class PHVIV(nn.Module):
         like: torch.Tensor,
         state: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # `state` is intentionally unused; kept for backward-compatible call sites.
         rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
         if rv_raw is None:
             u_flow = like.new_full(like.shape[:-1] + (1,), float(self.U))
@@ -1362,16 +1363,8 @@ class PHVIV(nn.Module):
             )
             f_n = omega_n / (2.0 * math.pi)
             u_flow = rv_raw * f_n * float(self.D)
-
-        if state is None:
-            dy = torch.zeros_like(u_flow)
-        else:
-            dy = state[..., 1:2] / float(self.m)
-            if dy.shape[:-1] != u_flow.shape[:-1]:
-                dy = dy.expand(u_flow.shape[:-1] + (1,))
-            dy = dy.to(device=u_flow.device, dtype=u_flow.dtype)
-
-        f0 = 0.5 * float(self.rho) * float(self.D) * (u_flow**2 + dy**2)
+        # Dynamic-pressure force scale (unit span): f0 = 0.5 * rho * D * U^2
+        f0 = 0.5 * float(self.rho) * float(self.D) * (u_flow**2)
         return torch.clamp(f0, min=1e-12)
 
     def _force_features(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
@@ -1400,7 +1393,7 @@ class PHVIV(nn.Module):
         sigma = sigma_min + F.softplus(raw)
         if self.force_output == "coefficient":
             # In coefficient mode, interpret sigma_net output as coefficient-scale
-            # diffusion and convert to force units using instantaneous F0.
+            # diffusion and convert to force units using dynamic-pressure F0.
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=sigma, state=x)
             sigma = sigma * f0
         return sigma
