@@ -29,6 +29,8 @@ from HNN_helper import (
     Config,
     GradNormBalancer,
     PHVIV,
+    ROLLOUT_DIVERGED_COUNT_KEY,
+    ROLLOUT_DIVERGED_KEY,
     build_dataloader_from_series,
     compute_validation_metrics,
     compute_model_grad_norm,
@@ -381,6 +383,7 @@ def _validate_if_needed(
     if val_series_raw is not None and val_sequences is not None:
         metrics_sum: dict[str, float] = {}
         count = 0
+        diverged_count = 0
         total = min(len(val_series_raw), len(val_sequences))
         ur_for_sampling: list[float] = []
         for idx in range(total):
@@ -412,12 +415,18 @@ def _validate_if_needed(
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
             )
+            diverged_flag = float(metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+            if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                diverged_count += 1
             for name, value in metrics.items():
+                if name == ROLLOUT_DIVERGED_KEY:
+                    continue
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
             count += 1
         if count > 0:
             for name, total in metrics_sum.items():
                 writer.add_scalar(f"val/{name}", total / float(count), epoch + 1)
+            writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
         selected_indices: list[int] | None = None
         if rollout_target_ur is not None:
             matches: list[int] = []
@@ -570,12 +579,15 @@ def _log_final_rollouts_all(
             step=step_idx,
             title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
         )
-        if metrics:
+        filtered_metrics = {
+            name: float(value)
+            for name, value in metrics.items()
+            if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+        }
+        if filtered_metrics:
             ur_values.append(ur_val)
-            metrics_list.append(metrics)
-        for name, value in metrics.items():
-            if not np.isfinite(value):
-                continue
+            metrics_list.append(filtered_metrics)
+        for name, value in filtered_metrics.items():
             metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
             metrics_count[name] = metrics_count.get(name, 0) + 1
         used += 1
@@ -1146,6 +1158,7 @@ def train(config: Config, config_name: str) -> None:
         val_dir = train_series_root / "val"
         if val_dir.exists():
             val_cut = resolve_cut_start_seconds(data_cfg, "val")
+            val_require_force = bool(use_force_data_loss or has_force_data)
             val_series_raw, _ = load_training_series(
                 y_data,
                 t,
@@ -1158,7 +1171,7 @@ def train(config: Config, config_name: str) -> None:
                 velocity_source=velocity_source,
                 eval_velocity=vel_data,
                 eval_reduced_velocity=reduced_velocity,
-                require_force=use_force_data_loss,
+                require_force=val_require_force,
                 eval_force=(F_data if has_force_data else None),
                 cut_start_seconds=val_cut,
             )

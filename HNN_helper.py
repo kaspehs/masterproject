@@ -24,15 +24,21 @@ from architectures import FourierFeatures, ODEPirateNet
 FORCE_MAPPING_NRMSE_KEY = "Force mapping NRMSE"
 FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
 DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
+DISP_SPECTRAL_REL_ERROR_KEY = "Displacement spectral relative error"
 DISP_STD_REL_ERROR_KEY = "Displacement std relative error"
 # Backward-compat: VPINN still imports this legacy key name.
 MEAN_DISP_AMP_REL_ERROR_KEY = DISP_STD_REL_ERROR_KEY
 DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
 FORCE_SPECTRAL_SHAPE_ERROR_KEY = "Force spectral shape error"
+FORCE_SPECTRAL_REL_ERROR_KEY = "Force spectral relative error"
+ROLLOUT_DIVERGED_KEY = "Rollout diverged"
+ROLLOUT_DIVERGED_COUNT_KEY = "Rollout diverged count"
 
 SPECTRAL_ERROR_FMIN_HZ = 0.1
 SPECTRAL_ERROR_FMAX_HZ = 5.0
 SPECTRAL_ERROR_NPERSEG = 1024
+ROLLOUT_DIVERGENCE_ABS_Y_NORM_LIMIT = 1e3
+ROLLOUT_DIVERGENCE_REL_Y_NORM_MULTIPLIER = 20.0
 
 @dataclass
 class DataConfig:
@@ -438,6 +444,8 @@ def log_validation_epoch(
 
     if log_metrics:
         for name, value in metrics.items():
+            if name == ROLLOUT_DIVERGED_KEY:
+                continue
             writer.add_scalar(f"val/{name}", value, epoch)
     zoom_mask = create_zoom_mask(t)
     middle_mask = create_window_mask(t, middle_time_plot)
@@ -547,12 +555,39 @@ def compute_validation_metrics(
     metrics: dict[str, float] = {}
 
     y_pred_norm = np.asarray(rollout["y_norm"], dtype=float).reshape(-1)
+    p_pred_norm = np.asarray(rollout["p_norm"], dtype=float).reshape(-1)
+    force_total_pred_full = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
     y_true = np.asarray(y_data_raw, dtype=float).reshape(-1)
+    y_true_norm = y_true / float(D)
     y_pred = y_pred_norm * float(D)
+
+    diverged = False
+    if not np.all(np.isfinite(y_pred_norm)):
+        diverged = True
+    if not np.all(np.isfinite(p_pred_norm)):
+        diverged = True
+    if not np.all(np.isfinite(force_total_pred_full)):
+        diverged = True
+    if not diverged and y_pred_norm.size > 0 and y_true_norm.size > 0:
+        pred_max = float(np.max(np.abs(y_pred_norm)))
+        true_max = float(np.max(np.abs(y_true_norm)))
+        abs_limit = float(ROLLOUT_DIVERGENCE_ABS_Y_NORM_LIMIT)
+        rel_limit = float(ROLLOUT_DIVERGENCE_REL_Y_NORM_MULTIPLIER) * max(1e-6, true_max)
+        if pred_max > max(abs_limit, rel_limit):
+            diverged = True
+    metrics[ROLLOUT_DIVERGED_KEY] = 1.0 if diverged else 0.0
+
     min_len_y = min(y_pred.shape[0], y_true.shape[0])
     if min_len_y > 1:
         y_pred_aligned = y_pred[:min_len_y]
         y_true_aligned = y_true[:min_len_y]
+        half_idx_disp = min_len_y // 2
+        y_true_half = y_true_aligned[half_idx_disp:]
+        y_pred_half = y_pred_aligned[half_idx_disp:]
+        if y_true_half.size > 0 and y_pred_half.size > 0:
+            disp_spectral_rel = spectral_l2_relative_error(y_true_half, y_pred_half, dt)
+            if np.isfinite(disp_spectral_rel):
+                metrics[DISP_SPECTRAL_REL_ERROR_KEY] = float(disp_spectral_rel)
 
         true_dom = dominant_frequency(y_true_aligned, dt)
         pred_dom = dominant_frequency(y_pred_aligned, dt)
@@ -566,16 +601,8 @@ def compute_validation_metrics(
         if np.isfinite(std_rel):
             metrics[DISP_STD_REL_ERROR_KEY] = abs(float(std_rel))
 
-        half_idx_disp = min_len_y // 2
-        y_true_half = y_true_aligned[half_idx_disp:]
-        y_pred_half = y_pred_aligned[half_idx_disp:]
-        if y_true_half.size > 0 and y_pred_half.size > 0:
-            disp_spectral_err = spectral_relative_error(y_true_half, y_pred_half, dt)
-            if np.isfinite(disp_spectral_err):
-                metrics[DISP_SPECTRAL_SHAPE_ERROR_KEY] = float(disp_spectral_err)
-
     if force_data is not None:
-        force_total_pred = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
+        force_total_pred = force_total_pred_full
         force_target = np.asarray(force_data, dtype=float).reshape(-1)
         min_len_force = min(force_total_pred.shape[0], force_target.shape[0])
         if min_len_force > 1:
@@ -585,9 +612,9 @@ def compute_validation_metrics(
             force_true_half = force_true_aligned[half_idx_force:]
             force_pred_half = force_pred_aligned[half_idx_force:]
             if force_true_half.size > 0 and force_pred_half.size > 0:
-                force_spectral_err = spectral_relative_error(force_true_half, force_pred_half, dt)
-                if np.isfinite(force_spectral_err):
-                    metrics[FORCE_SPECTRAL_SHAPE_ERROR_KEY] = float(force_spectral_err)
+                force_spectral_rel = spectral_l2_relative_error(force_true_half, force_pred_half, dt)
+                if np.isfinite(force_spectral_rel):
+                    metrics[FORCE_SPECTRAL_REL_ERROR_KEY] = float(force_spectral_rel)
     return metrics
 
 
@@ -857,6 +884,76 @@ def spectral_relative_error(
     if not np.isfinite(tv):
         return float("nan")
     return float(np.clip(tv, 0.0, 1.0))
+
+
+def spectral_l2_relative_error(
+    true_signal: np.ndarray,
+    model_signal: np.ndarray,
+    dt: float,
+    fmin_hz: float = SPECTRAL_ERROR_FMIN_HZ,
+    fmax_hz: float = SPECTRAL_ERROR_FMAX_HZ,
+    nperseg: int = SPECTRAL_ERROR_NPERSEG,
+    eps: float = 1e-12,
+) -> float:
+    """Compute L2 relative error between band-limited PSDs."""
+    if dt <= 0.0:
+        return float("nan")
+    true_signal = np.asarray(true_signal, dtype=float).reshape(-1)
+    model_signal = np.asarray(model_signal, dtype=float).reshape(-1)
+    length = min(true_signal.size, model_signal.size)
+    if length < 8:
+        return float("nan")
+    true_trim = true_signal[-length:]
+    model_trim = model_signal[-length:]
+    true_proc = true_trim - np.mean(true_trim)
+    model_proc = model_trim - np.mean(model_trim)
+
+    if welch is not None:
+        fs = 1.0 / float(dt)
+        seg = int(max(8, min(int(nperseg), length)))
+        ov = seg // 2
+        freqs, true_psd = welch(
+            true_proc,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend=False,
+            scaling="density",
+        )
+        _, model_psd = welch(
+            model_proc,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend=False,
+            scaling="density",
+        )
+    else:
+        freqs = np.fft.rfftfreq(length, d=float(dt))
+        true_psd = np.abs(np.fft.rfft(true_proc)) ** 2
+        model_psd = np.abs(np.fft.rfft(model_proc)) ** 2
+
+    if freqs.size == 0:
+        return float("nan")
+
+    band = np.isfinite(freqs)
+    band = band & (freqs >= float(fmin_hz))
+    if np.isfinite(float(fmax_hz)) and float(fmax_hz) > 0.0:
+        band = band & (freqs <= float(fmax_hz))
+    if np.count_nonzero(band) < 2:
+        return float("nan")
+
+    p_true = np.clip(true_psd[band], a_min=0.0, a_max=None)
+    p_model = np.clip(model_psd[band], a_min=0.0, a_max=None)
+    denom = float(np.linalg.norm(p_true))
+    if denom <= eps:
+        return float("nan")
+    rel = float(np.linalg.norm(p_model - p_true) / (denom + eps))
+    if not np.isfinite(rel):
+        return float("nan")
+    return rel
 
 
 class PHVIV(nn.Module):
@@ -1934,10 +2031,10 @@ def log_final_rollout_errors_vs_ur(
     metrics_all = [p[1] for p in pairs]
 
     series = [
+        (DISP_SPECTRAL_REL_ERROR_KEY, DISP_SPECTRAL_REL_ERROR_KEY),
         (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
         (DISP_STD_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
-        (DISP_SPECTRAL_SHAPE_ERROR_KEY, DISP_SPECTRAL_SHAPE_ERROR_KEY),
-        (FORCE_SPECTRAL_SHAPE_ERROR_KEY, FORCE_SPECTRAL_SHAPE_ERROR_KEY),
+        (FORCE_SPECTRAL_REL_ERROR_KEY, FORCE_SPECTRAL_REL_ERROR_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
     for ur_val, metrics in pairs:

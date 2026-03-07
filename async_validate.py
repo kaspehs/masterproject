@@ -24,6 +24,8 @@ if str(ROOT) not in sys.path:
 
 from HNN_helper import (
     PHVIV,
+    ROLLOUT_DIVERGED_COUNT_KEY,
+    ROLLOUT_DIVERGED_KEY,
     build_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
@@ -181,6 +183,7 @@ def _run_hnn_validation(
 
     if bool(getattr(data_cfg, "use_generated_train_series", False)):
         series_dir = Path(data_cfg.train_series_dir) / "val"
+        val_require_force = bool(getattr(loss_cfg, "use_force_data_loss", False) or has_force_data)
         val_series_raw, _ = load_training_series(
             y_data,
             t,
@@ -193,11 +196,12 @@ def _run_hnn_validation(
             velocity_source=velocity_source,
             eval_velocity=vel_data,
             eval_reduced_velocity=reduced_velocity,
-            require_force=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            require_force=val_require_force,
             eval_force=(F_data if has_force_data else None),
             cut_start_seconds=val_cut,
         )
     else:
+        val_require_force = bool(getattr(loss_cfg, "use_force_data_loss", False) or has_force_data)
         val_series_raw, _ = load_training_series(
             y_data,
             t,
@@ -210,7 +214,7 @@ def _run_hnn_validation(
             velocity_source=velocity_source,
             eval_velocity=vel_data,
             eval_reduced_velocity=reduced_velocity,
-            require_force=bool(getattr(loss_cfg, "use_force_data_loss", False)),
+            require_force=val_require_force,
             eval_force=(F_data if has_force_data else None),
             cut_start_seconds=val_cut,
         )
@@ -285,6 +289,7 @@ def _run_hnn_validation(
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
+        diverged_count = 0
         total = min(len(val_series_raw), len(val_sequences))
         ur_for_sampling: list[float] = []
         for idx in range(total):
@@ -314,7 +319,12 @@ def _run_hnn_validation(
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
             )
+            diverged_flag = float(metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+            if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                diverged_count += 1
             for name, value in metrics.items():
+                if name == ROLLOUT_DIVERGED_KEY:
+                    continue
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
             count += 1
         if count > 0:
@@ -325,6 +335,8 @@ def _run_hnn_validation(
                     continue
                 writer.add_scalar(f"val/{name}", value_f, epoch)
                 num_rollout_scalars_written += 1
+            writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
+            num_rollout_scalars_written += 1
 
         ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
         rollout_idx = _rollout_index(
@@ -363,8 +375,6 @@ def _run_hnn_validation(
             rollout_seed=rollout_seed,
         )
 
-    writer.add_scalar("val/async_hnn_loss_metric_count", float(num_loss_scalars_written), epoch)
-    writer.add_scalar("val/async_hnn_rollout_metric_count", float(num_rollout_scalars_written), epoch)
     print(
         f"[async-val] epoch {epoch}: HNN scalar writes "
         f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
@@ -1106,12 +1116,6 @@ def main() -> None:
             )
         else:
             raise ValueError(f"Unsupported method '{method}'.")
-        # Heartbeat scalar: confirms this async worker wrote to TensorBoard.
-        writer.add_scalar("val/async_validation_completed", 1.0, int(args.epoch))
-        print(
-            f"[async-val] epoch {int(args.epoch)}: wrote TensorBoard heartbeat "
-            f"to {args.log_dir}"
-        )
     finally:
         writer.flush()
         writer.close()
