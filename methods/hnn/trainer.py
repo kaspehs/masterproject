@@ -1012,6 +1012,9 @@ def _evaluate_val_losses(
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
+    # Keep validation rollout-loss estimation deterministic to control cost and variance.
+    val_rollout_loss_mode = "deterministic"
+    val_rollout_stochastic_samples = 1
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     loss_sum = torch.zeros((), device=device)
     res_sum = torch.zeros((), device=device)
@@ -1162,8 +1165,8 @@ def _evaluate_val_losses(
                         device=device,
                         non_blocking=non_blocking,
                         per_traj_norm_eps=per_traj_norm_eps,
-                        rollout_loss_mode=rollout_loss_mode,
-                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_loss_mode=val_rollout_loss_mode,
+                        rollout_stochastic_samples=val_rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
                     )
                 else:
@@ -1219,6 +1222,9 @@ def _per_ur_loss_map_hnn(
     force_reg_on_coeff: bool,
 ) -> dict[str, dict[float, float]]:
     model.eval()
+    # Keep validation rollout-loss estimation deterministic to control cost and variance.
+    val_rollout_loss_mode = "deterministic"
+    val_rollout_stochastic_samples = 1
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     buckets: dict[str, dict[float, list[float]]] = {
@@ -1344,8 +1350,8 @@ def _per_ur_loss_map_hnn(
                     device=device,
                     non_blocking=non_blocking,
                     per_traj_norm_eps=per_traj_norm_eps,
-                    rollout_loss_mode=rollout_loss_mode,
-                    rollout_stochastic_samples=rollout_stochastic_samples,
+                    rollout_loss_mode=val_rollout_loss_mode,
+                    rollout_stochastic_samples=val_rollout_stochastic_samples,
                     rollout_noise_scale=rollout_noise_scale,
                     return_per_sample=True,
                 )

@@ -856,6 +856,9 @@ def _evaluate_val_losses(
     force_reg_on_coeff: bool,
 ) -> dict[str, float]:
     model.eval()
+    # Keep validation rollout-loss estimation deterministic to control cost and variance.
+    val_rollout_loss_mode = "deterministic"
+    val_rollout_stochastic_samples = 1
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
     loss_sum = torch.zeros((), device=device)
     res_sum = torch.zeros((), device=device)
@@ -1012,8 +1015,8 @@ def _evaluate_val_losses(
                         device=device,
                         non_blocking=non_blocking,
                         per_traj_norm_eps=per_traj_norm_eps,
-                        rollout_loss_mode=rollout_loss_mode,
-                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_loss_mode=val_rollout_loss_mode,
+                        rollout_stochastic_samples=val_rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
                     )
                 else:
@@ -1066,6 +1069,9 @@ def _per_ur_loss_map_hnn(
     per_traj_norm_eps: float,
 ) -> dict[str, dict[float, float]]:
     model.eval()
+    # Keep validation rollout-loss estimation deterministic to control cost and variance.
+    val_rollout_loss_mode = "deterministic"
+    val_rollout_stochastic_samples = 1
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     buckets: dict[str, dict[float, list[float]]] = {
@@ -1198,8 +1204,8 @@ def _per_ur_loss_map_hnn(
                     device=device,
                     non_blocking=non_blocking,
                     per_traj_norm_eps=per_traj_norm_eps,
-                    rollout_loss_mode=rollout_loss_mode,
-                    rollout_stochastic_samples=rollout_stochastic_samples,
+                    rollout_loss_mode=val_rollout_loss_mode,
+                    rollout_stochastic_samples=val_rollout_stochastic_samples,
                     rollout_noise_scale=rollout_noise_scale,
                     return_per_sample=True,
                 )
