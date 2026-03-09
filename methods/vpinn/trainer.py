@@ -1750,6 +1750,41 @@ def train(config: Config, config_name: str) -> None:
     middle_time_plot = resolve_middle_time_plot(config.data, vp, method_name="vpinn")
     D_val = float(getattr(config.model, "D", 1.0))
 
+    train_windows = len(train_dataset)
+    train_steps_per_epoch = len(train_loader)
+    val_windows = len(val_dataset) if val_dataset is not None else 0
+    val_steps_per_epoch = len(val_loader) if val_loader is not None else 0
+    startup_lines = [
+        f"Run name: {run_name}",
+        (
+            f"VPINN training setup: epochs={epochs}, batch_size={batch_size}, "
+            f"steps_per_epoch={train_steps_per_epoch}, train_windows={train_windows}, "
+            f"train_trajectories={len(train_trajs)}"
+        ),
+        (
+            f"Validation setup: steps={val_steps_per_epoch}, val_windows={val_windows}, "
+            f"val_trajectories={len(val_trajs) if val_trajs is not None else 0}"
+        ),
+        (
+            f"Windowing: window_M={window_M}, stride={stride}, dt={dt:g}, "
+            f"use_force_loss={use_force_loss}, use_weak_loss={use_weak_loss}"
+        ),
+        (
+            f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)}, amp={amp_enabled}, "
+            f"compile={bool(compile_cfg.use_compile)}, lr={base_lr:g}, scheduler={use_lr_scheduler}"
+        ),
+        (
+            f"Monitoring: validate_every={validate_every}, rollout_every={rollout_every}, "
+            f"print_every={print_every}, log_every={log_every}, async_validation={async_validation}"
+        ),
+    ]
+    if use_rollout_loss:
+        startup_lines.append(
+            f"Rollout loss: weight={rollout_force_weight:g}, steps={rollout_force_steps}, "
+            f"every={rollout_force_every}"
+        )
+    print("\n".join(startup_lines))
+
     for epoch in range(epochs):
         model.train()
         if use_lr_scheduler:

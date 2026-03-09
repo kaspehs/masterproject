@@ -1624,6 +1624,47 @@ def train(config: Config, config_name: str) -> None:
         device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype)
     )
 
+    train_instances = len(train_loader.dataset)
+    train_steps_per_epoch = len(train_loader)
+    val_instances = len(val_loader.dataset) if val_loader is not None else 0
+    val_steps_per_epoch = len(val_loader) if val_loader is not None else 0
+    train_rollout_instances = len(train_rollout_loader.dataset) if train_rollout_loader is not None else 0
+    train_rollout_steps_per_epoch = len(train_rollout_loader) if train_rollout_loader is not None else 0
+    val_rollout_instances = len(val_rollout_loader.dataset) if val_rollout_loader is not None else 0
+    val_rollout_steps_per_epoch = len(val_rollout_loader) if val_rollout_loader is not None else 0
+    rollout_mode_msg = rollout_loss_mode
+    if rollout_loss_mode == "stochastic":
+        rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
+    startup_lines = [
+        f"Run name: {run_name}",
+        (
+            f"HNN training setup: epochs={epochs}, batch_size={batch_size}, "
+            f"steps_per_epoch={train_steps_per_epoch}, train_instances={train_instances}, "
+            f"train_trajectories={len(train_series_raw)}"
+        ),
+        (
+            f"Validation setup: steps={val_steps_per_epoch}, val_instances={val_instances}, "
+            f"val_trajectories={0 if val_series_raw is None else len(val_series_raw)}"
+        ),
+        (
+            f"Runtime: device={device}, num_workers={num_workers}, amp={amp_enabled}, "
+            f"compile={bool(compile_cfg.use_compile)}, lr={lr:g}, scheduler={use_lr_scheduler}"
+        ),
+        (
+            f"Monitoring: validate_every={validate_every_epochs}, rollout_every={rollout_every_epochs}, "
+            f"print_every={print_every_epochs}, log_every={log_every_epochs}, async_validation={async_validation}"
+        ),
+    ]
+    if rollout_det_weight > 0.0 and current_rollout_det_steps > 0:
+        startup_lines.append(
+            "Rollout loss: "
+            f"mode={rollout_mode_msg}, weight={rollout_det_weight:g}, "
+            f"steps={current_rollout_det_steps}, rollout_batch_size={rollout_det_batch_size}, "
+            f"train_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}, "
+            f"val_windows={val_rollout_instances}, val_rollout_steps={val_rollout_steps_per_epoch}"
+        )
+    print("\n".join(startup_lines))
+
     for epoch in range(epochs):
         scheduled_rollout_det_steps = _scheduled_rollout_det_steps(
             epoch=epoch,
