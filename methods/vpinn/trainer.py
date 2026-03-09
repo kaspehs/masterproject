@@ -909,7 +909,6 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         *,
         window_intervals: int,
         stride: int,
-        return_scale: bool = False,
     ) -> None:
         if window_intervals < 1:
             raise ValueError("vpinn.window_M must be >= 1")
@@ -919,7 +918,6 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         self.M = int(window_intervals)
         self.M1 = self.M + 1
         self.stride = int(stride)
-        self._return_scale = bool(return_scale)
         self._return_f0 = any("f0" in traj for traj in self.trajectories)
 
         traj_ids: list[np.ndarray] = []
@@ -953,9 +951,6 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
         f = traj["f"][start:end]
         ur = traj["ur"][start:end]
         items: list[torch.Tensor] = [x, v, f, ur]
-        if self._return_scale:
-            scale = float(traj.get("scale", 1.0))
-            items.append(torch.tensor(scale, dtype=torch.float32))
         if self._return_f0:
             f0 = traj["f0"][start:end]
             items.append(f0)
@@ -1193,114 +1188,6 @@ def _weak_residual(
     return boundary + trap
 
 
-def _per_traj_force_rms(traj: dict[str, Any]) -> float:
-    f = torch.as_tensor(traj["f"], dtype=torch.float32)
-    rms = torch.sqrt(torch.mean(f.pow(2)))
-    val = float(rms.detach().cpu())
-    return val if np.isfinite(val) and val > 0.0 else 1.0
-
-
-def _per_traj_residual_rms(
-    traj: dict[str, Any],
-    *,
-    dt: float,
-    m: torch.Tensor,
-    c: torch.Tensor,
-    k: torch.Tensor,
-    w: torch.Tensor,
-    wdot: torch.Tensor,
-    alpha: torch.Tensor,
-    window_M: int,
-    stride: int,
-    eps: float,
-) -> float:
-    x = torch.as_tensor(traj["x"], dtype=torch.float32)
-    v = torch.as_tensor(traj["v"], dtype=torch.float32)
-    f = torch.as_tensor(traj["f"], dtype=torch.float32)
-    f0 = None
-    if "f0" in traj:
-        f0 = torch.as_tensor(traj["f0"], dtype=torch.float32)
-    length = int(x.shape[0])
-    M1 = int(window_M) + 1
-    if length < M1:
-        return 1.0
-    loss_sum = 0.0
-    count = 0
-    for start in range(0, length - M1 + 1, int(stride)):
-        end = start + M1
-        x_win = x[start:end].unsqueeze(0)
-        v_win = v[start:end].unsqueeze(0)
-        f_win = f[start:end].unsqueeze(0)
-        f0_win = None
-        if f0 is not None:
-            f0_win = f0[start:end].unsqueeze(0)
-        R = _weak_residual(
-            x=x_win,
-            v=v_win,
-            f_pred=f_win,
-            m=m,
-            c=c,
-            k=k,
-            dt=dt,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            f0=f0_win,
-        )
-        loss_w = torch.mean(R.pow(2))
-        loss_sum += float(loss_w.detach().cpu())
-        count += 1
-    mean_loss = loss_sum / float(max(count, 1))
-    scale = math.sqrt(max(mean_loss, float(eps)))
-    return scale if np.isfinite(scale) and scale > 0.0 else 1.0
-
-
-def _apply_per_traj_scale(
-    trajectories: list[dict[str, Any]],
-    *,
-    mode: str,
-    dt: float,
-    m: torch.Tensor,
-    c: torch.Tensor,
-    k: torch.Tensor,
-    w: torch.Tensor,
-    wdot: torch.Tensor,
-    alpha: torch.Tensor,
-    window_M: int,
-    stride: int,
-    eps: float,
-) -> None:
-    if not trajectories:
-        return
-    mode = str(mode).strip().lower()
-    m_cpu = m.detach().cpu()
-    c_cpu = c.detach().cpu()
-    k_cpu = k.detach().cpu()
-    w_cpu = w.detach().cpu()
-    wdot_cpu = wdot.detach().cpu()
-    alpha_cpu = alpha.detach().cpu()
-    for traj in trajectories:
-        if mode == "force_rms":
-            scale = _per_traj_force_rms(traj)
-        elif mode == "residual_rms":
-            scale = _per_traj_residual_rms(
-                traj,
-                dt=dt,
-                m=m_cpu,
-                c=c_cpu,
-                k=k_cpu,
-                w=w_cpu,
-                wdot=wdot_cpu,
-                alpha=alpha_cpu,
-                window_M=window_M,
-                stride=stride,
-                eps=eps,
-            )
-        else:
-            scale = 1.0
-        traj["scale"] = float(scale)
-
-
 def _evaluate_epoch(
     *,
     model: nn.Module,
@@ -1320,8 +1207,6 @@ def _evaluate_epoch(
     alpha: torch.Tensor,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    per_traj_norm_eps: float = 0.0,
-    expect_scale: bool = False,
     expect_f0: bool = False,
 ) -> dict[str, float]:
     model.eval()
@@ -1332,28 +1217,15 @@ def _evaluate_epoch(
         for batch in loader:
             if len(batch) == 4:
                 x_win, v_win, f_meas, ur_win = batch
-                scale = None
                 f0 = None
             elif len(batch) == 5:
-                x_win, v_win, f_meas, ur_win, extra = batch
-                if expect_scale and not expect_f0:
-                    scale = extra
-                    f0 = None
-                elif expect_f0 and not expect_scale:
-                    scale = None
-                    f0 = extra
-                else:
-                    raise ValueError("Unexpected batch format (missing scale or f0).")
-            elif len(batch) == 6:
-                x_win, v_win, f_meas, ur_win, scale, f0 = batch
+                x_win, v_win, f_meas, ur_win, f0 = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
-            if scale is not None:
-                scale = scale.to(device, non_blocking=non_blocking).view(-1)
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
@@ -1364,8 +1236,6 @@ def _evaluate_epoch(
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
-                if scale is not None:
-                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
                     R = _weak_residual(
@@ -1382,8 +1252,6 @@ def _evaluate_epoch(
                         f0=f0,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
-                    if scale is not None:
-                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
                     loss_w = torch.mean(per_loss_w)
                 else:
                     loss_w = loss_f.new_tensor(0.0)
@@ -1414,11 +1282,9 @@ def _per_ur_loss_map_vpinn(
     use_force_loss: bool,
     use_weak_loss: bool,
     rollout_force_steps: int,
-    expect_scale: bool,
     expect_f0: bool,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    per_traj_norm_eps: float,
 ) -> dict[str, dict[float, float]]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
@@ -1433,20 +1299,9 @@ def _per_ur_loss_map_vpinn(
         for batch in loader:
             if len(batch) == 4:
                 x_win, v_win, f_meas, ur_win = batch
-                scale = None
                 f0 = None
             elif len(batch) == 5:
-                x_win, v_win, f_meas, ur_win, extra = batch
-                if expect_scale and not expect_f0:
-                    scale = extra
-                    f0 = None
-                elif expect_f0 and not expect_scale:
-                    scale = None
-                    f0 = extra
-                else:
-                    raise ValueError("Unexpected batch format (missing scale or f0).")
-            elif len(batch) == 6:
-                x_win, v_win, f_meas, ur_win, scale, f0 = batch
+                x_win, v_win, f_meas, ur_win, f0 = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
 
@@ -1454,8 +1309,6 @@ def _per_ur_loss_map_vpinn(
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
-            if scale is not None:
-                scale = scale.to(device, non_blocking=non_blocking).view(-1)
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
@@ -1466,8 +1319,6 @@ def _per_ur_loss_map_vpinn(
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
-                if scale is not None:
-                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 per_loss_w = per_loss_f.new_zeros(per_loss_f.shape)
                 if use_weak_loss:
                     R = _weak_residual(
@@ -1484,8 +1335,6 @@ def _per_ur_loss_map_vpinn(
                         f0=f0,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
-                    if scale is not None:
-                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
 
                 per_roll = None
                 if rollout_force_steps > 0:
@@ -1507,8 +1356,6 @@ def _per_ur_loss_map_vpinn(
                         f_roll = f_seq[:, : steps_k + 1, :]
                         f_true = f_meas[:, : steps_k + 1, :]
                         per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
-                        if scale is not None:
-                            per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
 
             ur_vals = ur_win[:, 0, 0].detach().cpu().numpy()
             per_loss_f_vals = per_loss_f.detach().cpu().numpy()
@@ -1681,10 +1528,6 @@ def train(config: Config, config_name: str) -> None:
     use_force_coeff = force_representation == "coefficient"
     coeff_k = float(getattr(config.model, "k", 1218.0))
     coeff_m_eff = float(_m_eff_from_model_cfg(config.model))
-    per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
-    if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
-        raise ValueError("vpinn.per_traj_norm must be one of: none, force_rms, residual_rms.")
     if not (use_force_loss or use_weak_loss):
         raise ValueError("vpinn must enable at least one of: use_force_loss, use_weak_loss.")
 
@@ -1828,46 +1671,13 @@ def train(config: Config, config_name: str) -> None:
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
-    if per_traj_norm != "none":
-        _apply_per_traj_scale(
-            train_trajs,
-            mode=per_traj_norm,
-            dt=dt,
-            m=m,
-            c=c,
-            k=k,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            window_M=window_M,
-            stride=stride,
-            eps=per_traj_norm_eps,
-        )
-        if val_trajs:
-            _apply_per_traj_scale(
-                val_trajs,
-                mode=per_traj_norm,
-                dt=dt,
-                m=m,
-                c=c,
-                k=k,
-                w=w,
-                wdot=wdot,
-                alpha=alpha,
-                window_M=window_M,
-                stride=stride,
-                eps=per_traj_norm_eps,
-            )
-
-    return_scale = per_traj_norm != "none"
     train_dataset = WindowDataset(
         train_trajs,
         window_intervals=window_M,
         stride=stride,
-        return_scale=return_scale,
     )
     val_dataset = (
-        WindowDataset(val_trajs, window_intervals=window_M, stride=stride, return_scale=return_scale)
+        WindowDataset(val_trajs, window_intervals=window_M, stride=stride)
         if val_trajs
         else None
     )
@@ -1958,33 +1768,19 @@ def train(config: Config, config_name: str) -> None:
         gradnorm_count = 0
         batches = 0
 
-        expect_scale = per_traj_norm != "none"
         expect_f0 = use_force_coeff
         for step, batch in enumerate(train_loader):
             if len(batch) == 4:
                 x_win, v_win, f_meas, ur_win = batch
-                scale = None
                 f0 = None
             elif len(batch) == 5:
-                x_win, v_win, f_meas, ur_win, extra = batch
-                if expect_scale and not expect_f0:
-                    scale = extra
-                    f0 = None
-                elif expect_f0 and not expect_scale:
-                    scale = None
-                    f0 = extra
-                else:
-                    raise ValueError("Unexpected batch format (missing scale or f0).")
-            elif len(batch) == 6:
-                x_win, v_win, f_meas, ur_win, scale, f0 = batch
+                x_win, v_win, f_meas, ur_win, f0 = batch
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
-            if scale is not None:
-                scale = scale.to(device, non_blocking=non_blocking).view(-1)
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
@@ -1996,8 +1792,6 @@ def train(config: Config, config_name: str) -> None:
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
-                if scale is not None:
-                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 loss_f = torch.mean(per_loss_f)
                 if use_weak_loss:
                     R = _weak_residual(
@@ -2014,8 +1808,6 @@ def train(config: Config, config_name: str) -> None:
                         f0=f0,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
-                    if scale is not None:
-                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
                     loss_w = torch.mean(per_loss_w)
                 else:
                     loss_w = loss_f.new_tensor(0.0)
@@ -2042,8 +1834,6 @@ def train(config: Config, config_name: str) -> None:
                             f_roll = f_seq[:, : steps_k + 1, :]
                             f_true = f_meas[:, : steps_k + 1, :]
                             per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
-                            if scale is not None:
-                                per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
                             loss_roll = torch.mean(per_roll)
                             roll_computed = True
 
@@ -2202,8 +1992,6 @@ def train(config: Config, config_name: str) -> None:
                 alpha=alpha,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
-                per_traj_norm_eps=per_traj_norm_eps,
-                expect_scale=return_scale,
                 expect_f0=use_force_coeff,
             )
             for k_name, v_value in val_metrics.items():
@@ -2227,11 +2015,9 @@ def train(config: Config, config_name: str) -> None:
                 use_force_loss=use_force_loss,
                 use_weak_loss=use_weak_loss,
                 rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
-                expect_scale=return_scale,
                 expect_f0=use_force_coeff,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
-                per_traj_norm_eps=per_traj_norm_eps,
             )
             log_loss_vs_ur(
                 writer,
@@ -2395,11 +2181,9 @@ def train(config: Config, config_name: str) -> None:
             use_force_loss=use_force_loss,
             use_weak_loss=use_weak_loss,
             rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
-            expect_scale=return_scale,
             expect_f0=use_force_coeff,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
-            per_traj_norm_eps=per_traj_norm_eps,
         )
         if final_loss_by_ur:
             log_loss_vs_ur(

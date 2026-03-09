@@ -40,7 +40,6 @@ from HNN_helper import (
     sample_one_index_per_ur,
 )
 from methods.vpinn.trainer import (
-    _apply_per_traj_scale,
     _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
     WindowDataset,
@@ -146,22 +145,18 @@ def _rollout_loss_from_batch(
     batch: Any,
     device: torch.device,
     non_blocking: bool,
-    per_traj_norm_eps: float,
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
     return_per_sample: bool = False,
 ) -> torch.Tensor:
-    z0, t_seq, z_traj, ur0, history0, scale = _parse_rollout_batch(batch)
+    z0, t_seq, z_traj, ur0, history0, _scale = _parse_rollout_batch(batch)
     z0 = z0.to(device, non_blocking=non_blocking)
     t_seq = t_seq.to(device, non_blocking=non_blocking)
     z_traj = z_traj.to(device, non_blocking=non_blocking)
     ur0 = ur0.to(device, non_blocking=non_blocking)
     if history0 is not None:
         history0 = history0.to(device, non_blocking=non_blocking)
-    if scale is not None:
-        scale = scale.to(device, non_blocking=non_blocking).view(-1)
-
     mode_key = str(rollout_loss_mode).strip().lower()
     if mode_key not in {"deterministic", "stochastic"}:
         raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
@@ -188,9 +183,13 @@ def _rollout_loss_from_batch(
         )
         z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, 1, -1)
-        err = (z_pred - z_traj_ref) / z_scale
-        per = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
-        per = torch.mean(per, dim=0)
+        z_pred_scaled = z_pred / z_scale
+        z_true_scaled = z_traj_ref / z_scale
+        mu = torch.mean(z_pred_scaled, dim=0)
+        var = torch.mean((z_pred_scaled - mu.unsqueeze(0)) ** 2, dim=0)
+        var = torch.clamp(var, min=1e-6)
+        nll = 0.5 * (((z_true_scaled - mu) ** 2) / var + torch.log(var))
+        per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
     else:
         z_pred, _ = model.rollout(
             z0,
@@ -204,8 +203,6 @@ def _rollout_loss_from_batch(
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
         err = (z_pred - z_traj) / z_scale
         per = torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1)
-    if scale is not None:
-        per = per / (scale * scale + float(per_traj_norm_eps))
     if return_per_sample:
         return per
     return torch.mean(per)
@@ -246,16 +243,12 @@ def _run_hnn_validation(
     monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
-    per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(hnn_cfg.get("per_traj_norm_eps", 1e-8))
     rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
     rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
     if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
         raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
     rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
     rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
-    if per_traj_norm not in {"none", "force_rms"}:
-        raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
     fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
     validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
@@ -273,6 +266,8 @@ def _run_hnn_validation(
         raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
     if rollout_stochastic_samples < 1:
         raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
+    if rollout_loss_mode == "stochastic" and rollout_det_weight > 0.0 and rollout_stochastic_samples < 2:
+        raise ValueError("loss.rollout_stochastic_samples must be >= 2 when loss.rollout_loss_mode=stochastic.")
     if rollout_det_weight > 0.0 and rollout_det_steps < 1:
         raise ValueError("loss.rollout_det_steps must be >= 1 when loss.rollout_det_weight > 0.")
     if rollout_det_batch_size < 1:
@@ -373,8 +368,6 @@ def _run_hnn_validation(
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
-        per_traj_norm=per_traj_norm,
-        per_traj_norm_eps=per_traj_norm_eps,
         history_window=history_window,
     )
     val_rollout_loader: Any | None = None
@@ -389,7 +382,6 @@ def _run_hnn_validation(
             shuffle=False,
             num_workers=int(num_workers),
             pin_memory=(device.type == "cuda"),
-            per_traj_norm=per_traj_norm,
             history_window=history_window,
         )
 
@@ -430,7 +422,6 @@ def _run_hnn_validation(
             symmetry_norm=symmetry_norm,
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-            per_traj_norm_eps=per_traj_norm_eps,
         )
         for name, value in loss_metrics.items():
             value_f = float(value)
@@ -460,7 +451,6 @@ def _run_hnn_validation(
             symmetry_norm=symmetry_norm,
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-            per_traj_norm_eps=per_traj_norm_eps,
         )
         log_loss_vs_ur(
             writer,
@@ -678,32 +668,10 @@ def _run_vpinn_validation(
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
-    per_traj_norm = str(vp.get("per_traj_norm", "none")).strip().lower()
-    per_traj_norm_eps = float(vp.get("per_traj_norm_eps", 1e-8))
-    if per_traj_norm not in {"none", "force_rms", "residual_rms"}:
-        raise ValueError("vpinn.per_traj_norm must be one of: none, force_rms, residual_rms.")
-    if per_traj_norm != "none":
-        _apply_per_traj_scale(
-            val_trajs,
-            mode=per_traj_norm,
-            dt=dt,
-            m=m,
-            c=c,
-            k=k,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            window_M=int(vp.get("window_M", 50)),
-            stride=int(vp.get("stride", 1)),
-            eps=per_traj_norm_eps,
-        )
-
-    return_scale = per_traj_norm != "none"
     val_dataset = WindowDataset(
         val_trajs,
         window_intervals=int(vp.get("window_M", 50)),
         stride=int(vp.get("stride", 1)),
-        return_scale=return_scale,
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
@@ -734,8 +702,6 @@ def _run_vpinn_validation(
             alpha=alpha,
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-            per_traj_norm_eps=per_traj_norm_eps,
-            expect_scale=return_scale,
             expect_f0=(force_representation == "coefficient"),
         )
         for name, value in val_metrics.items():
@@ -759,11 +725,9 @@ def _run_vpinn_validation(
             use_force_loss=bool(vp.get("use_force_loss", True)),
             use_weak_loss=bool(vp.get("use_weak_loss", True)),
             rollout_force_steps=int(vp.get("rollout_force_steps", 0)),
-            expect_scale=return_scale,
             expect_f0=(force_representation == "coefficient"),
             amp_enabled=amp_enabled,
             amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-            per_traj_norm_eps=per_traj_norm_eps,
         )
         log_loss_vs_ur(
             writer,
@@ -852,7 +816,6 @@ def _evaluate_val_losses(
     symmetry_norm: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    per_traj_norm_eps: float,
     force_reg_on_coeff: bool,
 ) -> dict[str, float]:
     model.eval()
@@ -871,7 +834,7 @@ def _evaluate_val_losses(
     rollout_iter = iter(rollout_loader) if (rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
     with torch.no_grad():
         for batch in loader:
-            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, scale = _parse_hnn_batch(batch)
+            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
@@ -883,75 +846,39 @@ def _evaluate_val_losses(
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
-            if scale is not None:
-                scale = scale.to(device, non_blocking=non_blocking).view(-1)
-
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 history_context = model.history_context(
                     z_i,
                     reduced_velocity=ur_i,
                     history_window=history_i,
                 )
-                if scale is None:
-                    res_loss = model.res_loss(
-                        z_i,
-                        t_i,
-                        z_next,
-                        t_next,
-                        reduced_velocity=ur_i,
-                        history_context=history_context,
-                    )
-                    sigma_reg_loss = model.avg_sigma_reg_SRK4(
-                        z_i,
-                        t_i,
-                        z_next,
-                        t_next,
-                        reduced_velocity=ur_i,
-                        norm=sigma_reg_norm,
-                        history_context=history_context,
-                    )
-                    mean_reg_loss = model.avg_mean_reg_SRK4(
-                        z_i,
-                        t_i,
-                        z_next,
-                        t_next,
-                        reduced_velocity=ur_i,
-                        norm=mean_reg_norm,
-                        on_coeff=force_reg_on_coeff,
-                        history_context=history_context,
-                    )
-                else:
-                    per_res = model.res_loss_per_sample(
-                        z_i,
-                        t_i,
-                        z_next,
-                        t_next,
-                        reduced_velocity=ur_i,
-                        history_context=history_context,
-                    )
-                    per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
-                        z_i,
-                        t_i,
-                        z_next,
-                        t_next,
-                        reduced_velocity=ur_i,
-                        norm=sigma_reg_norm,
-                        history_context=history_context,
-                    )
-                    per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
-                        z_i,
-                        t_i,
-                        z_next,
-                        t_next,
-                        reduced_velocity=ur_i,
-                        norm=mean_reg_norm,
-                        on_coeff=force_reg_on_coeff,
-                        history_context=history_context,
-                    )
-                    denom = scale * scale + float(per_traj_norm_eps)
-                    res_loss = torch.mean(per_res / denom)
-                    sigma_reg_loss = torch.mean(per_sigma_reg / denom)
-                    mean_reg_loss = torch.mean(per_mean_reg / denom)
+                res_loss = model.res_loss(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    history_context=history_context,
+                )
+                sigma_reg_loss = model.avg_sigma_reg_SRK4(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=sigma_reg_norm,
+                    history_context=history_context,
+                )
+                mean_reg_loss = model.avg_mean_reg_SRK4(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    norm=mean_reg_norm,
+                    on_coeff=force_reg_on_coeff,
+                    history_context=history_context,
+                )
                 sigma_loss = float(force_reg) * sigma_reg_loss
                 mean_loss_reg = float(mean_reg) * mean_reg_loss
                 if use_force_data_loss:
@@ -968,8 +895,6 @@ def _evaluate_val_losses(
                     else:
                         f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
-                    if scale is not None:
-                        per_data = per_data / (scale * scale + float(per_traj_norm_eps))
                     data_force_loss = torch.mean(per_data)
                 else:
                     data_force_loss = res_loss.new_tensor(0.0)
@@ -987,12 +912,8 @@ def _evaluate_val_losses(
                         sym_res = sym_res.unsqueeze(-1)
                     if symmetry_norm == "l1":
                         per_sym = torch.mean(torch.abs(sym_res), dim=1)
-                        if scale is not None:
-                            per_sym = per_sym / (scale + float(per_traj_norm_eps))
                     else:
                         per_sym = torch.mean(sym_res * sym_res, dim=1)
-                        if scale is not None:
-                            per_sym = per_sym / (scale * scale + float(per_traj_norm_eps))
                     sym_loss = torch.mean(per_sym)
                 else:
                     sym_loss = res_loss.new_tensor(0.0)
@@ -1014,7 +935,6 @@ def _evaluate_val_losses(
                         batch=rollout_batch,
                         device=device,
                         non_blocking=non_blocking,
-                        per_traj_norm_eps=per_traj_norm_eps,
                         rollout_loss_mode=val_rollout_loss_mode,
                         rollout_stochastic_samples=val_rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
@@ -1066,7 +986,6 @@ def _per_ur_loss_map_hnn(
     symmetry_norm: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    per_traj_norm_eps: float,
 ) -> dict[str, dict[float, float]]:
     model.eval()
     # Keep validation rollout-loss estimation deterministic to control cost and variance.
@@ -1084,7 +1003,7 @@ def _per_ur_loss_map_hnn(
     }
     with torch.no_grad():
         for batch in loader:
-            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, scale = _parse_hnn_batch(batch)
+            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
@@ -1096,9 +1015,6 @@ def _per_ur_loss_map_hnn(
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
-            if scale is not None:
-                scale = scale.to(device, non_blocking=non_blocking).view(-1)
-
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 history_context = model.history_context(
                     z_i,
@@ -1132,11 +1048,6 @@ def _per_ur_loss_map_hnn(
                     on_coeff=force_reg_on_coeff,
                     history_context=history_context,
                 )
-                if scale is not None:
-                    denom = scale * scale + float(per_traj_norm_eps)
-                    per_res = per_res / denom
-                    per_sigma_reg = per_sigma_reg / denom
-                    per_mean_reg = per_mean_reg / denom
                 per_reg = float(force_reg) * per_sigma_reg
                 per_reg_mean = float(mean_reg) * per_mean_reg
 
@@ -1150,8 +1061,6 @@ def _per_ur_loss_map_hnn(
                     else:
                         f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
-                    if scale is not None:
-                        per_data = per_data / (scale * scale + float(per_traj_norm_eps))
                     per_data = float(force_data_weight) * per_data
                 else:
                     per_data = per_res.new_zeros(per_res.shape)
@@ -1169,12 +1078,8 @@ def _per_ur_loss_map_hnn(
                         sym_res = sym_res.unsqueeze(-1)
                     if symmetry_norm == "l1":
                         per_sym = torch.mean(torch.abs(sym_res), dim=1)
-                        if scale is not None:
-                            per_sym = per_sym / (scale + float(per_traj_norm_eps))
                     else:
                         per_sym = torch.mean(sym_res * sym_res, dim=1)
-                        if scale is not None:
-                            per_sym = per_sym / (scale * scale + float(per_traj_norm_eps))
                 else:
                     per_sym = per_res.new_zeros(per_res.shape)
 
@@ -1203,7 +1108,6 @@ def _per_ur_loss_map_hnn(
                     batch=batch,
                     device=device,
                     non_blocking=non_blocking,
-                    per_traj_norm_eps=per_traj_norm_eps,
                     rollout_loss_mode=val_rollout_loss_mode,
                     rollout_stochastic_samples=val_rollout_stochastic_samples,
                     rollout_noise_scale=rollout_noise_scale,
@@ -1246,11 +1150,9 @@ def _per_ur_loss_map_vpinn(
     use_force_loss: bool,
     use_weak_loss: bool,
     rollout_force_steps: int,
-    expect_scale: bool,
     expect_f0: bool,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    per_traj_norm_eps: float,
 ) -> dict[str, dict[float, float]]:
     model.eval()
     amp_enabled = bool(amp_enabled) and device.type == "cuda"
@@ -1264,20 +1166,11 @@ def _per_ur_loss_map_vpinn(
         for batch in loader:
             if len(batch) == 4:
                 x_win, v_win, f_meas, ur_win = batch
-                scale = None
                 f0 = None
             elif len(batch) == 5:
-                x_win, v_win, f_meas, ur_win, extra = batch
-                if expect_scale and not expect_f0:
-                    scale = extra
-                    f0 = None
-                elif expect_f0 and not expect_scale:
-                    scale = None
-                    f0 = extra
-                else:
-                    raise ValueError("Unexpected batch format (missing scale or f0).")
-            elif len(batch) == 6:
-                x_win, v_win, f_meas, ur_win, scale, f0 = batch
+                x_win, v_win, f_meas, ur_win, f0 = batch
+                if not expect_f0:
+                    raise ValueError("Unexpected batch format (received f0 when coefficient mode is disabled).")
             else:
                 raise ValueError("Unexpected batch format from dataloader.")
 
@@ -1285,8 +1178,6 @@ def _per_ur_loss_map_vpinn(
             v_win = v_win.to(device, non_blocking=non_blocking)
             f_meas = f_meas.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
-            if scale is not None:
-                scale = scale.to(device, non_blocking=non_blocking).view(-1)
             if f0 is not None:
                 f0 = f0.to(device, non_blocking=non_blocking)
 
@@ -1297,8 +1188,6 @@ def _per_ur_loss_map_vpinn(
                 flat = inp.reshape(B * M1, -1)
                 f_pred = model(flat).reshape(B, M1, d)
                 per_loss_f = torch.mean((f_pred - f_meas) ** 2, dim=(1, 2))
-                if scale is not None:
-                    per_loss_f = per_loss_f / (scale * scale + float(per_traj_norm_eps))
                 per_loss_w = per_loss_f.new_zeros(per_loss_f.shape)
                 if use_weak_loss:
                     R = _weak_residual(
@@ -1315,8 +1204,6 @@ def _per_ur_loss_map_vpinn(
                         f0=f0,
                     )
                     per_loss_w = torch.mean(R.pow(2), dim=(1, 2))
-                    if scale is not None:
-                        per_loss_w = per_loss_w / (scale * scale + float(per_traj_norm_eps))
 
                 per_roll = None
                 if rollout_force_steps > 0:
@@ -1338,8 +1225,6 @@ def _per_ur_loss_map_vpinn(
                         f_roll = f_seq[:, : steps_k + 1, :]
                         f_true = f_meas[:, : steps_k + 1, :]
                         per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
-                        if scale is not None:
-                            per_roll = per_roll / (scale * scale + float(per_traj_norm_eps))
 
             ur_vals = ur_win[:, 0, 0].detach().cpu().numpy()
             per_loss_f_vals = per_loss_f.detach().cpu().numpy()

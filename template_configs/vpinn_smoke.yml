@@ -126,11 +126,6 @@ vpinn:
   num_poly_test: 3
   num_sine_test: 0
 
-  # Per-trajectory normalization: divide each window loss by a per-trajectory RMS scale.
-  # Options: none | force_rms | residual_rms
-  per_traj_norm: none
-  per_traj_norm_eps: 1e-8
-
   # Network architecture
   # If true, uses the shared `architecture:` block (force_net_type + *_kwargs) like HNN.
   # If false, uses vpinn.hidden_dim/depth/activation below.

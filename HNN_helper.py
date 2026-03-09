@@ -3236,8 +3236,6 @@ def build_dataloader_from_series(
     pin_memory: bool = False,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
-    per_traj_norm: str = "none",
-    per_traj_norm_eps: float = 1e-8,
     history_window: int | None = None,
 ) -> tuple[DataLoader, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], int]:
     if not series_data:
@@ -3245,9 +3243,6 @@ def build_dataloader_from_series(
     sequence_tensors: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     datasets: list[TensorDataset | ConcatDataset] = []
     min_length: int | None = None
-    per_traj_norm = str(per_traj_norm).strip().lower()
-    if per_traj_norm not in {"none", "force_rms"}:
-        raise ValueError("per_traj_norm must be one of: none, force_rms.")
     for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
         y_tensor, vel_tensor, t_tensor = prepare_sequence_tensors(
             y_np,
@@ -3272,16 +3267,6 @@ def build_dataloader_from_series(
             if force_arr.shape[0] != y_tensor.shape[0]:
                 raise ValueError("Force array must have the same length as displacement.")
             force_tensor = torch.from_numpy(np.ascontiguousarray(force_arr)).float()
-        traj_scale: float | None = None
-        if per_traj_norm == "force_rms":
-            if force_np is None:
-                traj_scale = 1.0
-            else:
-                force_arr = np.asarray(force_np, dtype=float)
-                rms = float(np.sqrt(np.mean(force_arr**2)))
-                if not np.isfinite(rms) or rms <= 0.0:
-                    rms = 1.0
-                traj_scale = rms
         sequence_tensors.append((y_tensor, vel_tensor, t_tensor, ur_tensor))
         datasets.append(
             build_dataset(
@@ -3291,7 +3276,6 @@ def build_dataloader_from_series(
                 t_tensor,
                 reduced_velocity=ur_tensor,
                 force_tensor=force_tensor,
-                traj_scale=traj_scale,
                 history_window=history_window,
             )
         )
@@ -3558,7 +3542,6 @@ def build_dataset(
     *,
     reduced_velocity: torch.Tensor,
     force_tensor: torch.Tensor | None = None,
-    traj_scale: float | None = None,
     history_window: int | None = None,
 ) -> TensorDataset:
     """Construct consecutive state/time pairs for training (optionally with force labels)."""
@@ -3575,27 +3558,7 @@ def build_dataset(
         history_features = torch.cat([z, ur], dim=1)
         history_full = _build_causal_feature_windows(history_features, int(history_window))
         history_tensor = history_full[:-1]
-    scale_tensor: torch.Tensor | None = None
-    if traj_scale is not None:
-        scale_tensor = torch.full((z.shape[0] - 1,), float(traj_scale), dtype=torch.float32)
     if force_tensor is None:
-        if scale_tensor is None:
-            if history_tensor is not None:
-                return TensorDataset(
-                    z[:-1],
-                    t_tensor[:-1].unsqueeze(1),
-                    z[1:],
-                    t_tensor[1:].unsqueeze(1),
-                    ur[:-1],
-                    history_tensor,
-                )
-            return TensorDataset(
-                z[:-1],
-                t_tensor[:-1].unsqueeze(1),
-                z[1:],
-                t_tensor[1:].unsqueeze(1),
-                ur[:-1],
-            )
         if history_tensor is not None:
             return TensorDataset(
                 z[:-1],
@@ -3604,7 +3567,6 @@ def build_dataset(
                 t_tensor[1:].unsqueeze(1),
                 ur[:-1],
                 history_tensor,
-                scale_tensor,
             )
         return TensorDataset(
             z[:-1],
@@ -3612,31 +3574,9 @@ def build_dataset(
             z[1:],
             t_tensor[1:].unsqueeze(1),
             ur[:-1],
-            scale_tensor,
         )
     if force_tensor.shape[0] != z.shape[0]:
         raise ValueError("force_tensor must match the sequence length.")
-    if scale_tensor is None:
-        if history_tensor is not None:
-            return TensorDataset(
-                z[:-1],
-                t_tensor[:-1].unsqueeze(1),
-                z[1:],
-                t_tensor[1:].unsqueeze(1),
-                ur[:-1],
-                history_tensor,
-                force_tensor[:-1].unsqueeze(1),
-                force_tensor[1:].unsqueeze(1),
-            )
-        return TensorDataset(
-            z[:-1],
-            t_tensor[:-1].unsqueeze(1),
-            z[1:],
-            t_tensor[1:].unsqueeze(1),
-            ur[:-1],
-            force_tensor[:-1].unsqueeze(1),
-            force_tensor[1:].unsqueeze(1),
-        )
     if history_tensor is not None:
         return TensorDataset(
             z[:-1],
@@ -3647,7 +3587,6 @@ def build_dataset(
             history_tensor,
             force_tensor[:-1].unsqueeze(1),
             force_tensor[1:].unsqueeze(1),
-            scale_tensor,
         )
     return TensorDataset(
         z[:-1],
@@ -3657,7 +3596,6 @@ def build_dataset(
         ur[:-1],
         force_tensor[:-1].unsqueeze(1),
         force_tensor[1:].unsqueeze(1),
-        scale_tensor,
     )
 
 def build_rollout_dataset(
@@ -3668,7 +3606,6 @@ def build_rollout_dataset(
     rollout_steps: int,
     *,
     reduced_velocity: torch.Tensor,
-    traj_scale: float | None = None,
     history_window: int | None = None,
 ) -> TensorDataset:
     """
@@ -3719,14 +3656,9 @@ def build_rollout_dataset(
         history_features = torch.cat([z, ur], dim=1)
         history_full = _build_causal_feature_windows(history_features, int(history_window))
         history0_batch = history_full[:num_windows]
-    if traj_scale is None:
-        if history0_batch is not None:
-            return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch, history0_batch)
-        return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch)
-    scale_tensor = torch.full((num_windows,), float(traj_scale), dtype=torch.float32)
     if history0_batch is not None:
-        return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch, history0_batch, scale_tensor)
-    return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch, scale_tensor)
+        return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch, history0_batch)
+    return TensorDataset(z0_batch, t_seq_batch, z_traj_batch, ur0_batch)
 
 
 def build_rollout_dataloader_from_series(
@@ -3742,17 +3674,12 @@ def build_rollout_dataloader_from_series(
     pin_memory: bool = False,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
-    per_traj_norm: str = "none",
     history_window: int | None = None,
 ) -> tuple[DataLoader, int]:
     if rollout_steps < 1:
         raise ValueError("rollout_steps must be at least 1.")
     if not series_data:
         raise ValueError("series_data must contain at least one series.")
-    per_traj_norm = str(per_traj_norm).strip().lower()
-    if per_traj_norm not in {"none", "force_rms"}:
-        raise ValueError("per_traj_norm must be one of: none, force_rms.")
-
     datasets: list[TensorDataset | ConcatDataset] = []
     total_windows = 0
     for y_np, t_np, dt_value, vel_np, force_np, ur_np in series_data:
@@ -3774,17 +3701,6 @@ def build_rollout_dataloader_from_series(
             raise ValueError("Reduced velocity array must have the same length as displacement.")
         ur_tensor = torch.from_numpy(np.ascontiguousarray(ur_arr)).float()
 
-        traj_scale: float | None = None
-        if per_traj_norm == "force_rms":
-            if force_np is None:
-                traj_scale = 1.0
-            else:
-                force_arr = np.asarray(force_np, dtype=float)
-                rms = float(np.sqrt(np.mean(force_arr**2)))
-                if not np.isfinite(rms) or rms <= 0.0:
-                    rms = 1.0
-                traj_scale = rms
-
         dataset = build_rollout_dataset(
             y_tensor,
             vel_tensor,
@@ -3792,7 +3708,6 @@ def build_rollout_dataloader_from_series(
             t_tensor,
             int(rollout_steps),
             reduced_velocity=ur_tensor,
-            traj_scale=traj_scale,
             history_window=history_window,
         )
         total_windows += len(dataset)

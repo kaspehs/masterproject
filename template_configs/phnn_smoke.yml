@@ -104,7 +104,8 @@ loss:
   rollout_det_steps: 0
   # Rollout loss mode: deterministic | stochastic
   rollout_loss_mode: deterministic
-  # Number of stochastic rollout samples K to average when rollout_loss_mode=stochastic.
+  # Number of stochastic rollout samples K used to estimate Gaussian rollout NLL when
+  # rollout_loss_mode=stochastic. Must be >= 2 in stochastic mode.
   rollout_stochastic_samples: 1
   # Optional linear schedule for rollout length. <=0 keeps rollout_det_steps fixed.
   rollout_det_steps_final: 0
@@ -178,8 +179,4 @@ hnn: # file or compute
   train_include_ur: null
   train_exclude_ur: []
   train_ur_filter_tol: 1e-6
-  # Per-trajectory normalization (PHNN): scale losses by per-trajectory RMS force.
-  # Options: none | force_rms
-  per_traj_norm: none
-  per_traj_norm_eps: 1e-8
 pinn: {}
