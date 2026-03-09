@@ -1901,6 +1901,8 @@ def train(config: Config, config_name: str) -> None:
     rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
     rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
     rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
@@ -2244,7 +2246,8 @@ def train(config: Config, config_name: str) -> None:
             if not candidates:
                 continue
             ur_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in candidates]
-            sampled_metric_indices = sample_one_index_per_ur(ur_all, seed=int(epoch) + 1)
+            sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+            sampled_metric_indices = sample_one_index_per_ur(ur_all, seed=sample_seed)
             metrics_sum: dict[str, float] = {}
             metrics_count: dict[str, int] = {}
             for sidx in sampled_metric_indices:

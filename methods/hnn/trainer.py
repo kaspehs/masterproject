@@ -432,6 +432,8 @@ def _validate_if_needed(
     val_loader: Any | None,
     val_rollout_loader: Any | None,
     cycle_validation_rollout: bool,
+    fixed_validation_sampling: bool,
+    validation_sampling_seed: int,
     rollout_target_ur: float | None,
     rollout_target_ur_tol: float,
     m_eff: float,
@@ -465,6 +467,7 @@ def _validate_if_needed(
 ) -> None:
     if not validate_now and not rollout_now:
         return
+    validation_start = time.perf_counter()
     if validate_now and val_loader is not None:
         val_loss_metrics = _evaluate_val_losses(
             model=model,
@@ -517,6 +520,7 @@ def _validate_if_needed(
         )
 
     if not rollout_now:
+        writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
         return
 
     if val_series_raw is not None and val_sequences is not None:
@@ -528,7 +532,8 @@ def _validate_if_needed(
         for idx in range(total):
             ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
             ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
-        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=int(epoch) + 1)
+        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=sample_seed)
         for idx in sampled_indices:
             series_raw = val_series_raw[idx]
             sequence = val_sequences[idx]
@@ -624,6 +629,7 @@ def _validate_if_needed(
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
         )
+        writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
         return
     log_validation_epoch(
         writer,
@@ -648,6 +654,7 @@ def _validate_if_needed(
         rollout_noise_scale=rollout_noise_scale,
         rollout_seed=rollout_seed,
     )
+    writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
 
 
 def _log_final_rollouts_all(
@@ -1337,6 +1344,8 @@ def train(config: Config, config_name: str) -> None:
     rollout_every_epochs = int(monitoring_cfg.rollout_every_epochs)
     validate_every_epochs = int(getattr(monitoring_cfg, "validate_every_epochs", rollout_every_epochs))
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
     rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
@@ -1674,6 +1683,8 @@ def train(config: Config, config_name: str) -> None:
                 val_loader=val_loader,
                 val_rollout_loader=val_rollout_loader,
                 cycle_validation_rollout=cycle_validation_rollout,
+                fixed_validation_sampling=fixed_validation_sampling,
+                validation_sampling_seed=validation_sampling_seed,
                 rollout_target_ur=rollout_target_ur,
                 rollout_target_ur_tol=rollout_target_ur_tol,
                 m_eff=m_eff,

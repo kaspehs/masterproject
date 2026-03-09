@@ -155,6 +155,7 @@ def _run_hnn_validation(
     num_workers: int,
 ) -> None:
     data_cfg = cfg.data
+    monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
     velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
     per_traj_norm = str(hnn_cfg.get("per_traj_norm", "none")).strip().lower()
@@ -168,6 +169,8 @@ def _run_hnn_validation(
     if per_traj_norm not in {"none", "force_rms"}:
         raise ValueError("hnn.per_traj_norm must be one of: none, force_rms.")
     loss_cfg = cfg.loss
+    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_det_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
@@ -373,7 +376,8 @@ def _run_hnn_validation(
         for idx in range(total):
             ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
             ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
-        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=int(epoch) + 1)
+        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=sample_seed)
         for idx in sampled_indices:
             series_raw = val_series_raw[idx]
             sequence = val_sequences[idx]
@@ -475,8 +479,11 @@ def _run_vpinn_validation(
     num_workers: int,
 ) -> None:
     data_cfg = cfg.data
+    monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
+    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
@@ -665,7 +672,8 @@ def _run_vpinn_validation(
 
     if do_rollout:
         ur_values_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
-        sampled_metric_indices = sample_one_index_per_ur(ur_values_all, seed=int(epoch) + 1)
+        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sampled_metric_indices = sample_one_index_per_ur(ur_values_all, seed=sample_seed)
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         for sidx in sampled_metric_indices:
@@ -1252,6 +1260,7 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=str(args.log_dir))
     try:
+        validation_start = time.perf_counter()
         if method in {"hnn", "phnn"}:
             _run_hnn_validation(
                 ckpt=ckpt,
@@ -1284,6 +1293,8 @@ def main() -> None:
             )
         else:
             raise ValueError(f"Unsupported method '{method}'.")
+        elapsed = time.perf_counter() - validation_start
+        writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(args.epoch))
     finally:
         writer.flush()
         writer.close()

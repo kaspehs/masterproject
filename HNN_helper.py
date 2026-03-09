@@ -176,6 +176,8 @@ class MonitoringConfig:
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
     cycle_validation_rollout: bool = False
+    fixed_validation_sampling: bool = False
+    validation_sampling_seed: int = 1
     rollout_use_excluded_ur: bool = False
     rollout_target_ur_tol: float = 1e-6
     final_rollout_all_validation: bool = False
@@ -313,6 +315,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "print_every_epochs",
         "log_component_grad_norms",
         "log_extra_validation_metrics",
+        "fixed_validation_sampling",
+        "validation_sampling_seed",
         "rollout_use_excluded_ur",
         "rollout_target_ur_tol",
     }
