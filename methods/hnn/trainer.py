@@ -47,20 +47,71 @@ from HNN_helper import (
 )
 
 
+def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+    if len(batch) < 5:
+        raise ValueError("Unexpected batch format from dataloader.")
+    z_i, t_i, z_next, t_next, ur_i = batch[:5]
+    idx = 5
+    history = None
+    f_i = None
+    f_next = None
+    scale = None
+    if len(batch) > idx:
+        candidate = batch[idx]
+        if torch.is_tensor(candidate) and candidate.ndim == 3 and candidate.shape[-1] == 3:
+            history = candidate
+            idx += 1
+    remaining = len(batch) - idx
+    if remaining == 0:
+        pass
+    elif remaining == 1:
+        scale = batch[idx]
+    elif remaining == 2:
+        f_i, f_next = batch[idx], batch[idx + 1]
+    elif remaining == 3:
+        f_i, f_next, scale = batch[idx], batch[idx + 1], batch[idx + 2]
+    else:
+        raise ValueError("Unexpected batch format from dataloader.")
+    return z_i, t_i, z_next, t_next, ur_i, history, f_i, f_next, scale
+
+
+def _parse_rollout_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
+    if len(batch) < 4:
+        raise ValueError("Unexpected rollout batch format.")
+    z0, t_seq, z_traj, ur0 = batch[:4]
+    idx = 4
+    history = None
+    scale = None
+    if len(batch) > idx:
+        candidate = batch[idx]
+        if torch.is_tensor(candidate) and candidate.ndim == 3 and candidate.shape[-1] == 3:
+            history = candidate
+            idx += 1
+    remaining = len(batch) - idx
+    if remaining == 0:
+        pass
+    elif remaining == 1:
+        scale = batch[idx]
+    else:
+        raise ValueError("Unexpected rollout batch format.")
+    return z0, t_seq, z_traj, ur0, history, scale
+
+
 def _odd_symmetry_penalty_per_sample(
     *,
     model: torch.nn.Module,
     z: torch.Tensor,
     ur: torch.Tensor,
     norm: str,
+    history_context: torch.Tensor | None = None,
 ) -> torch.Tensor:
     z_flip = -z
     if getattr(model, "force_output", "force") == "coefficient":
-        f_pos = model.u_theta_coeff(z, reduced_velocity=ur)
-        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur)
+        f_pos = model.u_theta_coeff(z, reduced_velocity=ur, history_context=history_context)
+        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur, history_context=history_context)
     else:
-        f_pos = model.u_theta(z, reduced_velocity=ur)
-        f_neg = model.u_theta(z_flip, reduced_velocity=ur)
+        f_pos = model.u_theta(z, reduced_velocity=ur, history_context=history_context)
+        f_neg = model.u_theta(z_flip, reduced_velocity=ur, history_context=history_context)
     sym_residual = f_pos + f_neg
     if sym_residual.ndim == 1:
         sym_residual = sym_residual.unsqueeze(-1)
@@ -78,21 +129,23 @@ def _deterministic_rollout_loss_from_batch(
     per_traj_norm_eps: float,
     return_per_sample: bool = False,
 ) -> torch.Tensor:
-    if len(batch) == 4:
-        z0, t_seq, z_traj, ur0 = batch
-        scale = None
-    elif len(batch) == 5:
-        z0, t_seq, z_traj, ur0, scale = batch
-    else:
-        raise ValueError("Unexpected rollout batch format.")
+    z0, t_seq, z_traj, ur0, history0, scale = _parse_rollout_batch(batch)
     z0 = z0.to(device, non_blocking=non_blocking)
     t_seq = t_seq.to(device, non_blocking=non_blocking)
     z_traj = z_traj.to(device, non_blocking=non_blocking)
     ur0 = ur0.to(device, non_blocking=non_blocking)
+    if history0 is not None:
+        history0 = history0.to(device, non_blocking=non_blocking)
     if scale is not None:
         scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
-    z_pred, _ = model.rollout(z0, t_seq, float(model.dt), reduced_velocity=ur0)
+    z_pred, _ = model.rollout(
+        z0,
+        t_seq,
+        float(model.dt),
+        reduced_velocity=ur0,
+        history_init=history0,
+    )
     z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
     err = (z_pred - z_traj) / z_scale
     per = torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1)
@@ -152,27 +205,14 @@ def _train_one_epoch(
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     rollout_iter = iter(train_rollout_loader) if (train_rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
     for batch in train_loader:
-        if len(batch) == 5:
-            z_i, t_i, z_next, t_next, ur_i = batch
-            f_i = None
-            f_next = None
-            scale = None
-        elif len(batch) == 6:
-            z_i, t_i, z_next, t_next, ur_i, scale = batch
-            f_i = None
-            f_next = None
-        elif len(batch) == 7:
-            z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
-            scale = None
-        elif len(batch) == 8:
-            z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
-        else:
-            raise ValueError("Unexpected batch format from dataloader.")
+        z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, scale = _parse_hnn_batch(batch)
         z_i = z_i.to(device, non_blocking=non_blocking)
         t_i = t_i.to(device, non_blocking=non_blocking)
         z_next = z_next.to(device, non_blocking=non_blocking)
         t_next = t_next.to(device, non_blocking=non_blocking)
         ur_i = ur_i.to(device, non_blocking=non_blocking)
+        if history_i is not None:
+            history_i = history_i.to(device, non_blocking=non_blocking)
         if f_i is not None:
             f_i = f_i.to(device, non_blocking=non_blocking)
         if f_next is not None:
@@ -183,8 +223,20 @@ def _train_one_epoch(
         opt.zero_grad()
 
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+            history_context = model.history_context(
+                z_i,
+                reduced_velocity=ur_i,
+                history_window=history_i,
+            )
             if scale is None:
-                res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                res_loss = model.res_loss(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    history_context=history_context,
+                )
                 sigma_reg_loss = model.avg_sigma_reg_SRK4(
                     z_i,
                     t_i,
@@ -192,6 +244,7 @@ def _train_one_epoch(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=sigma_reg_norm,
+                    history_context=history_context,
                 )
                 mean_reg_loss = model.avg_mean_reg_SRK4(
                     z_i,
@@ -201,9 +254,17 @@ def _train_one_epoch(
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
                     on_coeff=force_reg_on_coeff,
+                    history_context=history_context,
                 )
             else:
-                per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                per_res = model.res_loss_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    history_context=history_context,
+                )
                 per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
                     z_i,
                     t_i,
@@ -211,6 +272,7 @@ def _train_one_epoch(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=sigma_reg_norm,
+                    history_context=history_context,
                 )
                 per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
                     z_i,
@@ -220,6 +282,7 @@ def _train_one_epoch(
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
                     on_coeff=force_reg_on_coeff,
+                    history_context=history_context,
                 )
                 denom = scale * scale + float(per_traj_norm_eps)
                 res_loss = torch.mean(per_res / denom)
@@ -236,10 +299,10 @@ def _train_one_epoch(
                 f_mid = 0.5 * (f_i + f_next)
                 if force_output_coeff:
                     f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
-                    f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                    f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
                     f_mid = f_mid / f0
                 else:
-                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                    f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
                 per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                 if scale is not None:
                     per_data = per_data / (scale * scale + float(per_traj_norm_eps))
@@ -254,6 +317,7 @@ def _train_one_epoch(
                     z=z_mid,
                     ur=ur_i,
                     norm=symmetry_norm,
+                    history_context=history_context,
                 )
                 if scale is not None:
                     if symmetry_norm == "l1":
@@ -891,27 +955,14 @@ def _evaluate_val_losses(
     rollout_iter = iter(rollout_loader) if (rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
     with torch.no_grad():
         for batch in loader:
-            if len(batch) == 5:
-                z_i, t_i, z_next, t_next, ur_i = batch
-                f_i = None
-                f_next = None
-                scale = None
-            elif len(batch) == 6:
-                z_i, t_i, z_next, t_next, ur_i, scale = batch
-                f_i = None
-                f_next = None
-            elif len(batch) == 7:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
-                scale = None
-            elif len(batch) == 8:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
-            else:
-                raise ValueError("Unexpected batch format from dataloader.")
+            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, scale = _parse_hnn_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
+            if history_i is not None:
+                history_i = history_i.to(device, non_blocking=non_blocking)
             if f_i is not None:
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
@@ -920,8 +971,20 @@ def _evaluate_val_losses(
                 scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                history_context = model.history_context(
+                    z_i,
+                    reduced_velocity=ur_i,
+                    history_window=history_i,
+                )
                 if scale is None:
-                    res_loss = model.res_loss(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    res_loss = model.res_loss(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        history_context=history_context,
+                    )
                     sigma_reg_loss = model.avg_sigma_reg_SRK4(
                         z_i,
                         t_i,
@@ -929,6 +992,7 @@ def _evaluate_val_losses(
                         t_next,
                         reduced_velocity=ur_i,
                         norm=sigma_reg_norm,
+                        history_context=history_context,
                     )
                     mean_reg_loss = model.avg_mean_reg_SRK4(
                         z_i,
@@ -938,9 +1002,17 @@ def _evaluate_val_losses(
                         reduced_velocity=ur_i,
                         norm=mean_reg_norm,
                         on_coeff=force_reg_on_coeff,
+                        history_context=history_context,
                     )
                 else:
-                    per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                    per_res = model.res_loss_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        history_context=history_context,
+                    )
                     per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
                         z_i,
                         t_i,
@@ -948,6 +1020,7 @@ def _evaluate_val_losses(
                         t_next,
                         reduced_velocity=ur_i,
                         norm=sigma_reg_norm,
+                        history_context=history_context,
                     )
                     per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
                         z_i,
@@ -957,6 +1030,7 @@ def _evaluate_val_losses(
                         reduced_velocity=ur_i,
                         norm=mean_reg_norm,
                         on_coeff=force_reg_on_coeff,
+                        history_context=history_context,
                     )
                     denom = scale * scale + float(per_traj_norm_eps)
                     res_loss = torch.mean(per_res / denom)
@@ -973,10 +1047,10 @@ def _evaluate_val_losses(
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
                         f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
-                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
                         f_mid = f_mid / f0
                     else:
-                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     if scale is not None:
                         per_data = per_data / (scale * scale + float(per_traj_norm_eps))
@@ -990,6 +1064,7 @@ def _evaluate_val_losses(
                         z=z_mid,
                         ur=ur_i,
                         norm=symmetry_norm,
+                        history_context=history_context,
                     )
                     if scale is not None:
                         if symmetry_norm == "l1":
@@ -1081,27 +1156,14 @@ def _per_ur_loss_map_hnn(
     }
     with torch.no_grad():
         for batch in loader:
-            if len(batch) == 5:
-                z_i, t_i, z_next, t_next, ur_i = batch
-                f_i = None
-                f_next = None
-                scale = None
-            elif len(batch) == 6:
-                z_i, t_i, z_next, t_next, ur_i, scale = batch
-                f_i = None
-                f_next = None
-            elif len(batch) == 7:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next = batch
-                scale = None
-            elif len(batch) == 8:
-                z_i, t_i, z_next, t_next, ur_i, f_i, f_next, scale = batch
-            else:
-                raise ValueError("Unexpected batch format from dataloader.")
+            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, scale = _parse_hnn_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
+            if history_i is not None:
+                history_i = history_i.to(device, non_blocking=non_blocking)
             if f_i is not None:
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
@@ -1110,7 +1172,19 @@ def _per_ur_loss_map_hnn(
                 scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                per_res = model.res_loss_per_sample(z_i, t_i, z_next, t_next, reduced_velocity=ur_i)
+                history_context = model.history_context(
+                    z_i,
+                    reduced_velocity=ur_i,
+                    history_window=history_i,
+                )
+                per_res = model.res_loss_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    history_context=history_context,
+                )
                 per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
                     z_i,
                     t_i,
@@ -1118,6 +1192,7 @@ def _per_ur_loss_map_hnn(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=sigma_reg_norm,
+                    history_context=history_context,
                 )
                 per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
                     z_i,
@@ -1127,6 +1202,7 @@ def _per_ur_loss_map_hnn(
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
                     on_coeff=force_reg_on_coeff,
+                    history_context=history_context,
                 )
                 if scale is not None:
                     denom = scale * scale + float(per_traj_norm_eps)
@@ -1140,10 +1216,10 @@ def _per_ur_loss_map_hnn(
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
                         f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
-                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
                         f_mid = f_mid / f0
                     else:
-                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
+                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     if scale is not None:
                         per_data = per_data / (scale * scale + float(per_traj_norm_eps))
@@ -1157,6 +1233,7 @@ def _per_ur_loss_map_hnn(
                         z=z_mid,
                         ur=ur_i,
                         norm=symmetry_norm,
+                        history_context=history_context,
                     )
                     if scale is not None:
                         if symmetry_norm == "l1":
@@ -1185,12 +1262,7 @@ def _per_ur_loss_map_hnn(
     if rollout_loader is not None and float(rollout_det_weight) > 0.0:
         with torch.no_grad():
             for batch in rollout_loader:
-                if len(batch) == 4:
-                    _z0, _t_seq, _z_traj, ur0 = batch
-                elif len(batch) == 5:
-                    _z0, _t_seq, _z_traj, ur0, _scale = batch
-                else:
-                    raise ValueError("Unexpected rollout batch format.")
+                _z0, _t_seq, _z_traj, ur0, _history0, _scale = _parse_rollout_batch(batch)
                 per_rollout = _deterministic_rollout_loss_from_batch(
                     model=model,
                     batch=batch,
@@ -1385,6 +1457,7 @@ def train(config: Config, config_name: str) -> None:
     D = derived_params["D"]
     k = derived_params["k"]
     m_eff = derived_params["m_eff"]
+    history_window = int(getattr(model_cfg, "history_window", 32)) if bool(getattr(model_cfg, "use_history_tcn", False)) else None
 
     train_series_raw, eval_tensors = load_training_series(
         y_data,
@@ -1419,6 +1492,7 @@ def train(config: Config, config_name: str) -> None:
         pin_memory=pin_memory,
         per_traj_norm=per_traj_norm,
         per_traj_norm_eps=per_traj_norm_eps,
+        history_window=history_window,
     )
     train_rollout_loader: Any | None = None
     if rollout_det_weight > 0.0 and rollout_det_steps > 0:
@@ -1433,6 +1507,7 @@ def train(config: Config, config_name: str) -> None:
             num_workers=num_workers,
             pin_memory=pin_memory,
             per_traj_norm=per_traj_norm,
+            history_window=history_window,
         )
         print(
             f"Enabled deterministic rollout loss: steps={rollout_det_steps}, "
@@ -1476,6 +1551,7 @@ def train(config: Config, config_name: str) -> None:
                 pin_memory=pin_memory,
                 per_traj_norm=per_traj_norm,
                 per_traj_norm_eps=per_traj_norm_eps,
+                history_window=history_window,
             )
             if rollout_det_weight > 0.0 and rollout_det_steps > 0:
                 val_rollout_loader, _ = build_rollout_dataloader_from_series(
@@ -1489,6 +1565,7 @@ def train(config: Config, config_name: str) -> None:
                     num_workers=num_workers,
                     pin_memory=pin_memory,
                     per_traj_norm=per_traj_norm,
+                    history_window=history_window,
                 )
 
     if use_generated_train_series:

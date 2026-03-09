@@ -35,6 +35,20 @@ model:
   # Learn heteroscedastic process noise in the momentum channel (PHNN-only).
   use_stochastic_process_noise: true
   sigma_min: 1.0e-6
+  # History-augmented PHNN (base Markovian + optional TCN correction).
+  use_history_tcn: true
+  history_window: 25
+  history_tcn_channels: 8
+  history_tcn_layers: 3
+  history_tcn_kernel_size: 4
+  history_tcn_dropout: 0.05
+  # Turn residual correction on/off: a = a_base + delta_a
+  use_history_correction: true
+  # Sigma source: false -> Markovian sigma_net, true -> history-dependent sigma_net
+  sigma_from_history: false
+  # Correction head init: zero | tiny | standard
+  corr_init_mode: zero
+  corr_init_tiny_std: 1.0e-4
   ur_scale: 10.0
 
 smoothing:
