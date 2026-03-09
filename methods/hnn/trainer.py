@@ -146,9 +146,32 @@ def _rollout_loss_from_batch(
     if mode_key not in {"deterministic", "stochastic"}:
         raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
     samples = max(1, int(rollout_stochastic_samples))
-    per_runs: list[torch.Tensor] = []
-    run_count = 1 if mode_key == "deterministic" else samples
-    for _ in range(run_count):
+    batch_size = z0.shape[0]
+    if mode_key == "stochastic" and samples > 1:
+        z0_in = z0.unsqueeze(0).expand(samples, *z0.shape).reshape(samples * batch_size, *z0.shape[1:])
+        t_seq_in = t_seq.unsqueeze(0).expand(samples, *t_seq.shape).reshape(samples * batch_size, *t_seq.shape[1:])
+        z_traj_ref = z_traj.unsqueeze(0)
+        ur0_in = ur0.unsqueeze(0).expand(samples, *ur0.shape).reshape(samples * batch_size, *ur0.shape[1:])
+        history0_in = None
+        if history0 is not None:
+            history0_in = history0.unsqueeze(0).expand(samples, *history0.shape).reshape(
+                samples * batch_size, *history0.shape[1:]
+            )
+        z_pred, _ = model.rollout(
+            z0_in,
+            t_seq_in,
+            float(model.dt),
+            reduced_velocity=ur0_in,
+            history_init=history0_in,
+            stochastic=True,
+            noise_scale=rollout_noise_scale,
+        )
+        z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
+        z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, 1, -1)
+        err = (z_pred - z_traj_ref) / z_scale
+        per = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
+        per = torch.mean(per, dim=0)
+    else:
         z_pred, _ = model.rollout(
             z0,
             t_seq,
@@ -160,8 +183,7 @@ def _rollout_loss_from_batch(
         )
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
         err = (z_pred - z_traj) / z_scale
-        per_runs.append(torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1))
-    per = per_runs[0] if len(per_runs) == 1 else torch.mean(torch.stack(per_runs, dim=0), dim=0)
+        per = torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1)
     if scale is not None:
         per = per / (scale * scale + float(per_traj_norm_eps))
     if return_per_sample:
