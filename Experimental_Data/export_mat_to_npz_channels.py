@@ -11,7 +11,7 @@ from scipy.signal import savgol_filter
 
 # Paths / selection
 INPUT_DIR = Path("Experimental_Data/CrossFlow/CleanedCorrectedSmoothedData")
-OUTPUT_DIR = Path("Experimental_Data/npz_exports_v2")
+OUTPUT_DIR = Path("Experimental_Data/npz_exports_v2_60s")
 INPUT_GLOB = "*.mat"  # Use "*.mat" for measurement files.
 DATA_VARIABLE = "data"  # Set to None to auto-detect first 2D numeric dataset.
 OVERWRITE = True
@@ -20,7 +20,7 @@ OVERWRITE = True
 # - "flat": one output file per source MAT file in OUTPUT_DIR.
 # - "split": split each MAT file into fixed-length chunks, then write to train/val/test subfolders.
 EXPORT_LAYOUT = "split"  # one of: flat, split
-SPLIT_CHUNK_SECONDS = 20.0
+SPLIT_CHUNK_SECONDS = 60.0
 TRAIN_FRACTION = 0.8
 VAL_FRACTION = 0.2
 TEST_FRACTION = 0.0

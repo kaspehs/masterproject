@@ -9,8 +9,8 @@ import numpy as np
 # -------------------------
 # Settings (edit these)
 # -------------------------
-INPUT_DIR = Path("Experimental_Data/npz_exports_v2")
-OUTPUT_DIR = Path("Experimental_Data/npz_exports__v2_zero_mean")
+INPUT_DIR = Path("Experimental_Data/npz_exports_v2_60s")
+OUTPUT_DIR = Path("Experimental_Data/npz_exports_v2_60s_zero_mean")
 INPUT_GLOB = "*.npz"
 RECURSIVE = True
 
