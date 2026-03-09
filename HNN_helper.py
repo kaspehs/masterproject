@@ -148,6 +148,8 @@ class LossConfig:
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
+    rollout_loss_mode: str = "deterministic"  # "deterministic" or "stochastic"
+    rollout_stochastic_samples: int = 1
     rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
@@ -303,6 +305,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "sigma_reg_norm",
         "rollout_det_weight",
         "rollout_det_steps",
+        "rollout_loss_mode",
+        "rollout_stochastic_samples",
         "rollout_det_steps_final",
         "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
@@ -2068,6 +2072,9 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         *,
         history_init: torch.Tensor | np.ndarray | None = None,
+        stochastic: bool = False,
+        noise_scale: float = 1.0,
+        generator: torch.Generator | None = None,
     ):
         """
         z0: (B, state_dim)    starting state from data
@@ -2097,13 +2104,29 @@ class PHVIV(nn.Module):
                 reduced_velocity=reduced_velocity,
                 history_window=history_window,
             )
-            z, Fk = self.rk4_step(
+            z_det, Fk = self.rk4_step(
                 z,
                 t,
                 dt,
                 reduced_velocity=reduced_velocity,
                 history_context=ctx,
             )
+            if stochastic and self.use_stochastic_process_noise:
+                sigma = self.sigma_theta(
+                    z,
+                    reduced_velocity=reduced_velocity,
+                    history_context=ctx,
+                )
+                noise = torch.randn(
+                    sigma.shape,
+                    device=z_det.device,
+                    dtype=z_det.dtype,
+                    generator=generator,
+                )
+                z = z_det.clone()
+                z[..., 1:2] = z[..., 1:2] + float(noise_scale) * sigma * math.sqrt(float(dt)) * noise
+            else:
+                z = z_det
             Z_pred.append(z)
             F_hist.append(Fk)
             if self.use_history_tcn:

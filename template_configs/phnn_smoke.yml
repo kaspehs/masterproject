@@ -99,9 +99,13 @@ loss:
   force_reg: 0.1
   # Norm for sigma regularizer: l1 | l2
   sigma_reg_norm: l2
-  # Optional deterministic multi-step rollout loss (mean/drift only, no sigma sampling).
+  # Optional multi-step rollout loss.
   rollout_det_weight: 0.0
   rollout_det_steps: 0
+  # Rollout loss mode: deterministic | stochastic
+  rollout_loss_mode: deterministic
+  # Number of stochastic rollout samples K to average when rollout_loss_mode=stochastic.
+  rollout_stochastic_samples: 1
   # Optional linear schedule for rollout length. <=0 keeps rollout_det_steps fixed.
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0

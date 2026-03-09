@@ -120,13 +120,16 @@ def _odd_symmetry_penalty_per_sample(
     return torch.mean(sym_residual * sym_residual, dim=1)
 
 
-def _deterministic_rollout_loss_from_batch(
+def _rollout_loss_from_batch(
     *,
     model: PHVIV,
     batch: Any,
     device: torch.device,
     non_blocking: bool,
     per_traj_norm_eps: float,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
+    rollout_noise_scale: float,
     return_per_sample: bool = False,
 ) -> torch.Tensor:
     z0, t_seq, z_traj, ur0, history0, scale = _parse_rollout_batch(batch)
@@ -139,16 +142,26 @@ def _deterministic_rollout_loss_from_batch(
     if scale is not None:
         scale = scale.to(device, non_blocking=non_blocking).view(-1)
 
-    z_pred, _ = model.rollout(
-        z0,
-        t_seq,
-        float(model.dt),
-        reduced_velocity=ur0,
-        history_init=history0,
-    )
-    z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
-    err = (z_pred - z_traj) / z_scale
-    per = torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1)
+    mode_key = str(rollout_loss_mode).strip().lower()
+    if mode_key not in {"deterministic", "stochastic"}:
+        raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
+    samples = max(1, int(rollout_stochastic_samples))
+    per_runs: list[torch.Tensor] = []
+    run_count = 1 if mode_key == "deterministic" else samples
+    for _ in range(run_count):
+        z_pred, _ = model.rollout(
+            z0,
+            t_seq,
+            float(model.dt),
+            reduced_velocity=ur0,
+            history_init=history0,
+            stochastic=(mode_key == "stochastic"),
+            noise_scale=rollout_noise_scale,
+        )
+        z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
+        err = (z_pred - z_traj) / z_scale
+        per_runs.append(torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1))
+    per = per_runs[0] if len(per_runs) == 1 else torch.mean(torch.stack(per_runs, dim=0), dim=0)
     if scale is not None:
         per = per / (scale * scale + float(per_traj_norm_eps))
     if return_per_sample:
@@ -187,6 +200,9 @@ def _train_one_epoch(
     force_reg: float,
     sigma_reg_norm: str,
     rollout_det_weight: float,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
+    rollout_noise_scale: float,
     use_force_data_loss: bool,
     force_data_weight: float,
     gradnorm_balancer: Optional[GradNormBalancer],
@@ -387,12 +403,15 @@ def _train_one_epoch(
                 except StopIteration:
                     rollout_iter = iter(train_rollout_loader)
                     rollout_batch = next(rollout_iter)
-                rollout_det_loss = _deterministic_rollout_loss_from_batch(
+                rollout_det_loss = _rollout_loss_from_batch(
                     model=model,
                     batch=rollout_batch,
                     device=device,
                     non_blocking=non_blocking,
                     per_traj_norm_eps=per_traj_norm_eps,
+                    rollout_loss_mode=rollout_loss_mode,
+                    rollout_stochastic_samples=rollout_stochastic_samples,
+                    rollout_noise_scale=rollout_noise_scale,
                 )
             else:
                 rollout_det_loss = res_loss.new_tensor(0.0)
@@ -537,6 +556,8 @@ def _validate_if_needed(
     force_reg: float,
     sigma_reg_norm: str,
     rollout_det_weight: float,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -561,6 +582,9 @@ def _validate_if_needed(
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
             rollout_det_weight=rollout_det_weight,
+            rollout_loss_mode=rollout_loss_mode,
+            rollout_stochastic_samples=rollout_stochastic_samples,
+            rollout_noise_scale=rollout_noise_scale,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             symmetry_weight=symmetry_weight,
@@ -583,6 +607,9 @@ def _validate_if_needed(
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
             rollout_det_weight=rollout_det_weight,
+            rollout_loss_mode=rollout_loss_mode,
+            rollout_stochastic_samples=rollout_stochastic_samples,
+            rollout_noise_scale=rollout_noise_scale,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             symmetry_weight=symmetry_weight,
@@ -949,6 +976,9 @@ def _evaluate_val_losses(
     force_reg: float,
     sigma_reg_norm: str,
     rollout_det_weight: float,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
+    rollout_noise_scale: float,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -1104,12 +1134,15 @@ def _evaluate_val_losses(
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rollout_batch = next(rollout_iter)
-                    rollout_det_loss = _deterministic_rollout_loss_from_batch(
+                    rollout_det_loss = _rollout_loss_from_batch(
                         model=model,
                         batch=rollout_batch,
                         device=device,
                         non_blocking=non_blocking,
                         per_traj_norm_eps=per_traj_norm_eps,
+                        rollout_loss_mode=rollout_loss_mode,
+                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
                     )
                 else:
                     rollout_det_loss = res_loss.new_tensor(0.0)
@@ -1151,6 +1184,9 @@ def _per_ur_loss_map_hnn(
     force_reg: float,
     sigma_reg_norm: str,
     rollout_det_weight: float,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
+    rollout_noise_scale: float,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -1280,12 +1316,15 @@ def _per_ur_loss_map_hnn(
         with torch.no_grad():
             for batch in rollout_loader:
                 _z0, _t_seq, _z_traj, ur0, _history0, _scale = _parse_rollout_batch(batch)
-                per_rollout = _deterministic_rollout_loss_from_batch(
+                per_rollout = _rollout_loss_from_batch(
                     model=model,
                     batch=batch,
                     device=device,
                     non_blocking=non_blocking,
                     per_traj_norm_eps=per_traj_norm_eps,
+                    rollout_loss_mode=rollout_loss_mode,
+                    rollout_stochastic_samples=rollout_stochastic_samples,
+                    rollout_noise_scale=rollout_noise_scale,
                     return_per_sample=True,
                 )
                 ur_vals = ur0.detach().cpu().view(-1).numpy()
@@ -1408,6 +1447,8 @@ def train(config: Config, config_name: str) -> None:
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
+    rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
+    rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
     rollout_det_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
     rollout_det_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
     rollout_det_steps_final = rollout_det_steps if rollout_det_steps_final_raw <= 0 else rollout_det_steps_final_raw
@@ -1428,6 +1469,10 @@ def train(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_det_weight must be non-negative.")
     if rollout_det_steps < 0:
         raise ValueError("loss.rollout_det_steps must be non-negative.")
+    if rollout_loss_mode not in {"deterministic", "stochastic"}:
+        raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
+    if rollout_stochastic_samples < 1:
+        raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
     if rollout_det_steps_final < 0:
         raise ValueError("loss.rollout_det_steps_final must be non-negative.")
     if rollout_det_steps_warmup_epochs < 0:
@@ -1606,9 +1651,13 @@ def train(config: Config, config_name: str) -> None:
 
     if rollout_det_weight > 0.0:
         train_rollout_loader, val_rollout_loader, train_rollout_windows = _rebuild_rollout_loaders(current_rollout_det_steps)
+        rollout_mode_msg = rollout_loss_mode
+        if rollout_loss_mode == "stochastic":
+            rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
         if rollout_det_steps_final > rollout_det_steps and rollout_det_steps_warmup_epochs > 0:
             print(
-                "Enabled deterministic rollout loss schedule: "
+                "Enabled rollout loss schedule: "
+                f"mode={rollout_mode_msg}, "
                 f"steps={rollout_det_steps}->{rollout_det_steps_final} over "
                 f"{rollout_det_steps_warmup_epochs} epoch(s), "
                 f"current_steps={current_rollout_det_steps}, "
@@ -1616,7 +1665,7 @@ def train(config: Config, config_name: str) -> None:
             )
         else:
             print(
-                f"Enabled deterministic rollout loss: steps={current_rollout_det_steps}, "
+                f"Enabled rollout loss: mode={rollout_mode_msg}, steps={current_rollout_det_steps}, "
                 f"weight={rollout_det_weight:g}, windows={train_rollout_windows}, "
                 f"rollout_batch_size={rollout_det_batch_size}"
             )
@@ -1678,7 +1727,7 @@ def train(config: Config, config_name: str) -> None:
             current_rollout_det_steps = scheduled_rollout_det_steps
             train_rollout_loader, val_rollout_loader, train_rollout_windows = _rebuild_rollout_loaders(current_rollout_det_steps)
             print(
-                f"Epoch {epoch}: updated deterministic rollout loss horizon to "
+                f"Epoch {epoch}: updated rollout loss horizon to "
                 f"{current_rollout_det_steps} step(s) with {train_rollout_windows} training windows."
             )
         if use_lr_scheduler:
@@ -1698,6 +1747,9 @@ def train(config: Config, config_name: str) -> None:
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
             rollout_det_weight=rollout_det_weight,
+            rollout_loss_mode=rollout_loss_mode,
+            rollout_stochastic_samples=rollout_stochastic_samples,
+            rollout_noise_scale=rollout_noise_scale,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             gradnorm_balancer=gradnorm_balancer,
@@ -1853,6 +1905,8 @@ def train(config: Config, config_name: str) -> None:
                 force_reg=force_reg,
                 sigma_reg_norm=sigma_reg_norm,
                 rollout_det_weight=rollout_det_weight,
+                rollout_loss_mode=rollout_loss_mode,
+                rollout_stochastic_samples=rollout_stochastic_samples,
                 use_force_data_loss=use_force_data_loss,
                 force_data_weight=force_data_weight,
                 symmetry_weight=symmetry_weight,
@@ -1911,6 +1965,9 @@ def train(config: Config, config_name: str) -> None:
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
             rollout_det_weight=rollout_det_weight,
+            rollout_loss_mode=rollout_loss_mode,
+            rollout_stochastic_samples=rollout_stochastic_samples,
+            rollout_noise_scale=rollout_noise_scale,
             use_force_data_loss=use_force_data_loss,
             force_data_weight=force_data_weight,
             symmetry_weight=symmetry_weight,
