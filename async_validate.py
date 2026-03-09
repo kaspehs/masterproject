@@ -8,6 +8,7 @@ Intended to be spawned as a child process so training can continue.
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Any, Optional
 import os

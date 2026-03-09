@@ -1209,10 +1209,10 @@ class PHVIV(nn.Module):
 
         pirate_cfg_base = dict(pirate_force_kwargs) if pirate_force_kwargs is not None else {}
 
-        def _build_pirate_args() -> dict[str, Any]:
+        def _build_pirate_args(input_size: int) -> dict[str, Any]:
             pirate_cfg = dict(pirate_cfg_base)
             pirate_args = {
-                "input_size": base_force_dim,
+                "input_size": int(input_size),
                 "output_size": 1,
                 "depth": int(pirate_cfg.pop("depth", pirate_cfg.pop("pirate_layers", 2))),
                 "fourier_features": int(pirate_cfg.pop("fourier_features", 64)),
@@ -1225,7 +1225,7 @@ class PHVIV(nn.Module):
 
         def _build_scalar_net(input_features: int, *, use_selected_backbone: bool) -> nn.Module:
             if use_selected_backbone and self.use_pirate_force:
-                return ODEPirateNet(**_build_pirate_args())
+                return ODEPirateNet(**_build_pirate_args(input_features))
             if use_selected_backbone and self.residual_net:
                 layers = [nn.Linear(int(input_features), self.residual_hidden)]
                 for _ in range(self.residual_layers):
@@ -1276,7 +1276,7 @@ class PHVIV(nn.Module):
             if self.use_history_correction:
                 self.corr_net = _build_scalar_net(
                     force_in_features + self.history_context_dim,
-                    use_selected_backbone=False,
+                    use_selected_backbone=True,
                 )
                 _initialize_last_linear(self.corr_net, self.corr_init_mode, self.corr_init_tiny_std)
 
@@ -1290,7 +1290,7 @@ class PHVIV(nn.Module):
                 raise ValueError("sigma_from_history requires a history encoder.")
             self.sigma_history_net = _build_scalar_net(
                 force_in_features + self.history_context_dim,
-                use_selected_backbone=False,
+                use_selected_backbone=True,
             )
 
         if self.learn_hamiltonian:
