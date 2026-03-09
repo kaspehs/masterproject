@@ -102,6 +102,9 @@ loss:
   # Optional deterministic multi-step rollout loss (mean/drift only, no sigma sampling).
   rollout_det_weight: 0.0
   rollout_det_steps: 0
+  # Optional linear schedule for rollout length. <=0 keeps rollout_det_steps fixed.
+  rollout_det_steps_final: 0
+  rollout_det_steps_warmup_epochs: 0
   # Batch size for deterministic rollout loss windows (<=0 uses training.batch_size).
   rollout_det_batch_size: 0
   # If true, mean regularizer is applied on force coefficient instead of force units.

@@ -148,6 +148,8 @@ class LossConfig:
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
+    rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
+    rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
     force_reg_on_coeff: bool = False
     use_gradnorm: bool = False
@@ -301,6 +303,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "sigma_reg_norm",
         "rollout_det_weight",
         "rollout_det_steps",
+        "rollout_det_steps_final",
+        "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
         "force_reg_on_coeff",
         "use_gradnorm",

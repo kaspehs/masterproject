@@ -156,6 +156,23 @@ def _deterministic_rollout_loss_from_batch(
     return torch.mean(per)
 
 
+def _scheduled_rollout_det_steps(
+    *,
+    epoch: int,
+    base_steps: int,
+    final_steps: int,
+    warmup_epochs: int,
+) -> int:
+    target_steps = base_steps if final_steps <= 0 else final_steps
+    if target_steps <= base_steps:
+        return int(base_steps)
+    if warmup_epochs <= 0:
+        return int(target_steps)
+    progress = min(1.0, float(max(0, epoch)) / float(max(1, warmup_epochs)))
+    steps = int(np.floor(float(base_steps) + progress * float(target_steps - base_steps)))
+    return max(int(base_steps), min(int(target_steps), steps))
+
+
 def _train_one_epoch(
     *,
     model: torch.nn.Module,
@@ -1391,6 +1408,9 @@ def train(config: Config, config_name: str) -> None:
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
+    rollout_det_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
+    rollout_det_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
+    rollout_det_steps_final = rollout_det_steps if rollout_det_steps_final_raw <= 0 else rollout_det_steps_final_raw
     rollout_det_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_det_batch_size = batch_size if rollout_det_batch_size_raw <= 0 else rollout_det_batch_size_raw
     force_reg_on_coeff = bool(getattr(loss_cfg, "force_reg_on_coeff", False))
@@ -1408,8 +1428,16 @@ def train(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_det_weight must be non-negative.")
     if rollout_det_steps < 0:
         raise ValueError("loss.rollout_det_steps must be non-negative.")
+    if rollout_det_steps_final < 0:
+        raise ValueError("loss.rollout_det_steps_final must be non-negative.")
+    if rollout_det_steps_warmup_epochs < 0:
+        raise ValueError("loss.rollout_det_steps_warmup_epochs must be non-negative.")
     if rollout_det_weight > 0.0 and rollout_det_steps < 1:
-        raise ValueError("loss.rollout_det_steps must be >= 1 when loss.rollout_det_weight > 0.")
+        if rollout_det_steps_final < 1:
+            raise ValueError(
+                "loss.rollout_det_steps or loss.rollout_det_steps_final must be >= 1 when "
+                "loss.rollout_det_weight > 0."
+            )
     if rollout_det_batch_size < 1:
         raise ValueError("loss.rollout_det_batch_size must be >= 1 after fallback resolution.")
 
@@ -1494,31 +1522,10 @@ def train(config: Config, config_name: str) -> None:
         per_traj_norm_eps=per_traj_norm_eps,
         history_window=history_window,
     )
-    train_rollout_loader: Any | None = None
-    if rollout_det_weight > 0.0 and rollout_det_steps > 0:
-        train_rollout_loader, train_rollout_windows = build_rollout_dataloader_from_series(
-            train_series_raw,
-            m_eff=m_eff,
-            batch_size=rollout_det_batch_size,
-            device=device,
-            smoothing_cfg=smoothing_cfg,
-            rollout_steps=rollout_det_steps,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            per_traj_norm=per_traj_norm,
-            history_window=history_window,
-        )
-        print(
-            f"Enabled deterministic rollout loss: steps={rollout_det_steps}, "
-            f"weight={rollout_det_weight:g}, windows={train_rollout_windows}, "
-            f"rollout_batch_size={rollout_det_batch_size}"
-        )
 
     val_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] | None = None
     val_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
     val_loader: Any | None = None
-    val_rollout_loader: Any | None = None
     if use_generated_train_series:
         val_dir = train_series_root / "val"
         if val_dir.exists():
@@ -1553,20 +1560,66 @@ def train(config: Config, config_name: str) -> None:
                 per_traj_norm_eps=per_traj_norm_eps,
                 history_window=history_window,
             )
-            if rollout_det_weight > 0.0 and rollout_det_steps > 0:
-                val_rollout_loader, _ = build_rollout_dataloader_from_series(
+
+    train_rollout_loader: Any | None = None
+    val_rollout_loader: Any | None = None
+    current_rollout_det_steps = _scheduled_rollout_det_steps(
+        epoch=0,
+        base_steps=rollout_det_steps,
+        final_steps=rollout_det_steps_final,
+        warmup_epochs=rollout_det_steps_warmup_epochs,
+    )
+
+    def _rebuild_rollout_loaders(steps: int) -> tuple[Any | None, Any | None, int]:
+        train_loader_out: Any | None = None
+        val_loader_out: Any | None = None
+        train_windows = 0
+        if rollout_det_weight > 0.0 and steps > 0:
+            train_loader_out, train_windows = build_rollout_dataloader_from_series(
+                train_series_raw,
+                m_eff=m_eff,
+                batch_size=rollout_det_batch_size,
+                device=device,
+                smoothing_cfg=smoothing_cfg,
+                rollout_steps=steps,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                per_traj_norm=per_traj_norm,
+                history_window=history_window,
+            )
+            if val_series_raw is not None:
+                val_loader_out, _ = build_rollout_dataloader_from_series(
                     val_series_raw,
                     m_eff=m_eff,
                     batch_size=rollout_det_batch_size,
                     device=device,
                     smoothing_cfg=smoothing_cfg,
-                    rollout_steps=rollout_det_steps,
+                    rollout_steps=steps,
                     shuffle=False,
                     num_workers=num_workers,
                     pin_memory=pin_memory,
                     per_traj_norm=per_traj_norm,
                     history_window=history_window,
                 )
+        return train_loader_out, val_loader_out, int(train_windows)
+
+    if rollout_det_weight > 0.0:
+        train_rollout_loader, val_rollout_loader, train_rollout_windows = _rebuild_rollout_loaders(current_rollout_det_steps)
+        if rollout_det_steps_final > rollout_det_steps and rollout_det_steps_warmup_epochs > 0:
+            print(
+                "Enabled deterministic rollout loss schedule: "
+                f"steps={rollout_det_steps}->{rollout_det_steps_final} over "
+                f"{rollout_det_steps_warmup_epochs} epoch(s), "
+                f"current_steps={current_rollout_det_steps}, "
+                f"windows={train_rollout_windows}, rollout_batch_size={rollout_det_batch_size}"
+            )
+        else:
+            print(
+                f"Enabled deterministic rollout loss: steps={current_rollout_det_steps}, "
+                f"weight={rollout_det_weight:g}, windows={train_rollout_windows}, "
+                f"rollout_batch_size={rollout_det_batch_size}"
+            )
 
     if use_generated_train_series:
         y_data_t, val_vel, _t_tensor, val_ur = eval_y_tensor, eval_vel_tensor, eval_t_tensor, eval_ur_tensor
@@ -1615,6 +1668,19 @@ def train(config: Config, config_name: str) -> None:
     )
 
     for epoch in range(epochs):
+        scheduled_rollout_det_steps = _scheduled_rollout_det_steps(
+            epoch=epoch,
+            base_steps=rollout_det_steps,
+            final_steps=rollout_det_steps_final,
+            warmup_epochs=rollout_det_steps_warmup_epochs,
+        )
+        if scheduled_rollout_det_steps != current_rollout_det_steps:
+            current_rollout_det_steps = scheduled_rollout_det_steps
+            train_rollout_loader, val_rollout_loader, train_rollout_windows = _rebuild_rollout_loaders(current_rollout_det_steps)
+            print(
+                f"Epoch {epoch}: updated deterministic rollout loss horizon to "
+                f"{current_rollout_det_steps} step(s) with {train_rollout_windows} training windows."
+            )
         if use_lr_scheduler:
             for group in opt.param_groups:
                 group["lr"] = lr_scheduler.get_lr(epoch)
@@ -1669,6 +1735,7 @@ def train(config: Config, config_name: str) -> None:
             "loss_data": mean_force_data_loss,
             "loss_sym": mean_sym_loss,
             "loss_rollout_det": mean_rollout_det_loss,
+            "rollout_det_steps": float(current_rollout_det_steps),
             "lr": current_lr,
             "grad_norm": mean_grad_norm,
             "avg_sigma_reg": mean_sigma_reg,
@@ -1718,10 +1785,12 @@ def train(config: Config, config_name: str) -> None:
                 state_source = getattr(model, "_orig_mod")
             async_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = async_dir / f"epoch_{epoch + 1:06d}.pt"
+            checkpoint_config = asdict(config)
+            checkpoint_config["loss"]["rollout_det_steps"] = int(current_rollout_det_steps)
             torch.save(
                 {
                     "model_state": state_source.state_dict(),
-                    "config": asdict(config),
+                    "config": checkpoint_config,
                     "run_name": run_name,
                     "dt": dt,
                     "method": str(config.method),
@@ -1871,10 +1940,12 @@ def train(config: Config, config_name: str) -> None:
     state_source = model
     if hasattr(model, "_orig_mod"):
         state_source = getattr(model, "_orig_mod")
+    final_config = asdict(config)
+    final_config["loss"]["rollout_det_steps"] = int(current_rollout_det_steps)
     torch.save(
         {
             "model_state": state_source.state_dict(),
-            "config": asdict(config),
+            "config": final_config,
             "run_name": run_name,
         },
         model_path,
