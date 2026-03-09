@@ -3843,19 +3843,36 @@ def rollout_model(
     noise_scale: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """Roll the model forward over the full time grid and return normalised traces."""
-    p0 = vel[0] * m_eff
-    state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
-    rv_val = reduced_velocity
-    if torch.is_tensor(rv_val):
-        rv_val = float(rv_val.reshape(-1)[0].detach().cpu())
+    total_steps = int(min(len(t), int(y0.shape[0]), int(vel.shape[0])))
+    if total_steps < 1:
+        raise ValueError("rollout_model requires at least one time step.")
+    y_series = y0[:total_steps].to(device=device)
+    vel_series = vel[:total_steps].to(device=device)
+    if torch.is_tensor(reduced_velocity):
+        rv_series = reduced_velocity.to(device=device, dtype=y_series.dtype)
     else:
-        rv_val = float(np.asarray(rv_val).reshape(-1)[0])
-    rv_tensor = torch.tensor(rv_val, device=device)
-    history_window = model._prepare_history_window(
-        x=state,
-        reduced_velocity=rv_tensor,
-        history_window=None,
-    )
+        rv_series = torch.as_tensor(reduced_velocity, device=device, dtype=y_series.dtype)
+    if rv_series.ndim == 0:
+        rv_series = rv_series.view(1, 1).expand(total_steps, 1)
+    else:
+        rv_series = rv_series.reshape(-1, 1)
+        if rv_series.shape[0] == 1:
+            rv_series = rv_series.expand(total_steps, 1)
+        elif rv_series.shape[0] != total_steps:
+            raise ValueError("Reduced velocity series must be scalar or match the rollout length.")
+
+    observed_states = torch.stack((y_series, vel_series * float(m_eff)), dim=1)
+    warmup_steps = 0
+    observed_history: torch.Tensor | None = None
+    state = observed_states[0:1]
+    history_window = None
+    if model.use_history_tcn:
+        warmup_len = min(int(model.history_window), total_steps)
+        history_features = torch.cat([observed_states[:warmup_len], rv_series[:warmup_len]], dim=1)
+        observed_history = _build_causal_feature_windows(history_features, int(model.history_window))
+        warmup_steps = warmup_len - 1
+        state = observed_states[warmup_steps : warmup_steps + 1]
+        history_window = observed_history[warmup_steps : warmup_steps + 1]
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
     force_total: list[torch.Tensor] = []
@@ -3867,17 +3884,49 @@ def rollout_model(
         generator = torch.Generator(device=device)
         generator.manual_seed(int(rollout_seed))
     with torch.no_grad():
-        for _ in range(len(t)):
+        for step_idx in range(warmup_steps):
+            state_obs = observed_states[step_idx : step_idx + 1]
+            rv_step = rv_series[step_idx : step_idx + 1]
+            hist_step = observed_history[step_idx : step_idx + 1] if observed_history is not None else None
+            ctx = model._resolve_history_context(
+                state_obs,
+                reduced_velocity=rv_step,
+                history_window=hist_step,
+            )
+            y_samples.append(state_obs[0, 0].detach())
+            p_samples.append(state_obs[0, 1].detach())
+            model_force = model.learned_force(
+                state_obs,
+                reduced_velocity=rv_step,
+                history_context=ctx,
+            ).squeeze().detach()
+            if model.include_physical_drag:
+                drag_force = model.drag_force(state_obs).squeeze().detach()
+            else:
+                drag_force = model_force.new_tensor(0.0)
+            total_force = model.u_theta(
+                state_obs,
+                reduced_velocity=rv_step,
+                history_context=ctx,
+            ).squeeze().detach()
+            H_val = model.H(state_obs).detach()
+            force_model.append(model_force)
+            force_drag.append(drag_force)
+            force_total.append(total_force)
+            hamiltonian_model_vals.append(H_val)
+
+        for step_idx in range(warmup_steps, total_steps):
+            rv_step = rv_series[step_idx : step_idx + 1]
             ctx = model._resolve_history_context(
                 state,
-                reduced_velocity=rv_tensor,
+                reduced_velocity=rv_step,
                 history_window=history_window,
             )
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
             model_force = model.learned_force(
                 state,
-                reduced_velocity=rv_tensor,
+                reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
             if model.include_physical_drag:
@@ -3886,7 +3935,7 @@ def rollout_model(
                 drag_force = model_force.new_tensor(0.0)
             total_force = model.u_theta(
                 state,
-                reduced_velocity=rv_tensor,
+                reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
             H_val = model.H(state).detach()
@@ -3894,6 +3943,8 @@ def rollout_model(
             force_drag.append(drag_force)
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
+            if step_idx == total_steps - 1:
+                break
             if stochastic and getattr(model, "use_stochastic_process_noise", False):
                 noise = torch.randn(
                     state.shape[0],
@@ -3906,7 +3957,7 @@ def rollout_model(
                     state,
                     t,
                     dt,
-                    reduced_velocity=rv_tensor,
+                    reduced_velocity=rv_step,
                     noise=noise,
                     noise_scale=noise_scale,
                     history_context=ctx,
@@ -3916,14 +3967,15 @@ def rollout_model(
                     state,
                     t,
                     dt,
-                    reduced_velocity=rv_tensor,
+                    reduced_velocity=rv_step,
                     history_context=ctx,
                 )
             if model.use_history_tcn:
+                rv_next = rv_series[step_idx + 1 : step_idx + 2]
                 history_window = model.advance_history_window(
                     history_window,
                     state,
-                    reduced_velocity=rv_tensor,
+                    reduced_velocity=rv_next,
                 )
 
     y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
@@ -3966,21 +4018,37 @@ def rollout_model_with_progress(
     on the final step.
     """
     every = max(1, int(callback_every))
-    total_steps = int(len(t))
+    total_steps = int(min(len(t), int(y0.shape[0]), int(vel.shape[0])))
+    if total_steps < 1:
+        raise ValueError("rollout_model_with_progress requires at least one time step.")
 
-    p0 = vel[0] * m_eff
-    state = torch.stack((y0[0], p0), dim=0).unsqueeze(0).to(device)
-    rv_val = reduced_velocity
-    if torch.is_tensor(rv_val):
-        rv_val = float(rv_val.reshape(-1)[0].detach().cpu())
+    y_series = y0[:total_steps].to(device=device)
+    vel_series = vel[:total_steps].to(device=device)
+    if torch.is_tensor(reduced_velocity):
+        rv_series = reduced_velocity.to(device=device, dtype=y_series.dtype)
     else:
-        rv_val = float(np.asarray(rv_val).reshape(-1)[0])
-    rv_tensor = torch.tensor(rv_val, device=device)
-    history_window = model._prepare_history_window(
-        x=state,
-        reduced_velocity=rv_tensor,
-        history_window=None,
-    )
+        rv_series = torch.as_tensor(reduced_velocity, device=device, dtype=y_series.dtype)
+    if rv_series.ndim == 0:
+        rv_series = rv_series.view(1, 1).expand(total_steps, 1)
+    else:
+        rv_series = rv_series.reshape(-1, 1)
+        if rv_series.shape[0] == 1:
+            rv_series = rv_series.expand(total_steps, 1)
+        elif rv_series.shape[0] != total_steps:
+            raise ValueError("Reduced velocity series must be scalar or match the rollout length.")
+
+    observed_states = torch.stack((y_series, vel_series * float(m_eff)), dim=1)
+    warmup_steps = 0
+    observed_history: torch.Tensor | None = None
+    state = observed_states[0:1]
+    history_window = None
+    if model.use_history_tcn:
+        warmup_len = min(int(model.history_window), total_steps)
+        history_features = torch.cat([observed_states[:warmup_len], rv_series[:warmup_len]], dim=1)
+        observed_history = _build_causal_feature_windows(history_features, int(model.history_window))
+        warmup_steps = warmup_len - 1
+        state = observed_states[warmup_steps : warmup_steps + 1]
+        history_window = observed_history[warmup_steps : warmup_steps + 1]
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
     force_total: list[torch.Tensor] = []
@@ -3988,17 +4056,52 @@ def rollout_model_with_progress(
     force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
     with torch.no_grad():
-        for step_idx in range(total_steps):
+        for step_idx in range(warmup_steps):
+            state_obs = observed_states[step_idx : step_idx + 1]
+            rv_step = rv_series[step_idx : step_idx + 1]
+            hist_step = observed_history[step_idx : step_idx + 1] if observed_history is not None else None
+            ctx = model._resolve_history_context(
+                state_obs,
+                reduced_velocity=rv_step,
+                history_window=hist_step,
+            )
+            y_samples.append(state_obs[0, 0].detach())
+            p_samples.append(state_obs[0, 1].detach())
+            model_force = model.learned_force(
+                state_obs,
+                reduced_velocity=rv_step,
+                history_context=ctx,
+            ).squeeze().detach()
+            if model.include_physical_drag:
+                drag_force = model.drag_force(state_obs).squeeze().detach()
+            else:
+                drag_force = model_force.new_tensor(0.0)
+            total_force = model.u_theta(
+                state_obs,
+                reduced_velocity=rv_step,
+                history_context=ctx,
+            ).squeeze().detach()
+            H_val = model.H(state_obs).detach()
+            force_model.append(model_force)
+            force_drag.append(drag_force)
+            force_total.append(total_force)
+            hamiltonian_model_vals.append(H_val)
+            completed = step_idx + 1
+            if progress_callback is not None and (completed % every == 0 or completed == total_steps):
+                progress_callback(completed, total_steps)
+
+        for step_idx in range(warmup_steps, total_steps):
+            rv_step = rv_series[step_idx : step_idx + 1]
             ctx = model._resolve_history_context(
                 state,
-                reduced_velocity=rv_tensor,
+                reduced_velocity=rv_step,
                 history_window=history_window,
             )
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
             model_force = model.learned_force(
                 state,
-                reduced_velocity=rv_tensor,
+                reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
             if model.include_physical_drag:
@@ -4007,7 +4110,7 @@ def rollout_model_with_progress(
                 drag_force = model_force.new_tensor(0.0)
             total_force = model.u_theta(
                 state,
-                reduced_velocity=rv_tensor,
+                reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
             H_val = model.H(state).detach()
@@ -4015,19 +4118,21 @@ def rollout_model_with_progress(
             force_drag.append(drag_force)
             force_total.append(total_force)
             hamiltonian_model_vals.append(H_val)
-            state = model.step_rk4(
-                state,
-                t,
-                dt,
-                reduced_velocity=rv_tensor,
-                history_context=ctx,
-            )
-            if model.use_history_tcn:
-                history_window = model.advance_history_window(
-                    history_window,
+            if step_idx < total_steps - 1:
+                state = model.step_rk4(
                     state,
-                    reduced_velocity=rv_tensor,
+                    t,
+                    dt,
+                    reduced_velocity=rv_step,
+                    history_context=ctx,
                 )
+                if model.use_history_tcn:
+                    rv_next = rv_series[step_idx + 1 : step_idx + 2]
+                    history_window = model.advance_history_window(
+                        history_window,
+                        state,
+                        reduced_velocity=rv_next,
+                    )
 
             completed = step_idx + 1
             if progress_callback is not None and (completed % every == 0 or completed == total_steps):
