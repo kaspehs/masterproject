@@ -2335,6 +2335,32 @@ class PHVIV(nn.Module):
         nll = 0.5 * (innovation * innovation / var + torch.log(var))
         return nll.squeeze(-1)
 
+    def _deterministic_residual_srk4_per_sample(
+        self,
+        zi: torch.Tensor,
+        zin: torch.Tensor,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        *,
+        history_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        drift_rate, z_mid = self._srk4_drift_rate(
+            zi,
+            zin,
+            reduced_velocity=reduced_velocity,
+            history_context=history_context,
+        )
+        res = (zin - zi) - float(self.dt) * drift_rate
+        res_scaled = res / self.res_scale.to(device=res.device, dtype=res.dtype)
+        if self.force_output == "coefficient":
+            f0 = self._force_scale_from_reduced_velocity(
+                reduced_velocity,
+                like=res_scaled[..., 1:2],
+                state=z_mid,
+            )
+            res_scaled = res_scaled.clone()
+            res_scaled[..., 1:2] = res_scaled[..., 1:2] / torch.clamp(f0, min=1e-12)
+        return torch.sum(res_scaled * res_scaled, dim=1)
+
     def avg_diffusion_SRK4(
         self,
         zi,
@@ -2516,12 +2542,20 @@ class PHVIV(nn.Module):
             history_window=history_window,
             history_context=history_context,
         )
-        per_sample = self._stochastic_nll_per_sample(
-            zi,
-            zin,
-            reduced_velocity=reduced_velocity,
-            history_context=ctx,
-        )
+        if self.use_stochastic_process_noise:
+            per_sample = self._stochastic_nll_per_sample(
+                zi,
+                zin,
+                reduced_velocity=reduced_velocity,
+                history_context=ctx,
+            )
+        else:
+            per_sample = self._deterministic_residual_srk4_per_sample(
+                zi,
+                zin,
+                reduced_velocity=reduced_velocity,
+                history_context=ctx,
+            )
         return torch.mean(per_sample)
 
     def res_loss_SRK4_per_sample(
@@ -2541,7 +2575,14 @@ class PHVIV(nn.Module):
             history_window=history_window,
             history_context=history_context,
         )
-        return self._stochastic_nll_per_sample(
+        if self.use_stochastic_process_noise:
+            return self._stochastic_nll_per_sample(
+                zi,
+                zin,
+                reduced_velocity=reduced_velocity,
+                history_context=ctx,
+            )
+        return self._deterministic_residual_srk4_per_sample(
             zi,
             zin,
             reduced_velocity=reduced_velocity,
