@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.utils as nn_utils
+from torch.utils.data import ConcatDataset, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from core.logging import setup_writer
@@ -97,6 +98,63 @@ def _parse_rollout_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
     else:
         raise ValueError("Unexpected rollout batch format.")
     return z0, t_seq, z_traj, ur0, history, scale
+
+
+def _ur_bin_id(value: float, ur_bin_size: float) -> int:
+    return int(np.rint(float(value) / float(ur_bin_size)))
+
+
+def _collect_ur_bin_counts_from_dataset(
+    dataset: Any,
+    *,
+    ur_tensor_index: int,
+    ur_bin_size: float,
+) -> dict[int, int]:
+    cache_key = f"ur_bin_counts:{int(ur_tensor_index)}:{float(ur_bin_size):.12g}"
+    cache = getattr(dataset, "_codex_cache", None)
+    if isinstance(cache, dict) and cache_key in cache:
+        return dict(cache[cache_key])
+
+    counts: dict[int, int] = {}
+    if isinstance(dataset, TensorDataset):
+        ur_tensor = dataset.tensors[int(ur_tensor_index)]
+        ur_vals = ur_tensor.reshape(ur_tensor.shape[0], -1)[:, 0].detach().cpu().numpy()
+        for ur_val in ur_vals:
+            key = _ur_bin_id(float(ur_val), ur_bin_size)
+            counts[key] = counts.get(key, 0) + 1
+    elif isinstance(dataset, ConcatDataset):
+        for subdataset in dataset.datasets:
+            sub_counts = _collect_ur_bin_counts_from_dataset(
+                subdataset,
+                ur_tensor_index=ur_tensor_index,
+                ur_bin_size=ur_bin_size,
+            )
+            for key, value in sub_counts.items():
+                counts[key] = counts.get(key, 0) + int(value)
+    else:
+        raise TypeError(f"Unsupported dataset type for U_r bin counting: {type(dataset)!r}")
+
+    if cache is None or not isinstance(cache, dict):
+        cache = {}
+        setattr(dataset, "_codex_cache", cache)
+    cache[cache_key] = dict(counts)
+    return counts
+
+
+def _weighted_mean_by_ur_bins(
+    per_sample: torch.Tensor,
+    ur_values: torch.Tensor,
+    *,
+    ur_bin_counts: dict[int, int] | None,
+    ur_bin_size: float,
+) -> torch.Tensor:
+    if not ur_bin_counts:
+        return torch.mean(per_sample)
+    ur_flat = ur_values.reshape(-1).detach().cpu().numpy()
+    weights = [1.0 / float(max(1, ur_bin_counts.get(_ur_bin_id(float(ur), ur_bin_size), 1))) for ur in ur_flat]
+    weight_t = torch.as_tensor(weights, device=per_sample.device, dtype=per_sample.dtype)
+    denom = torch.clamp(torch.sum(weight_t), min=torch.finfo(weight_t.dtype).eps)
+    return torch.sum(weight_t * per_sample) / denom
 
 
 def _odd_symmetry_penalty_per_sample(
@@ -230,6 +288,9 @@ def _train_one_epoch(
     mean_reg_norm: str,
     force_reg: float,
     sigma_reg_norm: str,
+    equalize_residual_over_ur_bins: bool,
+    equalize_rollout_over_ur_bins: bool,
+    ur_bin_size: float,
     rollout_det_weight: float,
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
@@ -265,6 +326,24 @@ def _train_one_epoch(
 
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
     rollout_iter = iter(train_rollout_loader) if (train_rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
+    residual_ur_bin_counts = (
+        _collect_ur_bin_counts_from_dataset(
+            train_loader.dataset,
+            ur_tensor_index=4,
+            ur_bin_size=ur_bin_size,
+        )
+        if equalize_residual_over_ur_bins
+        else None
+    )
+    rollout_ur_bin_counts = (
+        _collect_ur_bin_counts_from_dataset(
+            train_rollout_loader.dataset,
+            ur_tensor_index=3,
+            ur_bin_size=ur_bin_size,
+        )
+        if equalize_rollout_over_ur_bins and train_rollout_loader is not None and float(rollout_det_weight) > 0.0
+        else None
+    )
     for batch in train_loader:
         z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
         z_i = z_i.to(device, non_blocking=non_blocking)
@@ -286,14 +365,30 @@ def _train_one_epoch(
                 reduced_velocity=ur_i,
                 history_window=history_i,
             )
-            res_loss = model.res_loss(
-                z_i,
-                t_i,
-                z_next,
-                t_next,
-                reduced_velocity=ur_i,
-                history_context=history_context,
-            )
+            if equalize_residual_over_ur_bins:
+                per_res = model.res_loss_per_sample(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    history_context=history_context,
+                )
+                res_loss = _weighted_mean_by_ur_bins(
+                    per_res,
+                    ur_i,
+                    ur_bin_counts=residual_ur_bin_counts,
+                    ur_bin_size=ur_bin_size,
+                )
+            else:
+                res_loss = model.res_loss(
+                    z_i,
+                    t_i,
+                    z_next,
+                    t_next,
+                    reduced_velocity=ur_i,
+                    history_context=history_context,
+                )
             sigma_reg_loss = model.avg_sigma_reg_SRK4(
                 z_i,
                 t_i,
@@ -383,15 +478,34 @@ def _train_one_epoch(
                 except StopIteration:
                     rollout_iter = iter(train_rollout_loader)
                     rollout_batch = next(rollout_iter)
-                rollout_det_loss = _rollout_loss_from_batch(
-                    model=model,
-                    batch=rollout_batch,
-                    device=device,
-                    non_blocking=non_blocking,
-                    rollout_loss_mode=rollout_loss_mode,
-                    rollout_stochastic_samples=rollout_stochastic_samples,
-                    rollout_noise_scale=rollout_noise_scale,
-                )
+                if equalize_rollout_over_ur_bins:
+                    per_rollout = _rollout_loss_from_batch(
+                        model=model,
+                        batch=rollout_batch,
+                        device=device,
+                        non_blocking=non_blocking,
+                        rollout_loss_mode=rollout_loss_mode,
+                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
+                        return_per_sample=True,
+                    )
+                    _z0, _t_seq, _z_traj, ur0, _history0, _scale = _parse_rollout_batch(rollout_batch)
+                    rollout_det_loss = _weighted_mean_by_ur_bins(
+                        per_rollout,
+                        ur0,
+                        ur_bin_counts=rollout_ur_bin_counts,
+                        ur_bin_size=ur_bin_size,
+                    )
+                else:
+                    rollout_det_loss = _rollout_loss_from_batch(
+                        model=model,
+                        batch=rollout_batch,
+                        device=device,
+                        non_blocking=non_blocking,
+                        rollout_loss_mode=rollout_loss_mode,
+                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
+                    )
             else:
                 rollout_det_loss = res_loss.new_tensor(0.0)
             weighted_rollout_det = float(rollout_det_weight) * rollout_det_loss
@@ -524,6 +638,9 @@ def _validate_if_needed(
     mean_reg_norm: str,
     force_reg: float,
     sigma_reg_norm: str,
+    equalize_residual_over_ur_bins: bool,
+    equalize_rollout_over_ur_bins: bool,
+    ur_bin_size: float,
     rollout_det_weight: float,
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
@@ -549,6 +666,9 @@ def _validate_if_needed(
             mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
+            equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
+            equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
+            ur_bin_size=ur_bin_size,
             rollout_det_weight=rollout_det_weight,
             rollout_loss_mode=rollout_loss_mode,
             rollout_stochastic_samples=rollout_stochastic_samples,
@@ -981,6 +1101,9 @@ def _evaluate_val_losses(
     mean_reg_norm: str,
     force_reg: float,
     sigma_reg_norm: str,
+    equalize_residual_over_ur_bins: bool,
+    equalize_rollout_over_ur_bins: bool,
+    ur_bin_size: float,
     rollout_det_weight: float,
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
@@ -1008,6 +1131,24 @@ def _evaluate_val_losses(
     rollout_det_sum = torch.zeros((), device=device)
     batches = 0
     rollout_iter = iter(rollout_loader) if (rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
+    residual_ur_bin_counts = (
+        _collect_ur_bin_counts_from_dataset(
+            loader.dataset,
+            ur_tensor_index=4,
+            ur_bin_size=ur_bin_size,
+        )
+        if equalize_residual_over_ur_bins
+        else None
+    )
+    rollout_ur_bin_counts = (
+        _collect_ur_bin_counts_from_dataset(
+            rollout_loader.dataset,
+            ur_tensor_index=3,
+            ur_bin_size=ur_bin_size,
+        )
+        if equalize_rollout_over_ur_bins and rollout_loader is not None and float(rollout_det_weight) > 0.0
+        else None
+    )
     with torch.no_grad():
         for batch in loader:
             z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
@@ -1028,14 +1169,30 @@ def _evaluate_val_losses(
                     reduced_velocity=ur_i,
                     history_window=history_i,
                 )
-                res_loss = model.res_loss(
-                    z_i,
-                    t_i,
-                    z_next,
-                    t_next,
-                    reduced_velocity=ur_i,
-                    history_context=history_context,
-                )
+                if equalize_residual_over_ur_bins:
+                    per_res = model.res_loss_per_sample(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        history_context=history_context,
+                    )
+                    res_loss = _weighted_mean_by_ur_bins(
+                        per_res,
+                        ur_i,
+                        ur_bin_counts=residual_ur_bin_counts,
+                        ur_bin_size=ur_bin_size,
+                    )
+                else:
+                    res_loss = model.res_loss(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
+                        history_context=history_context,
+                    )
                 sigma_reg_loss = model.avg_sigma_reg_SRK4(
                     z_i,
                     t_i,
@@ -1099,15 +1256,34 @@ def _evaluate_val_losses(
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rollout_batch = next(rollout_iter)
-                    rollout_det_loss = _rollout_loss_from_batch(
-                        model=model,
-                        batch=rollout_batch,
-                        device=device,
-                        non_blocking=non_blocking,
-                        rollout_loss_mode=val_rollout_loss_mode,
-                        rollout_stochastic_samples=val_rollout_stochastic_samples,
-                        rollout_noise_scale=rollout_noise_scale,
-                    )
+                    if equalize_rollout_over_ur_bins:
+                        per_rollout = _rollout_loss_from_batch(
+                            model=model,
+                            batch=rollout_batch,
+                            device=device,
+                            non_blocking=non_blocking,
+                            rollout_loss_mode=val_rollout_loss_mode,
+                            rollout_stochastic_samples=val_rollout_stochastic_samples,
+                            rollout_noise_scale=rollout_noise_scale,
+                            return_per_sample=True,
+                        )
+                        _z0, _t_seq, _z_traj, ur0, _history0, _scale = _parse_rollout_batch(rollout_batch)
+                        rollout_det_loss = _weighted_mean_by_ur_bins(
+                            per_rollout,
+                            ur0,
+                            ur_bin_counts=rollout_ur_bin_counts,
+                            ur_bin_size=ur_bin_size,
+                        )
+                    else:
+                        rollout_det_loss = _rollout_loss_from_batch(
+                            model=model,
+                            batch=rollout_batch,
+                            device=device,
+                            non_blocking=non_blocking,
+                            rollout_loss_mode=val_rollout_loss_mode,
+                            rollout_stochastic_samples=val_rollout_stochastic_samples,
+                            rollout_noise_scale=rollout_noise_scale,
+                        )
                 else:
                     rollout_det_loss = res_loss.new_tensor(0.0)
                 total = total + float(rollout_det_weight) * rollout_det_loss
@@ -1395,6 +1571,9 @@ def train(config: Config, config_name: str) -> None:
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
+    equalize_residual_over_ur_bins = bool(getattr(loss_cfg, "equalize_residual_over_ur_bins", False))
+    equalize_rollout_over_ur_bins = bool(getattr(loss_cfg, "equalize_rollout_over_ur_bins", False))
+    ur_bin_size = float(getattr(loss_cfg, "ur_bin_size", 1e-6))
     rollout_det_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
     rollout_det_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
     rollout_det_steps_final = rollout_det_steps if rollout_det_steps_final_raw <= 0 else rollout_det_steps_final_raw
@@ -1423,6 +1602,8 @@ def train(config: Config, config_name: str) -> None:
         )
     if rollout_stochastic_samples < 1:
         raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
+    if not np.isfinite(ur_bin_size) or ur_bin_size <= 0.0:
+        raise ValueError("loss.ur_bin_size must be finite and > 0.")
     if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_det_weight > 0.0 and rollout_stochastic_samples < 2:
         raise ValueError(
             "loss.rollout_stochastic_samples must be >= 2 when "
@@ -1705,6 +1886,13 @@ def train(config: Config, config_name: str) -> None:
             f"train_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}, "
             f"val_windows={val_rollout_instances}, val_rollout_steps={val_rollout_steps_per_epoch}"
         )
+    if equalize_residual_over_ur_bins or equalize_rollout_over_ur_bins:
+        startup_lines.append(
+            "U_r loss equalization: "
+            f"residual={equalize_residual_over_ur_bins}, "
+            f"rollout={equalize_rollout_over_ur_bins}, "
+            f"bin_size={ur_bin_size:g}"
+        )
     print("\n".join(startup_lines))
 
     for epoch in range(epochs):
@@ -1737,6 +1925,9 @@ def train(config: Config, config_name: str) -> None:
             mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
+            equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
+            equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
+            ur_bin_size=ur_bin_size,
             rollout_det_weight=rollout_det_weight,
             rollout_loss_mode=rollout_loss_mode,
             rollout_stochastic_samples=rollout_stochastic_samples,
@@ -1949,6 +2140,9 @@ def train(config: Config, config_name: str) -> None:
             mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
+            equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
+            equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
+            ur_bin_size=ur_bin_size,
             rollout_det_weight=rollout_det_weight,
             rollout_loss_mode=rollout_loss_mode,
             rollout_stochastic_samples=rollout_stochastic_samples,

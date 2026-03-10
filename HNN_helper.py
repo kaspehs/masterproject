@@ -158,6 +158,9 @@ class LossConfig:
     mean_reg_norm: str = "l1"  # "l1" or "l2"
     force_reg: float = 1e-2
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
+    equalize_residual_over_ur_bins: bool = False
+    equalize_rollout_over_ur_bins: bool = False
+    ur_bin_size: float = 1e-6
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
     rollout_loss_mode: str = "deterministic"  # "deterministic" | "stochastic_nll" | "stochastic_mse"
@@ -315,6 +318,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "mean_reg_norm",
         "force_reg",
         "sigma_reg_norm",
+        "equalize_residual_over_ur_bins",
+        "equalize_rollout_over_ur_bins",
+        "ur_bin_size",
         "rollout_det_weight",
         "rollout_det_steps",
         "rollout_loss_mode",

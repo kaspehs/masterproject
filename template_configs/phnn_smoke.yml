@@ -99,6 +99,12 @@ loss:
   force_reg: 0.1
   # Norm for sigma regularizer: l1 | l2
   sigma_reg_norm: l2
+  # If true, average the residual/physics loss equally over reduced-velocity bins.
+  equalize_residual_over_ur_bins: false
+  # If true, average the rollout loss equally over reduced-velocity bins.
+  equalize_rollout_over_ur_bins: false
+  # Global reduced-velocity bin size used by the equalized loss aggregation above.
+  ur_bin_size: 1.0e-6
   # Optional multi-step rollout loss.
   rollout_det_weight: 0.0
   rollout_det_steps: 0
