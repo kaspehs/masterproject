@@ -260,8 +260,6 @@ def _train_one_epoch(
     sigma_grad_component_sum = torch.zeros((), device=device)
     mean_grad_component_sum = torch.zeros((), device=device)
     gradnorm_res_weight_sum = torch.zeros((), device=device)
-    gradnorm_sigma_weight_sum = torch.zeros((), device=device)
-    gradnorm_mean_weight_sum = torch.zeros((), device=device) if float(mean_reg) > 0.0 else None
     gradnorm_data_weight_sum = torch.zeros((), device=device) if use_force_data_loss else None
     gradnorm_weight_count = 0
 
@@ -352,21 +350,14 @@ def _train_one_epoch(
                 loss_inputs: dict[str, torch.Tensor] = {
                     "residual": res_loss.float(),
                 }
-                if "sigma" in gradnorm_balancer.names:
-                    loss_inputs["sigma"] = base_sigma_reg_loss.float()
                 if "data" in gradnorm_balancer.names:
                     loss_inputs["data"] = data_force_loss.float()
-                if "mean" in gradnorm_balancer.names:
-                    loss_inputs["mean"] = base_mean_reg_loss.float()
                 weights = gradnorm_balancer.update(loss_inputs)
                 res_weight = weights["residual"]
-                sigma_weight = weights.get("sigma", res_loss.new_tensor(1.0))
-                mean_weight = weights.get("mean", res_loss.new_tensor(1.0))
+                sigma_weight = res_loss.new_tensor(1.0)
+                mean_weight = res_loss.new_tensor(1.0)
                 data_weight = weights.get("data", res_loss.new_tensor(1.0))
                 gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
-                gradnorm_sigma_weight_sum = gradnorm_sigma_weight_sum + sigma_weight
-                if gradnorm_mean_weight_sum is not None:
-                    gradnorm_mean_weight_sum = gradnorm_mean_weight_sum + mean_weight
                 if gradnorm_data_weight_sum is not None:
                     gradnorm_data_weight_sum = gradnorm_data_weight_sum + data_weight
                 gradnorm_weight_count += 1
@@ -487,16 +478,6 @@ def _train_one_epoch(
         metrics["mean_gradnorm_weight_residual"] = float(
             (gradnorm_res_weight_sum / float(gradnorm_weight_count)).detach().cpu()
         )
-        metrics["mean_gradnorm_weight_force"] = float(
-            (gradnorm_sigma_weight_sum / float(gradnorm_weight_count)).detach().cpu()
-        )
-        metrics["mean_gradnorm_weight_sigma"] = float(
-            (gradnorm_sigma_weight_sum / float(gradnorm_weight_count)).detach().cpu()
-        )
-        if gradnorm_mean_weight_sum is not None:
-            metrics["mean_gradnorm_weight_mean"] = float(
-                (gradnorm_mean_weight_sum / float(gradnorm_weight_count)).detach().cpu()
-            )
         if gradnorm_data_weight_sum is not None:
             metrics["mean_gradnorm_weight_data"] = float(
                 (gradnorm_data_weight_sum / float(gradnorm_weight_count)).detach().cpu()
@@ -1667,10 +1648,6 @@ def train(config: Config, config_name: str) -> None:
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(loss_cfg.use_gradnorm):
         names = ["residual"]
-        if bool(getattr(model_cfg, "use_stochastic_process_noise", False)) and force_reg > 0.0:
-            names.append("sigma")
-        if mean_reg > 0.0:
-            names.append("mean")
         if use_force_data_loss and force_data_weight > 0.0:
             names.append("data")
         if len(names) >= 2:
@@ -1812,10 +1789,6 @@ def train(config: Config, config_name: str) -> None:
             train_metrics["grad_norm_mean_comp"] = mean_mean_grad_component
         if "mean_gradnorm_weight_residual" in epoch_metrics:
             train_metrics["gradnorm_weight_physics"] = float(epoch_metrics["mean_gradnorm_weight_residual"])
-        if "mean_gradnorm_weight_force" in epoch_metrics:
-            train_metrics["gradnorm_weight_reg"] = float(epoch_metrics["mean_gradnorm_weight_force"])
-        if "mean_gradnorm_weight_mean" in epoch_metrics:
-            train_metrics["gradnorm_weight_mean_reg"] = float(epoch_metrics["mean_gradnorm_weight_mean"])
         if "mean_gradnorm_weight_data" in epoch_metrics:
             train_metrics["gradnorm_weight_data"] = float(epoch_metrics["mean_gradnorm_weight_data"])
 
