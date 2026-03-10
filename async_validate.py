@@ -75,14 +75,19 @@ def _rollout_index(
     if num_series <= 0:
         return 0
     selected = list(range(num_series))
-    if target_ur is not None and ur_values is not None and len(ur_values) == num_series:
-        matched = [
-            idx
-            for idx, ur_val in enumerate(ur_values)
-            if np.isclose(float(ur_val), float(target_ur), rtol=0.0, atol=float(target_ur_tol))
-        ]
-        if matched:
-            selected = matched
+    if ur_values is not None and len(ur_values) == num_series:
+        if target_ur is not None:
+            matched = [
+                idx
+                for idx, ur_val in enumerate(ur_values)
+                if np.isclose(float(ur_val), float(target_ur), rtol=0.0, atol=float(target_ur_tol))
+            ]
+            if matched:
+                selected = [matched[0]]
+        else:
+            sampled = sample_one_index_per_ur(ur_values, seed=0)
+            if sampled:
+                selected = sampled
     if not cycle:
         return int(selected[0])
     step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)

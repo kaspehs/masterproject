@@ -39,9 +39,11 @@ from HNN_helper import (
     format_loss_vs_ur_text,
     log_loss_vs_ur,
     log_final_rollout_errors_vs_ur,
+    log_phase_component_plots,
     log_training_metrics,
     log_validation_epoch,
     preprocess_timeseries,
+    rollout_model,
     resolve_cut_start_seconds,
     sample_one_index_per_ur,
 )
@@ -667,7 +669,7 @@ def _validate_if_needed(
                 ):
                     matches.append(idx)
             if matches:
-                selected_indices = matches
+                selected_indices = [matches[0]]
             else:
                 warnings.warn(
                     "monitoring.rollout_use_excluded_ur is enabled but no validation rollout "
@@ -675,7 +677,14 @@ def _validate_if_needed(
                     f"(tol={float(rollout_target_ur_tol):.3g}); falling back to default rollout selection."
                 )
         if selected_indices is None:
-            selected_indices = list(range(total))
+            ur_for_rollout = [
+                float(np.asarray(series_raw[5]).reshape(-1)[0])
+                for series_raw in val_series_raw
+                if np.asarray(series_raw[5]).reshape(-1).size > 0
+            ]
+            selected_indices = sample_one_index_per_ur(ur_for_rollout, seed=0)
+            if not selected_indices:
+                selected_indices = list(range(total))
         if cycle_validation_rollout:
             step = max(0, (epoch + 1) // max(1, int(rollout_every_epochs)) - 1)
             rollout_idx = selected_indices[step % len(selected_indices)]
@@ -803,6 +812,34 @@ def _log_final_rollouts_all(
             rollout_seed=rollout_seed,
             tag_prefix="final_val/rollout",
             step=step_idx,
+            title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
+        )
+        rollout = rollout_model(
+            model,
+            y_tensor,
+            vel_tensor,
+            ur_tensor,
+            m_eff,
+            dt_value,
+            t_np,
+            D,
+            k,
+            device,
+            stochastic=rollout_stochastic,
+            rollout_seed=rollout_seed,
+            noise_scale=rollout_noise_scale,
+        )
+        log_phase_component_plots(
+            writer,
+            epoch,
+            rollout["y_norm"],
+            rollout["p_norm"],
+            rollout["force_coeff_total"],
+            rollout["force_coeff_sigma"],
+            force_coeff_delta=rollout["force_coeff_delta"],
+            reduced_velocity=ur_val,
+            tag_prefix=f"final_val/phase/U_r={ur_val:.6g}",
+            step=epoch,
             title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
         )
         filtered_metrics = {

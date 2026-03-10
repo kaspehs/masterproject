@@ -498,47 +498,22 @@ def log_validation_epoch(
         step=step,
         title_suffix=title_suffix,
     )
-    with torch.no_grad():
-        z_true_plot = torch.stack((y_data_t, val_vel * float(m_eff)), dim=1).to(
-            device=device, non_blocking=(device.type == "cuda")
-        )
-        rv_plot = reduced_velocity
-        if not torch.is_tensor(rv_plot):
-            rv_plot = torch.as_tensor(rv_plot, dtype=z_true_plot.dtype)
-        rv_plot = rv_plot.to(device=z_true_plot.device, dtype=z_true_plot.dtype)
-        f0_plot_t = model._force_scale_from_reduced_velocity(
-            rv_plot,
-            like=z_true_plot[..., :1],
-            state=z_true_plot,
-        ).squeeze(-1).detach().cpu().numpy()
-    f0_plot_t = np.asarray(f0_plot_t, dtype=float).reshape(-1)
-    f0_plot_t = np.clip(np.nan_to_num(f0_plot_t, nan=1.0, posinf=1.0, neginf=1.0), 1e-12, None)
-    if force_data is None:
-        return metrics
-    force_pred = np.asarray(rollout["force_total"], dtype=float).reshape(-1)
-    force_true = np.asarray(force_data, dtype=float).reshape(-1)
-    plot_len = int(min(force_pred.size, force_true.size, f0_plot_t.size))
+    force_coeff_pred = np.asarray(rollout["force_coeff_total"], dtype=float).reshape(-1)
+    force_coeff_delta = np.asarray(rollout["force_coeff_delta"], dtype=float).reshape(-1)
+    force_coeff_sigma = np.asarray(rollout["force_coeff_sigma"], dtype=float).reshape(-1)
+    plot_len = int(min(force_coeff_pred.size, force_coeff_delta.size, force_coeff_sigma.size, len(t)))
     if plot_len <= 0:
-        plot_len = int(min(force_pred.size, force_true.size))
-        if plot_len <= 0:
-            plot_len = int(min(force_pred.size, force_true.size, len(t)))
-        force_coeff_pred_plot = force_pred[:plot_len]
-        force_coeff_true_plot = force_true[:plot_len]
-        t_force_plot = np.asarray(t, dtype=float)[:plot_len]
-    else:
-        force_coeff_pred_plot = force_pred[:plot_len] / f0_plot_t[:plot_len]
-        force_coeff_true_plot = force_true[:plot_len] / f0_plot_t[:plot_len]
-        t_force_plot = np.asarray(t, dtype=float)[:plot_len]
-    if t_force_plot.size == 0:
         return metrics
+    t_force_plot = np.asarray(t, dtype=float)[:plot_len]
     zoom_mask_force = create_zoom_mask(t_force_plot)
     middle_mask_force = create_window_mask(t_force_plot, middle_time_plot)
-    log_force_plots(
+    log_force_component_plots(
         writer,
         epoch,
         t_force_plot,
-        force_coeff_pred_plot,
-        force_coeff_true_plot,
+        force_coeff_pred[:plot_len],
+        force_coeff_delta[:plot_len],
+        force_coeff_sigma[:plot_len],
         zoom_mask_force,
         middle_mask_force,
         middle_time_plot,
@@ -2743,8 +2718,8 @@ def log_displacement_plots(
     step: int | None = None,
     title_suffix: str = "",
 ):
-    fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
-    ax_full, ax_diff, ax_zoom, ax_middle = axes
+    fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
+    ax_full, ax_diff, ax_zoom = axes
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
 
     ax_full.plot(t, y_true_norm, label="y/D (true)")
@@ -2771,15 +2746,6 @@ def log_displacement_plots(
     ax_zoom.grid(True, alpha=0.3)
     ax_zoom.set_title(f"Normalized rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_zoom.legend(loc="upper right")
-
-    mid_start, mid_end = middle_window
-    ax_middle.plot(t[middle_mask], y_true_norm[middle_mask], label="y/D (true)")
-    ax_middle.plot(t[middle_mask], y_pred_norm[middle_mask], label="y/D (pred)")
-    ax_middle.set_xlabel("time")
-    ax_middle.set_ylabel("y/D")
-    ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Normalized rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
-    ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_displacement", fig, epoch + 1 if step is None else step)
@@ -2839,6 +2805,142 @@ def log_force_plots(
 
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
+def log_force_component_plots(
+    writer,
+    epoch,
+    t,
+    force_coeff_pred,
+    force_coeff_delta,
+    sigma_coeff,
+    zoom_mask,
+    middle_mask,
+    middle_window,
+    reduced_velocity: float | None = None,
+    *,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    title_suffix: str = "",
+):
+    fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
+    ax_full, ax_zoom, ax_middle = axes
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+
+    ax_full.plot(t, force_coeff_pred, label="a", color="tab:purple")
+    ax_full.plot(t, force_coeff_delta, label="delta a", color="tab:orange")
+    ax_full.plot(t, sigma_coeff, label="sigma", color="tab:green")
+    ax_full.set_xlabel("time")
+    ax_full.set_ylabel("coefficient")
+    ax_full.grid(True, alpha=0.3)
+    ax_full.set_title(f"Force coefficient components at epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_full.legend(loc="upper right")
+
+    ax_zoom.plot(t[zoom_mask], force_coeff_pred[zoom_mask], label="a", color="tab:purple")
+    ax_zoom.plot(t[zoom_mask], force_coeff_delta[zoom_mask], label="delta a", color="tab:orange")
+    ax_zoom.plot(t[zoom_mask], sigma_coeff[zoom_mask], label="sigma", color="tab:green")
+    ax_zoom.set_xlabel("time")
+    ax_zoom.set_ylabel("coefficient")
+    ax_zoom.grid(True, alpha=0.3)
+    ax_zoom.set_title(f"Force coefficient components (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_zoom.legend(loc="upper right")
+
+    mid_start, mid_end = middle_window
+    ax_middle.plot(t[middle_mask], force_coeff_pred[middle_mask], label="a", color="tab:purple")
+    ax_middle.plot(t[middle_mask], force_coeff_delta[middle_mask], label="delta a", color="tab:orange")
+    ax_middle.plot(t[middle_mask], sigma_coeff[middle_mask], label="sigma", color="tab:green")
+    ax_middle.set_xlabel("time")
+    ax_middle.set_ylabel("coefficient")
+    ax_middle.grid(True, alpha=0.3)
+    ax_middle.set_title(f"Force coefficient components ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_middle.legend(loc="upper right")
+
+    plt.tight_layout()
+    writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
+def _phase_value_grid(
+    q_norm: np.ndarray,
+    p_norm: np.ndarray,
+    values: np.ndarray,
+    *,
+    bins: int = 96,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    q = np.asarray(q_norm, dtype=float).reshape(-1)
+    p = np.asarray(p_norm, dtype=float).reshape(-1)
+    v = np.asarray(values, dtype=float).reshape(-1)
+    mask = np.isfinite(q) & np.isfinite(p) & np.isfinite(v)
+    q = q[mask]
+    p = p[mask]
+    v = v[mask]
+    if q.size < 4:
+        raise ValueError("Need at least four finite samples to build a phase-space grid.")
+
+    q_min, q_max = float(np.min(q)), float(np.max(q))
+    p_min, p_max = float(np.min(p)), float(np.max(p))
+    if q_min == q_max:
+        q_min -= 1e-6
+        q_max += 1e-6
+    if p_min == p_max:
+        p_min -= 1e-6
+        p_max += 1e-6
+
+    q_edges = np.linspace(q_min, q_max, int(max(8, bins)) + 1)
+    p_edges = np.linspace(p_min, p_max, int(max(8, bins)) + 1)
+    weighted_sum, _, _ = np.histogram2d(q, p, bins=[q_edges, p_edges], weights=v)
+    counts, _, _ = np.histogram2d(q, p, bins=[q_edges, p_edges])
+    mean_grid = np.divide(
+        weighted_sum,
+        counts,
+        out=np.full_like(weighted_sum, np.nan, dtype=float),
+        where=counts > 0,
+    )
+    return q_edges, p_edges, mean_grid.T
+
+
+def log_phase_component_plots(
+    writer,
+    epoch,
+    q_norm,
+    p_norm,
+    force_coeff_pred,
+    sigma_coeff,
+    force_coeff_delta: np.ndarray | None = None,
+    reduced_velocity: float | None = None,
+    *,
+    tag_prefix: str = "final_val/phase",
+    step: int | None = None,
+    title_suffix: str = "",
+    bins: int = 96,
+):
+    component_specs: list[tuple[str, np.ndarray, str]] = [
+        ("a", np.asarray(force_coeff_pred, dtype=float), "Force coefficient a"),
+        ("sigma", np.asarray(sigma_coeff, dtype=float), "Sigma coefficient"),
+    ]
+    if force_coeff_delta is not None:
+        delta_arr = np.asarray(force_coeff_delta, dtype=float)
+        if np.any(np.abs(delta_arr) > 0.0):
+            component_specs.append(("delta a", delta_arr, "Correction coefficient delta a"))
+
+    fig, axes = plt.subplots(1, len(component_specs), figsize=(6 * len(component_specs), 5), sharex=True, sharey=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+
+    for ax, (label, values, title) in zip(axes, component_specs):
+        q_edges, p_edges, grid = _phase_value_grid(q_norm, p_norm, values, bins=bins)
+        cmap = ax.contourf(q_edges[:-1], p_edges[:-1], grid, levels=20, cmap="viridis")
+        ax.set_xlabel("y/D")
+        ax.set_ylabel("v/(omega D)")
+        ax.set_title(f"{title}{ur_title}{title_suffix}")
+        ax.grid(True, alpha=0.15)
+        cbar = fig.colorbar(cmap, ax=ax)
+        cbar.set_label(label)
+
+    plt.tight_layout()
+    writer.add_figure(f"{tag_prefix}_phase_components", fig, epoch + 1 if step is None else step)
     plt.close(fig)
 
 def log_hamiltonian_plots(
@@ -3768,6 +3870,44 @@ def resample_uniform_series(
     resampled_y = np.interp(resampled_t, series_t, series_y)
     return resampled_y, resampled_t
 
+
+def _force_component_coefficients(
+    model: "PHVIV",
+    state: torch.Tensor,
+    reduced_velocity: torch.Tensor,
+    history_context: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    base_features = model._force_features(state, reduced_velocity=reduced_velocity)
+    features = model.force_embed(base_features) if model.force_embed is not None else base_features
+    base_raw = model.u_base_net(features)
+    delta_raw = torch.zeros_like(base_raw)
+    if model.corr_net is not None and history_context is not None:
+        delta_raw = model.corr_net(torch.cat([features, history_context], dim=-1))
+
+    force_scale = model._force_scale_from_reduced_velocity(reduced_velocity, like=base_raw, state=state)
+    if model.force_output == "coefficient":
+        base_coeff = base_raw
+        delta_coeff = delta_raw
+    else:
+        coeff_scale = (float(model.k) * float(model.D)) / torch.clamp(force_scale, min=1e-12)
+        base_coeff = base_raw * coeff_scale
+        delta_coeff = delta_raw * coeff_scale
+
+    total_coeff = base_coeff + delta_coeff
+    if model.include_physical_drag:
+        total_coeff = total_coeff + model.drag_force_coeff(state, reduced_velocity=reduced_velocity)
+
+    if model.use_stochastic_process_noise:
+        sigma_force = model.sigma_theta(
+            state,
+            reduced_velocity=reduced_velocity,
+            history_context=history_context,
+        )
+        sigma_coeff = sigma_force / torch.clamp(force_scale, min=1e-12)
+    else:
+        sigma_coeff = torch.zeros_like(total_coeff)
+    return total_coeff, delta_coeff, sigma_coeff
+
 def rollout_model(
     model: PHVIV,
     y0: torch.Tensor,
@@ -3818,6 +3958,9 @@ def rollout_model(
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
     force_total: list[torch.Tensor] = []
+    force_coeff_total: list[torch.Tensor] = []
+    force_coeff_delta: list[torch.Tensor] = []
+    force_coeff_sigma: list[torch.Tensor] = []
     force_drag: list[torch.Tensor] = []
     force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
@@ -3851,10 +3994,19 @@ def rollout_model(
                 reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
+            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
+                model,
+                state_obs,
+                rv_step,
+                ctx,
+            )
             H_val = model.H(state_obs).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
             force_total.append(total_force)
+            force_coeff_total.append(total_coeff.squeeze().detach())
+            force_coeff_delta.append(delta_coeff.squeeze().detach())
+            force_coeff_sigma.append(sigma_coeff.squeeze().detach())
             hamiltonian_model_vals.append(H_val)
 
         for step_idx in range(warmup_steps, total_steps):
@@ -3880,10 +4032,19 @@ def rollout_model(
                 reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
+            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
+                model,
+                state,
+                rv_step,
+                ctx,
+            )
             H_val = model.H(state).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
             force_total.append(total_force)
+            force_coeff_total.append(total_coeff.squeeze().detach())
+            force_coeff_delta.append(delta_coeff.squeeze().detach())
+            force_coeff_sigma.append(sigma_coeff.squeeze().detach())
             hamiltonian_model_vals.append(H_val)
             if step_idx == total_steps - 1:
                 break
@@ -3925,6 +4086,9 @@ def rollout_model(
     y_pred_norm = y_samples_arr / D
     p_pred_norm = (p_samples_arr / m_eff) / (np.sqrt(k / m_eff) * D)
     force_total_arr = torch.stack(force_total).detach().cpu().numpy()
+    force_coeff_total_arr = torch.stack(force_coeff_total).detach().cpu().numpy()
+    force_coeff_delta_arr = torch.stack(force_coeff_delta).detach().cpu().numpy()
+    force_coeff_sigma_arr = torch.stack(force_coeff_sigma).detach().cpu().numpy()
     force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
     force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
@@ -3932,6 +4096,9 @@ def rollout_model(
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
         "force_total": force_total_arr,
+        "force_coeff_total": force_coeff_total_arr,
+        "force_coeff_delta": force_coeff_delta_arr,
+        "force_coeff_sigma": force_coeff_sigma_arr,
         "force_drag": force_drag_arr,
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
@@ -3994,6 +4161,9 @@ def rollout_model_with_progress(
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
     force_total: list[torch.Tensor] = []
+    force_coeff_total: list[torch.Tensor] = []
+    force_coeff_delta: list[torch.Tensor] = []
+    force_coeff_sigma: list[torch.Tensor] = []
     force_drag: list[torch.Tensor] = []
     force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
@@ -4023,10 +4193,19 @@ def rollout_model_with_progress(
                 reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
+            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
+                model,
+                state_obs,
+                rv_step,
+                ctx,
+            )
             H_val = model.H(state_obs).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
             force_total.append(total_force)
+            force_coeff_total.append(total_coeff.squeeze().detach())
+            force_coeff_delta.append(delta_coeff.squeeze().detach())
+            force_coeff_sigma.append(sigma_coeff.squeeze().detach())
             hamiltonian_model_vals.append(H_val)
             completed = step_idx + 1
             if progress_callback is not None and (completed % every == 0 or completed == total_steps):
@@ -4055,10 +4234,19 @@ def rollout_model_with_progress(
                 reduced_velocity=rv_step,
                 history_context=ctx,
             ).squeeze().detach()
+            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
+                model,
+                state,
+                rv_step,
+                ctx,
+            )
             H_val = model.H(state).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
             force_total.append(total_force)
+            force_coeff_total.append(total_coeff.squeeze().detach())
+            force_coeff_delta.append(delta_coeff.squeeze().detach())
+            force_coeff_sigma.append(sigma_coeff.squeeze().detach())
             hamiltonian_model_vals.append(H_val)
             if step_idx < total_steps - 1:
                 state = model.step_rk4(
@@ -4085,6 +4273,9 @@ def rollout_model_with_progress(
     y_pred_norm = y_samples_arr / D
     p_pred_norm = (p_samples_arr / m_eff) / (np.sqrt(k / m_eff) * D)
     force_total_arr = torch.stack(force_total).detach().cpu().numpy()
+    force_coeff_total_arr = torch.stack(force_coeff_total).detach().cpu().numpy()
+    force_coeff_delta_arr = torch.stack(force_coeff_delta).detach().cpu().numpy()
+    force_coeff_sigma_arr = torch.stack(force_coeff_sigma).detach().cpu().numpy()
     force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
     force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
@@ -4092,6 +4283,9 @@ def rollout_model_with_progress(
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
         "force_total": force_total_arr,
+        "force_coeff_total": force_coeff_total_arr,
+        "force_coeff_delta": force_coeff_delta_arr,
+        "force_coeff_sigma": force_coeff_sigma_arr,
         "force_drag": force_drag_arr,
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
