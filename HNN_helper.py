@@ -148,7 +148,7 @@ class LossConfig:
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
-    rollout_loss_mode: str = "deterministic"  # "deterministic" or "stochastic"
+    rollout_loss_mode: str = "deterministic"  # "deterministic" | "stochastic_nll" | "stochastic_mse"
     rollout_stochastic_samples: int = 1
     rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
     rollout_det_steps_warmup_epochs: int = 0

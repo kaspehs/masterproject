@@ -141,11 +141,15 @@ def _rollout_loss_from_batch(
     if history0 is not None:
         history0 = history0.to(device, non_blocking=non_blocking)
     mode_key = str(rollout_loss_mode).strip().lower()
-    if mode_key not in {"deterministic", "stochastic"}:
-        raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
+    if mode_key == "stochastic":
+        mode_key = "stochastic_nll"
+    if mode_key not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
+        raise ValueError(
+            "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
+        )
     samples = max(1, int(rollout_stochastic_samples))
     batch_size = z0.shape[0]
-    if mode_key == "stochastic" and samples > 1:
+    if mode_key in {"stochastic_nll", "stochastic_mse"} and samples > 1:
         z0_in = z0.unsqueeze(0).expand(samples, *z0.shape).reshape(samples * batch_size, *z0.shape[1:])
         t_seq_in = t_seq.unsqueeze(0).expand(samples, *t_seq.shape).reshape(samples * batch_size, *t_seq.shape[1:])
         z_traj_ref = z_traj.unsqueeze(0)
@@ -166,13 +170,18 @@ def _rollout_loss_from_batch(
         )
         z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, 1, -1)
-        z_pred_scaled = z_pred / z_scale
-        z_true_scaled = z_traj_ref / z_scale
-        mu = torch.mean(z_pred_scaled, dim=0)
-        var = torch.mean((z_pred_scaled - mu.unsqueeze(0)) ** 2, dim=0)
-        var = torch.clamp(var, min=1e-6)
-        nll = 0.5 * (((z_true_scaled - mu) ** 2) / var + torch.log(var))
-        per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
+        if mode_key == "stochastic_nll":
+            z_pred_scaled = z_pred / z_scale
+            z_true_scaled = z_traj_ref / z_scale
+            mu = torch.mean(z_pred_scaled, dim=0)
+            var = torch.mean((z_pred_scaled - mu.unsqueeze(0)) ** 2, dim=0)
+            var = torch.clamp(var, min=1e-6)
+            nll = 0.5 * (((z_true_scaled - mu) ** 2) / var + torch.log(var))
+            per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
+        else:
+            err = (z_pred - z_traj_ref) / z_scale
+            per_samples = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
+            per = torch.mean(per_samples, dim=0)
     else:
         z_pred, _ = model.rollout(
             z0,
@@ -180,7 +189,7 @@ def _rollout_loss_from_batch(
             float(model.dt),
             reduced_velocity=ur0,
             history_init=history0,
-            stochastic=(mode_key == "stochastic"),
+            stochastic=(mode_key != "deterministic"),
             noise_scale=rollout_noise_scale,
         )
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
@@ -1418,12 +1427,19 @@ def train(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_det_weight must be non-negative.")
     if rollout_det_steps < 0:
         raise ValueError("loss.rollout_det_steps must be non-negative.")
-    if rollout_loss_mode not in {"deterministic", "stochastic"}:
-        raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic.")
+    if rollout_loss_mode == "stochastic":
+        rollout_loss_mode = "stochastic_nll"
+    if rollout_loss_mode not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
+        raise ValueError(
+            "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
+        )
     if rollout_stochastic_samples < 1:
         raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
-    if rollout_loss_mode == "stochastic" and rollout_det_weight > 0.0 and rollout_stochastic_samples < 2:
-        raise ValueError("loss.rollout_stochastic_samples must be >= 2 when loss.rollout_loss_mode=stochastic.")
+    if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_det_weight > 0.0 and rollout_stochastic_samples < 2:
+        raise ValueError(
+            "loss.rollout_stochastic_samples must be >= 2 when "
+            "loss.rollout_loss_mode is stochastic_nll or stochastic_mse."
+        )
     if rollout_det_steps_final < 0:
         raise ValueError("loss.rollout_det_steps_final must be non-negative.")
     if rollout_det_steps_warmup_epochs < 0:
@@ -1597,7 +1613,7 @@ def train(config: Config, config_name: str) -> None:
     if rollout_det_weight > 0.0:
         train_rollout_loader, val_rollout_loader, train_rollout_windows = _rebuild_rollout_loaders(current_rollout_det_steps)
         rollout_mode_msg = rollout_loss_mode
-        if rollout_loss_mode == "stochastic":
+        if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}:
             rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
         if rollout_det_steps_final > rollout_det_steps and rollout_det_steps_warmup_epochs > 0:
             print(
@@ -1670,7 +1686,7 @@ def train(config: Config, config_name: str) -> None:
     val_rollout_instances = len(val_rollout_loader.dataset) if val_rollout_loader is not None else 0
     val_rollout_steps_per_epoch = len(val_rollout_loader) if val_rollout_loader is not None else 0
     rollout_mode_msg = rollout_loss_mode
-    if rollout_loss_mode == "stochastic":
+    if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}:
         rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
     startup_lines = [
         f"Run name: {run_name}",

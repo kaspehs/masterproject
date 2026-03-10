@@ -102,10 +102,10 @@ loss:
   # Optional multi-step rollout loss.
   rollout_det_weight: 0.0
   rollout_det_steps: 0
-  # Rollout loss mode: deterministic | stochastic
+  # Rollout loss mode: deterministic | stochastic_nll | stochastic_mse
   rollout_loss_mode: deterministic
-  # Number of stochastic rollout samples K used to estimate Gaussian rollout NLL when
-  # rollout_loss_mode=stochastic. Must be >= 2 in stochastic mode.
+  # Number of stochastic rollout samples K used for stochastic rollout losses.
+  # Must be >= 2 when rollout_loss_mode is stochastic_nll or stochastic_mse.
   rollout_stochastic_samples: 1
   # Optional linear schedule for rollout length. <=0 keeps rollout_det_steps fixed.
   rollout_det_steps_final: 0
