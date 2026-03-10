@@ -513,22 +513,37 @@ def log_validation_epoch(
     force_coeff_pred = np.asarray(rollout["force_coeff_total"], dtype=float).reshape(-1)
     force_coeff_delta = np.asarray(rollout["force_coeff_delta"], dtype=float).reshape(-1)
     force_coeff_sigma = np.asarray(rollout["force_coeff_sigma"], dtype=float).reshape(-1)
-    plot_len = int(min(force_coeff_pred.size, force_coeff_delta.size, force_coeff_sigma.size, len(t)))
+    force_true = np.asarray(force_data, dtype=float).reshape(-1) if force_data is not None else np.asarray([], dtype=float)
+    plot_len = int(min(force_coeff_pred.size, force_coeff_delta.size, force_coeff_sigma.size, force_true.size, len(t)))
     if plot_len <= 0:
         return metrics
     t_force_plot = np.asarray(t, dtype=float)[:plot_len]
     zoom_mask_force = create_zoom_mask(t_force_plot)
-    middle_mask_force = create_window_mask(t_force_plot, middle_time_plot)
-    log_force_component_plots(
+    with torch.no_grad():
+        z_true_plot = torch.stack((y_data_t[:plot_len], val_vel[:plot_len] * float(m_eff)), dim=1).to(
+            device=device, non_blocking=(device.type == "cuda")
+        )
+        rv_plot = reduced_velocity
+        if not torch.is_tensor(rv_plot):
+            rv_plot = torch.as_tensor(rv_plot, dtype=z_true_plot.dtype)
+        rv_plot = rv_plot.to(device=z_true_plot.device, dtype=z_true_plot.dtype)
+        f0_plot_t = model._force_scale_from_reduced_velocity(
+            rv_plot[:plot_len] if rv_plot.ndim > 0 else rv_plot,
+            like=z_true_plot[..., :1],
+            state=z_true_plot,
+        ).squeeze(-1).detach().cpu().numpy()
+    f0_plot_t = np.asarray(f0_plot_t, dtype=float).reshape(-1)
+    f0_plot_t = np.clip(np.nan_to_num(f0_plot_t, nan=1.0, posinf=1.0, neginf=1.0), 1e-12, None)
+    force_coeff_true = force_true[:plot_len] / f0_plot_t[:plot_len]
+    log_force_plots_with_components(
         writer,
         epoch,
         t_force_plot,
         force_coeff_pred[:plot_len],
+        force_coeff_true,
         force_coeff_delta[:plot_len],
         force_coeff_sigma[:plot_len],
         zoom_mask_force,
-        middle_mask_force,
-        middle_time_plot,
         reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
         step=step,
@@ -2912,6 +2927,64 @@ def log_force_component_plots(
     ax_middle.grid(True, alpha=0.3)
     ax_middle.set_title(f"Force coefficient components ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_middle.legend(loc="upper right")
+
+    plt.tight_layout()
+    writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
+def log_force_plots_with_components(
+    writer,
+    epoch,
+    t,
+    force_coeff_pred,
+    force_coeff_true,
+    force_coeff_delta,
+    sigma_coeff,
+    zoom_mask,
+    reduced_velocity: float | None = None,
+    *,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    title_suffix: str = "",
+):
+    fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
+    ax_full, ax_diff, ax_zoom, ax_components = axes
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+
+    ax_full.plot(t, force_coeff_true, label="C_F (true)", color="tab:blue", alpha=0.7)
+    ax_full.plot(t, force_coeff_pred, label="C_F (pred)", color="tab:purple")
+    ax_full.set_xlabel("time")
+    ax_full.set_ylabel("C_F")
+    ax_full.grid(True, alpha=0.3)
+    ax_full.set_title(f"Force coefficient rollout at epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_full.legend(loc="upper right")
+
+    diff_force = force_coeff_pred - force_coeff_true
+    ax_diff.plot(t, diff_force, label="ΔC_F", color="tab:orange")
+    ax_diff.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax_diff.set_xlabel("time")
+    ax_diff.set_ylabel("ΔC_F")
+    ax_diff.grid(True, alpha=0.3)
+    ax_diff.set_title(f"Force coefficient difference (pred - true) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_diff.legend(loc="upper right")
+
+    ax_zoom.plot(t[zoom_mask], force_coeff_true[zoom_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
+    ax_zoom.plot(t[zoom_mask], force_coeff_pred[zoom_mask], label="C_F (pred)", color="tab:purple")
+    ax_zoom.set_xlabel("time")
+    ax_zoom.set_ylabel("C_F")
+    ax_zoom.grid(True, alpha=0.3)
+    ax_zoom.set_title(f"Force coefficient rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_zoom.legend(loc="upper right")
+
+    ax_components.plot(t, force_coeff_pred, label="mean C_F", color="tab:purple")
+    ax_components.plot(t, force_coeff_delta, label="corrected C_F", color="tab:orange")
+    ax_components.plot(t, sigma_coeff, label="sigma", color="tab:green")
+    ax_components.set_xlabel("time")
+    ax_components.set_ylabel("coefficient")
+    ax_components.grid(True, alpha=0.3)
+    ax_components.set_title(f"Force coefficient components epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_components.legend(loc="upper right")
 
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
