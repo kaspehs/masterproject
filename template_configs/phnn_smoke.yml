@@ -105,6 +105,12 @@ loss:
   equalize_rollout_over_ur_bins: false
   # Global reduced-velocity bin size used by the equalized loss aggregation above.
   ur_bin_size: 1.0e-6
+  # If true, normalize residual/physics loss by fixed training-set state std per U_r bin.
+  normalize_residual_by_ur_bin_std: false
+  # If true, normalize rollout loss by fixed training-set state std per U_r bin.
+  normalize_rollout_by_ur_bin_std: false
+  # Minimum positive floor for the per-bin state std used above.
+  ur_bin_scale_eps: 1.0e-6
   # Optional multi-step rollout loss.
   rollout_det_weight: 0.0
   rollout_det_steps: 0

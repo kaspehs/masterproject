@@ -161,6 +161,9 @@ class LossConfig:
     equalize_residual_over_ur_bins: bool = False
     equalize_rollout_over_ur_bins: bool = False
     ur_bin_size: float = 1e-6
+    normalize_residual_by_ur_bin_std: bool = False
+    normalize_rollout_by_ur_bin_std: bool = False
+    ur_bin_scale_eps: float = 1e-6
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
     rollout_loss_mode: str = "deterministic"  # "deterministic" | "stochastic_nll" | "stochastic_mse"
@@ -321,6 +324,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "equalize_residual_over_ur_bins",
         "equalize_rollout_over_ur_bins",
         "ur_bin_size",
+        "normalize_residual_by_ur_bin_std",
+        "normalize_rollout_by_ur_bin_std",
+        "ur_bin_scale_eps",
         "rollout_det_weight",
         "rollout_det_steps",
         "rollout_loss_mode",
@@ -413,6 +419,185 @@ def parse_config(raw: dict[str, Any]) -> Config:
         pinn=pinn_block,
         vpinn=vpinn_block,
     )
+
+
+def _ur_bin_id(value: float, ur_bin_size: float) -> int:
+    return int(np.rint(float(value) / float(ur_bin_size)))
+
+
+def build_ur_bin_state_scale_info_from_dataset(
+    dataset: Any,
+    *,
+    ur_tensor_index: int,
+    state_tensor_indices: Sequence[int],
+    ur_bin_size: float,
+    eps: float = 1e-6,
+) -> dict[str, Any]:
+    cache_key = (
+        "ur_bin_state_scales:"
+        f"{int(ur_tensor_index)}:"
+        f"{','.join(str(int(idx)) for idx in state_tensor_indices)}:"
+        f"{float(ur_bin_size):.12g}:"
+        f"{float(eps):.12g}"
+    )
+    cache = getattr(dataset, "_codex_cache", None)
+    if isinstance(cache, dict) and cache_key in cache:
+        return dict(cache[cache_key])
+
+    stats_by_bin: dict[int, dict[str, Any]] = {}
+    global_count = 0
+    global_sum = np.zeros(2, dtype=np.float64)
+    global_sumsq = np.zeros(2, dtype=np.float64)
+
+    def _accumulate(ds: Any) -> None:
+        nonlocal global_count, global_sum, global_sumsq
+        if isinstance(ds, ConcatDataset):
+            for subdataset in ds.datasets:
+                _accumulate(subdataset)
+            return
+        if not isinstance(ds, TensorDataset):
+            raise TypeError(f"Unsupported dataset type for U_r bin scales: {type(ds)!r}")
+        ur_tensor = ds.tensors[int(ur_tensor_index)]
+        ur_vals = ur_tensor.reshape(ur_tensor.shape[0], -1)[:, 0].detach().cpu().numpy()
+        state_arrays = [
+            ds.tensors[int(idx)].reshape(ds.tensors[int(idx)].shape[0], -1)[:, :2].detach().cpu().numpy()
+            for idx in state_tensor_indices
+        ]
+        repeated_ur = np.repeat(ur_vals, len(state_arrays))
+        stacked_states = np.concatenate(state_arrays, axis=0)
+        for ur_val, state_vec in zip(repeated_ur, stacked_states):
+            key = _ur_bin_id(float(ur_val), ur_bin_size)
+            stat = stats_by_bin.setdefault(
+                key,
+                {"count": 0, "sum": np.zeros(2, dtype=np.float64), "sumsq": np.zeros(2, dtype=np.float64)},
+            )
+            vec = np.asarray(state_vec, dtype=np.float64)
+            stat["count"] += 1
+            stat["sum"] += vec
+            stat["sumsq"] += vec * vec
+            global_count += 1
+            global_sum += vec
+            global_sumsq += vec * vec
+
+    def _finalize(count: int, sum_vec: np.ndarray, sumsq_vec: np.ndarray) -> np.ndarray:
+        denom = float(max(int(count), 1))
+        mean = sum_vec / denom
+        var = np.maximum(sumsq_vec / denom - mean * mean, 0.0)
+        return np.sqrt(var)
+
+    _accumulate(dataset)
+    global_scale = _finalize(global_count, global_sum, global_sumsq)
+    global_scale = np.maximum(global_scale, float(eps))
+    by_bin: dict[str, list[float]] = {}
+    for key, stat in stats_by_bin.items():
+        scale = _finalize(int(stat["count"]), stat["sum"], stat["sumsq"])
+        if not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
+            scale = global_scale.copy()
+        scale = np.maximum(scale, float(eps))
+        by_bin[str(int(key))] = [float(scale[0]), float(scale[1])]
+    out = {
+        "global": [float(global_scale[0]), float(global_scale[1])],
+        "by_bin": by_bin,
+    }
+    if cache is None or not isinstance(cache, dict):
+        cache = {}
+        setattr(dataset, "_codex_cache", cache)
+    cache[cache_key] = dict(out)
+    return out
+
+
+def lookup_ur_bin_state_scale_tensor(
+    ur_values: torch.Tensor | np.ndarray | float | None,
+    *,
+    scale_info: dict[str, Any] | None,
+    ur_bin_size: float,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if not scale_info:
+        return torch.ones((int(batch_size), 2), device=device, dtype=dtype)
+    global_scale = np.asarray(scale_info.get("global", [1.0, 1.0]), dtype=np.float64).reshape(2)
+    by_bin = dict(scale_info.get("by_bin", {}) or {})
+    if ur_values is None:
+        scale_arr = np.repeat(global_scale.reshape(1, 2), int(batch_size), axis=0)
+        return torch.as_tensor(scale_arr, device=device, dtype=dtype)
+    if torch.is_tensor(ur_values):
+        ur_flat = ur_values.reshape(-1).detach().cpu().numpy()
+    else:
+        ur_flat = np.asarray(ur_values, dtype=np.float64).reshape(-1)
+    if ur_flat.size == 1 and int(batch_size) > 1:
+        ur_flat = np.repeat(ur_flat, int(batch_size))
+    scales: list[list[float]] = []
+    for ur_val in ur_flat[: int(batch_size)]:
+        key = str(_ur_bin_id(float(ur_val), ur_bin_size))
+        scale = by_bin.get(key, global_scale.tolist())
+        scales.append([float(scale[0]), float(scale[1])])
+    if len(scales) < int(batch_size):
+        scales.extend([global_scale.tolist()] * (int(batch_size) - len(scales)))
+    return torch.as_tensor(scales, device=device, dtype=dtype)
+
+
+def scaled_residual_loss_per_sample(
+    model: "PHVIV",
+    zi: torch.Tensor,
+    zin: torch.Tensor,
+    reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+    *,
+    history_context: torch.Tensor | None = None,
+    ur_bin_state_scale_info: dict[str, Any] | None = None,
+    ur_bin_size: float = 1e-6,
+) -> torch.Tensor:
+    batch_size = int(zi.shape[0])
+    if model.use_stochastic_process_noise:
+        innovation, _sigma, var = model._momentum_transition_stats_srk4(
+            zi,
+            zin,
+            reduced_velocity=reduced_velocity,
+            history_context=history_context,
+        )
+        if ur_bin_state_scale_info is not None:
+            state_scale = lookup_ur_bin_state_scale_tensor(
+                reduced_velocity,
+                scale_info=ur_bin_state_scale_info,
+                ur_bin_size=ur_bin_size,
+                batch_size=batch_size,
+                device=innovation.device,
+                dtype=innovation.dtype,
+            )
+            p_scale = torch.clamp(state_scale[..., 1:2], min=1e-12)
+            innovation = innovation / p_scale
+            var = var / torch.clamp(p_scale * p_scale, min=1e-12)
+        nll = 0.5 * (innovation * innovation / var + torch.log(var))
+        return nll.squeeze(-1)
+
+    drift_rate, z_mid = model._srk4_drift_rate(
+        zi,
+        zin,
+        reduced_velocity=reduced_velocity,
+        history_context=history_context,
+    )
+    res = (zin - zi) - float(model.dt) * drift_rate
+    res_scaled = res / model.res_scale.to(device=res.device, dtype=res.dtype)
+    if model.force_output == "coefficient":
+        f0 = model._force_scale_from_reduced_velocity(
+            reduced_velocity,
+            like=res_scaled[..., 1:2],
+            state=z_mid,
+        )
+        res_scaled = res_scaled.clone()
+        res_scaled[..., 1:2] = res_scaled[..., 1:2] / torch.clamp(f0, min=1e-12)
+    if ur_bin_state_scale_info is not None:
+        state_scale = lookup_ur_bin_state_scale_tensor(
+            reduced_velocity,
+            scale_info=ur_bin_state_scale_info,
+            ur_bin_size=ur_bin_size,
+            batch_size=batch_size,
+            device=res_scaled.device,
+            dtype=res_scaled.dtype,
+        )
+        res_scaled = res_scaled / torch.clamp(state_scale, min=1e-12)
+    return torch.sum(res_scaled * res_scaled, dim=1)
 
 
 def log_training_metrics(
