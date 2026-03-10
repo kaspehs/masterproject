@@ -710,6 +710,8 @@ def _validate_if_needed(
             mean_reg_norm=mean_reg_norm,
             force_reg=force_reg,
             sigma_reg_norm=sigma_reg_norm,
+            equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
+            equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
             normalize_residual_by_ur_bin_std=normalize_residual_by_ur_bin_std,
             normalize_rollout_by_ur_bin_std=normalize_rollout_by_ur_bin_std,
             ur_bin_state_scale_info=ur_bin_state_scale_info,
