@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,6 +40,17 @@ SPECTRAL_ERROR_FMAX_HZ = 5.0
 SPECTRAL_ERROR_NPERSEG = 1024
 ROLLOUT_DIVERGENCE_ABS_Y_NORM_LIMIT = 1e3
 ROLLOUT_DIVERGENCE_REL_Y_NORM_MULTIPLIER = 20.0
+
+SIGNED_PHASE_CMAP = LinearSegmentedColormap.from_list(
+    "signed_phase_map",
+    [
+        (0.00, "#2b6cb0"),
+        (0.35, "#7fb3d5"),
+        (0.50, "#b8b8b8"),
+        (0.65, "#f4a3a3"),
+        (1.00, "#b22222"),
+    ],
+)
 
 @dataclass
 class DataConfig:
@@ -2972,7 +2984,27 @@ def log_phase_component_plots(
     p_pred = np.asarray(p_norm_pred, dtype=float).reshape(-1)
 
     for ax, (label, values, title) in zip(axes, component_specs):
-        cmap = ax.contourf(q_grid, p_grid, values, levels=20, cmap="viridis")
+        finite_vals = values[np.isfinite(values)]
+        if label in {"a", "delta a"}:
+            vmax = float(np.max(np.abs(finite_vals))) if finite_vals.size > 0 else 1.0
+            vmax = max(vmax, 1e-12)
+            levels = np.linspace(-vmax, vmax, 21)
+            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+            cmap = ax.contourf(q_grid, p_grid, values, levels=levels, cmap=SIGNED_PHASE_CMAP, norm=norm)
+        else:
+            vmin = float(np.min(finite_vals)) if finite_vals.size > 0 else 0.0
+            vmax = float(np.max(finite_vals)) if finite_vals.size > 0 else 1.0
+            if not np.isfinite(vmin):
+                vmin = 0.0
+            if not np.isfinite(vmax) or vmax <= vmin:
+                vmax = vmin + 1e-12
+            levels = np.linspace(vmin, vmax, 21)
+            sigma_cmap = LinearSegmentedColormap.from_list(
+                "sigma_phase_map",
+                [(0.0, "#b8b8b8"), (1.0, "#2ca02c")],
+            )
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            cmap = ax.contourf(q_grid, p_grid, values, levels=levels, cmap=sigma_cmap, norm=norm)
         ax.plot(q_true, p_true, color="white", linewidth=1.4, alpha=0.9, linestyle="--", label="val traj")
         ax.plot(q_pred, p_pred, color="black", linewidth=1.0, alpha=0.9, label="rollout")
         ax.plot(q_pred[0], p_pred[0], marker="o", color="red", markersize=3)
