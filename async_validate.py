@@ -1171,6 +1171,8 @@ def _per_ur_loss_map_hnn(
     mean_reg_norm: str,
     force_reg: float,
     sigma_reg_norm: str,
+    equalize_residual_over_ur_bins: bool = False,
+    equalize_rollout_over_ur_bins: bool = False,
     normalize_residual_by_ur_bin_std: bool,
     normalize_rollout_by_ur_bin_std: bool,
     ur_bin_state_scale_info: dict[str, Any] | None,
