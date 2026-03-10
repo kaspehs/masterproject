@@ -680,6 +680,8 @@ class GradNormBalancer:
         self.latest_grad_norms = {name: torch.tensor(0.0, device=self.device) for name in self.names}
 
     def _grad_norm(self, loss: torch.Tensor) -> torch.Tensor:
+        if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+            return torch.tensor(0.0, device=self.device)
         grads = torch.autograd.grad(
             loss,
             self.params,
@@ -1752,6 +1754,8 @@ class PHVIV(nn.Module):
         history_window: torch.Tensor | np.ndarray | None = None,
         history_context: torch.Tensor | None = None,
     ):
+        if not self.use_stochastic_process_noise:
+            return torch.zeros_like(x[..., :1])
         raw = self._sigma_net_raw(
             x,
             reduced_velocity=reduced_velocity,

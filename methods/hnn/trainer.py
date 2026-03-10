@@ -351,14 +351,16 @@ def _train_one_epoch(
             if gradnorm_balancer is not None:
                 loss_inputs: dict[str, torch.Tensor] = {
                     "residual": res_loss.float(),
-                    "sigma": base_sigma_reg_loss.float(),
-                    "data": data_force_loss.float() if use_force_data_loss else res_loss.float(),
                 }
-                if float(mean_reg) > 0.0:
+                if "sigma" in gradnorm_balancer.names:
+                    loss_inputs["sigma"] = base_sigma_reg_loss.float()
+                if "data" in gradnorm_balancer.names:
+                    loss_inputs["data"] = data_force_loss.float()
+                if "mean" in gradnorm_balancer.names:
                     loss_inputs["mean"] = base_mean_reg_loss.float()
                 weights = gradnorm_balancer.update(loss_inputs)
                 res_weight = weights["residual"]
-                sigma_weight = weights["sigma"]
+                sigma_weight = weights.get("sigma", res_loss.new_tensor(1.0))
                 mean_weight = weights.get("mean", res_loss.new_tensor(1.0))
                 data_weight = weights.get("data", res_loss.new_tensor(1.0))
                 gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
@@ -1664,19 +1666,24 @@ def train(config: Config, config_name: str) -> None:
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(loss_cfg.use_gradnorm):
-        names = ["residual", "sigma"]
+        names = ["residual"]
+        if bool(getattr(model_cfg, "use_stochastic_process_noise", False)) and force_reg > 0.0:
+            names.append("sigma")
         if mean_reg > 0.0:
             names.append("mean")
-        if use_force_data_loss:
+        if use_force_data_loss and force_data_weight > 0.0:
             names.append("data")
-        gradnorm_balancer = GradNormBalancer(
-            model,
-            names,
-            alpha=float(loss_cfg.gradnorm_alpha),
-            eps=float(loss_cfg.gradnorm_eps),
-            min_weight=float(loss_cfg.gradnorm_min_weight),
-            max_weight=float(loss_cfg.gradnorm_max_weight),
-        )
+        if len(names) >= 2:
+            gradnorm_balancer = GradNormBalancer(
+                model,
+                names,
+                alpha=float(loss_cfg.gradnorm_alpha),
+                eps=float(loss_cfg.gradnorm_eps),
+                min_weight=float(loss_cfg.gradnorm_min_weight),
+                max_weight=float(loss_cfg.gradnorm_max_weight),
+            )
+        else:
+            print("loss.use_gradnorm is True but fewer than two differentiable HNN losses are active; skipping GradNorm.")
 
     amp_enabled, amp_dtype, scaler = setup_amp(
         device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype)
