@@ -2861,81 +2861,126 @@ def log_force_component_plots(
     plt.close(fig)
 
 
-def _phase_value_grid(
+def _phase_plot_extent(
     q_norm: np.ndarray,
     p_norm: np.ndarray,
-    values: np.ndarray,
     *,
     bins: int = 96,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    extent_scale: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
     q = np.asarray(q_norm, dtype=float).reshape(-1)
     p = np.asarray(p_norm, dtype=float).reshape(-1)
-    v = np.asarray(values, dtype=float).reshape(-1)
-    mask = np.isfinite(q) & np.isfinite(p) & np.isfinite(v)
+    mask = np.isfinite(q) & np.isfinite(p)
     q = q[mask]
     p = p[mask]
-    v = v[mask]
     if q.size < 4:
-        raise ValueError("Need at least four finite samples to build a phase-space grid.")
+        raise ValueError("Need at least four finite samples to build a phase-space extent.")
 
-    q_min, q_max = float(np.min(q)), float(np.max(q))
-    p_min, p_max = float(np.min(p)), float(np.max(p))
-    if q_min == q_max:
-        q_min -= 1e-6
-        q_max += 1e-6
-    if p_min == p_max:
-        p_min -= 1e-6
-        p_max += 1e-6
+    q_center = 0.5 * (float(np.min(q)) + float(np.max(q)))
+    p_center = 0.5 * (float(np.min(p)) + float(np.max(p)))
+    q_radius = max(1e-6, float(np.max(np.abs(q - q_center))))
+    p_radius = max(1e-6, float(np.max(np.abs(p - p_center))))
+    q_half = float(extent_scale) * q_radius
+    p_half = float(extent_scale) * p_radius
+    q_vals = np.linspace(q_center - q_half, q_center + q_half, int(max(16, bins)))
+    p_vals = np.linspace(p_center - p_half, p_center + p_half, int(max(16, bins)))
+    return q_vals, p_vals
 
-    q_edges = np.linspace(q_min, q_max, int(max(8, bins)) + 1)
-    p_edges = np.linspace(p_min, p_max, int(max(8, bins)) + 1)
-    weighted_sum, _, _ = np.histogram2d(q, p, bins=[q_edges, p_edges], weights=v)
-    counts, _, _ = np.histogram2d(q, p, bins=[q_edges, p_edges])
-    mean_grid = np.divide(
-        weighted_sum,
-        counts,
-        out=np.full_like(weighted_sum, np.nan, dtype=float),
-        where=counts > 0,
-    )
-    return q_edges, p_edges, mean_grid.T
+
+def _nearest_history_context_grid(
+    q_grid: np.ndarray,
+    p_grid: np.ndarray,
+    q_ref: np.ndarray,
+    p_ref: np.ndarray,
+    history_context: np.ndarray | None,
+) -> np.ndarray | None:
+    if history_context is None:
+        return None
+    ctx = np.asarray(history_context, dtype=float)
+    if ctx.ndim != 2 or ctx.shape[0] == 0:
+        return None
+    q_ref_arr = np.asarray(q_ref, dtype=float).reshape(-1)
+    p_ref_arr = np.asarray(p_ref, dtype=float).reshape(-1)
+    ref = np.stack([q_ref_arr, p_ref_arr], axis=1)
+    grid = np.stack([q_grid.reshape(-1), p_grid.reshape(-1)], axis=1)
+    dist2 = np.sum((grid[:, None, :] - ref[None, :, :]) ** 2, axis=2)
+    nearest = np.argmin(dist2, axis=1)
+    return ctx[nearest]
 
 
 def log_phase_component_plots(
     writer,
     epoch,
-    q_norm,
-    p_norm,
-    force_coeff_pred,
-    sigma_coeff,
-    force_coeff_delta: np.ndarray | None = None,
+    model: "PHVIV",
+    q_norm_true,
+    p_norm_true,
+    q_norm_pred,
+    p_norm_pred,
     reduced_velocity: float | None = None,
     *,
+    D: float,
+    k: float,
+    m_eff: float,
+    device: torch.device,
+    history_context: np.ndarray | None = None,
     tag_prefix: str = "final_val/phase",
     step: int | None = None,
     title_suffix: str = "",
     bins: int = 96,
+    extent_scale: float = 2.0,
 ):
+    q_vals, p_vals = _phase_plot_extent(q_norm_true, p_norm_true, bins=bins, extent_scale=extent_scale)
+    q_grid, p_grid = np.meshgrid(q_vals, p_vals, indexing="xy")
+    omega = math.sqrt(float(k) / float(m_eff))
+    q_phys = q_grid.reshape(-1) * float(D)
+    v_phys = p_grid.reshape(-1) * (omega * float(D))
+    p_phys = v_phys * float(m_eff)
+    state = torch.stack(
+        [
+            torch.as_tensor(q_phys, dtype=torch.float32, device=device),
+            torch.as_tensor(p_phys, dtype=torch.float32, device=device),
+        ],
+        dim=1,
+    )
+    rv_value = 0.0 if reduced_velocity is None else float(reduced_velocity)
+    rv = torch.full((state.shape[0], 1), rv_value, dtype=state.dtype, device=device)
+    ctx_grid_np = _nearest_history_context_grid(q_grid, p_grid, q_norm_pred, p_norm_pred, history_context)
+    ctx_grid = None
+    if ctx_grid_np is not None:
+        ctx_grid = torch.as_tensor(ctx_grid_np, dtype=state.dtype, device=device)
+    with torch.no_grad():
+        coeff_total, coeff_delta, coeff_sigma = _force_component_coefficients(model, state, rv, ctx_grid)
+    coeff_total_grid = coeff_total.detach().cpu().numpy().reshape(q_grid.shape)
+    coeff_sigma_grid = coeff_sigma.detach().cpu().numpy().reshape(q_grid.shape)
+    coeff_delta_grid = coeff_delta.detach().cpu().numpy().reshape(q_grid.shape)
+
     component_specs: list[tuple[str, np.ndarray, str]] = [
-        ("a", np.asarray(force_coeff_pred, dtype=float), "Force coefficient a"),
-        ("sigma", np.asarray(sigma_coeff, dtype=float), "Sigma coefficient"),
+        ("a", coeff_total_grid, "Force coefficient a"),
+        ("sigma", coeff_sigma_grid, "Sigma coefficient"),
     ]
-    if force_coeff_delta is not None:
-        delta_arr = np.asarray(force_coeff_delta, dtype=float)
-        if np.any(np.abs(delta_arr) > 0.0):
-            component_specs.append(("delta a", delta_arr, "Correction coefficient delta a"))
+    if np.any(np.abs(coeff_delta_grid) > 0.0):
+        component_specs.append(("delta a", coeff_delta_grid, "Correction coefficient delta a"))
 
     fig, axes = plt.subplots(1, len(component_specs), figsize=(6 * len(component_specs), 5), sharex=True, sharey=True)
     if not isinstance(axes, np.ndarray):
         axes = np.asarray([axes])
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
 
+    q_true = np.asarray(q_norm_true, dtype=float).reshape(-1)
+    p_true = np.asarray(p_norm_true, dtype=float).reshape(-1)
+    q_pred = np.asarray(q_norm_pred, dtype=float).reshape(-1)
+    p_pred = np.asarray(p_norm_pred, dtype=float).reshape(-1)
+
     for ax, (label, values, title) in zip(axes, component_specs):
-        q_edges, p_edges, grid = _phase_value_grid(q_norm, p_norm, values, bins=bins)
-        cmap = ax.contourf(q_edges[:-1], p_edges[:-1], grid, levels=20, cmap="viridis")
+        cmap = ax.contourf(q_grid, p_grid, values, levels=20, cmap="viridis")
+        ax.plot(q_true, p_true, color="white", linewidth=1.4, alpha=0.9, linestyle="--", label="val traj")
+        ax.plot(q_pred, p_pred, color="black", linewidth=1.0, alpha=0.9, label="rollout")
+        ax.plot(q_pred[0], p_pred[0], marker="o", color="red", markersize=3)
         ax.set_xlabel("y/D")
         ax.set_ylabel("v/(omega D)")
         ax.set_title(f"{title}{ur_title}{title_suffix}")
         ax.grid(True, alpha=0.15)
+        ax.legend(loc="upper right")
         cbar = fig.colorbar(cmap, ax=ax)
         cbar.set_label(label)
 
@@ -3957,6 +4002,7 @@ def rollout_model(
         history_window = observed_history[warmup_steps : warmup_steps + 1]
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
+    history_contexts: list[torch.Tensor] | None = [] if model.use_history_tcn else None
     force_total: list[torch.Tensor] = []
     force_coeff_total: list[torch.Tensor] = []
     force_coeff_delta: list[torch.Tensor] = []
@@ -3980,6 +4026,8 @@ def rollout_model(
             )
             y_samples.append(state_obs[0, 0].detach())
             p_samples.append(state_obs[0, 1].detach())
+            if history_contexts is not None and ctx is not None:
+                history_contexts.append(ctx[0].detach())
             model_force = model.learned_force(
                 state_obs,
                 reduced_velocity=rv_step,
@@ -4018,6 +4066,8 @@ def rollout_model(
             )
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
+            if history_contexts is not None and ctx is not None:
+                history_contexts.append(ctx[0].detach())
             model_force = model.learned_force(
                 state,
                 reduced_velocity=rv_step,
@@ -4092,6 +4142,9 @@ def rollout_model(
     force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
     force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
+    history_context_arr = None
+    if history_contexts:
+        history_context_arr = torch.stack(history_contexts).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
@@ -4102,6 +4155,7 @@ def rollout_model(
         "force_drag": force_drag_arr,
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
+        "history_context": history_context_arr,
     }
 
 
@@ -4160,6 +4214,7 @@ def rollout_model_with_progress(
         history_window = observed_history[warmup_steps : warmup_steps + 1]
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
+    history_contexts: list[torch.Tensor] | None = [] if model.use_history_tcn else None
     force_total: list[torch.Tensor] = []
     force_coeff_total: list[torch.Tensor] = []
     force_coeff_delta: list[torch.Tensor] = []
@@ -4179,6 +4234,8 @@ def rollout_model_with_progress(
             )
             y_samples.append(state_obs[0, 0].detach())
             p_samples.append(state_obs[0, 1].detach())
+            if history_contexts is not None and ctx is not None:
+                history_contexts.append(ctx[0].detach())
             model_force = model.learned_force(
                 state_obs,
                 reduced_velocity=rv_step,
@@ -4220,6 +4277,8 @@ def rollout_model_with_progress(
             )
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
+            if history_contexts is not None and ctx is not None:
+                history_contexts.append(ctx[0].detach())
             model_force = model.learned_force(
                 state,
                 reduced_velocity=rv_step,
@@ -4279,6 +4338,9 @@ def rollout_model_with_progress(
     force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
     force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
+    history_context_arr = None
+    if history_contexts:
+        history_context_arr = torch.stack(history_contexts).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
@@ -4289,4 +4351,5 @@ def rollout_model_with_progress(
         "force_drag": force_drag_arr,
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
+        "history_context": history_context_arr,
     }
