@@ -21,8 +21,8 @@ except ImportError:
     tqdm = None
 
 
-DEFAULT_INPUT_DIR = Path("Experimental_Data/npz_exports_v2_60s_zero_mean")
-DEFAULT_OUTPUT_DIR = Path("Experimental_Data/repeatability_floor_v2_60s")
+DEFAULT_INPUT_DIR = Path("Experimental_Data/npz_exports__v2_zero_mean")
+DEFAULT_OUTPUT_DIR = Path("Experimental_Data/repeatability_floor_v2")
 DEFAULT_PATTERN = "*.npz"
 DEFAULT_UR_DECIMALS = 0
 DEFAULT_MAX_DURATION_S = 60.0
@@ -116,16 +116,16 @@ def spectral_relative_error(true_signal: np.ndarray, model_signal: np.ndarray, d
     window = np.hanning(length)
     true_proc = (true_trim - np.mean(true_trim)) * window
     model_proc = (model_trim - np.mean(model_trim)) * window
-    true_fft = np.abs(np.fft.rfft(true_proc))
-    model_fft = np.abs(np.fft.rfft(model_proc))
-    if true_fft.size == 0:
+    true_psd = np.abs(np.fft.rfft(true_proc)) ** 2
+    model_psd = np.abs(np.fft.rfft(model_proc)) ** 2
+    if true_psd.size == 0:
         return float("nan")
-    true_fft[0] = 0.0
-    model_fft[0] = 0.0
-    denom = np.linalg.norm(true_fft)
+    true_psd[0] = 0.0
+    model_psd[0] = 0.0
+    denom = np.sum(np.abs(true_psd))
     if denom <= eps:
         return float("nan")
-    return float(np.linalg.norm(model_fft - true_fft) / (denom + eps))
+    return float(np.sum(np.abs(model_psd - true_psd)) / (denom + eps))
 
 
 def _parse_args() -> argparse.Namespace:
