@@ -810,11 +810,8 @@ def compute_validation_metrics(
     if min_len_y > 1:
         y_pred_aligned = y_pred[:min_len_y]
         y_true_aligned = y_true[:min_len_y]
-        half_idx_disp = min_len_y // 2
-        y_true_half = y_true_aligned[half_idx_disp:]
-        y_pred_half = y_pred_aligned[half_idx_disp:]
-        if y_true_half.size > 0 and y_pred_half.size > 0:
-            disp_spectral_rel = spectral_l2_relative_error(y_true_half, y_pred_half, dt)
+        if y_true_aligned.size > 0 and y_pred_aligned.size > 0:
+            disp_spectral_rel = spectral_l1_relative_error(y_true_aligned, y_pred_aligned, dt)
             if np.isfinite(disp_spectral_rel):
                 metrics[DISP_SPECTRAL_REL_ERROR_KEY] = float(disp_spectral_rel)
 
@@ -837,11 +834,8 @@ def compute_validation_metrics(
         if min_len_force > 1:
             force_pred_aligned = force_total_pred[:min_len_force]
             force_true_aligned = force_target[:min_len_force]
-            half_idx_force = min_len_force // 2
-            force_true_half = force_true_aligned[half_idx_force:]
-            force_pred_half = force_pred_aligned[half_idx_force:]
-            if force_true_half.size > 0 and force_pred_half.size > 0:
-                force_spectral_rel = spectral_l2_relative_error(force_true_half, force_pred_half, dt)
+            if force_true_aligned.size > 0 and force_pred_aligned.size > 0:
+                force_spectral_rel = spectral_l1_relative_error(force_true_aligned, force_pred_aligned, dt)
                 if np.isfinite(force_spectral_rel):
                     metrics[FORCE_SPECTRAL_REL_ERROR_KEY] = float(force_spectral_rel)
     return metrics
@@ -1268,6 +1262,76 @@ def spectral_l2_relative_error(
     if denom <= eps:
         return float("nan")
     rel = float(np.linalg.norm(p_model - p_true) / (denom + eps))
+    if not np.isfinite(rel):
+        return float("nan")
+    return rel
+
+
+def spectral_l1_relative_error(
+    true_signal: np.ndarray,
+    model_signal: np.ndarray,
+    dt: float,
+    fmin_hz: float = SPECTRAL_ERROR_FMIN_HZ,
+    fmax_hz: float = SPECTRAL_ERROR_FMAX_HZ,
+    nperseg: int = SPECTRAL_ERROR_NPERSEG,
+    eps: float = 1e-12,
+) -> float:
+    """Compute L1 relative error between band-limited PSDs."""
+    if dt <= 0.0:
+        return float("nan")
+    true_signal = np.asarray(true_signal, dtype=float).reshape(-1)
+    model_signal = np.asarray(model_signal, dtype=float).reshape(-1)
+    length = min(true_signal.size, model_signal.size)
+    if length < 8:
+        return float("nan")
+    true_trim = true_signal[-length:]
+    model_trim = model_signal[-length:]
+    true_proc = true_trim - np.mean(true_trim)
+    model_proc = model_trim - np.mean(model_trim)
+
+    if welch is not None:
+        fs = 1.0 / float(dt)
+        seg = int(max(8, min(int(nperseg), length)))
+        ov = seg // 2
+        freqs, true_psd = welch(
+            true_proc,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend=False,
+            scaling="density",
+        )
+        _, model_psd = welch(
+            model_proc,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend=False,
+            scaling="density",
+        )
+    else:
+        freqs = np.fft.rfftfreq(length, d=float(dt))
+        true_psd = np.abs(np.fft.rfft(true_proc)) ** 2
+        model_psd = np.abs(np.fft.rfft(model_proc)) ** 2
+
+    if freqs.size == 0:
+        return float("nan")
+
+    band = np.isfinite(freqs)
+    band = band & (freqs >= float(fmin_hz))
+    if np.isfinite(float(fmax_hz)) and float(fmax_hz) > 0.0:
+        band = band & (freqs <= float(fmax_hz))
+    if np.count_nonzero(band) < 2:
+        return float("nan")
+
+    p_true = np.clip(true_psd[band], a_min=0.0, a_max=None)
+    p_model = np.clip(model_psd[band], a_min=0.0, a_max=None)
+    denom = float(np.sum(np.abs(p_true)))
+    if denom <= eps:
+        return float("nan")
+    rel = float(np.sum(np.abs(p_model - p_true)) / (denom + eps))
     if not np.isfinite(rel):
         return float("nan")
     return rel
