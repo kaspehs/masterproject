@@ -157,6 +157,7 @@ monitoring:
   # If true, validation metric sampling uses a fixed seed across epochs for stability.
   fixed_validation_sampling: false
   validation_sampling_seed: 1
+  validation_samples_per_ur: 1
   # If true and exactly one train_exclude_ur is configured, validation rollout
   # will target that excluded U_r.
   rollout_use_excluded_ur: false

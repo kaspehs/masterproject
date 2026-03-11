@@ -39,6 +39,7 @@ from HNN_helper import (
     preprocess_timeseries,
     resolve_cut_start_seconds,
     resolve_middle_time_plot,
+    sample_indices_per_ur,
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
 )
@@ -342,6 +343,7 @@ def _run_hnn_validation(
     loss_cfg = cfg.loss
     fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
     validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+    validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
@@ -588,7 +590,11 @@ def _run_hnn_validation(
             ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
             ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
         sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
-        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=sample_seed)
+        sampled_indices = sample_indices_per_ur(
+            ur_for_sampling,
+            samples_per_ur=validation_samples_per_ur,
+            seed=sample_seed,
+        )
         for idx in sampled_indices:
             series_raw = val_series_raw[idx]
             sequence = val_sequences[idx]
@@ -695,6 +701,7 @@ def _run_vpinn_validation(
     velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
     fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
     validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+    validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
@@ -858,7 +865,11 @@ def _run_vpinn_validation(
     if do_rollout:
         ur_values_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
         sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
-        sampled_metric_indices = sample_one_index_per_ur(ur_values_all, seed=sample_seed)
+        sampled_metric_indices = sample_indices_per_ur(
+            ur_values_all,
+            samples_per_ur=validation_samples_per_ur,
+            seed=sample_seed,
+        )
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         for sidx in sampled_metric_indices:

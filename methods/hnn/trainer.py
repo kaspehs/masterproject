@@ -49,6 +49,7 @@ from HNN_helper import (
     rollout_model,
     scaled_residual_loss_per_sample,
     resolve_cut_start_seconds,
+    sample_indices_per_ur,
     sample_one_index_per_ur,
 )
 
@@ -658,6 +659,7 @@ def _validate_if_needed(
     cycle_validation_rollout: bool,
     fixed_validation_sampling: bool,
     validation_sampling_seed: int,
+    validation_samples_per_ur: int,
     rollout_target_ur: float | None,
     rollout_target_ur_tol: float,
     m_eff: float,
@@ -780,7 +782,11 @@ def _validate_if_needed(
             ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
             ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
         sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
-        sampled_indices = sample_one_index_per_ur(ur_for_sampling, seed=sample_seed)
+        sampled_indices = sample_indices_per_ur(
+            ur_for_sampling,
+            samples_per_ur=validation_samples_per_ur,
+            seed=sample_seed,
+        )
         for idx in sampled_indices:
             series_raw = val_series_raw[idx]
             sequence = val_sequences[idx]
@@ -1727,6 +1733,7 @@ def train(config: Config, config_name: str) -> None:
     cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
     fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
     validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+    validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
     rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
     log_every_epochs = max(1, int(monitoring_cfg.log_every_epochs))
@@ -1984,7 +1991,8 @@ def train(config: Config, config_name: str) -> None:
         ),
         (
             f"Monitoring: validate_every={validate_every_epochs}, rollout_every={rollout_every_epochs}, "
-            f"print_every={print_every_epochs}, log_every={log_every_epochs}, async_validation={async_validation}"
+            f"print_every={print_every_epochs}, log_every={log_every_epochs}, async_validation={async_validation}, "
+            f"val_samples_per_ur={validation_samples_per_ur}"
         ),
     ]
     if rollout_det_weight > 0.0 and current_rollout_det_steps > 0:
@@ -2181,6 +2189,7 @@ def train(config: Config, config_name: str) -> None:
                 cycle_validation_rollout=cycle_validation_rollout,
                 fixed_validation_sampling=fixed_validation_sampling,
                 validation_sampling_seed=validation_sampling_seed,
+                validation_samples_per_ur=validation_samples_per_ur,
                 rollout_target_ur=rollout_target_ur,
                 rollout_target_ur_tol=rollout_target_ur_tol,
                 m_eff=m_eff,

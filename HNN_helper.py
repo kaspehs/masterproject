@@ -210,6 +210,7 @@ class MonitoringConfig:
     cycle_validation_rollout: bool = False
     fixed_validation_sampling: bool = False
     validation_sampling_seed: int = 1
+    validation_samples_per_ur: int = 1
     rollout_use_excluded_ur: bool = False
     rollout_target_ur_tol: float = 1e-6
     final_rollout_all_validation: bool = False
@@ -359,6 +360,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "log_extra_validation_metrics",
         "fixed_validation_sampling",
         "validation_sampling_seed",
+        "validation_samples_per_ur",
         "rollout_use_excluded_ur",
         "rollout_target_ur_tol",
     }
@@ -1075,16 +1077,18 @@ def relative_error(model_value: float, true_value: float, eps: float = 1e-12) ->
     return float((model_value - true_value) / (denom + eps))
 
 
-def sample_one_index_per_ur(
+def sample_indices_per_ur(
     ur_values: Sequence[float],
     *,
+    samples_per_ur: int = 1,
     seed: int | None = None,
     decimals: int = 6,
 ) -> list[int]:
     """
-    Pick one random index per reduced-velocity bucket.
+    Pick up to `samples_per_ur` random indices per reduced-velocity bucket.
     Buckets are formed by rounding U_r to `decimals`.
     """
+    samples_per_ur = max(1, int(samples_per_ur))
     buckets: dict[float, list[int]] = {}
     for idx, ur in enumerate(ur_values):
         if not np.isfinite(float(ur)):
@@ -1097,12 +1101,26 @@ def sample_one_index_per_ur(
     selected: list[int] = []
     for key in sorted(buckets):
         candidates = buckets[key]
-        if len(candidates) == 1:
-            selected.append(candidates[0])
-        else:
-            pick = int(rng.integers(0, len(candidates)))
-            selected.append(candidates[pick])
+        if len(candidates) <= samples_per_ur:
+            selected.extend(int(idx) for idx in candidates)
+            continue
+        picks = rng.choice(len(candidates), size=samples_per_ur, replace=False)
+        selected.extend(int(candidates[int(pick)]) for pick in np.sort(picks))
     return selected
+
+
+def sample_one_index_per_ur(
+    ur_values: Sequence[float],
+    *,
+    seed: int | None = None,
+    decimals: int = 6,
+) -> list[int]:
+    return sample_indices_per_ur(
+        ur_values,
+        samples_per_ur=1,
+        seed=seed,
+        decimals=decimals,
+    )
 
 
 def spectral_relative_error(
