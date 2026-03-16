@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, TensorDataset
 
 from core.logging import setup_writer
 from core.optim import setup_optimizer_and_scheduler
