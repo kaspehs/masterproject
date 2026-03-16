@@ -2479,6 +2479,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 print(
                     f"[td-val][vpinn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
                     f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+                    f"dt={float(dt):.6g} rho={float(rho):.6g} D={float(diameter):.6g} "
                     f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
                     f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
                     f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
