@@ -8,14 +8,14 @@ data:
   cut_start_seconds_train: 0.0
   cut_start_seconds_val: 0.0
   reduce_time: true
-  reduction_factor: 8
+  reduction_factor: 5
   middle_time_plot: [15, 17]
   use_generated_train_series: true
-  train_series_dir: Experimental_Data/CF_corrected_v3
+   train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
 
 model:
-  rho: 1000.0
-  D: 0.1
+  rho: 1.0
+  D: 1.0
   structural_mass: 16.79
   Ca: 1.0
   k: 1218.0
@@ -33,7 +33,7 @@ model:
   fourier_sigma: 1.0
   use_feature_engineering: false
   # Learn heteroscedastic process noise in the momentum channel (PHNN-only).
-  use_stochastic_process_noise: true
+  use_stochastic_process_noise: false
   sigma_min: 1.0e-6
   # History-augmented PHNN (base Markovian + optional TCN correction).
   use_history_tcn: false
@@ -57,14 +57,14 @@ smoothing:
   polyorder: 3
 
 architecture:
-  force_net_type: pirate
+  force_net_type: mlp
   residual_kwargs:
     hidden: 128
     layers: 2
     activation: gelu
   mlp_kwargs:
     hidden: 128
-    layers: 3
+    layers: 2
     activation: gelu
   pirate_force_kwargs:
     depth: 1
@@ -74,9 +74,9 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 4096
+  batch_size: 1024
   max_grad_norm: 20.0
-  epochs: 200
+  epochs: 2000
 
 optim:
   lr: 0.001
@@ -96,7 +96,7 @@ loss:
   # Norm for mean-force regularizer: l1 | l2
   mean_reg_norm: l1
   # Sigma regularization weight (for stochastic PHNN this regularizes diffusion sigma).
-  sigma_reg: 0.1
+  sigma_reg: 0.0
   # Norm for sigma regularizer: l1 | l2
   sigma_reg_norm: l2
   # If true, average the residual/physics loss equally over reduced-velocity bins.
@@ -150,8 +150,8 @@ compile:
   compile_mode: reduce-overhead
 
 monitoring:
-  rollout_every_epochs: 20
-  validate_every_epochs: 20
+  rollout_every_epochs: 50
+  validate_every_epochs: 50
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
   # If true, validation metric sampling uses a fixed seed across epochs for stability.
@@ -160,7 +160,7 @@ monitoring:
   validation_samples_per_ur: 1
   # If true and exactly one train_exclude_ur is configured, validation rollout
   # will target that excluded U_r.
-  rollout_use_excluded_ur: false
+  rollout_use_excluded_ur: true
   rollout_target_ur_tol: 1e-6
   final_rollout_all_validation: true
   log_every_epochs: 10
@@ -191,12 +191,12 @@ hnn: # file or compute
   # Validation/final rollout sampling:
   # false -> deterministic drift-only rollout
   # true  -> stochastic momentum rollout using learned sigma_theta
-  rollout_stochastic: true
+  rollout_stochastic: false
   rollout_noise_scale: 1.0
   rollout_seed: null
   # Optional training-only U_r filtering when using generated series.
   # Validation loading is unchanged.
   train_include_ur: null
-  train_exclude_ur: []
+  train_exclude_ur: [5.75]
   train_ur_filter_tol: 1e-6
 pinn: {}
