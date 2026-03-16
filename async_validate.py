@@ -1103,6 +1103,11 @@ def _run_hnn_td_correction_validation(
             samples_per_ur=validation_samples_per_ur,
             seed=sample_seed,
         )
+        sampled_names = [str(val_trajs_np[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
+        print(
+            f"[async-val][phnn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
+            f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+        )
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         diverged_count = 0
@@ -1145,11 +1150,19 @@ def _run_hnn_td_correction_validation(
             target_ur=rollout_target_ur,
             target_ur_tol=rollout_target_ur_tol,
         )
+        rollout_traj = val_trajs_np[rollout_idx]
+        print(
+            f"[async-val][phnn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+            f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+            f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+            f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+            f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+        )
         _hnn_td_rollout_validation(
             writer=writer,
-            epoch=epoch,
+            epoch=epoch + 1,
             model=model,
-            traj=val_trajs_np[rollout_idx],
+            traj=rollout_traj,
             dt=dt,
             td_mass_source=td_mass_source,
             td_params=td_params,
@@ -1616,6 +1629,11 @@ def _run_vpinn_td_correction_validation(
             samples_per_ur=validation_samples_per_ur,
             seed=sample_seed,
         )
+        sampled_names = [str(val_trajs_np[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
+        print(
+            f"[async-val][vpinn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
+            f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+        )
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         diverged_count = 0
@@ -1661,11 +1679,19 @@ def _run_vpinn_td_correction_validation(
             target_ur=rollout_target_ur,
             target_ur_tol=rollout_target_ur_tol,
         )
+        rollout_traj = val_trajs_plot[rollout_idx]
+        print(
+            f"[async-val][vpinn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+            f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+            f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+            f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+            f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+        )
         _log_td_correction_rollout_validation(
             writer=writer,
             epoch=epoch,
             model=model,
-            traj=val_trajs_plot[rollout_idx],
+            traj=rollout_traj,
             dt=dt,
             td_mass_source=td_mass_source,
             rho=rho,

@@ -2422,6 +2422,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     samples_per_ur=validation_samples_per_ur,
                     seed=sample_seed,
                 )
+                sampled_names = [str(val_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
+                print(
+                    f"[td-val][vpinn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
+                    f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+                )
                 metrics_sum: dict[str, float] = {}
                 metrics_count: dict[str, int] = {}
                 for sidx in sampled_metric_indices:
@@ -2470,11 +2475,19 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     if cycle_validation_rollout
                     else selected_indices[0]
                 )
+                rollout_traj = val_trajs[rollout_idx]
+                print(
+                    f"[td-val][vpinn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+                    f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+                    f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+                    f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+                    f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+                )
                 _log_td_correction_rollout_validation(
                     writer=writer,
                     epoch=epoch + 1,
                     model=model,
-                    traj=val_trajs[rollout_idx],
+                    traj=rollout_traj,
                     dt=dt,
                     td_mass_source=td_mass_source,
                     rho=rho,
