@@ -12,8 +12,8 @@ data:
   reduction_factor: 5
 
 model:
-  rho: 1000.0
-  D: 0.1
+  rho: 1.0
+  D: 1.0
   structural_mass: 16.79
   Ca: 1.0
   k: 1218.0
