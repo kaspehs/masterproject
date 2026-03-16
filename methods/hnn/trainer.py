@@ -221,6 +221,7 @@ def _td_predict_correction(
     stiffness: torch.Tensor | float,
     history_window: torch.Tensor | None,
     predict_sigma: bool,
+    force_zero_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     z_model = _td_state_for_model_scaling(
         model,
@@ -239,11 +240,14 @@ def _td_predict_correction(
         reduced_velocity=reduced_velocity,
         history_window=history_model,
     )
-    raw_force = model._force_net_raw(
-        z_model,
-        reduced_velocity=reduced_velocity,
-        history_context=history_context,
-    )
+    if force_zero_output:
+        raw_force = z_model[..., :1].new_zeros(z_model.shape[:-1] + (1,))
+    else:
+        raw_force = model._force_net_raw(
+            z_model,
+            reduced_velocity=reduced_velocity,
+            history_context=history_context,
+        )
     output_scale = _td_output_scale_tensor(
         model,
         reduced_velocity=reduced_velocity,
@@ -253,13 +257,16 @@ def _td_predict_correction(
     )
     corr_mu = raw_force * output_scale
     if predict_sigma:
-        raw_sigma = model._sigma_net_raw(
-            z_model,
-            reduced_velocity=reduced_velocity,
-            history_context=history_context,
-        )
-        sigma = model.sigma_min.to(device=raw_sigma.device, dtype=raw_sigma.dtype) + F.softplus(raw_sigma)
-        sigma = sigma * output_scale
+        if force_zero_output:
+            sigma = model.sigma_min.to(device=raw_force.device, dtype=raw_force.dtype) * output_scale
+        else:
+            raw_sigma = model._sigma_net_raw(
+                z_model,
+                reduced_velocity=reduced_velocity,
+                history_context=history_context,
+            )
+            sigma = model.sigma_min.to(device=raw_sigma.device, dtype=raw_sigma.dtype) + F.softplus(raw_sigma)
+            sigma = sigma * output_scale
     else:
         sigma = corr_mu.new_zeros(corr_mu.shape)
     return corr_mu, sigma, history_context
@@ -278,6 +285,7 @@ def _td_correction_state_rollout(
     stiffness: torch.Tensor,
     td_params: dict[str, float],
     history0: torch.Tensor | None = None,
+    force_zero_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     z = z0
     td_context = td_context0
@@ -294,6 +302,7 @@ def _td_correction_state_rollout(
             stiffness=stiffness,
             history_window=history_window,
             predict_sigma=False,
+            force_zero_output=force_zero_output,
         )
         velocity = z[:, 1:2] / structural_mass
         td_force_next, td_context_next = td_baseline_step_torch(
@@ -488,6 +497,7 @@ def _log_td_correction_rollout_validation(
     td_params: dict[str, float],
     middle_time_plot: list[float] | tuple[float, float],
     device: torch.device,
+    force_zero_output: bool = False,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     log_metrics: bool = True,
@@ -529,6 +539,7 @@ def _log_td_correction_rollout_validation(
         stiffness=stiffness_t,
         td_params=td_params,
         history0=history0,
+        force_zero_output=force_zero_output,
     )
     y_pred = z_pred[0, :, 0].detach().cpu().numpy()
     v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
@@ -555,6 +566,7 @@ def _log_td_correction_rollout_validation(
             stiffness=torch.full_like(y_true_t, stiffness_value),
             history_window=hist_on_data,
             predict_sigma=False,
+            force_zero_output=force_zero_output,
         )
     force_total_full = np.concatenate(
         [np.asarray([float((td_force_t[0:1] + corr_on_data[0:1])[0, 0].detach().cpu())]), force_roll],
@@ -2170,6 +2182,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
     history_window = int(getattr(model_cfg, "history_window", 32)) if bool(getattr(model_cfg, "use_history_tcn", False)) else None
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
@@ -2261,6 +2274,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             stiffness=stiffness_i,
             history_window=history_i,
             predict_sigma=predict_sigma,
+            force_zero_output=force_zero_output,
         )
         total_force_next = td_force_next + corr_mu
         velocity_i = z_i[:, 1:2] / mass_i
@@ -2421,6 +2435,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         stiffness=stiffness0,
                         td_params=td_params,
                         history0=history0,
+                        force_zero_output=force_zero_output,
                     )
                     rollout_det_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
                 total_loss = base_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_det_weight) * rollout_det_loss
@@ -2541,6 +2556,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             stiffness=stiffness0,
                             td_params=td_params,
                             history0=history0,
+                            force_zero_output=force_zero_output,
                         )
                         rollout_loss_sum += torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2)).detach()
                         rollout_count += 1
@@ -2569,6 +2585,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         td_params=td_params,
                         middle_time_plot=middle_time_plot,
                         device=device,
+                        force_zero_output=force_zero_output,
                         log_metrics=False,
                         log_plots=False,
                     )
@@ -2602,6 +2619,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     td_params=td_params,
                     middle_time_plot=middle_time_plot,
                     device=device,
+                    force_zero_output=force_zero_output,
                     log_metrics=False,
                     log_plots=True,
                 )

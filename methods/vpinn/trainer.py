@@ -1621,6 +1621,7 @@ def _log_td_correction_rollout_validation(
     device: torch.device,
     sigma_min: float,
     probabilistic: bool,
+    force_zero_output: bool = False,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     log_metrics: bool = True,
@@ -1671,6 +1672,7 @@ def _log_td_correction_rollout_validation(
         td_params=td_params,
         probabilistic=probabilistic,
         sigma_min=sigma_min,
+        force_zero_output=force_zero_output,
     )
     x_pred = x_seq[0, :, 0].detach().cpu().numpy()
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
@@ -1685,6 +1687,7 @@ def _log_td_correction_rollout_validation(
             ur_true_t,
             probabilistic=probabilistic,
             sigma_min=sigma_min,
+            force_zero_output=force_zero_output,
         )
         f_on_data = (td_true_t + corr_on_data)[:, 0].detach().cpu().numpy()
 
@@ -1774,7 +1777,16 @@ def _vpinn_predict_correction(
     *,
     probabilistic: bool,
     sigma_min: float,
+    force_zero_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if force_zero_output:
+        d = int(x.shape[-1])
+        mu = x.new_zeros(x.shape[:-1] + (d,))
+        if probabilistic:
+            sigma = x.new_full(x.shape[:-1] + (d,), float(sigma_min))
+        else:
+            sigma = torch.zeros_like(mu)
+        return mu, sigma
     out = _vpinn_force(model, x, v, ur)
     d = int(x.shape[-1])
     if not probabilistic:
@@ -1803,6 +1815,7 @@ def _vpinn_td_rollout(
     td_params: dict[str, float],
     probabilistic: bool,
     sigma_min: float,
+    force_zero_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     x = x0
     v = v0
@@ -1820,6 +1833,7 @@ def _vpinn_td_rollout(
             ur0,
             probabilistic=probabilistic,
             sigma_min=sigma_min,
+            force_zero_output=force_zero_output,
         )
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=v,
@@ -1967,6 +1981,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     monitoring_cfg = config.monitoring
 
     probabilistic = bool(vp.get("predict_sigma", False))
+    force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
     if sigma_min < 0.0:
         raise ValueError("vpinn.sigma_min must be non-negative.")
@@ -2166,7 +2181,15 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             k_win = k_win.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                mu_corr, sigma_corr = _vpinn_predict_correction(model, x_win, v_win, ur_win, probabilistic=probabilistic, sigma_min=sigma_min)
+                mu_corr, sigma_corr = _vpinn_predict_correction(
+                    model,
+                    x_win,
+                    v_win,
+                    ur_win,
+                    probabilistic=probabilistic,
+                    sigma_min=sigma_min,
+                    force_zero_output=force_zero_output,
+                )
                 total_force_mu = td_force + mu_corr
                 if use_force_loss:
                     if probabilistic:
@@ -2225,6 +2248,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         td_params=td_params,
                         probabilistic=probabilistic,
                         sigma_min=sigma_min,
+                        force_zero_output=force_zero_output,
                     )
                     rollout_det_loss = torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2)
                 total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_weight) * rollout_det_loss
@@ -2306,7 +2330,15 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 for batch in val_loader:
                     x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                        mu_corr, sigma_corr = _vpinn_predict_correction(model, x_win, v_win, ur_win, probabilistic=probabilistic, sigma_min=sigma_min)
+                        mu_corr, sigma_corr = _vpinn_predict_correction(
+                            model,
+                            x_win,
+                            v_win,
+                            ur_win,
+                            probabilistic=probabilistic,
+                            sigma_min=sigma_min,
+                            force_zero_output=force_zero_output,
+                        )
                         total_force_mu = td_force + mu_corr
                         if use_force_loss:
                             if probabilistic:
@@ -2373,6 +2405,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                             td_params=td_params,
                             probabilistic=probabilistic,
                             sigma_min=sigma_min,
+                            force_zero_output=force_zero_output,
                         )
                         roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
                         roll_batches += 1
@@ -2403,6 +2436,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         device=device,
                         sigma_min=sigma_min,
                         probabilistic=probabilistic,
+                        force_zero_output=force_zero_output,
                         log_metrics=False,
                         log_plots=False,
                     )
@@ -2447,6 +2481,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     device=device,
                     sigma_min=sigma_min,
                     probabilistic=probabilistic,
+                    force_zero_output=force_zero_output,
                     log_metrics=False,
                     log_plots=True,
                 )

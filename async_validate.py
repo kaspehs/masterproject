@@ -930,6 +930,7 @@ def _run_hnn_td_correction_validation(
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     td_params = resolve_td_correction_params(hnn_cfg)
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     history_window = int(getattr(cfg.model, "history_window", 32)) if bool(getattr(cfg.model, "use_history_tcn", False)) else None
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
@@ -1011,6 +1012,7 @@ def _run_hnn_td_correction_validation(
                     stiffness=stiffness_i,
                     history_window=history_i,
                     predict_sigma=predict_sigma,
+                    force_zero_output=force_zero_output,
                 )
                 total_force_next = td_force_next + corr_mu
                 velocity_i = z_i[:, 1:2] / mass_i
@@ -1086,6 +1088,7 @@ def _run_hnn_td_correction_validation(
                         stiffness=stiffness0,
                         td_params=td_params,
                         history0=history0,
+                        force_zero_output=force_zero_output,
                     )
                     rollout_loss_sum += torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2)).detach()
                     rollout_count += 1
@@ -1115,6 +1118,7 @@ def _run_hnn_td_correction_validation(
                 td_params=td_params,
                 middle_time_plot=middle_time_plot,
                 device=device,
+                force_zero_output=force_zero_output,
                 log_metrics=False,
                 log_plots=False,
             )
@@ -1151,6 +1155,7 @@ def _run_hnn_td_correction_validation(
             td_params=td_params,
             middle_time_plot=middle_time_plot,
             device=device,
+            force_zero_output=force_zero_output,
             log_metrics=False,
             log_plots=True,
         )
@@ -1424,6 +1429,7 @@ def _run_vpinn_td_correction_validation(
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
     probabilistic = bool(vp.get("predict_sigma", False))
+    force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
     td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
     if td_mass_source not in {"dry", "effective"}:
@@ -1518,6 +1524,7 @@ def _run_vpinn_td_correction_validation(
                     ur_win,
                     probabilistic=probabilistic,
                     sigma_min=sigma_min,
+                    force_zero_output=force_zero_output,
                 )
                 total_force_mu = td_force + mu_corr
                 if use_force_loss:
@@ -1592,6 +1599,7 @@ def _run_vpinn_td_correction_validation(
                         td_params=td_params,
                         probabilistic=probabilistic,
                         sigma_min=sigma_min,
+                        force_zero_output=force_zero_output,
                     )
                     roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
                     roll_batches += 1
@@ -1628,6 +1636,7 @@ def _run_vpinn_td_correction_validation(
                 device=device,
                 sigma_min=sigma_min,
                 probabilistic=probabilistic,
+                force_zero_output=force_zero_output,
                 log_metrics=False,
                 log_plots=False,
             )
@@ -1666,6 +1675,7 @@ def _run_vpinn_td_correction_validation(
             device=device,
             sigma_min=sigma_min,
             probabilistic=probabilistic,
+            force_zero_output=force_zero_output,
             log_metrics=False,
             log_plots=True,
         )

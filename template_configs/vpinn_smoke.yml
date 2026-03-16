@@ -109,6 +109,8 @@ vpinn:
   # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
   use_td_correction: true
   predict_sigma: false
+  # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.
+  force_zero_output: false
   # Structural mass used in TD-correction mode: dry | effective
   td_mass_source: dry
   # Loss toggles
