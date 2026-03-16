@@ -3,13 +3,13 @@ method: vpinn
 data:
   # Use the same training-series setup as `HNNrunconfigs/pirate_smoke.yml`.
   file: data.npz
-  cut_start_seconds: 2.0
-  cut_start_seconds_train: 45.0
-  cut_start_seconds_val: 45.0
+  cut_start_seconds: 0.0
+  cut_start_seconds_train: 0.0
+  cut_start_seconds_val: 0.0
   use_generated_train_series: true
-  train_series_dir: Data_Gen/generated_series_Ur_60
+  train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
   reduce_time: true
-  reduction_factor: 100
+  reduction_factor: 5
 
 model:
   rho: 1000.0
@@ -27,7 +27,7 @@ smoothing:
 
 architecture:
   # Used when `vpinn.use_architecture_config: true`
-  force_net_type: residual
+  force_net_type: mlp
   residual_kwargs:
     hidden: 128
     layers: 3
@@ -44,9 +44,9 @@ architecture:
     activation: gelu
 
 training:
-  batch_size: 8192
-  max_grad_norm: 10000.0
-  epochs: 2000
+  batch_size: 1024
+  max_grad_norm: 20.0
+  epochs: 200
 
 optim:
   lr: 0.001
@@ -80,12 +80,12 @@ logging:
 
 monitoring:
   # Logging / validation cadence
-  log_every_epochs: 10
+  log_every_epochs: 5
   print_every_epochs: 50
-  validate_every_epochs: 20
+  validate_every_epochs: 10
 
   # Rollout validation plots (dynamics check)
-  rollout_every_epochs: 20
+  rollout_every_epochs: 10
   rollout_max_trajectories: 1
   cycle_validation_rollout: true
   final_rollout_all_validation: true
@@ -98,12 +98,12 @@ monitoring:
   async_validation_do_rollout: true
   # If true and exactly one train_exclude_ur is configured, validation rollout
   # targets that excluded U_r from the validation set (if available).
-  rollout_use_excluded_ur: false
+  rollout_use_excluded_ur: true
   rollout_target_ur_tol: 1e-6
 
 vpinn:
   # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
-  use_td_correction: false
+  use_td_correction: true
   predict_sigma: false
   # Structural mass used in TD-correction mode: dry | effective
   td_mass_source: dry
@@ -150,7 +150,7 @@ vpinn:
   # Optional training-only U_r filtering when using generated series.
   # Validation loading is unchanged.
   train_include_ur: null
-  train_exclude_ur: []
+  train_exclude_ur: [5.75]
   train_ur_filter_tol: 1e-6
   use_data_file_for_validation: true
   validation_only_data_file: true
