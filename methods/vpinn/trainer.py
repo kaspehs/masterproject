@@ -1560,6 +1560,52 @@ def _log_rollout_validation(
     return metrics
 
 
+def _td_rollout_traj_to_tensors(traj: dict[str, Any]) -> dict[str, Any]:
+    if "x" in traj and "v" in traj and "f" in traj:
+        return {
+            "name": str(traj.get("name", "")),
+            "x": traj["x"] if torch.is_tensor(traj["x"]) else torch.from_numpy(np.ascontiguousarray(traj["x"])).float(),
+            "v": traj["v"] if torch.is_tensor(traj["v"]) else torch.from_numpy(np.ascontiguousarray(traj["v"])).float(),
+            "f": traj["f"] if torch.is_tensor(traj["f"]) else torch.from_numpy(np.ascontiguousarray(traj["f"])).float(),
+            "td_force": (
+                traj["td_force"]
+                if torch.is_tensor(traj["td_force"])
+                else torch.from_numpy(np.ascontiguousarray(traj["td_force"])).float()
+            ),
+            "ur": traj["ur"] if torch.is_tensor(traj["ur"]) else torch.from_numpy(np.ascontiguousarray(traj["ur"])).float(),
+            "td_context": (
+                traj["td_context"]
+                if torch.is_tensor(traj["td_context"])
+                else torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
+            ),
+            "t": traj["t"] if torch.is_tensor(traj["t"]) else torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
+            "dry_mass_kg": np.asarray(traj["dry_mass_kg"]),
+            "effective_mass_kg": np.asarray(traj["effective_mass_kg"]),
+            "damping_c": np.asarray(traj["damping_c"]),
+            "stiffness_n_m": np.asarray(traj["stiffness_n_m"]),
+        }
+
+    required = {"y", "dy", "force_total", "force_td", "ur", "td_context", "t"}
+    missing = sorted(required.difference(traj))
+    if missing:
+        raise KeyError(f"TD VPINN rollout trajectory is missing required keys: {missing}")
+
+    return {
+        "name": str(traj.get("name", "")),
+        "x": torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1),
+        "v": torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1),
+        "f": torch.from_numpy(np.ascontiguousarray(traj["force_total"])).float().unsqueeze(1),
+        "td_force": torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1),
+        "ur": torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1),
+        "td_context": torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float(),
+        "t": torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
+        "dry_mass_kg": np.asarray(traj["dry_mass_kg"]),
+        "effective_mass_kg": np.asarray(traj["effective_mass_kg"]),
+        "damping_c": np.asarray(traj["damping_c"]),
+        "stiffness_n_m": np.asarray(traj["stiffness_n_m"]),
+    }
+
+
 def _log_td_correction_rollout_validation(
     *,
     writer: Any,
@@ -1581,13 +1627,14 @@ def _log_td_correction_rollout_validation(
     log_plots: bool = True,
     title_suffix: str = "",
 ) -> dict[str, float]:
-    x_true_t = traj["x"].to(device)
-    v_true_t = traj["v"].to(device)
-    f_true_t = traj["f"].to(device)
-    ur_true_t = traj["ur"].to(device)
-    td_true_t = traj["td_force"].to(device)
-    td_context_t = traj["td_context"].to(device)
-    t_np = traj["t"].detach().cpu().numpy()
+    traj_t = _td_rollout_traj_to_tensors(traj)
+    x_true_t = traj_t["x"].to(device)
+    v_true_t = traj_t["v"].to(device)
+    f_true_t = traj_t["f"].to(device)
+    ur_true_t = traj_t["ur"].to(device)
+    td_true_t = traj_t["td_force"].to(device)
+    td_context_t = traj_t["td_context"].to(device)
+    t_np = traj_t["t"].detach().cpu().numpy()
     if x_true_t.ndim != 2:
         return {}
     d = int(x_true_t.shape[-1])
@@ -1601,9 +1648,9 @@ def _log_td_correction_rollout_validation(
         return {}
 
     mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
-    mass_value = float(np.asarray(traj[mass_key]).reshape(()))
-    damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
-    stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+    mass_value = float(np.asarray(traj_t[mass_key]).reshape(()))
+    damping_value = float(np.asarray(traj_t["damping_c"]).reshape(()))
+    stiffness_value = float(np.asarray(traj_t["stiffness_n_m"]).reshape(()))
     m = torch.full((1, d), mass_value, dtype=x_true_t.dtype, device=device)
     c = torch.full((1, d), damping_value, dtype=x_true_t.dtype, device=device)
     k = torch.full((1, d), stiffness_value, dtype=x_true_t.dtype, device=device)

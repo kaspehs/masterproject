@@ -28,12 +28,16 @@ from HNN_helper import (
     PHVIV,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
+    create_window_mask,
+    create_zoom_mask,
     load_td_correction_trajectories,
     lookup_ur_bin_state_scale_tensor,
     build_dataloader_from_series,
     build_rollout_dataloader_from_series,
     compute_validation_metrics,
     load_training_series,
+    log_displacement_plots,
+    log_force_plots,
     log_loss_vs_ur,
     log_validation_epoch,
     parse_config,
@@ -45,6 +49,7 @@ from HNN_helper import (
     sample_one_index_per_ur,
     resolve_td_correction_params,
 )
+from methods.hnn.trainer import _td_correction_state_rollout
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
@@ -58,6 +63,7 @@ from methods.vpinn.trainer import (
     _test_functions,
     _log_rollout_validation,
     _log_td_correction_rollout_validation,
+    _td_rollout_traj_to_tensors,
     _build_td_correction_vpinn_datasets,
     _vpinn_predict_correction,
     _vpinn_td_rollout,
@@ -1136,24 +1142,7 @@ def _run_vpinn_td_correction_validation(
         metrics_count: dict[str, int] = {}
         diverged_count = 0
         middle_time_plot = resolve_middle_time_plot(data_cfg, vp, method_name="vpinn")
-        val_trajs_plot = []
-        for traj in val_trajs_np:
-            val_trajs_plot.append(
-                {
-                    "name": traj["name"],
-                    "x": torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1),
-                    "v": torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1),
-                    "f": torch.from_numpy(np.ascontiguousarray(traj["force_total"])).float().unsqueeze(1),
-                    "td_force": torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1),
-                    "ur": torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1),
-                    "td_context": torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float(),
-                    "t": torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
-                    "dry_mass_kg": np.asarray(traj["dry_mass_kg"]),
-                    "effective_mass_kg": np.asarray(traj["effective_mass_kg"]),
-                    "damping_c": np.asarray(traj["damping_c"]),
-                    "stiffness_n_m": np.asarray(traj["stiffness_n_m"]),
-                }
-            )
+        val_trajs_plot = [_td_rollout_traj_to_tensors(traj) for traj in val_trajs_np]
         for sidx in sampled_metric_indices:
             metrics = _log_td_correction_rollout_validation(
                 writer=writer,
