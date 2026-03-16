@@ -75,6 +75,14 @@ def _maybe_print_progress(*, label: str, completed: int, total: int, last_percen
 
 def _load_split_trajectories(config: Any, split: str) -> list[dict[str, np.ndarray]]:
     data_cfg = config.data
+    method_name = str(getattr(config, "method", "")).strip().lower()
+    if method_name in {"hnn", "phnn"}:
+        method_cfg = dict(getattr(config, "hnn", {}) or {})
+    elif method_name == "vpinn":
+        method_cfg = dict(getattr(config, "vpinn", {}) or {})
+    else:
+        method_cfg = {}
+    ur_source = str(method_cfg.get("td_mass_source", "dry")).strip().lower()
     split = str(split).strip().lower()
     if not bool(getattr(data_cfg, "use_generated_train_series", False)):
         raise ValueError(
@@ -91,6 +99,7 @@ def _load_split_trajectories(config: Any, split: str) -> list[dict[str, np.ndarr
         cut_start_seconds=resolve_cut_start_seconds(data_cfg, split),
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        ur_source=ur_source,
     )
 
 

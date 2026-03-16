@@ -925,6 +925,7 @@ def _run_hnn_td_correction_validation(
         cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        ur_source=td_mass_source,
     )
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     td_params = resolve_td_correction_params(hnn_cfg)
@@ -1441,6 +1442,7 @@ def _run_vpinn_td_correction_validation(
         cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        ur_source=td_mass_source,
     )
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     rho = float(getattr(cfg.model, "rho", 1000.0))

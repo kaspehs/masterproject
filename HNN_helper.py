@@ -4032,6 +4032,7 @@ def load_td_correction_trajectories(
     cut_start_seconds: float = 0.0,
     reduce_time: bool = False,
     reduction_factor: int = 1,
+    ur_source: str = "stored",
 ) -> list[dict[str, np.ndarray]]:
     trajectories: list[dict[str, np.ndarray]] = []
     for path in paths:
@@ -4067,8 +4068,15 @@ def load_td_correction_trajectories(
             effective_mass_kg = _extract_required_scalar(data, ("effective_mass_kg",), path=path)
             dry_mass_kg = _extract_required_scalar(data, ("dry_mass_kg",), path=path)
             damping_c = _extract_required_scalar(data, ("damping_c",), path=path)
+            diameter_m = _extract_required_scalar(data, ("diameter_m",), path=path)
             flow_speed_raw = _extract_first_present(data, ("flow_speed_m_s",), path=path, required=False)
             ur_raw = _extract_first_present(data, ("U_r_computed_series", "U_r"), path=path)
+            ur_label_raw = _extract_first_present(
+                data,
+                ("U_r_label_series", "U_r_label_scalar"),
+                path=path,
+                required=False,
+            )
         arrays = [t, y, dy, ddy, force_total, force_td, phi_td, sig_dy_td, sig_ddy_td]
         n = t.shape[0]
         if any(arr.shape[0] != n for arr in arrays[1:]):
@@ -4078,7 +4086,7 @@ def load_td_correction_trajectories(
         dt = float(t[1] - t[0])
         if not np.allclose(np.diff(t), dt, rtol=1e-6, atol=1e-9):
             raise ValueError(f"{path} time vector is not uniform.")
-        ur = _prepare_reduced_velocity_series(ur_raw, n, name=str(path))
+        ur_stored = _prepare_reduced_velocity_series(ur_raw, n, name=str(path))
         if flow_speed_raw is None:
             flow_speed = np.full((n,), np.nan, dtype=float)
         else:
@@ -4093,6 +4101,27 @@ def load_td_correction_trajectories(
                     raise ValueError(f"{path} flow speed must be scalar or length-matched to time.")
         if not np.all(np.isfinite(flow_speed)):
             flow_speed = np.full((n,), float(np.nanmean(flow_speed)), dtype=float)
+        ur_label = None
+        if ur_label_raw is not None:
+            ur_label = _prepare_reduced_velocity_series(ur_label_raw, n, name=f"{path} U_r_label")
+        ur_key = str(ur_source).strip().lower()
+        if ur_key == "stored":
+            ur = ur_stored
+        elif ur_key in {"dry", "effective"}:
+            mass_value = float(dry_mass_kg) if ur_key == "dry" else float(effective_mass_kg)
+            if not np.isfinite(float(diameter_m)) or float(diameter_m) <= 0.0:
+                raise ValueError(f"{path} requires a positive diameter_m to derive U_r.")
+            if not np.isfinite(mass_value) or mass_value <= 0.0:
+                raise ValueError(f"{path} requires a positive {ur_key}_mass_kg to derive U_r.")
+            omega_n = np.sqrt(float(stiffness_n_m) / mass_value)
+            f_n = float(omega_n / (2.0 * np.pi))
+            ur = np.asarray(flow_speed, dtype=float) / max(np.finfo(float).eps, f_n * float(diameter_m))
+        elif ur_key == "label":
+            if ur_label is None:
+                raise ValueError(f"{path} does not contain U_r label values.")
+            ur = ur_label
+        else:
+            raise ValueError("ur_source must be one of: stored, dry, effective, label.")
         t, reduced = _maybe_reduce_time_td(
             t=t,
             arrays={
@@ -4105,6 +4134,8 @@ def load_td_correction_trajectories(
                 "sig_dy_td": sig_dy_td,
                 "sig_ddy_td": sig_ddy_td,
                 "ur": ur,
+                "ur_stored": ur_stored,
+                **({"ur_label": ur_label} if ur_label is not None else {}),
                 "flow_speed": flow_speed,
             },
             enabled=bool(reduce_time),
@@ -4119,6 +4150,9 @@ def load_td_correction_trajectories(
         sig_dy_td = reduced["sig_dy_td"]
         sig_ddy_td = reduced["sig_ddy_td"]
         ur = reduced["ur"]
+        ur_stored = reduced["ur_stored"]
+        if ur_label is not None:
+            ur_label = reduced["ur_label"]
         flow_speed = reduced["flow_speed"]
         if cut_start_seconds > 0.0:
             t0 = float(t[0])
@@ -4135,6 +4169,9 @@ def load_td_correction_trajectories(
             sig_dy_td = sig_dy_td[mask]
             sig_ddy_td = sig_ddy_td[mask]
             ur = ur[mask]
+            ur_stored = ur_stored[mask]
+            if ur_label is not None:
+                ur_label = ur_label[mask]
             flow_speed = flow_speed[mask]
         td_context = np.stack([ddy, phi_td, sig_dy_td, sig_ddy_td, flow_speed], axis=1)
         trajectories.append(
@@ -4148,6 +4185,8 @@ def load_td_correction_trajectories(
                 "force_td": np.asarray(force_td, dtype=np.float32),
                 "force_corr": np.asarray(force_total - force_td, dtype=np.float32),
                 "ur": np.asarray(ur, dtype=np.float32),
+                "ur_stored": np.asarray(ur_stored, dtype=np.float32),
+                "ur_label": (None if ur_label is None else np.asarray(ur_label, dtype=np.float32)),
                 "flow_speed": np.asarray(flow_speed, dtype=np.float32),
                 "td_context": np.asarray(td_context, dtype=np.float32),
                 "stiffness_n_m": np.asarray(stiffness_n_m, dtype=np.float32),

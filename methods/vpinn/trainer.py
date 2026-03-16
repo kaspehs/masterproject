@@ -1985,6 +1985,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     val_paths = sorted(val_dir.glob("*.npz"))
     if not train_paths:
         raise FileNotFoundError("No TD correction VPINN training trajectories were found.")
+    td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
+    if td_mass_source not in {"dry", "effective"}:
+        raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
     train_cut = float(getattr(data_cfg, "cut_start_seconds_train", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
     val_cut = float(getattr(data_cfg, "cut_start_seconds_val", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
     train_trajs = load_td_correction_trajectories(
@@ -1992,6 +1995,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         cut_start_seconds=train_cut,
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        ur_source=td_mass_source,
     )
     val_trajs = (
         load_td_correction_trajectories(
@@ -1999,15 +2003,13 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             cut_start_seconds=val_cut,
             reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
             reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+            ur_source=td_mass_source,
         )
         if val_paths
         else []
     )
 
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
-    td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
-    if td_mass_source not in {"dry", "effective"}:
-        raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
     rho = float(getattr(model_cfg, "rho", 1000.0))
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)

@@ -2142,6 +2142,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     if not train_paths:
         raise FileNotFoundError("No TD correction training trajectories were found.")
 
+    td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
+    if td_mass_source not in {"dry", "effective"}:
+        raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
     train_cut = resolve_cut_start_seconds(data_cfg, "train")
     val_cut = resolve_cut_start_seconds(data_cfg, "val")
     train_trajs = load_td_correction_trajectories(
@@ -2149,6 +2152,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         cut_start_seconds=train_cut,
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        ur_source=td_mass_source,
     )
     val_trajs = (
         load_td_correction_trajectories(
@@ -2156,15 +2160,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             cut_start_seconds=val_cut,
             reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
             reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+            ur_source=td_mass_source,
         )
         if val_paths
         else []
     )
 
     td_params = resolve_td_correction_params(hnn_cfg)
-    td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
-    if td_mass_source not in {"dry", "effective"}:
-        raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
     history_window = int(getattr(model_cfg, "history_window", 32)) if bool(getattr(model_cfg, "use_history_tcn", False)) else None
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
