@@ -50,7 +50,12 @@ from HNN_helper import (
     sample_one_index_per_ur,
     resolve_td_correction_params,
 )
-from methods.hnn.trainer import _build_td_correction_hnn_loaders, _td_correction_state_rollout
+from methods.hnn.trainer import (
+    _build_td_correction_hnn_loaders,
+    _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
+    _td_correction_state_rollout,
+    _td_predict_correction,
+)
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
@@ -945,6 +950,7 @@ def _run_hnn_td_correction_validation(
     model_dict["structural_mass"] = float(np.asarray(first_val_traj[mass_key]).reshape(()))
     model_dict["k"] = float(np.asarray(first_val_traj["stiffness_n_m"]).reshape(()))
     model_dict["damping_c"] = float(np.asarray(first_val_traj["damping_c"]).reshape(()))
+    model_dict["Ca"] = 0.0
     model_dict["include_physical_drag"] = False
     model_dict["use_stochastic_process_noise"] = predict_sigma
     arch_dict = asdict(cfg.architecture)
@@ -996,12 +1002,14 @@ def _run_hnn_td_correction_validation(
                 if history_i is not None:
                     history_i = history_i.to(device, non_blocking=(device.type == "cuda"))
 
-                history_context = model.history_context(z_i, reduced_velocity=ur_i, history_window=history_i)
-                corr_mu = model.learned_force(z_i, reduced_velocity=ur_i, history_context=history_context)
-                sigma_corr = (
-                    model.sigma_theta(z_i, reduced_velocity=ur_i, history_context=history_context)
-                    if predict_sigma
-                    else corr_mu.new_zeros(corr_mu.shape)
+                corr_mu, sigma_corr, _history_context = _td_predict_correction(
+                    model,
+                    z=z_i,
+                    reduced_velocity=ur_i,
+                    structural_mass=mass_i,
+                    stiffness=stiffness_i,
+                    history_window=history_i,
+                    predict_sigma=predict_sigma,
                 )
                 total_force_next = td_force_next + corr_mu
                 velocity_i = z_i[:, 1:2] / mass_i
@@ -1096,7 +1104,7 @@ def _run_hnn_td_correction_validation(
         diverged_count = 0
         middle_time_plot = resolve_middle_time_plot(data_cfg, hnn_cfg, method_name="hnn")
         for sidx in sampled_metric_indices:
-            metrics = _log_td_correction_hnn_rollout_validation(
+            metrics = _hnn_td_rollout_validation(
                 writer=writer,
                 epoch=epoch,
                 model=model,
@@ -1132,7 +1140,7 @@ def _run_hnn_td_correction_validation(
             target_ur=rollout_target_ur,
             target_ur_tol=rollout_target_ur_tol,
         )
-        _log_td_correction_hnn_rollout_validation(
+        _hnn_td_rollout_validation(
             writer=writer,
             epoch=epoch,
             model=model,
