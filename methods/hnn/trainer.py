@@ -115,18 +115,38 @@ def _parse_rollout_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
     return z0, t_seq, z_traj, ur0, history, scale
 
 
-def _td_force_scale_tensor(
+def _td_output_scale_tensor(
     model: PHVIV,
     *,
+    reduced_velocity: torch.Tensor,
+    structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
     like: torch.Tensor,
 ) -> torch.Tensor:
+    mass_t = torch.as_tensor(structural_mass, device=like.device, dtype=like.dtype)
     stiffness_t = torch.as_tensor(stiffness, device=like.device, dtype=like.dtype)
+    if mass_t.ndim == 0:
+        mass_t = mass_t.view(1, 1)
+    elif mass_t.ndim == 1:
+        mass_t = mass_t.view(-1, 1)
     if stiffness_t.ndim == 0:
         stiffness_t = stiffness_t.view(1, 1)
     elif stiffness_t.ndim == 1:
         stiffness_t = stiffness_t.view(-1, 1)
-    return stiffness_t.expand(like.shape[:-1] + (1,)) * float(model.D)
+    shape = like.shape[:-1] + (1,)
+    mass_t = mass_t.expand(shape)
+    stiffness_t = stiffness_t.expand(shape)
+    if getattr(model, "force_output", "force") == "coefficient":
+        rv_raw = model._prepare_reduced_velocity_raw(reduced_velocity, like=like)
+        if rv_raw is None:
+            u_flow = like.new_full(shape, float(model.U))
+        else:
+            omega_n = torch.sqrt(torch.clamp(stiffness_t / mass_t, min=1e-12))
+            f_n = omega_n / (2.0 * np.pi)
+            u_flow = rv_raw * f_n * float(model.D)
+        f0 = 0.5 * float(model.rho) * float(model.D) * (u_flow**2)
+        return torch.clamp(f0, min=1e-12)
+    return stiffness_t * float(model.D)
 
 
 def _td_p_scale_tensor(
@@ -202,8 +222,6 @@ def _td_predict_correction(
     history_window: torch.Tensor | None,
     predict_sigma: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    if getattr(model, "force_output", "force") != "force":
-        raise ValueError("TD correction PHNN helpers currently require model.force_output='force'.")
     z_model = _td_state_for_model_scaling(
         model,
         z=z,
@@ -226,7 +244,14 @@ def _td_predict_correction(
         reduced_velocity=reduced_velocity,
         history_context=history_context,
     )
-    corr_mu = raw_force * _td_force_scale_tensor(model, stiffness=stiffness, like=raw_force)
+    output_scale = _td_output_scale_tensor(
+        model,
+        reduced_velocity=reduced_velocity,
+        structural_mass=structural_mass,
+        stiffness=stiffness,
+        like=raw_force,
+    )
+    corr_mu = raw_force * output_scale
     if predict_sigma:
         raw_sigma = model._sigma_net_raw(
             z_model,
@@ -234,7 +259,7 @@ def _td_predict_correction(
             history_context=history_context,
         )
         sigma = model.sigma_min.to(device=raw_sigma.device, dtype=raw_sigma.dtype) + F.softplus(raw_sigma)
-        sigma = sigma * _td_force_scale_tensor(model, stiffness=stiffness, like=sigma)
+        sigma = sigma * output_scale
     else:
         sigma = corr_mu.new_zeros(corr_mu.shape)
     return corr_mu, sigma, history_context
@@ -2093,9 +2118,6 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     compile_cfg = config.compile
     monitoring_cfg = config.monitoring
     hnn_cfg = dict(config.hnn or {})
-
-    if str(getattr(model_cfg, "force_output", "force")).strip().lower() != "force":
-        raise ValueError("hnn.use_td_correction currently requires model.force_output='force'.")
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
     print(f"Using device: {device}")
