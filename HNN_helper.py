@@ -1,3 +1,4 @@
+import importlib
 import math
 import warnings
 import yaml
@@ -156,7 +157,7 @@ class OptimConfig:
 class LossConfig:
     mean_reg: float = 0.0
     mean_reg_norm: str = "l1"  # "l1" or "l2"
-    force_reg: float = 1e-2
+    sigma_reg: float = 1e-2
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
     equalize_residual_over_ur_bins: bool = False
     equalize_rollout_over_ur_bins: bool = False
@@ -320,6 +321,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
     loss_keys = {
         "mean_reg",
         "mean_reg_norm",
+        "sigma_reg",
         "force_reg",
         "sigma_reg_norm",
         "equalize_residual_over_ur_bins",
@@ -391,6 +393,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
     scheduler = SchedulerConfig(**scheduler_dict)
     optim_fields = {k: v for k, v in optim_cfg.items() if k != "scheduler"}
     optim = OptimConfig(**optim_fields, scheduler=scheduler)
+    if "sigma_reg" not in loss_cfg and "force_reg" in loss_cfg:
+        loss_cfg["sigma_reg"] = loss_cfg["force_reg"]
+    loss_cfg.pop("force_reg", None)
     loss = LossConfig(**loss_cfg)
     runtime = RuntimeConfig(**runtime_cfg)
     precision = PrecisionConfig(**precision_cfg)
@@ -3925,6 +3930,243 @@ def _prepare_reduced_velocity_series(
     if ur_flat.shape[0] != length:
         return np.full((length,), ur_val, dtype=float)
     return np.full((length,), ur_val, dtype=float)
+
+
+def resolve_td_correction_params(raw_cfg: dict[str, Any] | None) -> dict[str, float]:
+    cfg = dict(raw_cfg or {})
+    keys = {
+        "Cv": "td_cv",
+        "Cd": "td_cd",
+        "Ca": "td_ca",
+        "fhat0": "td_fhat0",
+        "fhat_min": "td_fhat_min",
+        "fhat_max": "td_fhat_max",
+        "n_memory": "td_n_memory",
+    }
+    out: dict[str, float] = {}
+    missing = [name for name, key in keys.items() if key not in cfg]
+    if missing:
+        try:
+            td_hidden = importlib.import_module("Data_Gen.td_hidden_state")
+        except ModuleNotFoundError:
+            td_hidden = importlib.import_module("td_hidden_state")
+        defaults = td_hidden.build_single_paramset_from_burnin_config()
+        try:
+            burnin = importlib.import_module("Data_Gen.analyze_vivana_td_burnin")
+        except ModuleNotFoundError:
+            burnin = importlib.import_module("analyze_vivana_td_burnin")
+        for name in ("Cv", "Cd", "Ca", "fhat0", "fhat_min", "fhat_max"):
+            out[name] = float(cfg.get(keys[name], defaults[name]))
+        out["n_memory"] = float(cfg.get("td_n_memory", getattr(burnin, "N_MEMORY", 500)))
+    else:
+        for name, key in keys.items():
+            out[name] = float(cfg[key])
+    if not (out["fhat_min"] <= out["fhat0"] <= out["fhat_max"]):
+        raise ValueError("Require td_fhat_min <= td_fhat0 <= td_fhat_max.")
+    if out["n_memory"] < 1.0:
+        raise ValueError("td_n_memory must be >= 1.")
+    return out
+
+
+def _extract_first_present(data: Any, keys: Sequence[str], *, path: Path, required: bool = True) -> np.ndarray | None:
+    for key in keys:
+        if key in data:
+            return np.asarray(data[key])
+    if required:
+        raise KeyError(f"{path} is missing required keys {list(keys)}.")
+    return None
+
+
+def load_td_correction_trajectories(
+    *,
+    paths: Sequence[Path],
+    cut_start_seconds: float = 0.0,
+) -> list[dict[str, np.ndarray]]:
+    trajectories: list[dict[str, np.ndarray]] = []
+    for path in paths:
+        with np.load(path, allow_pickle=True) as data:
+            t = np.asarray(
+                _extract_first_present(data, ("time_dim", "a", "time"), path=path),
+                dtype=float,
+            ).reshape(-1)
+            y = np.asarray(
+                _extract_first_present(data, ("y_disp_dim", "b", "y"), path=path),
+                dtype=float,
+            ).reshape(-1)
+            dy = np.asarray(
+                _extract_first_present(data, ("y_vel_dim", "dy", "e", "v"), path=path),
+                dtype=float,
+            ).reshape(-1)
+            ddy = np.asarray(
+                _extract_first_present(data, ("y_acc_dim", "ddy"), path=path),
+                dtype=float,
+            ).reshape(-1)
+            force_total = np.asarray(
+                _extract_first_present(data, ("y_force_dim", "c", "F_total", "force_total", "force"), path=path),
+                dtype=float,
+            ).reshape(-1)
+            force_td = np.asarray(
+                _extract_first_present(data, ("F_total_td",), path=path),
+                dtype=float,
+            ).reshape(-1)
+            phi_td = np.asarray(_extract_first_present(data, ("phi_vy_td",), path=path), dtype=float).reshape(-1)
+            sig_dy_td = np.asarray(_extract_first_present(data, ("sig_dy_loc_td",), path=path), dtype=float).reshape(-1)
+            sig_ddy_td = np.asarray(_extract_first_present(data, ("sig_ddy_loc_td",), path=path), dtype=float).reshape(-1)
+            flow_speed_raw = _extract_first_present(data, ("flow_speed_m_s",), path=path, required=False)
+            ur_raw = _extract_first_present(data, ("U_r_computed_series", "U_r"), path=path)
+        arrays = [t, y, dy, ddy, force_total, force_td, phi_td, sig_dy_td, sig_ddy_td]
+        n = t.shape[0]
+        if any(arr.shape[0] != n for arr in arrays[1:]):
+            raise ValueError(f"{path} has mismatched TD correction array lengths.")
+        if n < 2:
+            raise ValueError(f"{path} is too short for TD correction training.")
+        dt = float(t[1] - t[0])
+        if not np.allclose(np.diff(t), dt, rtol=1e-6, atol=1e-9):
+            raise ValueError(f"{path} time vector is not uniform.")
+        ur = _prepare_reduced_velocity_series(ur_raw, n, name=str(path))
+        if flow_speed_raw is None:
+            flow_speed = np.full((n,), np.nan, dtype=float)
+        else:
+            flow_arr = np.asarray(flow_speed_raw, dtype=float)
+            if flow_arr.ndim == 0:
+                flow_speed = np.full((n,), float(flow_arr), dtype=float)
+            else:
+                flow_speed = flow_arr.reshape(-1)
+                if flow_speed.shape[0] == 1:
+                    flow_speed = np.full((n,), float(flow_speed[0]), dtype=float)
+                elif flow_speed.shape[0] != n:
+                    raise ValueError(f"{path} flow speed must be scalar or length-matched to time.")
+        if not np.all(np.isfinite(flow_speed)):
+            flow_speed = np.full((n,), float(np.nanmean(flow_speed)), dtype=float)
+        if cut_start_seconds > 0.0:
+            t0 = float(t[0])
+            mask = t >= (t0 + float(cut_start_seconds))
+            if int(np.count_nonzero(mask)) < 2:
+                raise ValueError(f"{path} became too short after cut_start_seconds={cut_start_seconds}.")
+            t = t[mask]
+            y = y[mask]
+            dy = dy[mask]
+            ddy = ddy[mask]
+            force_total = force_total[mask]
+            force_td = force_td[mask]
+            phi_td = phi_td[mask]
+            sig_dy_td = sig_dy_td[mask]
+            sig_ddy_td = sig_ddy_td[mask]
+            ur = ur[mask]
+            flow_speed = flow_speed[mask]
+        td_context = np.stack([ddy, phi_td, sig_dy_td, sig_ddy_td, flow_speed], axis=1)
+        trajectories.append(
+            {
+                "name": path.name,
+                "t": np.asarray(t, dtype=np.float32),
+                "y": np.asarray(y, dtype=np.float32),
+                "dy": np.asarray(dy, dtype=np.float32),
+                "ddy": np.asarray(ddy, dtype=np.float32),
+                "force_total": np.asarray(force_total, dtype=np.float32),
+                "force_td": np.asarray(force_td, dtype=np.float32),
+                "force_corr": np.asarray(force_total - force_td, dtype=np.float32),
+                "ur": np.asarray(ur, dtype=np.float32),
+                "flow_speed": np.asarray(flow_speed, dtype=np.float32),
+                "td_context": np.asarray(td_context, dtype=np.float32),
+            }
+        )
+    if not trajectories:
+        raise ValueError("No TD correction trajectories were loaded.")
+    return trajectories
+
+
+def td_baseline_step_torch(
+    *,
+    velocity: torch.Tensor,
+    acceleration: torch.Tensor,
+    td_context: torch.Tensor,
+    dt: float,
+    rho: float,
+    diameter: float,
+    params: dict[str, float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if td_context.ndim != 2 or td_context.shape[1] < 5:
+        raise ValueError("td_context must have shape (B, 5) with [ddy, phi, sig_dy, sig_ddy, flow_speed].")
+    ddy = td_context[:, 0:1]
+    phi_vy = td_context[:, 1:2]
+    sig_dy = td_context[:, 2:3]
+    sig_ddy = td_context[:, 3:4]
+    flow_speed = td_context[:, 4:5]
+    n_memory = max(1.0, float(params["n_memory"]))
+
+    speed_mag = torch.sqrt(torch.clamp(flow_speed * flow_speed + velocity * velocity, min=1e-12))
+    projection = flow_speed / speed_mag
+    dy_r = velocity * projection
+    ddy_r = ddy * projection
+
+    sig_dy_next = torch.sqrt(torch.clamp(((n_memory - 1.0) / n_memory) * (sig_dy * sig_dy) + (dy_r * dy_r) / n_memory, min=1e-12))
+    sig_ddy_next = torch.sqrt(torch.clamp(((n_memory - 1.0) / n_memory) * (sig_ddy * sig_ddy) + (ddy_r * ddy_r) / n_memory, min=1e-12))
+
+    cos_phi_dy = dy_r / torch.clamp(sig_dy_next, min=1e-12)
+    sin_phi_dy = -ddy_r / torch.clamp(sig_ddy_next, min=1e-12)
+    phi_dy = torch.atan2(sin_phi_dy, cos_phi_dy)
+
+    theta = phi_dy - phi_vy
+    theta = torch.atan2(torch.sin(theta), torch.cos(theta))
+    fhat = torch.where(
+        theta <= 0.0,
+        float(params["fhat0"]) + (float(params["fhat0"]) - float(params["fhat_min"])) * torch.sin(theta),
+        float(params["fhat0"]) + (float(params["fhat_max"]) - float(params["fhat0"])) * torch.sin(theta),
+    )
+    omega_vy = 2.0 * math.pi * fhat * speed_mag / float(diameter)
+    phi_vy_next = phi_vy + float(dt) * omega_vy
+
+    fdy = -0.5 * float(rho) * float(diameter) * float(params["Cd"]) * speed_mag * velocity
+    fcv = 0.5 * float(rho) * float(diameter) * float(params["Cv"]) * speed_mag * flow_speed * torch.cos(phi_vy_next)
+    fca = -0.25 * float(rho) * float(params["Ca"]) * math.pi * (float(diameter) ** 2) * acceleration
+    force_total = fca + fcv + fdy
+
+    next_context = torch.cat([acceleration, phi_vy_next, sig_dy_next, sig_ddy_next, flow_speed], dim=1)
+    return force_total, next_context
+
+
+def structural_step_constant_force_torch(
+    *,
+    y: torch.Tensor,
+    velocity: torch.Tensor,
+    force: torch.Tensor,
+    dt: float,
+    mass: float,
+    damping_c: float,
+    stiffness: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dt_t = y.new_tensor(float(dt))
+    half = y.new_tensor(0.5)
+    sixth = y.new_tensor(1.0 / 6.0)
+    mass_f = float(mass)
+    damping_f = float(damping_c)
+    stiffness_f = float(stiffness)
+
+    def accel(y_state: torch.Tensor, v_state: torch.Tensor) -> torch.Tensor:
+        return (force - damping_f * v_state - stiffness_f * y_state) / mass_f
+
+    k1_y = velocity
+    k1_v = accel(y, velocity)
+
+    y2 = y + half * dt_t * k1_y
+    v2 = velocity + half * dt_t * k1_v
+    k2_y = v2
+    k2_v = accel(y2, v2)
+
+    y3 = y + half * dt_t * k2_y
+    v3 = velocity + half * dt_t * k2_v
+    k3_y = v3
+    k3_v = accel(y3, v3)
+
+    y4 = y + dt_t * k3_y
+    v4 = velocity + dt_t * k3_v
+    k4_y = v4
+    k4_v = accel(y4, v4)
+
+    y_next = y + (dt_t * sixth) * (k1_y + 2.0 * k2_y + 2.0 * k3_y + k4_y)
+    v_next = velocity + (dt_t * sixth) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+    a_next = accel(y_next, v_next)
+    return y_next, v_next, a_next
 
 
 def _normalize_ur_filter(

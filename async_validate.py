@@ -519,7 +519,7 @@ def _run_hnn_validation(
             non_blocking=(device.type == "cuda"),
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
-            force_reg=float(loss_cfg.force_reg),
+            sigma_reg=float(loss_cfg.sigma_reg),
             sigma_reg_norm=sigma_reg_norm,
             equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
             equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
@@ -554,7 +554,7 @@ def _run_hnn_validation(
             non_blocking=(device.type == "cuda"),
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
-            force_reg=float(loss_cfg.force_reg),
+            sigma_reg=float(loss_cfg.sigma_reg),
             sigma_reg_norm=sigma_reg_norm,
             normalize_residual_by_ur_bin_std=normalize_residual_by_ur_bin_std,
             normalize_rollout_by_ur_bin_std=normalize_rollout_by_ur_bin_std,
@@ -933,7 +933,7 @@ def _evaluate_val_losses(
     non_blocking: bool,
     mean_reg: float,
     mean_reg_norm: str,
-    force_reg: float,
+    sigma_reg: float,
     sigma_reg_norm: str,
     equalize_residual_over_ur_bins: bool,
     equalize_rollout_over_ur_bins: bool,
@@ -1063,7 +1063,7 @@ def _evaluate_val_losses(
                     on_coeff=force_reg_on_coeff,
                     history_context=history_context,
                 )
-                sigma_loss = float(force_reg) * sigma_reg_loss
+                sigma_loss = float(sigma_reg) * sigma_reg_loss
                 mean_loss_reg = float(mean_reg) * mean_reg_loss
                 if use_force_data_loss:
                     if f_i is None or f_next is None:
@@ -1180,7 +1180,7 @@ def _per_ur_loss_map_hnn(
     non_blocking: bool,
     mean_reg: float,
     mean_reg_norm: str,
-    force_reg: float,
+    sigma_reg: float,
     sigma_reg_norm: str,
     equalize_residual_over_ur_bins: bool = False,
     equalize_rollout_over_ur_bins: bool = False,
@@ -1273,7 +1273,7 @@ def _per_ur_loss_map_hnn(
                     on_coeff=force_reg_on_coeff,
                     history_context=history_context,
                 )
-                per_reg = float(force_reg) * per_sigma_reg
+                per_reg = float(sigma_reg) * per_sigma_reg
                 per_reg_mean = float(mean_reg) * per_mean_reg
 
                 if use_force_data_loss and f_i is not None and f_next is not None:

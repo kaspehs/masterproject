@@ -96,7 +96,7 @@ loss:
   # Norm for mean-force regularizer: l1 | l2
   mean_reg_norm: l1
   # Sigma regularization weight (for stochastic PHNN this regularizes diffusion sigma).
-  force_reg: 0.1
+  sigma_reg: 0.1
   # Norm for sigma regularizer: l1 | l2
   sigma_reg_norm: l2
   # If true, average the residual/physics loss equally over reduced-velocity bins.

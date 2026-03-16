@@ -46,8 +46,12 @@ from HNN_helper import (
     resolve_middle_time_plot,
     relative_error,
     resample_uniform_series,
+    load_td_correction_trajectories,
+    resolve_td_correction_params,
     sample_one_index_per_ur,
     spectral_relative_error,
+    structural_step_constant_force_torch,
+    td_baseline_step_torch,
 )
 from architectures import ODEPirateNet
 
@@ -1500,7 +1504,466 @@ def _log_rollout_validation(
     return metrics
 
 
+def _vpinn_predict_correction(
+    model: nn.Module,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    ur: torch.Tensor,
+    *,
+    probabilistic: bool,
+    sigma_min: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = _vpinn_force(model, x, v, ur)
+    d = int(x.shape[-1])
+    if not probabilistic:
+        return out, torch.zeros_like(out)
+    if int(out.shape[-1]) != int(2 * d):
+        raise ValueError("Probabilistic TD correction VPINN expects output dimension 2*d.")
+    mu = out[..., :d]
+    sigma = float(sigma_min) + F.softplus(out[..., d:])
+    return mu, sigma
+
+
+def _vpinn_td_rollout(
+    *,
+    model: nn.Module,
+    x0: torch.Tensor,
+    v0: torch.Tensor,
+    ur0: torch.Tensor,
+    td_context0: torch.Tensor,
+    steps: int,
+    dt: float,
+    m: float,
+    c: float,
+    k: float,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+    probabilistic: bool,
+    sigma_min: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = x0
+    v = v0
+    td_context = td_context0
+    xs = [x]
+    vs = [v]
+    fs: list[torch.Tensor] = []
+    for _ in range(int(steps)):
+        corr_mu, _corr_sigma = _vpinn_predict_correction(
+            model,
+            x,
+            v,
+            ur0,
+            probabilistic=probabilistic,
+            sigma_min=sigma_min,
+        )
+        td_force_next, td_context_next = td_baseline_step_torch(
+            velocity=v,
+            acceleration=td_context[:, 0:1],
+            td_context=td_context,
+            dt=dt,
+            rho=rho,
+            diameter=diameter,
+            params=td_params,
+        )
+        total_force = td_force_next + corr_mu
+        x, v, a_next = structural_step_constant_force_torch(
+            y=x,
+            velocity=v,
+            force=total_force,
+            dt=dt,
+            mass=m,
+            damping_c=c,
+            stiffness=k,
+        )
+        td_context = td_context_next.clone()
+        td_context[:, 0:1] = a_next
+        xs.append(x)
+        vs.append(v)
+        fs.append(total_force)
+    return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1) if fs else x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
+
+
+def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
+    vp = dict(config.vpinn or {})
+    data_cfg = config.data
+    model_cfg = config.model
+    training_cfg = config.training
+    optim_cfg = config.optim
+    loss_cfg = config.loss
+    runtime_cfg = config.runtime
+    precision_cfg = config.precision
+    compile_cfg = config.compile
+    monitoring_cfg = config.monitoring
+
+    probabilistic = bool(vp.get("predict_sigma", False))
+    sigma_min = float(vp.get("sigma_min", 1e-6))
+    if sigma_min < 0.0:
+        raise ValueError("vpinn.sigma_min must be non-negative.")
+    device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
+    print(f"Using device: {device}")
+    configure_tf32(device, bool(precision_cfg.use_tf32))
+    set_num_threads_from_slurm(default=1)
+    non_blocking = device.type == "cuda"
+
+    train_series_root = Path(data_cfg.train_series_dir)
+    if not data_cfg.use_generated_train_series:
+        raise ValueError("vpinn.use_td_correction currently expects data.use_generated_train_series=true.")
+    train_dir = train_series_root / "train"
+    val_dir = train_series_root / "val"
+    train_paths = sorted(train_dir.glob("*.npz"))
+    val_paths = sorted(val_dir.glob("*.npz"))
+    if not train_paths:
+        raise FileNotFoundError("No TD correction VPINN training trajectories were found.")
+    train_cut = float(getattr(data_cfg, "cut_start_seconds_train", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
+    val_cut = float(getattr(data_cfg, "cut_start_seconds_val", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
+    train_trajs = load_td_correction_trajectories(paths=train_paths, cut_start_seconds=train_cut)
+    val_trajs = load_td_correction_trajectories(paths=val_paths, cut_start_seconds=val_cut) if val_paths else []
+
+    dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
+    structural_mass = float(getattr(model_cfg, "structural_mass", 16.79))
+    damping_c = float(getattr(model_cfg, "damping_c", 1e-4))
+    stiffness = float(getattr(model_cfg, "k", 1218.0))
+    rho = float(getattr(model_cfg, "rho", 1000.0))
+    diameter = float(getattr(model_cfg, "D", 0.1))
+    td_params = resolve_td_correction_params(vp)
+
+    d = int(np.asarray(train_trajs[0]["y"]).ndim == 1)
+    input_dim = 3
+    output_dim = 2 if probabilistic else 1
+    model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim).to(device)
+    model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
+
+    def _windows(trajs: list[dict[str, np.ndarray]], rollout_steps: int) -> tuple[Dataset, Dataset | None]:
+        train_items: list[TensorDataset] = []
+        roll_items: list[TensorDataset] = []
+        window_M = int(vp.get("window_M", 50))
+        stride = max(1, int(vp.get("stride", 1)))
+        window = window_M + 1
+        roll_window = rollout_steps + 1
+        for traj in trajs:
+            x = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
+            v = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
+            f_corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
+            f_td = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
+            ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+            t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
+            td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
+            if x.shape[0] >= window:
+                xw = []
+                vw = []
+                cw = []
+                tdw = []
+                urw = []
+                for start in range(0, x.shape[0] - window + 1, stride):
+                    end = start + window
+                    xw.append(x[start:end])
+                    vw.append(v[start:end])
+                    cw.append(f_corr[start:end])
+                    tdw.append(f_td[start:end])
+                    urw.append(ur[start:end])
+                train_items.append(
+                    TensorDataset(
+                        torch.stack(xw, dim=0),
+                        torch.stack(vw, dim=0),
+                        torch.stack(cw, dim=0),
+                        torch.stack(tdw, dim=0),
+                        torch.stack(urw, dim=0),
+                    )
+                )
+            if rollout_steps > 0 and x.shape[0] >= roll_window:
+                x0s = []
+                v0s = []
+                urs = []
+                td0s = []
+                xtr = []
+                vtr = []
+                for start in range(0, x.shape[0] - roll_window + 1, stride):
+                    end = start + roll_window
+                    x0s.append(x[start])
+                    v0s.append(v[start])
+                    urs.append(ur[start])
+                    td0s.append(td_context[start])
+                    xtr.append(x[start:end])
+                    vtr.append(v[start:end])
+                roll_items.append(
+                    TensorDataset(
+                        torch.stack(x0s, dim=0),
+                        torch.stack(v0s, dim=0),
+                        torch.stack(urs, dim=0),
+                        torch.stack(td0s, dim=0),
+                        torch.stack(xtr, dim=0),
+                        torch.stack(vtr, dim=0),
+                    )
+                )
+        train_ds = train_items[0] if len(train_items) == 1 else ConcatDataset(train_items)
+        roll_ds = None
+        if roll_items:
+            roll_ds = roll_items[0] if len(roll_items) == 1 else ConcatDataset(roll_items)
+        return train_ds, roll_ds
+
+    rollout_weight = float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0))))
+    rollout_steps = int(vp.get("rollout_force_steps", int(getattr(loss_cfg, "rollout_det_steps", 0))))
+    train_dataset, _ = _windows(train_trajs, rollout_steps=0)
+    val_dataset = None
+    val_rollout_dataset = None
+    if val_trajs:
+        val_dataset, val_rollout_dataset = _windows(val_trajs, rollout_steps=rollout_steps)
+    train_rollout_dataset = _windows(train_trajs, rollout_steps=rollout_steps)[1] if rollout_weight > 0.0 and rollout_steps > 0 else None
+
+    train_loader = DataLoader(train_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_dataset is not None else None
+    rollout_loader = DataLoader(train_rollout_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if train_rollout_dataset is not None else None
+    val_rollout_loader = DataLoader(val_rollout_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_rollout_dataset is not None else None
+
+    opt, lr_scheduler = setup_optimizer_and_scheduler(model, optim_cfg=optim_cfg, scheduler_cfg=optim_cfg.scheduler, epochs=int(training_cfg.epochs))
+    amp_enabled, amp_dtype, scaler = setup_amp(device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype))
+    writer, run_name = setup_writer(
+        config.logging.run_dir_root,
+        config_name,
+        run_name_override=getattr(config.logging, "run_name", None),
+        append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
+    )
+
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
+    use_force_loss = bool(vp.get("use_force_loss", True))
+    use_weak_loss = bool(vp.get("use_weak_loss", True))
+    if not (use_force_loss or use_weak_loss):
+        raise ValueError("vpinn.use_td_correction requires at least one of use_force_loss/use_weak_loss.")
+    w, wdot, alpha = _test_functions(int(vp.get("window_M", 50)), dt, num_poly=int(vp.get("num_poly_test", 2)), num_sine=int(vp.get("num_sine_test", 0)))
+    w = w.to(device)
+    wdot = wdot.to(device)
+    alpha = alpha.to(device)
+
+    def _reg(val: torch.Tensor, norm: str) -> torch.Tensor:
+        return torch.mean(torch.abs(val)) if str(norm).strip().lower() == "l1" else torch.mean(val * val)
+
+    epochs = int(training_cfg.epochs)
+    validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
+    log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
+    print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
+
+    for epoch in range(epochs):
+        model.train()
+        if bool(optim_cfg.use_lr_scheduler):
+            for group in opt.param_groups:
+                group["lr"] = lr_scheduler.get_lr(epoch)
+        sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_rollout_det", "grad_norm"]}
+        batches = 0
+        rollout_iter = iter(rollout_loader) if rollout_loader is not None else None
+        for batch in train_loader:
+            x_win, v_win, corr_true, td_force, ur_win = batch
+            x_win = x_win.to(device, non_blocking=non_blocking)
+            v_win = v_win.to(device, non_blocking=non_blocking)
+            corr_true = corr_true.to(device, non_blocking=non_blocking)
+            td_force = td_force.to(device, non_blocking=non_blocking)
+            ur_win = ur_win.to(device, non_blocking=non_blocking)
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                mu_corr, sigma_corr = _vpinn_predict_correction(model, x_win, v_win, ur_win, probabilistic=probabilistic, sigma_min=sigma_min)
+                total_force_mu = td_force + mu_corr
+                if use_force_loss:
+                    if probabilistic:
+                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                        loss_data = torch.mean(0.5 * (((corr_true - mu_corr) ** 2) / var + torch.log(var)))
+                    else:
+                        loss_data = torch.mean((corr_true - mu_corr) ** 2)
+                else:
+                    loss_data = mu_corr.new_tensor(0.0)
+                if use_weak_loss:
+                    R_mean = _weak_residual(
+                        x=x_win,
+                        v=v_win,
+                        f_pred=total_force_mu,
+                        m=torch.tensor([structural_mass], device=device),
+                        c=torch.tensor([damping_c], device=device),
+                        k=torch.tensor([stiffness], device=device),
+                        dt=dt,
+                        w=w,
+                        wdot=wdot,
+                        alpha=alpha,
+                        f0=None,
+                    )
+                    if probabilistic:
+                        coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
+                        weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                        weak_var = torch.clamp(weak_var, min=1e-9)
+                        loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
+                    else:
+                        loss_physics = torch.mean(R_mean * R_mean)
+                else:
+                    loss_physics = mu_corr.new_tensor(0.0)
+                mean_reg_loss = _reg(mu_corr, mean_reg_norm)
+                sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
+                rollout_det_loss = mu_corr.new_tensor(0.0)
+                if rollout_iter is not None and rollout_weight > 0.0 and rollout_steps > 0:
+                    try:
+                        rb = next(rollout_iter)
+                    except StopIteration:
+                        rollout_iter = iter(rollout_loader)
+                        rb = next(rollout_iter)
+                    x0, v0, ur0, td0, x_true_seq, v_true_seq = [item.to(device, non_blocking=non_blocking) for item in rb]
+                    x_seq, v_seq, _f_seq = _vpinn_td_rollout(
+                        model=model,
+                        x0=x0,
+                        v0=v0,
+                        ur0=ur0,
+                        td_context0=td0,
+                        steps=int(x_true_seq.shape[1] - 1),
+                        dt=dt,
+                        m=structural_mass,
+                        c=damping_c,
+                        k=stiffness,
+                        rho=rho,
+                        diameter=diameter,
+                        td_params=td_params,
+                        probabilistic=probabilistic,
+                        sigma_min=sigma_min,
+                    )
+                    rollout_det_loss = torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2)
+                total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_weight) * rollout_det_loss
+            if scaler.is_enabled():
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(opt)
+            else:
+                total_loss.backward()
+            grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=float(training_cfg.max_grad_norm))
+            if scaler.is_enabled():
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            batches += 1
+            sums["loss_total"] += total_loss.detach()
+            sums["loss_data"] += loss_data.detach()
+            sums["loss_physics"] += loss_physics.detach()
+            sums["loss_reg_mean"] += mean_reg_loss.detach()
+            sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+            sums["loss_rollout_det"] += rollout_det_loss.detach()
+            sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
+        denom = float(max(1, batches))
+        metrics = {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
+        metrics["lr"] = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(optim_cfg.lr)
+        if epoch % log_every == 0 or epoch == epochs - 1:
+            for name, value in metrics.items():
+                writer.add_scalar(f"train/{name}", value, epoch + 1)
+        if epoch % print_every == 0 or epoch == epochs - 1:
+            print(
+                f"Epoch {epoch}: loss={metrics['loss_total']:.4e}, "
+                f"Ldata={metrics['loss_data']:.4e}, Lphys={metrics['loss_physics']:.4e}, "
+                f"Lroll={metrics['loss_rollout_det']:.4e}, lr={metrics['lr']:.3e}"
+            )
+        if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
+            model.eval()
+            val_sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma"]}
+            val_batches = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    x_win, v_win, corr_true, td_force, ur_win = [item.to(device, non_blocking=non_blocking) for item in batch]
+                    with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                        mu_corr, sigma_corr = _vpinn_predict_correction(model, x_win, v_win, ur_win, probabilistic=probabilistic, sigma_min=sigma_min)
+                        total_force_mu = td_force + mu_corr
+                        if use_force_loss:
+                            if probabilistic:
+                                var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                                loss_data = torch.mean(0.5 * (((corr_true - mu_corr) ** 2) / var + torch.log(var)))
+                            else:
+                                loss_data = torch.mean((corr_true - mu_corr) ** 2)
+                        else:
+                            loss_data = mu_corr.new_tensor(0.0)
+                        if use_weak_loss:
+                            R_mean = _weak_residual(
+                                x=x_win,
+                                v=v_win,
+                                f_pred=total_force_mu,
+                                m=torch.tensor([structural_mass], device=device),
+                                c=torch.tensor([damping_c], device=device),
+                                k=torch.tensor([stiffness], device=device),
+                                dt=dt,
+                                w=w,
+                                wdot=wdot,
+                                alpha=alpha,
+                                f0=None,
+                            )
+                            if probabilistic:
+                                coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
+                                weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                                weak_var = torch.clamp(weak_var, min=1e-9)
+                                loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
+                            else:
+                                loss_physics = torch.mean(R_mean * R_mean)
+                        else:
+                            loss_physics = mu_corr.new_tensor(0.0)
+                        mean_reg_loss = _reg(mu_corr, mean_reg_norm)
+                        sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
+                        total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                    val_sums["loss_total"] += total_loss.detach()
+                    val_sums["loss_data"] += loss_data.detach()
+                    val_sums["loss_physics"] += loss_physics.detach()
+                    val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                    val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                    val_batches += 1
+            val_denom = float(max(1, val_batches))
+            for name, value in val_sums.items():
+                writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch + 1)
+            if val_rollout_loader is not None and rollout_weight > 0.0 and rollout_steps > 0:
+                with torch.no_grad():
+                    roll_sum = torch.zeros((), device=device)
+                    roll_batches = 0
+                    for rb in val_rollout_loader:
+                        x0, v0, ur0, td0, x_true_seq, v_true_seq = [item.to(device, non_blocking=non_blocking) for item in rb]
+                        x_seq, v_seq, _ = _vpinn_td_rollout(
+                            model=model,
+                            x0=x0,
+                            v0=v0,
+                            ur0=ur0,
+                            td_context0=td0,
+                            steps=int(x_true_seq.shape[1] - 1),
+                            dt=dt,
+                            m=structural_mass,
+                            c=damping_c,
+                            k=stiffness,
+                            rho=rho,
+                            diameter=diameter,
+                            td_params=td_params,
+                            probabilistic=probabilistic,
+                            sigma_min=sigma_min,
+                        )
+                        roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
+                        roll_batches += 1
+                    writer.add_scalar("val/loss_rollout_det", float((roll_sum / float(max(1, roll_batches))).detach().cpu()), epoch + 1)
+
+    writer.add_text("vpinn/td_correction_config", json.dumps(vp, indent=2, sort_keys=True), 0)
+    models_dir = Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"{run_name}.pt"
+    state_source: nn.Module = model
+    if hasattr(model, "_orig_mod"):
+        state_source = getattr(model, "_orig_mod")
+    torch.save(
+        {
+            "model_state": state_source.state_dict(),
+            "config": asdict(config),
+            "run_name": run_name,
+            "dt": dt,
+            "method": "vpinn",
+            "td_correction": True,
+        },
+        model_path,
+    )
+    print(f"Saved final model to {model_path}")
+    writer.flush()
+    writer.close()
+
+
 def train(config: Config, config_name: str) -> None:
+    if bool(dict(config.vpinn or {}).get("use_td_correction", False)):
+        _train_td_correction_vpinn(config, config_name)
+        return
+
     vp = dict(config.vpinn or {})
     runtime_cfg = config.runtime
     precision_cfg = config.precision

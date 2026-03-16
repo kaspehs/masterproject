@@ -1,0 +1,909 @@
+from __future__ import annotations
+
+import json
+from itertools import product
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+    tqdm = None
+
+try:
+    from Data_Gen.td_hidden_state import (
+        build_paramsets_from_values,
+        compute_theta_series as shared_compute_theta_series,
+        initial_hidden_sigmas as shared_initial_hidden_sigmas,
+        initial_phi_dy as shared_initial_phi_dy,
+        paramset_id as shared_paramset_id,
+        replay_hidden_state_with_cfd_motion as shared_replay_hidden_state_with_cfd_motion,
+        wrap_phase as shared_wrap_phase,
+    )
+except ModuleNotFoundError:
+    from td_hidden_state import (
+        build_paramsets_from_values,
+        compute_theta_series as shared_compute_theta_series,
+        initial_hidden_sigmas as shared_initial_hidden_sigmas,
+        initial_phi_dy as shared_initial_phi_dy,
+        paramset_id as shared_paramset_id,
+        replay_hidden_state_with_cfd_motion as shared_replay_hidden_state_with_cfd_motion,
+        wrap_phase as shared_wrap_phase,
+    )
+
+
+# Case selection
+INPUT_NPZS: list[Path] | None = None  # None -> use all files matching INPUT_NPZ_GLOB
+#INPUT_NPZ_GLOB = "CFD_Data/npz_exports/comb_Ur7__2Hydro.npz"
+INPUT_NPZ_GLOB = "CFD_Data/npz_exports/*.npz"
+OUTPUT_DIR = Path("CFD_Data/td_burnin_analysis")
+OVERWRITE = True
+MULTI_CASE_ONLY_SPREAD_PLOT = False  # If True, only generate the phase spread vs burn-in plot for multiple cases, skip single-case endpoint mismatch and trajectory overlay plots.
+SKIP_INVALID_CASES = True
+SHOW_PROGRESS = True
+
+# TD parameter sweep
+CV_VALUES = [1.2]
+CD_VALUES = [1.1]
+CA_VALUES = [1.0]
+
+FHAT_MIN_VALUES = [0.11]
+FHAT0_VALUES = [0.18]
+FHAT_MAX_VALUES = [0.26]
+
+DAMPING_C_VALUES = [1e-4]
+N_MEMORY = 500
+INTEGRATOR = "rk4"
+
+# Burn-in analysis configs
+EVAL_FRACTION = 1.0
+THETA0_VALUES = np.linspace(-np.pi / 2, np.pi / 2, 7, endpoint=True)
+
+MIN_BURNIN_SECONDS = 0.0
+MAX_BURNIN_SECONDS = None
+BURNIN_STEP_SECONDS = 5.0
+
+COMPARISON_WINDOW_SECONDS = 10.0
+PHASE_WRAP = "principal"
+RERUN_BURNIN_WINDOWS_SECONDS = [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)]
+SPREAD_PLOT_YMIN = 1.0e-12
+
+# Hidden-state initialization
+SIGMA_INIT_MODE = "local_rms"  # "zero" or "local_rms"
+SIGMA_INIT_WINDOW_SECONDS = None  # None -> use up to N_MEMORY samples
+
+
+def _as_list(value):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return list(value)
+    return [value]
+
+
+def _format_float(value: float) -> str:
+    text = f"{float(value):.6g}"
+    return text.replace("+", "")
+
+
+def _paramset_id(params: dict[str, float]) -> str:
+    return shared_paramset_id(params)
+
+
+def _wrap_phase(values: np.ndarray, mode: str) -> np.ndarray:
+    return shared_wrap_phase(values, mode=mode)
+
+
+def _compute_theta_series(
+    *,
+    dy: np.ndarray,
+    ddy: np.ndarray,
+    phi_vy: np.ndarray,
+    sig_dy_loc: np.ndarray,
+    sig_ddy_loc: np.ndarray,
+    flow_speed_m_s: float,
+) -> np.ndarray:
+    return shared_compute_theta_series(
+        dy=dy,
+        ddy=ddy,
+        phi_vy=phi_vy,
+        sig_dy_loc=sig_dy_loc,
+        sig_ddy_loc=sig_ddy_loc,
+        flow_speed_m_s=flow_speed_m_s,
+        mode=PHASE_WRAP,
+    )
+
+
+def _initial_phi_dy(
+    *,
+    dy0: float,
+    ddy0: float,
+    sig_dy_loc0: float,
+    sig_ddy_loc0: float,
+    flow_speed_m_s: float,
+) -> float:
+    return shared_initial_phi_dy(
+        dy0=dy0,
+        ddy0=ddy0,
+        sig_dy_loc0=sig_dy_loc0,
+        sig_ddy_loc0=sig_ddy_loc0,
+        flow_speed_m_s=flow_speed_m_s,
+    )
+
+
+def _circular_std(values: np.ndarray) -> float:
+    angles = np.asarray(values, dtype=float)
+    resultant = np.abs(np.mean(np.exp(1j * angles)))
+    resultant = np.clip(resultant, 1.0e-12, 1.0)
+    return float(np.sqrt(-2.0 * np.log(resultant)))
+
+
+def _load_case(npz_path: Path) -> dict[str, np.ndarray | float | str]:
+    if not npz_path.exists():
+        raise FileNotFoundError(f"Input CFD case '{npz_path}' not found.")
+
+    data = np.load(npz_path, allow_pickle=True)
+    required_arrays = ["time_dim", "y_disp_dim", "y_vel_dim", "y_acc_dim", "y_force_dim"]
+    required_scalars = [
+        "dt_dim",
+        "flow_speed_m_s",
+        "stiffness_n_m",
+        "dry_mass_kg",
+        "diameter_m",
+        "rho_kg_m3",
+    ]
+    missing = [key for key in required_arrays + required_scalars if key not in data.files]
+    if missing:
+        raise KeyError(f"CFD case '{npz_path}' is missing required keys: {missing}")
+
+    time_dim = np.asarray(data["time_dim"], dtype=float)
+    y_dim = np.asarray(data["y_disp_dim"], dtype=float)
+    dy_dim = np.asarray(data["y_vel_dim"], dtype=float)
+    ddy_dim = np.asarray(data["y_acc_dim"], dtype=float)
+    force_dim = np.asarray(data["y_force_dim"], dtype=float)
+    if not (len(time_dim) == len(y_dim) == len(dy_dim) == len(ddy_dim) == len(force_dim)):
+        raise ValueError("Dimensional CFD channels must have the same length.")
+    if len(time_dim) < 4:
+        raise ValueError("Need at least 4 CFD samples for the burn-in analysis.")
+
+    keep_mask = np.ones(len(time_dim), dtype=bool)
+    dup_mask = np.diff(time_dim) <= 0.0
+    if np.any(dup_mask):
+        if np.any(np.diff(time_dim) < 0.0):
+            raise ValueError("CFD time vector must be nondecreasing.")
+        keep_mask[1:] = ~dup_mask
+        time_dim = time_dim[keep_mask]
+        y_dim = y_dim[keep_mask]
+        dy_dim = dy_dim[keep_mask]
+        ddy_dim = ddy_dim[keep_mask]
+        force_dim = force_dim[keep_mask]
+
+    dt_dim = float(np.asarray(data["dt_dim"]).reshape(()))
+    diffs = np.diff(time_dim)
+    if np.any(diffs <= 0.0):
+        raise ValueError("CFD time vector must be strictly increasing after duplicate removal.")
+    dt_median = float(np.median(diffs))
+    if dt_median <= 0.0:
+        raise ValueError("Median CFD time step must be positive.")
+    # Use the observed median step in the analysis. The exported CFD series can
+    # contain tiny floating-point jitter, and exact equality with dt_dim is not
+    # important for the burn-in scan as long as time is monotone and near-uniform.
+    dt_dim = dt_median
+
+    return {
+        "case_name": npz_path.stem,
+        "source_path": str(npz_path),
+        "time_dim": time_dim,
+        "y_dim": y_dim,
+        "dy_dim": dy_dim,
+        "ddy_dim": ddy_dim,
+        "force_dim": force_dim,
+        "force_std_dim": float(np.std(force_dim)),
+        "dt_dim": dt_dim,
+        "flow_speed_m_s": float(np.asarray(data["flow_speed_m_s"]).reshape(())),
+        "stiffness_n_m": float(np.asarray(data["stiffness_n_m"]).reshape(())),
+        "dry_mass_kg": float(np.asarray(data["dry_mass_kg"]).reshape(())),
+        "diameter_m": float(np.asarray(data["diameter_m"]).reshape(())),
+        "rho_kg_m3": float(np.asarray(data["rho_kg_m3"]).reshape(())),
+        "structural_frequency_hz": (
+            float(np.asarray(data["structural_frequency_hz"]).reshape(()))
+            if "structural_frequency_hz" in data.files
+            else None
+        ),
+    }
+
+
+def _build_paramsets() -> list[dict[str, float]]:
+    return build_paramsets_from_values(
+        cv_values=CV_VALUES,
+        cd_values=CD_VALUES,
+        ca_values=CA_VALUES,
+        damping_c_values=DAMPING_C_VALUES,
+        fhat_min_values=FHAT_MIN_VALUES,
+        fhat0_values=FHAT0_VALUES,
+        fhat_max_values=FHAT_MAX_VALUES,
+    )
+
+
+def _candidate_start_indices(time_dim: np.ndarray, dt_dim: float, eval_idx: int) -> list[int]:
+    step_samples = int(round(float(BURNIN_STEP_SECONDS) / float(dt_dim)))
+    if step_samples <= 0:
+        raise ValueError("BURNIN_STEP_SECONDS is too small relative to dt_dim.")
+
+    eval_time = float(time_dim[eval_idx])
+    max_burnin_seconds = eval_time - float(time_dim[0]) if MAX_BURNIN_SECONDS is None else float(MAX_BURNIN_SECONDS)
+    if max_burnin_seconds < float(MIN_BURNIN_SECONDS):
+        raise ValueError("MAX_BURNIN_SECONDS must be >= MIN_BURNIN_SECONDS.")
+
+    starts: list[int] = []
+    burnin = float(MIN_BURNIN_SECONDS)
+    while burnin <= max_burnin_seconds + 0.5 * dt_dim:
+        target_time = eval_time - burnin
+        start_idx = int(np.searchsorted(time_dim, target_time, side="left"))
+        start_idx = max(0, min(start_idx, eval_idx - 1))
+        if eval_idx - start_idx >= 2:
+            starts.append(start_idx)
+        burnin += step_samples * dt_dim
+
+    unique_starts = sorted(set(starts))
+    if len(unique_starts) < 2:
+        raise ValueError("Need at least two valid candidate burn-in starts.")
+    return unique_starts
+
+
+def _run_single_sim(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    params: dict[str, float],
+    start_idx: int,
+    eval_idx: int,
+    theta0: float,
+) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+    time_dim = case["time_dim"]
+    y_dim = case["y_dim"]
+    dy_dim = case["dy_dim"]
+    ddy_dim = case["ddy_dim"]
+
+    start_time = float(time_dim[start_idx])
+    eval_time = float(time_dim[eval_idx])
+    burnin_seconds = eval_time - start_time
+    sig_dy_loc0, sig_ddy_loc0 = _initial_hidden_sigmas(
+        case=case,
+        start_idx=start_idx,
+        flow_speed_m_s=float(case["flow_speed_m_s"]),
+    )
+    phi_dy0 = _initial_phi_dy(
+        dy0=float(dy_dim[start_idx]),
+        ddy0=float(ddy_dim[start_idx]),
+        sig_dy_loc0=sig_dy_loc0,
+        sig_ddy_loc0=sig_ddy_loc0,
+        flow_speed_m_s=float(case["flow_speed_m_s"]),
+    )
+    phi_vy0 = float(_wrap_phase(np.asarray([phi_dy0 - float(theta0)]), PHASE_WRAP)[0])
+    sim = _replay_hidden_state_with_cfd_motion(
+        time=time_dim[start_idx : eval_idx + 1],
+        y=y_dim[start_idx : eval_idx + 1],
+        dy=dy_dim[start_idx : eval_idx + 1],
+        ddy=ddy_dim[start_idx : eval_idx + 1],
+        flow_speed_m_s=float(case["flow_speed_m_s"]),
+        rho_kg_m3=float(case["rho_kg_m3"]),
+        diameter_m=float(case["diameter_m"]),
+        params=params,
+        phi_vy0=float(phi_vy0),
+        sig_dy_loc0=sig_dy_loc0,
+        sig_ddy_loc0=sig_ddy_loc0,
+    )
+
+    phi_vy_eval = float(sim["phi_vy"][-1])
+    theta_series = _compute_theta_series(
+        dy=sim["dy"],
+        ddy=sim["ddy"],
+        phi_vy=sim["phi_vy"],
+        sig_dy_loc=sim["sig_dy_loc"],
+        sig_ddy_loc=sim["sig_ddy_loc"],
+        flow_speed_m_s=float(case["flow_speed_m_s"]),
+    )
+    theta_eval = float(theta_series[-1])
+    row = {
+        "case_name": str(case["case_name"]),
+        "Cv": float(params["Cv"]),
+        "Cd": float(params["Cd"]),
+        "Ca": float(params["Ca"]),
+        "C": float(params["C"]),
+        "fhat_min": float(params["fhat_min"]),
+        "fhat0": float(params["fhat0"]),
+        "fhat_max": float(params["fhat_max"]),
+        "theta0": float(theta0),
+        "phi_dy0": phi_dy0,
+        "phi_vy0": float(phi_vy0),
+        "start_idx": int(start_idx),
+        "start_time": start_time,
+        "eval_idx": int(eval_idx),
+        "eval_time": eval_time,
+        "burnin_seconds": burnin_seconds,
+        "phi_vy_eval": phi_vy_eval,
+        "phi_vy_eval_wrapped": float(_wrap_phase(np.asarray([phi_vy_eval]), PHASE_WRAP)[0]),
+        "theta_eval": theta_eval,
+        "theta_eval_wrapped": float(_wrap_phase(np.asarray([theta_eval]), PHASE_WRAP)[0]),
+        "F_total_eval": float(sim["F_total"][-1]),
+        "Fy_eval": float(sim["Fy"][-1]),
+        "sig_dy_loc0": sig_dy_loc0,
+        "sig_ddy_loc0": sig_ddy_loc0,
+        "y_eval_td": float(sim["y"][-1]),
+        "dy_eval_td": float(sim["dy"][-1]),
+        "ddy_eval_td": float(sim["ddy"][-1]),
+        "y_eval_cfd": float(y_dim[eval_idx]),
+        "dy_eval_cfd": float(dy_dim[eval_idx]),
+        "ddy_eval_cfd": float(ddy_dim[eval_idx]),
+    }
+    row["y_err_eval"] = row["y_eval_td"] - row["y_eval_cfd"]
+    row["dy_err_eval"] = row["dy_eval_td"] - row["dy_eval_cfd"]
+    row["ddy_err_eval"] = row["ddy_eval_td"] - row["ddy_eval_cfd"]
+    return row, sim
+
+
+def _replay_hidden_state_with_cfd_motion(
+    *,
+    time: np.ndarray,
+    y: np.ndarray,
+    dy: np.ndarray,
+    ddy: np.ndarray,
+    flow_speed_m_s: float,
+    rho_kg_m3: float,
+    diameter_m: float,
+    params: dict[str, float],
+    phi_vy0: float,
+    sig_dy_loc0: float,
+    sig_ddy_loc0: float,
+) -> dict[str, np.ndarray]:
+    return shared_replay_hidden_state_with_cfd_motion(
+        time=time,
+        y=y,
+        dy=dy,
+        ddy=ddy,
+        flow_speed_m_s=flow_speed_m_s,
+        rho_kg_m3=rho_kg_m3,
+        diameter_m=diameter_m,
+        params=params,
+        phi_vy0=phi_vy0,
+        sig_dy_loc0=sig_dy_loc0,
+        sig_ddy_loc0=sig_ddy_loc0,
+        n_memory=int(N_MEMORY),
+    )
+
+
+def _initial_hidden_sigmas(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    start_idx: int,
+    flow_speed_m_s: float,
+) -> tuple[float, float]:
+    return shared_initial_hidden_sigmas(
+        case_like=case,
+        start_idx=start_idx,
+        flow_speed_m_s=flow_speed_m_s,
+        n_memory=int(N_MEMORY),
+        mode=SIGMA_INIT_MODE,
+        window_seconds=SIGMA_INIT_WINDOW_SECONDS,
+    )
+
+
+def _plot_phase_vs_burnin(df: pd.DataFrame, out_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for theta0, group in df.groupby("theta0", sort=True):
+        group = group.sort_values("burnin_seconds")
+        ax.plot(
+            group["burnin_seconds"].to_numpy(),
+            group["theta_eval_wrapped"].to_numpy(),
+            marker="o",
+            linewidth=1.2,
+            markersize=3.0,
+            label=f"theta0={theta0:.3f}",
+        )
+    ax.set_xlabel("Burn-in length [s]")
+    ax.set_ylabel("Wrapped theta at evaluation [rad]")
+    ax.set_title("Evaluation theta vs burn-in length")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, ncol=1)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_phase_spread(
+    case: dict[str, np.ndarray | float | str],
+    df: pd.DataFrame,
+    out_path: Path,
+) -> None:
+    grouped = _phase_spread_summary(case, df)
+    _plot_phase_spread_summary(grouped, out_path=out_path)
+
+
+def _phase_spread_summary(
+    case: dict[str, np.ndarray | float | str],
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    force_std_ref = max(float(case["force_std_dim"]), np.finfo(float).eps)
+    for burnin, group in df.groupby("burnin_seconds", sort=True):
+        theta_vals = group["theta_eval_wrapped"].to_numpy(dtype=float)
+        force_vals = group["F_total_eval"].to_numpy(dtype=float)
+        rows.append(
+            {
+                "burnin_seconds": float(burnin),
+                "theta_circular_std": _circular_std(theta_vals),
+                "cos_theta_std": float(np.std(np.cos(theta_vals))),
+                "force_total_rel_std": float(np.std(force_vals) / force_std_ref),
+            }
+        )
+    grouped = pd.DataFrame(rows).sort_values("burnin_seconds").reset_index(drop=True)
+    grouped["case_name"] = str(case["case_name"])
+    return grouped
+
+
+def _plot_phase_spread_summary(grouped: pd.DataFrame, *, out_path: Path) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
+    panel_specs = [
+        ("theta_circular_std", "Circular std of wrapped theta [rad]", "Theta spread vs burn-in length"),
+        ("cos_theta_std", "Std of cos(theta) [-]", "cos(theta) spread vs burn-in length"),
+        (
+            "force_total_rel_std",
+            "Std of total predicted force / std(CFD total force) [-]",
+            "Relative total force spread vs burn-in length",
+        ),
+    ]
+    for ax, (column, ylabel, title) in zip(axes, panel_specs):
+        ax.plot(grouped["burnin_seconds"], grouped[column], marker="o", linewidth=1.5)
+        min_col = f"{column}_min"
+        max_col = f"{column}_max"
+        if min_col in grouped.columns and max_col in grouped.columns:
+            ax.fill_between(
+                grouped["burnin_seconds"].to_numpy(dtype=float),
+                grouped[min_col].to_numpy(dtype=float),
+                grouped[max_col].to_numpy(dtype=float),
+                alpha=0.16,
+            )
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        positive = grouped[column].to_numpy(dtype=float)
+        positive = positive[np.isfinite(positive) & (positive > 0.0)]
+        if positive.size > 0:
+            ax.set_yscale("log")
+            ax.set_ylim(bottom=max(float(np.min(positive)) * 0.8, float(SPREAD_PLOT_YMIN)))
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Burn-in length [s]")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _combine_phase_spread_summaries(summaries: list[pd.DataFrame]) -> pd.DataFrame:
+    if not summaries:
+        raise ValueError("Need at least one phase spread summary to combine.")
+    return pd.concat(summaries, ignore_index=True).sort_values(["case_name", "burnin_seconds"]).reset_index(drop=True)
+
+
+def _plot_phase_spread_all_cases(combined: pd.DataFrame, *, out_path: Path) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(9, 11), sharex=True)
+    panel_specs = [
+        ("theta_circular_std", "Circular std of wrapped theta [rad]", "Theta spread vs burn-in length"),
+        ("cos_theta_std", "Std of cos(theta) [-]", "cos(theta) spread vs burn-in length"),
+        (
+            "force_total_rel_std",
+            "Std of total predicted force / std(CFD total force) [-]",
+            "Relative total force spread vs burn-in length",
+        ),
+    ]
+
+    case_groups = list(combined.groupby("case_name", sort=True))
+    for ax, (column, ylabel, title) in zip(axes, panel_specs):
+        positive_values = []
+        for case_name, group in case_groups:
+            values = group[column].to_numpy(dtype=float)
+            ax.plot(
+                group["burnin_seconds"].to_numpy(dtype=float),
+                values,
+                marker="o",
+                linewidth=1.3,
+                markersize=3.0,
+                label=str(case_name),
+            )
+            positive_values.append(values[np.isfinite(values) & (values > 0.0)])
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        nonempty_positive_values = [vals for vals in positive_values if vals.size > 0]
+        if nonempty_positive_values:
+            positive = np.concatenate(nonempty_positive_values)
+            if positive.size > 0:
+                ax.set_yscale("log")
+                ax.set_ylim(bottom=max(float(np.min(positive)) * 0.8, float(SPREAD_PLOT_YMIN)))
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Burn-in length [s]")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), fontsize=8)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _write_combined_phase_spread_outputs(
+    *,
+    summaries: list[pd.DataFrame],
+    out_dir: Path,
+) -> None:
+    combined = _combine_phase_spread_summaries(summaries)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(out_dir / "phase_spread_vs_burnin_all_cases.csv", index=False)
+    _plot_phase_spread_all_cases(
+        combined,
+        out_path=out_dir / "phase_spread_vs_burnin_all_cases.png",
+    )
+
+
+def _plot_endpoint_mismatch(df: pd.DataFrame, out_path: Path) -> None:
+    metrics = ["y_err_eval", "dy_err_eval", "ddy_err_eval"]
+    titles = ["|y error| at evaluation", "|dy error| at evaluation", "|ddy error| at evaluation"]
+    fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+    grouped = df.groupby("burnin_seconds", sort=True)
+    for ax, metric, title in zip(axes, metrics, titles):
+        summary = grouped[metric].agg(
+            mean_abs=lambda s: np.mean(np.abs(s.to_numpy())),
+            min_abs=lambda s: np.min(np.abs(s.to_numpy())),
+            max_abs=lambda s: np.max(np.abs(s.to_numpy())),
+        ).reset_index()
+        x = summary["burnin_seconds"].to_numpy()
+        ax.plot(x, summary["mean_abs"].to_numpy(), color="tab:blue", linewidth=1.8, label="mean |err|")
+        ax.fill_between(
+            x,
+            summary["min_abs"].to_numpy(),
+            summary["max_abs"].to_numpy(),
+            color="tab:blue",
+            alpha=0.18,
+            label="min/max |err|",
+        )
+        ax.set_ylabel(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    axes[-1].set_xlabel("Burn-in length [s]")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _selected_burnins(df: pd.DataFrame) -> list[float]:
+    values = sorted(df["burnin_seconds"].unique())
+    selected: list[float] = []
+    for window_start, window_end in RERUN_BURNIN_WINDOWS_SECONDS:
+        in_window = [
+            float(value)
+            for value in values
+            if float(window_start) <= float(value) <= float(window_end)
+        ]
+        if not in_window:
+            continue
+        selected_value = min(in_window, key=lambda value: (abs(value - float(window_end)), value))
+        if not any(np.isclose(selected_value, existing) for existing in selected):
+            selected.append(selected_value)
+    if selected:
+        return selected
+    if len(values) <= 3:
+        return values
+    return [values[0], values[len(values) // 2], values[-1]]
+
+
+def _comparison_window(case: dict[str, np.ndarray | float | str], eval_time: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    time_dim = np.asarray(case["time_dim"], dtype=float)
+    y_dim = np.asarray(case["y_dim"], dtype=float)
+    dy_dim = np.asarray(case["dy_dim"], dtype=float)
+    ddy_dim = np.asarray(case["ddy_dim"], dtype=float)
+    t0 = max(float(time_dim[0]), eval_time - float(COMPARISON_WINDOW_SECONDS))
+    mask = time_dim >= t0
+    return time_dim[mask], y_dim[mask], dy_dim[mask], ddy_dim[mask]
+
+
+def _rerun_for_selected_burnins(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    params: dict[str, float],
+    df: pd.DataFrame,
+) -> dict[float, list[tuple[float, dict[str, np.ndarray]]]]:
+    selected = _selected_burnins(df)
+    reruns: dict[float, list[tuple[float, dict[str, np.ndarray]]]] = {}
+    for burnin in selected:
+        subset = df[np.isclose(df["burnin_seconds"], burnin)].sort_values("theta0")
+        runs: list[tuple[float, dict[str, np.ndarray]]] = []
+        for row in subset.itertuples(index=False):
+            _, sim = _run_single_sim(
+                case=case,
+                params=params,
+                start_idx=int(row.start_idx),
+                eval_idx=int(row.eval_idx),
+                theta0=float(row.theta0),
+            )
+            runs.append((float(row.theta0), sim))
+        reruns[float(burnin)] = runs
+    return reruns
+
+
+def _plot_trajectory_overlay(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    df: pd.DataFrame,
+    reruns: dict[float, list[tuple[float, dict[str, np.ndarray]]]],
+    out_path: Path,
+) -> None:
+    eval_time = float(df["eval_time"].iloc[0])
+    cfd_t, cfd_y, cfd_dy, cfd_ddy = _comparison_window(case, eval_time)
+    burnins = list(reruns.keys())
+    fig, axes = plt.subplots(len(burnins), 3, figsize=(15, 4.0 * len(burnins)), sharex=False)
+    if len(burnins) == 1:
+        axes = np.asarray([axes])
+
+    for row_idx, burnin in enumerate(burnins):
+        for col_idx, (series, ylabel) in enumerate(
+            [(cfd_y, "y [m]"), (cfd_dy, "dy [m/s]"), (cfd_ddy, "ddy [m/s^2]")]
+        ):
+            ax = axes[row_idx, col_idx]
+            ax.plot(cfd_t, series, color="black", linewidth=2.0, label="CFD")
+            for theta0, sim in reruns[burnin]:
+                abs_time = df.loc[np.isclose(df["burnin_seconds"], burnin), "start_time"].iloc[0] + sim["time"]
+                mask = abs_time >= max(float(abs_time[0]), eval_time - float(COMPARISON_WINDOW_SECONDS))
+                if col_idx == 0:
+                    values = sim["y"][mask]
+                elif col_idx == 1:
+                    values = sim["dy"][mask]
+                else:
+                    values = sim["ddy"][mask]
+                ax.plot(abs_time[mask], values, linewidth=1.0, alpha=0.85, label=f"TD theta0={theta0:.2f}")
+            ax.axvline(eval_time, color="tab:red", linestyle="--", linewidth=1.0)
+            if row_idx == 0:
+                ax.set_title(["Displacement", "Velocity", "Acceleration"][col_idx])
+            if col_idx == 0:
+                ax.set_ylabel(f"Burn-in {burnin:.2f}s\n{ylabel}")
+            else:
+                ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4, fontsize=8)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_phi_trajectories(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    df: pd.DataFrame,
+    reruns: dict[float, list[tuple[float, dict[str, np.ndarray]]]],
+    out_path: Path,
+) -> None:
+    eval_time = float(df["eval_time"].iloc[0])
+    burnins = list(reruns.keys())
+    fig, axes = plt.subplots(len(burnins), 1, figsize=(11, 3.2 * len(burnins)), sharex=False)
+    if len(burnins) == 1:
+        axes = [axes]
+
+    for ax, burnin in zip(axes, burnins):
+        start_time = float(df.loc[np.isclose(df["burnin_seconds"], burnin), "start_time"].iloc[0])
+        for theta0, sim in reruns[burnin]:
+            abs_time = start_time + sim["time"]
+            mask = abs_time >= max(float(abs_time[0]), eval_time - float(COMPARISON_WINDOW_SECONDS))
+            theta_series = _compute_theta_series(
+                dy=sim["dy"],
+                ddy=sim["ddy"],
+                phi_vy=sim["phi_vy"],
+                sig_dy_loc=sim["sig_dy_loc"],
+                sig_ddy_loc=sim["sig_ddy_loc"],
+                flow_speed_m_s=float(case["flow_speed_m_s"]),
+            )
+            ax.plot(
+                abs_time[mask],
+                theta_series[mask],
+                linewidth=1.2,
+                label=f"theta0={theta0:.2f}",
+            )
+        ax.axvline(eval_time, color="tab:red", linestyle="--", linewidth=1.0)
+        ax.set_ylabel(f"Burn-in {burnin:.2f}s\nwrapped theta [rad]")
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Absolute CFD time [s]")
+    axes[0].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_total_predicted_force_trajectories(
+    *,
+    df: pd.DataFrame,
+    reruns: dict[float, list[tuple[float, dict[str, np.ndarray]]]],
+    out_path: Path,
+) -> None:
+    eval_time = float(df["eval_time"].iloc[0])
+    burnins = list(reruns.keys())
+    fig, axes = plt.subplots(len(burnins), 1, figsize=(11, 3.2 * len(burnins)), sharex=False)
+    if len(burnins) == 1:
+        axes = [axes]
+
+    for ax, burnin in zip(axes, burnins):
+        start_time = float(df.loc[np.isclose(df["burnin_seconds"], burnin), "start_time"].iloc[0])
+        for theta0, sim in reruns[burnin]:
+            abs_time = start_time + sim["time"]
+            mask = abs_time >= max(float(abs_time[0]), eval_time - float(COMPARISON_WINDOW_SECONDS))
+            total_predicted_force = sim["Fca"] + sim["Fcv"] + sim["Fdy"]
+            ax.plot(
+                abs_time[mask],
+                total_predicted_force[mask],
+                linewidth=1.2,
+                label=f"theta0={theta0:.2f}",
+            )
+        ax.axvline(eval_time, color="tab:red", linestyle="--", linewidth=1.0)
+        ax.set_ylabel(f"Burn-in {burnin:.2f}s\npredicted force [N]")
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Absolute CFD time [s]")
+    axes[0].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_run_metadata(
+    out_path: Path,
+    *,
+    case: dict[str, np.ndarray | float | str],
+    params: dict[str, float],
+    eval_idx: int,
+    candidate_starts: list[int],
+) -> None:
+    payload = {
+        "case_name": case["case_name"],
+        "input_npz": str(case["source_path"]),
+        "integrator": INTEGRATOR,
+        "sigma_init_mode": SIGMA_INIT_MODE,
+        "sigma_init_window_seconds": SIGMA_INIT_WINDOW_SECONDS,
+        "comparison_window_seconds": float(COMPARISON_WINDOW_SECONDS),
+        "phase_wrap": PHASE_WRAP,
+        "n_memory": int(N_MEMORY),
+        "eval_fraction": float(EVAL_FRACTION),
+        "eval_idx": int(eval_idx),
+        "eval_time": float(np.asarray(case["time_dim"])[eval_idx]),
+        "num_candidate_starts": len(candidate_starts),
+        "candidate_start_indices": [int(x) for x in candidate_starts],
+        "theta0_values": [float(x) for x in np.asarray(THETA0_VALUES, dtype=float)],
+        "dt_dim": float(case["dt_dim"]),
+        "flow_speed_m_s": float(case["flow_speed_m_s"]),
+        "stiffness_n_m": float(case["stiffness_n_m"]),
+        "dry_mass_kg": float(case["dry_mass_kg"]),
+        "diameter_m": float(case["diameter_m"]),
+        "rho_kg_m3": float(case["rho_kg_m3"]),
+        "force_std_dim": float(case["force_std_dim"]),
+        "structural_frequency_hz": case["structural_frequency_hz"],
+        "params": params,
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+
+
+def _resolve_input_npzs() -> list[Path]:
+    if INPUT_NPZS is not None:
+        paths = [Path(path).resolve() for path in INPUT_NPZS]
+    else:
+        paths = sorted(Path().glob(INPUT_NPZ_GLOB))
+        paths = [path.resolve() for path in paths if path.suffix == ".npz"]
+    if not paths:
+        raise FileNotFoundError("No CFD .npz files selected for burn-in analysis.")
+    return paths
+
+
+def _progress(iterable, *, total: int | None = None, desc: str = ""):
+    if SHOW_PROGRESS and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, leave=False)
+    return iterable
+
+
+def main() -> None:
+    if str(INTEGRATOR).lower() != "rk4":
+        raise ValueError("This prototype requires INTEGRATOR='rk4'.")
+    if SIGMA_INIT_MODE not in {"zero", "local_rms"}:
+        raise ValueError("SIGMA_INIT_MODE must be 'zero' or 'local_rms'.")
+
+    paramsets = _build_paramsets()
+    input_npzs = _resolve_input_npzs()
+    multi_case_mode = len(input_npzs) > 1
+    combined_phase_spread_by_param = {_paramset_id(params): [] for params in paramsets}
+
+    for npz_path in _progress(input_npzs, total=len(input_npzs), desc="Cases"):
+        try:
+            case = _load_case(npz_path)
+            time_dim = np.asarray(case["time_dim"], dtype=float)
+            eval_idx = int(len(time_dim) * float(EVAL_FRACTION))
+            eval_idx = max(1, min(eval_idx, len(time_dim) - 2))
+            candidate_starts = _candidate_start_indices(time_dim, float(case["dt_dim"]), eval_idx)
+        except Exception as exc:
+            if SKIP_INVALID_CASES:
+                print(f"Skipping case {npz_path.name}: {exc}")
+                continue
+            raise
+
+        base_out_dir = OUTPUT_DIR.resolve() / str(case["case_name"])
+        base_out_dir.mkdir(parents=True, exist_ok=True)
+        if SHOW_PROGRESS:
+            print(
+                f"Case {case['case_name']}: {len(candidate_starts)} burn-in starts, "
+                f"{len(np.asarray(THETA0_VALUES, dtype=float))} theta0 values, "
+                f"{len(paramsets)} parameter set(s)"
+            )
+
+        for params in _progress(paramsets, total=len(paramsets), desc=f"{case['case_name']} paramsets"):
+            param_dir = base_out_dir / _paramset_id(params)
+            if param_dir.exists() and not bool(OVERWRITE):
+                raise FileExistsError(f"Output directory already exists: {param_dir}")
+            param_dir.mkdir(parents=True, exist_ok=True)
+
+            rows: list[dict[str, object]] = []
+            total_runs = len(candidate_starts) * len(np.asarray(THETA0_VALUES, dtype=float))
+            run_iterator = (
+                (start_idx, theta0)
+                for start_idx in candidate_starts
+                for theta0 in np.asarray(THETA0_VALUES, dtype=float)
+            )
+            for start_idx, theta0 in _progress(
+                run_iterator,
+                total=total_runs,
+                desc=f"{case['case_name']} {_paramset_id(params)}",
+            ):
+                row, _ = _run_single_sim(
+                    case=case,
+                    params=params,
+                    start_idx=start_idx,
+                    eval_idx=eval_idx,
+                    theta0=float(theta0),
+                )
+                rows.append(row)
+
+            df = pd.DataFrame(rows).sort_values(["burnin_seconds", "theta0"]).reset_index(drop=True)
+            df.to_csv(param_dir / "burnin_scan.csv", index=False)
+
+            phase_spread_summary = _phase_spread_summary(case, df)
+            combined_phase_spread_by_param[_paramset_id(params)].append(phase_spread_summary)
+            if not (multi_case_mode and MULTI_CASE_ONLY_SPREAD_PLOT):
+                _plot_phase_vs_burnin(df, param_dir / "phase_vs_burnin.png")
+            _plot_phase_spread_summary(
+                phase_spread_summary,
+                out_path=param_dir / "phase_spread_vs_burnin.png",
+            )
+            if not (multi_case_mode and MULTI_CASE_ONLY_SPREAD_PLOT):
+                reruns = _rerun_for_selected_burnins(case=case, params=params, df=df)
+                _plot_phi_trajectories(
+                    case=case,
+                    df=df,
+                    reruns=reruns,
+                    out_path=param_dir / "phi_traj_short_mid_long.png",
+                )
+                _plot_total_predicted_force_trajectories(
+                    df=df,
+                    reruns=reruns,
+                    out_path=param_dir / "predicted_force_traj_short_mid_long.png",
+                )
+            _write_run_metadata(
+                param_dir / "run_metadata.json",
+                case=case,
+                params=params,
+                eval_idx=eval_idx,
+                candidate_starts=candidate_starts,
+            )
+            print(f"Wrote burn-in analysis to {param_dir}")
+
+    if multi_case_mode:
+        combined_root = OUTPUT_DIR.resolve() / "all_cases"
+        for params in paramsets:
+            param_id = _paramset_id(params)
+            summaries = combined_phase_spread_by_param[param_id]
+            if summaries:
+                _write_combined_phase_spread_outputs(
+                    summaries=summaries,
+                    out_dir=combined_root / param_id,
+                )
+                print(f"Wrote combined burn-in spread analysis to {combined_root / param_id}")
+
+
+if __name__ == "__main__":
+    main()

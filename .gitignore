@@ -17,6 +17,7 @@
 /Data_Gen/generated_series_Ur_60
 /Data_Gen/groundtruth_runs_100hz
 /Experimental_Data/eval_models
+/CFD_Data
 __pycache__/
 *.pyc
 *.npz

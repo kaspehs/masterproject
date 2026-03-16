@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.utils as nn_utils
-from torch.utils.data import ConcatDataset, TensorDataset
+from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from core.logging import setup_writer
@@ -46,8 +46,12 @@ from HNN_helper import (
     log_training_metrics,
     log_validation_epoch,
     preprocess_timeseries,
+    load_td_correction_trajectories,
+    resolve_td_correction_params,
     rollout_model,
+    structural_step_constant_force_torch,
     scaled_residual_loss_per_sample,
+    td_baseline_step_torch,
     resolve_cut_start_seconds,
     sample_indices_per_ur,
     sample_one_index_per_ur,
@@ -102,6 +106,200 @@ def _parse_rollout_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
     else:
         raise ValueError("Unexpected rollout batch format.")
     return z0, t_seq, z_traj, ur0, history, scale
+
+
+def _td_correction_state_rollout(
+    *,
+    model: PHVIV,
+    z0: torch.Tensor,
+    ur0: torch.Tensor,
+    td_context0: torch.Tensor,
+    steps: int,
+    dt: float,
+    structural_mass: float,
+    damping_c: float,
+    stiffness: float,
+    td_params: dict[str, float],
+    history0: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    z = z0
+    td_context = td_context0
+    history_window = history0
+    z_hist = [z0]
+    total_force_hist: list[torch.Tensor] = []
+    corr_mu_hist: list[torch.Tensor] = []
+    for _ in range(int(steps)):
+        history_context = model.history_context(
+            z,
+            reduced_velocity=ur0,
+            history_window=history_window,
+        )
+        corr_mu = model.learned_force(
+            z,
+            reduced_velocity=ur0,
+            history_context=history_context,
+        )
+        velocity = z[:, 1:2] / float(structural_mass)
+        td_force_next, td_context_next = td_baseline_step_torch(
+            velocity=velocity,
+            acceleration=td_context[:, 0:1],
+            td_context=td_context,
+            dt=dt,
+            rho=float(model.rho),
+            diameter=float(model.D),
+            params=td_params,
+        )
+        total_force = td_force_next + corr_mu
+        y_next, v_next, a_next = structural_step_constant_force_torch(
+            y=z[:, 0:1],
+            velocity=velocity,
+            force=total_force,
+            dt=dt,
+            mass=structural_mass,
+            damping_c=damping_c,
+            stiffness=stiffness,
+        )
+        z = torch.cat([y_next, v_next * float(structural_mass)], dim=1)
+        td_context = td_context_next.clone()
+        td_context[:, 0:1] = a_next
+        if history_window is not None:
+            history_window = model.advance_history_window(
+                history_window,
+                z,
+                reduced_velocity=ur0,
+            )
+        z_hist.append(z)
+        total_force_hist.append(total_force)
+        corr_mu_hist.append(corr_mu)
+    z_seq = torch.stack(z_hist, dim=1)
+    total_force_seq = torch.stack(total_force_hist, dim=1) if total_force_hist else z0.new_zeros((z0.shape[0], 0, 1))
+    corr_mu_seq = torch.stack(corr_mu_hist, dim=1) if corr_mu_hist else z0.new_zeros((z0.shape[0], 0, 1))
+    return z_seq, total_force_seq, corr_mu_seq
+
+
+def _build_td_correction_hnn_loaders(
+    *,
+    train_trajs: list[dict[str, np.ndarray]],
+    val_trajs: list[dict[str, np.ndarray]],
+    structural_mass: float,
+    history_window: int | None,
+    batch_size: int,
+    rollout_batch_size: int,
+    rollout_steps: int,
+    num_workers: int,
+    pin_memory: bool,
+) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+    def _one_step_dataset(trajs: list[dict[str, np.ndarray]]) -> TensorDataset | None:
+        tensors: list[TensorDataset] = []
+        for traj in trajs:
+            y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float()
+            dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
+            t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
+            ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+            corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
+            td_force = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
+            z = torch.stack((y, dy * float(structural_mass)), dim=1)
+            items: list[torch.Tensor] = [z[:-1], t[:-1].unsqueeze(1), z[1:], t[1:].unsqueeze(1), ur[:-1]]
+            if history_window is not None and int(history_window) > 0:
+                hist_features = torch.cat([z, ur], dim=1)
+                hist_full = model_history = hist_features.new_zeros((hist_features.shape[0], int(history_window), hist_features.shape[1]))
+                for idx in range(hist_features.shape[0]):
+                    start = max(0, idx - int(history_window) + 1)
+                    window = hist_features[start : idx + 1]
+                    hist_full[idx, -window.shape[0] :, :] = window
+                    if window.shape[0] < int(history_window):
+                        hist_full[idx, : int(history_window) - window.shape[0], :] = window[0:1]
+                items.append(hist_full[:-1])
+            items.extend([corr[1:], td_force[1:]])
+            tensors.append(TensorDataset(*items))
+        if not tensors:
+            return None
+        return tensors[0] if len(tensors) == 1 else ConcatDataset(tensors)
+
+    def _rollout_dataset(trajs: list[dict[str, np.ndarray]]) -> TensorDataset | None:
+        if rollout_steps < 1:
+            return None
+        tensors: list[TensorDataset] = []
+        window = int(rollout_steps) + 1
+        for traj in trajs:
+            y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float()
+            dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
+            t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
+            ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+            td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
+            z = torch.stack((y, dy * float(structural_mass)), dim=1)
+            if z.shape[0] < window:
+                continue
+            z0_list = []
+            t_list = []
+            ztraj_list = []
+            ur0_list = []
+            td0_list = []
+            hist0_list: list[torch.Tensor] = []
+            hist_full = None
+            if history_window is not None and int(history_window) > 0:
+                hist_features = torch.cat([z, ur], dim=1)
+                hist_full = hist_features.new_zeros((hist_features.shape[0], int(history_window), hist_features.shape[1]))
+                for idx in range(hist_features.shape[0]):
+                    start = max(0, idx - int(history_window) + 1)
+                    window_hist = hist_features[start : idx + 1]
+                    hist_full[idx, -window_hist.shape[0] :, :] = window_hist
+                    if window_hist.shape[0] < int(history_window):
+                        hist_full[idx, : int(history_window) - window_hist.shape[0], :] = window_hist[0:1]
+            for start in range(z.shape[0] - window + 1):
+                end = start + window
+                z0_list.append(z[start])
+                t_list.append(t[start:end])
+                ztraj_list.append(z[start:end])
+                ur0_list.append(ur[start])
+                td0_list.append(td_context[start])
+                if hist_full is not None:
+                    hist0_list.append(hist_full[start])
+            items: list[torch.Tensor] = [
+                torch.stack(z0_list, dim=0),
+                torch.stack(t_list, dim=0),
+                torch.stack(ztraj_list, dim=0),
+                torch.stack(ur0_list, dim=0),
+                torch.stack(td0_list, dim=0),
+            ]
+            if hist0_list:
+                items.append(torch.stack(hist0_list, dim=0))
+            tensors.append(TensorDataset(*items))
+        if not tensors:
+            return None
+        return tensors[0] if len(tensors) == 1 else ConcatDataset(tensors)
+
+    train_dataset = _one_step_dataset(train_trajs)
+    if train_dataset is None:
+        raise ValueError("No TD correction training samples were built.")
+    val_dataset = _one_step_dataset(val_trajs)
+    rollout_dataset = _rollout_dataset(val_trajs if val_trajs else train_trajs)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    rollout_loader = None
+    if rollout_dataset is not None:
+        rollout_loader = DataLoader(
+            rollout_dataset,
+            batch_size=rollout_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    return train_loader, val_loader, rollout_loader
 
 
 def _ur_bin_id(value: float, ur_bin_size: float) -> int:
@@ -306,7 +504,7 @@ def _train_one_epoch(
     max_grad_norm: float,
     mean_reg: float,
     mean_reg_norm: str,
-    force_reg: float,
+    sigma_reg: float,
     sigma_reg_norm: str,
     equalize_residual_over_ur_bins: bool,
     equalize_rollout_over_ur_bins: bool,
@@ -506,7 +704,7 @@ def _train_one_epoch(
             gradnorm_weighted_mean = mean_weight * base_mean_reg_loss
             gradnorm_weighted_data = data_weight * data_force_loss
 
-            weighted_sigma = float(force_reg) * gradnorm_weighted_sigma
+            weighted_sigma = float(sigma_reg) * gradnorm_weighted_sigma
             weighted_mean = float(mean_reg) * gradnorm_weighted_mean
             weighted_data = float(force_data_weight) * gradnorm_weighted_data
             weighted_sym = float(symmetry_weight) * sym_loss
@@ -602,7 +800,7 @@ def _train_one_epoch(
         batch_count += 1
         loss_sum = loss_sum + loss.detach()
         res_loss_sum = res_loss_sum + res_loss.detach().float()
-        # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
+        # Log loss_reg as the raw regularizer magnitude (before sigma_reg scaling).
         sigma_reg_sum = sigma_reg_sum + base_sigma_reg_loss.detach().float()
         mean_reg_sum = mean_reg_sum + base_mean_reg_loss.detach().float()
         force_data_loss_sum = force_data_loss_sum + data_force_loss.detach().float()
@@ -679,7 +877,7 @@ def _validate_if_needed(
     rollout_seed: int | None,
     mean_reg: float,
     mean_reg_norm: str,
-    force_reg: float,
+    sigma_reg: float,
     sigma_reg_norm: str,
     equalize_residual_over_ur_bins: bool,
     equalize_rollout_over_ur_bins: bool,
@@ -710,7 +908,7 @@ def _validate_if_needed(
             rollout_loader=val_rollout_loader,
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
-            force_reg=force_reg,
+            sigma_reg=sigma_reg,
             sigma_reg_norm=sigma_reg_norm,
             equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
             equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
@@ -740,7 +938,7 @@ def _validate_if_needed(
             rollout_loader=val_rollout_loader,
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
-            force_reg=force_reg,
+            sigma_reg=sigma_reg,
             sigma_reg_norm=sigma_reg_norm,
             equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
             equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
@@ -1158,7 +1356,7 @@ def _evaluate_val_losses(
     non_blocking: bool,
     mean_reg: float,
     mean_reg_norm: str,
-    force_reg: float,
+    sigma_reg: float,
     sigma_reg_norm: str,
     equalize_residual_over_ur_bins: bool,
     equalize_rollout_over_ur_bins: bool,
@@ -1289,7 +1487,7 @@ def _evaluate_val_losses(
                     on_coeff=force_reg_on_coeff,
                     history_context=history_context,
                 )
-                sigma_loss = float(force_reg) * sigma_reg_loss
+                sigma_loss = float(sigma_reg) * sigma_reg_loss
                 mean_loss_reg = float(mean_reg) * mean_reg_loss
                 if use_force_data_loss:
                     if f_i is None or f_next is None:
@@ -1371,7 +1569,7 @@ def _evaluate_val_losses(
 
             loss_sum = loss_sum + total.detach().float()
             res_sum = res_sum + res_loss.detach().float()
-            # Log loss_reg as the raw regularizer magnitude (before force_reg scaling).
+            # Log loss_reg as the raw regularizer magnitude (before sigma_reg scaling).
             sigma_sum = sigma_sum + sigma_reg_loss.detach().float()
             mean_reg_sum = mean_reg_sum + mean_reg_loss.detach().float()
             data_sum = data_sum + data_force_loss.detach().float()
@@ -1402,7 +1600,7 @@ def _per_ur_loss_map_hnn(
     non_blocking: bool,
     mean_reg: float,
     mean_reg_norm: str,
-    force_reg: float,
+    sigma_reg: float,
     sigma_reg_norm: str,
     equalize_residual_over_ur_bins: bool = False,
     equalize_rollout_over_ur_bins: bool = False,
@@ -1495,7 +1693,7 @@ def _per_ur_loss_map_hnn(
                     on_coeff=force_reg_on_coeff,
                     history_context=history_context,
                 )
-                per_sigma = float(force_reg) * per_sigma_reg
+                per_sigma = float(sigma_reg) * per_sigma_reg
                 per_mean = float(mean_reg) * per_mean_reg
                 if use_force_data_loss and f_i is not None and f_next is not None:
                     z_mid = 0.5 * (z_i + z_next)
@@ -1577,7 +1775,398 @@ def _as_float_list(values: Any, *, key: str) -> list[float] | None:
     return [float(v) for v in arr.tolist()]
 
 
+def _train_td_correction(config: Config, config_name: str) -> None:
+    data_cfg = config.data
+    model_cfg = config.model
+    training_cfg = config.training
+    optim_cfg = config.optim
+    loss_cfg = config.loss
+    runtime_cfg = config.runtime
+    precision_cfg = config.precision
+    compile_cfg = config.compile
+    monitoring_cfg = config.monitoring
+    hnn_cfg = dict(config.hnn or {})
+
+    if str(getattr(model_cfg, "force_output", "force")).strip().lower() != "force":
+        raise ValueError("hnn.use_td_correction currently requires model.force_output='force'.")
+
+    device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA available: {torch.cuda.is_available()}, gpu0: {torch.cuda.get_device_name(0)}")
+    configure_tf32(device, bool(precision_cfg.use_tf32))
+    set_num_threads_from_slurm(default=1)
+    non_blocking = device.type == "cuda"
+
+    train_series_root = Path(data_cfg.train_series_dir)
+    if data_cfg.use_generated_train_series:
+        train_dir = train_series_root / "train"
+        val_dir = train_series_root / "val"
+        if not train_dir.exists() or not val_dir.exists():
+            raise FileNotFoundError("TD correction mode expects generated train/ and val/ directories.")
+        train_paths = sorted(train_dir.glob("*.npz"))
+        val_paths = sorted(val_dir.glob("*.npz"))
+    else:
+        data_path = Path(data_cfg.file)
+        train_paths = [data_path]
+        val_paths = []
+    if not train_paths:
+        raise FileNotFoundError("No TD correction training trajectories were found.")
+
+    train_cut = resolve_cut_start_seconds(data_cfg, "train")
+    val_cut = resolve_cut_start_seconds(data_cfg, "val")
+    train_trajs = load_td_correction_trajectories(paths=train_paths, cut_start_seconds=train_cut)
+    val_trajs = load_td_correction_trajectories(paths=val_paths, cut_start_seconds=val_cut) if val_paths else []
+
+    td_params = resolve_td_correction_params(hnn_cfg)
+    structural_mass = float(getattr(model_cfg, "structural_mass", 16.79))
+    damping_c = float(getattr(model_cfg, "damping_c", 1e-4))
+    stiffness = float(getattr(model_cfg, "k", 1218.0))
+    dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
+    history_window = int(getattr(model_cfg, "history_window", 32)) if bool(getattr(model_cfg, "use_history_tcn", False)) else None
+    predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
+    rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
+    rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
+    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
+    force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+
+    model_dict = asdict(model_cfg)
+    model_dict["include_physical_drag"] = False
+    model_dict["use_stochastic_process_noise"] = predict_sigma
+    arch_dict = asdict(config.architecture)
+    model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
+
+    train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
+        train_trajs=train_trajs,
+        val_trajs=val_trajs,
+        structural_mass=structural_mass,
+        history_window=history_window,
+        batch_size=int(training_cfg.batch_size),
+        rollout_batch_size=rollout_batch_size,
+        rollout_steps=rollout_det_steps,
+        num_workers=int(runtime_cfg.num_workers),
+        pin_memory=(device.type == "cuda"),
+    )
+
+    gradnorm_balancer: Optional[GradNormBalancer] = None
+    if bool(getattr(loss_cfg, "use_gradnorm", False)) and use_force_data_loss:
+        gradnorm_balancer = GradNormBalancer(
+            model,
+            ["state", "data"],
+            alpha=float(getattr(loss_cfg, "gradnorm_alpha", 0.9)),
+            eps=float(getattr(loss_cfg, "gradnorm_eps", 1e-8)),
+            min_weight=float(getattr(loss_cfg, "gradnorm_min_weight", 0.1)),
+            max_weight=float(getattr(loss_cfg, "gradnorm_max_weight", 10.0)),
+        )
+
+    opt, lr_scheduler = setup_optimizer_and_scheduler(
+        model,
+        optim_cfg=optim_cfg,
+        scheduler_cfg=optim_cfg.scheduler,
+        epochs=int(training_cfg.epochs),
+    )
+    amp_enabled, amp_dtype, scaler = setup_amp(
+        device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype)
+    )
+    writer, run_name = setup_writer(
+        config.logging.run_dir_root,
+        config_name,
+        run_name_override=getattr(config.logging, "run_name", None),
+        append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
+    )
+
+    def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        if len(batch) == 7:
+            z_i, _t_i, z_next, _t_next, ur_i, corr_next, td_force_next = batch
+            history_i = None
+        elif len(batch) == 8:
+            z_i, _t_i, z_next, _t_next, ur_i, history_i, corr_next, td_force_next = batch
+        else:
+            raise ValueError("Unexpected TD correction HNN batch format.")
+        return z_i, z_next, ur_i, corr_next, history_i, td_force_next, z_next[:, 0:1]
+
+    def _state_loss(
+        *,
+        z_i: torch.Tensor,
+        z_next: torch.Tensor,
+        ur_i: torch.Tensor,
+        td_force_next: torch.Tensor,
+        history_i: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        history_context = model.history_context(z_i, reduced_velocity=ur_i, history_window=history_i)
+        corr_mu = model.learned_force(z_i, reduced_velocity=ur_i, history_context=history_context)
+        sigma_corr = (
+            model.sigma_theta(z_i, reduced_velocity=ur_i, history_context=history_context)
+            if predict_sigma
+            else corr_mu.new_zeros(corr_mu.shape)
+        )
+        total_force_next = td_force_next + corr_mu
+        velocity_i = z_i[:, 1:2] / float(structural_mass)
+        y_next_mean, v_next_mean, _a_next = structural_step_constant_force_torch(
+            y=z_i[:, 0:1],
+            velocity=velocity_i,
+            force=total_force_next,
+            dt=dt,
+            mass=structural_mass,
+            damping_c=damping_c,
+            stiffness=stiffness,
+        )
+        z_next_mean = torch.cat([y_next_mean, v_next_mean * float(structural_mass)], dim=1)
+        if predict_sigma:
+            var_p = torch.clamp((float(dt) * sigma_corr) ** 2, min=1e-9)
+            var_y = torch.clamp(((0.5 * (float(dt) ** 2) / float(structural_mass)) * sigma_corr) ** 2, min=1e-9)
+            nll_y = 0.5 * (((z_next[:, 0:1] - z_next_mean[:, 0:1]) ** 2) / var_y + torch.log(var_y))
+            nll_p = 0.5 * (((z_next[:, 1:2] - z_next_mean[:, 1:2]) ** 2) / var_p + torch.log(var_p))
+            state_loss = torch.mean(nll_y + nll_p)
+        else:
+            state_loss = torch.mean(torch.sum((z_next_mean - z_next) ** 2, dim=1))
+        return state_loss, corr_mu, sigma_corr
+
+    def _regularizer(value: torch.Tensor, norm: str) -> torch.Tensor:
+        key = str(norm).strip().lower()
+        if key == "l1":
+            return torch.mean(torch.abs(value))
+        if key == "l2":
+            return torch.mean(value * value)
+        raise ValueError("Regularizer norm must be one of: l1, l2.")
+
+    epochs = int(training_cfg.epochs)
+    validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
+    log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
+    print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
+
+    for epoch in range(epochs):
+        model.train()
+        if bool(optim_cfg.use_lr_scheduler):
+            for group in opt.param_groups:
+                group["lr"] = lr_scheduler.get_lr(epoch)
+        sums = {
+            "loss_total": torch.zeros((), device=device),
+            "loss_state": torch.zeros((), device=device),
+            "loss_data": torch.zeros((), device=device),
+            "loss_reg_mean": torch.zeros((), device=device),
+            "loss_reg_sigma": torch.zeros((), device=device),
+            "loss_rollout_det": torch.zeros((), device=device),
+            "grad_norm": torch.zeros((), device=device),
+        }
+        batch_count = 0
+        rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_det_weight > 0.0 else None
+        for batch in train_loader:
+            z_i, z_next, ur_i, corr_next, history_i, td_force_next, _ = _parse_td_train_batch(batch)
+            z_i = z_i.to(device, non_blocking=non_blocking)
+            z_next = z_next.to(device, non_blocking=non_blocking)
+            ur_i = ur_i.to(device, non_blocking=non_blocking)
+            corr_next = corr_next.to(device, non_blocking=non_blocking)
+            td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+            if history_i is not None:
+                history_i = history_i.to(device, non_blocking=non_blocking)
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                state_loss, corr_mu, sigma_corr = _state_loss(
+                    z_i=z_i,
+                    z_next=z_next,
+                    ur_i=ur_i,
+                    td_force_next=td_force_next,
+                    history_i=history_i,
+                )
+                if use_force_data_loss:
+                    if predict_sigma:
+                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                        data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
+                    else:
+                        data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                else:
+                    data_loss = state_loss.new_tensor(0.0)
+                mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
+                sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                if gradnorm_balancer is not None:
+                    weights = gradnorm_balancer.update({"state": state_loss.float(), "data": data_loss.float()})
+                    base_loss = weights["state"] * state_loss + float(force_data_weight) * weights["data"] * data_loss
+                else:
+                    base_loss = state_loss + float(force_data_weight) * data_loss
+                rollout_det_loss = state_loss.new_tensor(0.0)
+                if rollout_iter is not None:
+                    try:
+                        rollout_batch = next(rollout_iter)
+                    except StopIteration:
+                        rollout_iter = iter(rollout_loader)
+                        rollout_batch = next(rollout_iter)
+                    if len(rollout_batch) == 5:
+                        z0, t_seq, z_traj, ur0, td_context0 = rollout_batch
+                        history0 = None
+                    elif len(rollout_batch) == 6:
+                        z0, t_seq, z_traj, ur0, td_context0, history0 = rollout_batch
+                        history0 = history0.to(device, non_blocking=non_blocking)
+                    else:
+                        raise ValueError("Unexpected TD correction rollout batch format.")
+                    z0 = z0.to(device, non_blocking=non_blocking)
+                    t_seq = t_seq.to(device, non_blocking=non_blocking)
+                    z_traj = z_traj.to(device, non_blocking=non_blocking)
+                    ur0 = ur0.to(device, non_blocking=non_blocking)
+                    td_context0 = td_context0.to(device, non_blocking=non_blocking)
+                    z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+                        model=model,
+                        z0=z0,
+                        ur0=ur0,
+                        td_context0=td_context0,
+                        steps=int(t_seq.shape[1] - 1),
+                        dt=dt,
+                        structural_mass=structural_mass,
+                        damping_c=damping_c,
+                        stiffness=stiffness,
+                        td_params=td_params,
+                        history0=history0,
+                    )
+                    rollout_det_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
+                total_loss = base_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_det_weight) * rollout_det_loss
+            if scaler.is_enabled():
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(opt)
+            else:
+                total_loss.backward()
+            grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=float(training_cfg.max_grad_norm))
+            if scaler.is_enabled():
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            batch_count += 1
+            sums["loss_total"] += total_loss.detach()
+            sums["loss_state"] += state_loss.detach()
+            sums["loss_data"] += data_loss.detach()
+            sums["loss_reg_mean"] += mean_reg_loss.detach()
+            sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+            sums["loss_rollout_det"] += rollout_det_loss.detach()
+            sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
+
+        denom = float(max(1, batch_count))
+        train_metrics = {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
+        train_metrics["lr"] = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(optim_cfg.lr)
+        if epoch % log_every == 0 or epoch == epochs - 1:
+            for name, value in train_metrics.items():
+                writer.add_scalar(f"train/{name}", value, epoch + 1)
+        if epoch % print_every == 0 or epoch == epochs - 1:
+            print(
+                f"Epoch {epoch}: loss={train_metrics['loss_total']:.4e}, "
+                f"Lstate={train_metrics['loss_state']:.4e}, Ldata={train_metrics['loss_data']:.4e}, "
+                f"Lroll={train_metrics['loss_rollout_det']:.4e}, lr={train_metrics['lr']:.3e}"
+            )
+
+        if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
+            model.eval()
+            val_sums = {
+                "loss_total": torch.zeros((), device=device),
+                "loss_state": torch.zeros((), device=device),
+                "loss_data": torch.zeros((), device=device),
+                "loss_reg_mean": torch.zeros((), device=device),
+                "loss_reg_sigma": torch.zeros((), device=device),
+            }
+            val_count = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    z_i, z_next, ur_i, corr_next, history_i, td_force_next, _ = _parse_td_train_batch(batch)
+                    z_i = z_i.to(device, non_blocking=non_blocking)
+                    z_next = z_next.to(device, non_blocking=non_blocking)
+                    ur_i = ur_i.to(device, non_blocking=non_blocking)
+                    corr_next = corr_next.to(device, non_blocking=non_blocking)
+                    td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+                    if history_i is not None:
+                        history_i = history_i.to(device, non_blocking=non_blocking)
+                    with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                        state_loss, corr_mu, sigma_corr = _state_loss(
+                            z_i=z_i,
+                            z_next=z_next,
+                            ur_i=ur_i,
+                            td_force_next=td_force_next,
+                            history_i=history_i,
+                        )
+                        if use_force_data_loss:
+                            if predict_sigma:
+                                var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                                data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
+                            else:
+                                data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                        else:
+                            data_loss = state_loss.new_tensor(0.0)
+                        mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
+                        sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                        total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                    val_sums["loss_total"] += total_loss.detach()
+                    val_sums["loss_state"] += state_loss.detach()
+                    val_sums["loss_data"] += data_loss.detach()
+                    val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                    val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                    val_count += 1
+            val_denom = float(max(1, val_count))
+            for name, value in val_sums.items():
+                writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch + 1)
+            if rollout_loader is not None and rollout_det_weight > 0.0:
+                with torch.no_grad():
+                    rollout_loss_sum = torch.zeros((), device=device)
+                    rollout_count = 0
+                    for rollout_batch in rollout_loader:
+                        if len(rollout_batch) == 5:
+                            z0, t_seq, z_traj, ur0, td_context0 = rollout_batch
+                            history0 = None
+                        else:
+                            z0, t_seq, z_traj, ur0, td_context0, history0 = rollout_batch
+                            history0 = history0.to(device, non_blocking=non_blocking)
+                        z0 = z0.to(device, non_blocking=non_blocking)
+                        z_traj = z_traj.to(device, non_blocking=non_blocking)
+                        ur0 = ur0.to(device, non_blocking=non_blocking)
+                        td_context0 = td_context0.to(device, non_blocking=non_blocking)
+                        z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+                            model=model,
+                            z0=z0,
+                            ur0=ur0,
+                            td_context0=td_context0,
+                            steps=int(z_traj.shape[1] - 1),
+                            dt=dt,
+                            structural_mass=structural_mass,
+                            damping_c=damping_c,
+                            stiffness=stiffness,
+                            td_params=td_params,
+                            history0=history0,
+                        )
+                        rollout_loss_sum += torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2)).detach()
+                        rollout_count += 1
+                    writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch + 1)
+
+    writer.add_text("hnn/td_correction_config", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
+    models_dir = Path("models")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"{run_name}.pt"
+    state_source: torch.nn.Module = model
+    if hasattr(model, "_orig_mod"):
+        state_source = getattr(model, "_orig_mod")
+    torch.save(
+        {
+            "model_state": state_source.state_dict(),
+            "config": asdict(config),
+            "run_name": run_name,
+            "dt": dt,
+            "method": "phnn",
+            "td_correction": True,
+        },
+        model_path,
+    )
+    print(f"Saved final model to {model_path}")
+    writer.flush()
+    writer.close()
+
+
 def train(config: Config, config_name: str) -> None:
+    if bool(dict(config.hnn or {}).get("use_td_correction", False)):
+        _train_td_correction(config, config_name)
+        return
+
     data_cfg = config.data
     middle_time_plot = data_cfg.middle_time_plot
     use_generated_train_series = data_cfg.use_generated_train_series
@@ -1664,7 +2253,7 @@ def train(config: Config, config_name: str) -> None:
     use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
     scheduler_cfg = optim_cfg.scheduler
 
-    force_reg = float(loss_cfg.force_reg)
+    sigma_reg = float(loss_cfg.sigma_reg)
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
     mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
@@ -2048,7 +2637,7 @@ def train(config: Config, config_name: str) -> None:
             max_grad_norm=max_grad_norm,
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
-            force_reg=force_reg,
+            sigma_reg=sigma_reg,
             sigma_reg_norm=sigma_reg_norm,
             equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
             equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
@@ -2209,7 +2798,7 @@ def train(config: Config, config_name: str) -> None:
                 rollout_seed=rollout_seed,
                 mean_reg=mean_reg,
                 mean_reg_norm=mean_reg_norm,
-                force_reg=force_reg,
+                sigma_reg=sigma_reg,
                 sigma_reg_norm=sigma_reg_norm,
                 equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
                 equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
@@ -2274,7 +2863,7 @@ def train(config: Config, config_name: str) -> None:
             non_blocking=(device.type == "cuda"),
             mean_reg=mean_reg,
             mean_reg_norm=mean_reg_norm,
-            force_reg=force_reg,
+            sigma_reg=sigma_reg,
             sigma_reg_norm=sigma_reg_norm,
             equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
             equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
