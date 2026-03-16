@@ -87,9 +87,9 @@ monitoring:
   # Rollout validation plots (dynamics check)
   rollout_every_epochs: 10
   rollout_max_trajectories: 1
-  cycle_validation_rollout: true
+  cycle_validation_rollout: false
   # If true, validation metric sampling uses a fixed seed across epochs for stability.
-  fixed_validation_sampling: false
+  fixed_validation_sampling: true
   validation_sampling_seed: 1
   validation_samples_per_ur: 2
   final_rollout_all_validation: true
