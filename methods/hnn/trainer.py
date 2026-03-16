@@ -2315,6 +2315,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
     validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+    rollout_target_ur: float | None = None
+    rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
+    if bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False)):
+        excluded = hnn_cfg.get("train_exclude_ur")
+        if excluded is not None:
+            excluded_arr = np.asarray(excluded, dtype=float).reshape(-1)
+            if excluded_arr.size == 1 and np.isfinite(excluded_arr[0]):
+                rollout_target_ur = float(excluded_arr[0])
     train_instances = len(train_loader.dataset)
     train_steps_per_epoch = len(train_loader)
     val_instances = len(val_loader.dataset) if val_loader is not None else 0
@@ -2604,9 +2612,30 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     writer.add_scalar(f"val/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch + 1)
                 writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
 
-                selected_indices = sample_one_index_per_ur(ur_all, seed=0)
-                if not selected_indices:
-                    selected_indices = list(range(len(val_trajs)))
+                selected_indices: list[int] | None = None
+                if rollout_target_ur is not None:
+                    matches = [
+                        idx
+                        for idx, traj in enumerate(val_trajs)
+                        if np.isclose(
+                            float(np.asarray(traj["ur"]).reshape(-1)[0]),
+                            float(rollout_target_ur),
+                            rtol=0.0,
+                            atol=float(rollout_target_ur_tol),
+                        )
+                    ]
+                    if matches:
+                        selected_indices = matches
+                    else:
+                        warnings.warn(
+                            "monitoring.rollout_use_excluded_ur is enabled but no TD-correction "
+                            f"validation trajectory matched U_r={float(rollout_target_ur):.6g} "
+                            f"(tol={float(rollout_target_ur_tol):.3g}); falling back to default rollout selection."
+                        )
+                if selected_indices is None:
+                    selected_indices = sample_one_index_per_ur(ur_all, seed=0)
+                    if not selected_indices:
+                        selected_indices = list(range(len(val_trajs)))
                 rollout_idx = (
                     selected_indices[max(0, (epoch + 1) // max(1, int(rollout_every)) - 1) % len(selected_indices)]
                     if cycle_validation_rollout

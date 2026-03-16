@@ -1097,7 +1097,7 @@ def _run_hnn_td_correction_validation(
 
     if do_rollout:
         ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs_np]
-        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else int(epoch)
+        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
         sampled_metric_indices = sample_indices_per_ur(
             ur_values_all,
             samples_per_ur=validation_samples_per_ur,

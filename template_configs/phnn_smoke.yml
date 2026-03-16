@@ -153,11 +153,11 @@ monitoring:
   rollout_every_epochs: 50
   validate_every_epochs: 50
   rollout_max_trajectories: 1
-  cycle_validation_rollout: true
+  cycle_validation_rollout: false
   # If true, validation metric sampling uses a fixed seed across epochs for stability.
-  fixed_validation_sampling: false
+  fixed_validation_sampling: true
   validation_sampling_seed: 1
-  validation_samples_per_ur: 1
+  validation_samples_per_ur: 2
   # If true and exactly one train_exclude_ur is configured, validation rollout
   # will target that excluded U_r.
   rollout_use_excluded_ur: true
