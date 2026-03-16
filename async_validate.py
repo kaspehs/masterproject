@@ -987,14 +987,16 @@ def _run_hnn_td_correction_validation(
         with torch.no_grad():
             for batch in val_loader:
                 if len(batch) == 10:
-                    z_i, _t_i, z_next, _t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
+                    z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
                     history_i = None
                 elif len(batch) == 11:
-                    z_i, _t_i, z_next, _t_next, ur_i, history_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
+                    z_i, t_i, z_next, t_next, ur_i, history_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
                 else:
                     raise ValueError("Unexpected TD correction HNN batch format.")
                 z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
+                t_i = t_i.to(device, non_blocking=(device.type == "cuda"))
                 z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
+                t_next = t_next.to(device, non_blocking=(device.type == "cuda"))
                 ur_i = ur_i.to(device, non_blocking=(device.type == "cuda"))
                 corr_next = corr_next.to(device, non_blocking=(device.type == "cuda"))
                 td_force_next = td_force_next.to(device, non_blocking=(device.type == "cuda"))
@@ -1014,21 +1016,22 @@ def _run_hnn_td_correction_validation(
                     predict_sigma=predict_sigma,
                     force_zero_output=force_zero_output,
                 )
+                dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
                 total_force_next = td_force_next + corr_mu
                 velocity_i = z_i[:, 1:2] / mass_i
                 y_next_mean, v_next_mean, _a_next = structural_step_constant_force_torch(
                     y=z_i[:, 0:1],
                     velocity=velocity_i,
                     force=total_force_next,
-                    dt=dt,
+                    dt=dt_i,
                     mass=mass_i,
                     damping_c=damping_i,
                     stiffness=stiffness_i,
                 )
                 z_next_mean = torch.cat([y_next_mean, v_next_mean * mass_i], dim=1)
                 if predict_sigma:
-                    var_p = torch.clamp((float(dt) * sigma_corr) ** 2, min=1e-9)
-                    var_y = torch.clamp(((0.5 * (float(dt) ** 2) / mass_i) * sigma_corr) ** 2, min=1e-9)
+                    var_p = torch.clamp((dt_i * sigma_corr) ** 2, min=1e-9)
+                    var_y = torch.clamp(((0.5 * (dt_i ** 2) / mass_i) * sigma_corr) ** 2, min=1e-9)
                     nll_y = 0.5 * (((z_next[:, 0:1] - z_next_mean[:, 0:1]) ** 2) / var_y + torch.log(var_y))
                     nll_p = 0.5 * (((z_next[:, 1:2] - z_next_mean[:, 1:2]) ** 2) / var_p + torch.log(var_p))
                     state_loss = torch.mean(nll_y + nll_p)
@@ -1062,27 +1065,29 @@ def _run_hnn_td_correction_validation(
             with torch.no_grad():
                 for rollout_batch in rollout_loader:
                     if len(rollout_batch) == 8:
-                        z0, _t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
+                        z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
                         history0 = None
                     elif len(rollout_batch) == 9:
-                        z0, _t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, history0 = rollout_batch
+                        z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, history0 = rollout_batch
                         history0 = history0.to(device, non_blocking=(device.type == "cuda"))
                     else:
                         raise ValueError("Unexpected TD correction rollout batch format.")
                     z0 = z0.to(device, non_blocking=(device.type == "cuda"))
+                    t_seq = t_seq.to(device, non_blocking=(device.type == "cuda"))
                     z_traj = z_traj.to(device, non_blocking=(device.type == "cuda"))
                     ur0 = ur0.to(device, non_blocking=(device.type == "cuda"))
                     td_context0 = td_context0.to(device, non_blocking=(device.type == "cuda"))
                     mass0 = mass0.to(device, non_blocking=(device.type == "cuda"))
                     damping0 = damping0.to(device, non_blocking=(device.type == "cuda"))
                     stiffness0 = stiffness0.to(device, non_blocking=(device.type == "cuda"))
+                    dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
                     z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
                         model=model,
                         z0=z0,
                         ur0=ur0,
                         td_context0=td_context0,
                         steps=int(z_traj.shape[1] - 1),
-                        dt=dt,
+                        dt=dt_roll,
                         structural_mass=mass0,
                         damping_c=damping0,
                         stiffness=stiffness0,
@@ -1151,10 +1156,11 @@ def _run_hnn_td_correction_validation(
             target_ur_tol=rollout_target_ur_tol,
         )
         rollout_traj = val_trajs_np[rollout_idx]
+        rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
         print(
             f"[async-val][phnn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
             f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-            f"dt={float(dt):.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
+            f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
             f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
             f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
             f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"

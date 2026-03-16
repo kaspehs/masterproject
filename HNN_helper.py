@@ -4205,7 +4205,7 @@ def td_baseline_step_torch(
     velocity: torch.Tensor,
     acceleration: torch.Tensor,
     td_context: torch.Tensor,
-    dt: float,
+    dt: float | torch.Tensor,
     rho: float,
     diameter: float,
     params: dict[str, float],
@@ -4218,6 +4218,12 @@ def td_baseline_step_torch(
     sig_ddy = td_context[:, 3:4]
     flow_speed = td_context[:, 4:5]
     n_memory = max(1.0, float(params["n_memory"]))
+    dt_t = torch.as_tensor(dt, device=velocity.device, dtype=velocity.dtype)
+    if dt_t.ndim == 0:
+        dt_t = dt_t.view(1, 1)
+    elif dt_t.ndim == 1:
+        dt_t = dt_t.view(-1, 1)
+    dt_t = dt_t.expand_as(velocity)
 
     speed_mag = torch.sqrt(torch.clamp(flow_speed * flow_speed + velocity * velocity, min=1e-12))
     projection = flow_speed / speed_mag
@@ -4239,7 +4245,7 @@ def td_baseline_step_torch(
         float(params["fhat0"]) + (float(params["fhat_max"]) - float(params["fhat0"])) * torch.sin(theta),
     )
     omega_vy = 2.0 * math.pi * fhat * speed_mag / float(diameter)
-    phi_vy_next = phi_vy + float(dt) * omega_vy
+    phi_vy_next = phi_vy + dt_t * omega_vy
 
     fdy = -0.5 * float(rho) * float(diameter) * float(params["Cd"]) * speed_mag * velocity
     fcv = 0.5 * float(rho) * float(diameter) * float(params["Cv"]) * speed_mag * flow_speed * torch.cos(phi_vy_next)
@@ -4255,12 +4261,16 @@ def structural_step_constant_force_torch(
     y: torch.Tensor,
     velocity: torch.Tensor,
     force: torch.Tensor,
-    dt: float,
+    dt: float | torch.Tensor,
     mass: torch.Tensor | float,
     damping_c: torch.Tensor | float,
     stiffness: torch.Tensor | float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dt_t = y.new_tensor(float(dt))
+    dt_t = torch.as_tensor(dt, device=y.device, dtype=y.dtype)
+    if dt_t.ndim == 0:
+        dt_t = dt_t.view(1, 1)
+    elif dt_t.ndim == 1:
+        dt_t = dt_t.view(-1, 1)
     half = y.new_tensor(0.5)
     sixth = y.new_tensor(1.0 / 6.0)
     mass_t = torch.as_tensor(mass, device=y.device, dtype=y.dtype)
@@ -4278,6 +4288,7 @@ def structural_step_constant_force_torch(
         stiffness_t = stiffness_t.view(1, 1)
     elif stiffness_t.ndim == 1:
         stiffness_t = stiffness_t.view(-1, 1)
+    dt_t = dt_t.expand_as(y)
     mass_t = mass_t.expand_as(y)
     damping_t = damping_t.expand_as(y)
     stiffness_t = stiffness_t.expand_as(y)

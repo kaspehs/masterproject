@@ -1871,6 +1871,58 @@ def _vpinn_td_rollout(
     )
 
 
+def _vpinn_pure_baseline_rollout(
+    *,
+    x0: torch.Tensor,
+    v0: torch.Tensor,
+    td_context0: torch.Tensor,
+    steps: int,
+    dt: float,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = x0
+    v = v0
+    td_context = td_context0
+    xs = [x]
+    vs = [v]
+    total_fs: list[torch.Tensor] = []
+    for _ in range(int(steps)):
+        td_force_next, td_context_next = td_baseline_step_torch(
+            velocity=v,
+            acceleration=td_context[:, 0:1],
+            td_context=td_context,
+            dt=dt,
+            rho=rho,
+            diameter=diameter,
+            params=td_params,
+        )
+        x, v, a_next = structural_step_constant_force_torch(
+            y=x,
+            velocity=v,
+            force=td_force_next,
+            dt=dt,
+            mass=m,
+            damping_c=c,
+            stiffness=k,
+        )
+        td_context = td_context_next.clone()
+        td_context[:, 0:1] = a_next
+        xs.append(x)
+        vs.append(v)
+        total_fs.append(td_force_next)
+    empty_force = x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
+    return (
+        torch.stack(xs, dim=1),
+        torch.stack(vs, dim=1),
+        torch.stack(total_fs, dim=1) if total_fs else empty_force,
+    )
+
+
 def _build_td_correction_vpinn_datasets(
     *,
     trajs: list[dict[str, np.ndarray]],
@@ -2081,6 +2133,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         run_name_override=getattr(config.logging, "run_name", None),
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
+    writer.add_text("vpinn/td_correction_config", json.dumps(vp, indent=2, sort_keys=True), 0)
+    writer.flush()
 
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
     sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
@@ -2507,7 +2561,6 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
         async_processes = _reap_async_processes(async_processes, wait=True)
 
-    writer.add_text("vpinn/td_correction_config", json.dumps(vp, indent=2, sort_keys=True), 0)
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / f"{run_name}.pt"
