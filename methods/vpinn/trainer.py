@@ -1624,8 +1624,22 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         raise FileNotFoundError("No TD correction VPINN training trajectories were found.")
     train_cut = float(getattr(data_cfg, "cut_start_seconds_train", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
     val_cut = float(getattr(data_cfg, "cut_start_seconds_val", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
-    train_trajs = load_td_correction_trajectories(paths=train_paths, cut_start_seconds=train_cut)
-    val_trajs = load_td_correction_trajectories(paths=val_paths, cut_start_seconds=val_cut) if val_paths else []
+    train_trajs = load_td_correction_trajectories(
+        paths=train_paths,
+        cut_start_seconds=train_cut,
+        reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+        reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+    )
+    val_trajs = (
+        load_td_correction_trajectories(
+            paths=val_paths,
+            cut_start_seconds=val_cut,
+            reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+            reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        )
+        if val_paths
+        else []
+    )
 
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
     td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()

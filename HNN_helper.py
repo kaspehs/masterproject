@@ -3985,10 +3985,36 @@ def _extract_required_scalar(data: Any, keys: Sequence[str], *, path: Path) -> f
     return float(arr[0])
 
 
+def _maybe_reduce_time_td(
+    *,
+    t: np.ndarray,
+    arrays: dict[str, np.ndarray],
+    enabled: bool,
+    reduction_factor: int,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    if not enabled:
+        return t, arrays
+    rf_requested = max(1, int(reduction_factor))
+    rf = min(rf_requested, max(1, int(t.size) - 1))
+    if rf < rf_requested:
+        warnings.warn(
+            "Reduction factor was too large for the current TD trajectory; "
+            f"using step={rf} instead of {rf_requested} to keep at least two samples."
+        )
+    sl = slice(None, None, rf)
+    t_out = t[sl]
+    arrays_out = {name: np.asarray(value)[sl] for name, value in arrays.items()}
+    if t_out.size < 2:
+        raise ValueError("reduce_time produced too few TD-correction samples")
+    return t_out, arrays_out
+
+
 def load_td_correction_trajectories(
     *,
     paths: Sequence[Path],
     cut_start_seconds: float = 0.0,
+    reduce_time: bool = False,
+    reduction_factor: int = 1,
 ) -> list[dict[str, np.ndarray]]:
     trajectories: list[dict[str, np.ndarray]] = []
     for path in paths:
@@ -4050,6 +4076,33 @@ def load_td_correction_trajectories(
                     raise ValueError(f"{path} flow speed must be scalar or length-matched to time.")
         if not np.all(np.isfinite(flow_speed)):
             flow_speed = np.full((n,), float(np.nanmean(flow_speed)), dtype=float)
+        t, reduced = _maybe_reduce_time_td(
+            t=t,
+            arrays={
+                "y": y,
+                "dy": dy,
+                "ddy": ddy,
+                "force_total": force_total,
+                "force_td": force_td,
+                "phi_td": phi_td,
+                "sig_dy_td": sig_dy_td,
+                "sig_ddy_td": sig_ddy_td,
+                "ur": ur,
+                "flow_speed": flow_speed,
+            },
+            enabled=bool(reduce_time),
+            reduction_factor=int(reduction_factor),
+        )
+        y = reduced["y"]
+        dy = reduced["dy"]
+        ddy = reduced["ddy"]
+        force_total = reduced["force_total"]
+        force_td = reduced["force_td"]
+        phi_td = reduced["phi_td"]
+        sig_dy_td = reduced["sig_dy_td"]
+        sig_ddy_td = reduced["sig_ddy_td"]
+        ur = reduced["ur"]
+        flow_speed = reduced["flow_speed"]
         if cut_start_seconds > 0.0:
             t0 = float(t[0])
             mask = t >= (t0 + float(cut_start_seconds))

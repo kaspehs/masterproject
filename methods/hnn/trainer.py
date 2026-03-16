@@ -1834,8 +1834,22 @@ def _train_td_correction(config: Config, config_name: str) -> None:
 
     train_cut = resolve_cut_start_seconds(data_cfg, "train")
     val_cut = resolve_cut_start_seconds(data_cfg, "val")
-    train_trajs = load_td_correction_trajectories(paths=train_paths, cut_start_seconds=train_cut)
-    val_trajs = load_td_correction_trajectories(paths=val_paths, cut_start_seconds=val_cut) if val_paths else []
+    train_trajs = load_td_correction_trajectories(
+        paths=train_paths,
+        cut_start_seconds=train_cut,
+        reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+        reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+    )
+    val_trajs = (
+        load_td_correction_trajectories(
+            paths=val_paths,
+            cut_start_seconds=val_cut,
+            reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+            reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        )
+        if val_paths
+        else []
+    )
 
     td_params = resolve_td_correction_params(hnn_cfg)
     td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
