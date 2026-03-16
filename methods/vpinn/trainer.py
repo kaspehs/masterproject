@@ -449,6 +449,16 @@ def _prune_async_processes(processes: list[subprocess.Popen]) -> list[subprocess
     return [proc for proc in processes if proc.poll() is None]
 
 
+def _wait_async_processes(processes: list[subprocess.Popen]) -> list[subprocess.Popen]:
+    remaining: list[subprocess.Popen] = []
+    for proc in processes:
+        if proc.poll() is None:
+            proc.wait()
+        if proc.poll() is None:
+            remaining.append(proc)
+    return remaining
+
+
 def _launch_async_validation(
     *,
     processes: list[subprocess.Popen],
@@ -2650,6 +2660,10 @@ def train(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                 )
+
+    if async_validation and async_processes:
+        print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
+        async_processes = _wait_async_processes(async_processes)
 
     if final_rollout_all_validation and val_trajs:
         print("Final validation rollout (all trajectories) started.")
