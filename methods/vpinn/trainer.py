@@ -33,6 +33,7 @@ from HNN_helper import (
     GradNormBalancer,
     MEAN_DISP_AMP_REL_ERROR_KEY,
     Residual,
+    compute_validation_metrics,
     compute_velocity_numpy,
     create_window_mask,
     create_zoom_mask,
@@ -48,6 +49,7 @@ from HNN_helper import (
     resample_uniform_series,
     load_td_correction_trajectories,
     resolve_td_correction_params,
+    sample_indices_per_ur,
     sample_one_index_per_ur,
     spectral_relative_error,
     structural_step_constant_force_torch,
@@ -1558,6 +1560,160 @@ def _log_rollout_validation(
     return metrics
 
 
+def _log_td_correction_rollout_validation(
+    *,
+    writer: Any,
+    epoch: int,
+    model: nn.Module,
+    traj: dict[str, Any],
+    dt: float,
+    td_mass_source: str,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+    middle_time_plot: Sequence[float],
+    device: torch.device,
+    sigma_min: float,
+    probabilistic: bool,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    log_metrics: bool = True,
+    log_plots: bool = True,
+    title_suffix: str = "",
+) -> dict[str, float]:
+    x_true_t = traj["x"].to(device)
+    v_true_t = traj["v"].to(device)
+    f_true_t = traj["f"].to(device)
+    ur_true_t = traj["ur"].to(device)
+    td_true_t = traj["td_force"].to(device)
+    td_context_t = traj["td_context"].to(device)
+    t_np = traj["t"].detach().cpu().numpy()
+    if x_true_t.ndim != 2:
+        return {}
+    d = int(x_true_t.shape[-1])
+    if d < 1:
+        return {}
+    if d > 1:
+        print("vpinn td-correction rollout validation: d>1 detected; logging only the first DOF.")
+
+    steps = int(x_true_t.shape[0] - 1)
+    if steps < 1:
+        return {}
+
+    mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
+    mass_value = float(np.asarray(traj[mass_key]).reshape(()))
+    damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
+    stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+    m = torch.full((1, d), mass_value, dtype=x_true_t.dtype, device=device)
+    c = torch.full((1, d), damping_value, dtype=x_true_t.dtype, device=device)
+    k = torch.full((1, d), stiffness_value, dtype=x_true_t.dtype, device=device)
+
+    x_seq, v_seq, f_seq = _vpinn_td_rollout(
+        model=model,
+        x0=x_true_t[0:1, :],
+        v0=v_true_t[0:1, :],
+        ur0=ur_true_t[0:1, :],
+        td_context0=td_context_t[0:1, :],
+        steps=steps,
+        dt=dt,
+        m=m,
+        c=c,
+        k=k,
+        rho=rho,
+        diameter=diameter,
+        td_params=td_params,
+        probabilistic=probabilistic,
+        sigma_min=sigma_min,
+    )
+    x_pred = x_seq[0, :, 0].detach().cpu().numpy()
+    v_pred = v_seq[0, :, 0].detach().cpu().numpy()
+    f_roll = f_seq[0, :, 0].detach().cpu().numpy()
+
+    with torch.no_grad():
+        corr_on_data, _sigma_on_data = _vpinn_predict_correction(
+            model,
+            x_true_t,
+            v_true_t,
+            ur_true_t,
+            probabilistic=probabilistic,
+            sigma_min=sigma_min,
+        )
+        f_on_data = (td_true_t + corr_on_data)[:, 0].detach().cpu().numpy()
+
+    if f_roll.size > 0:
+        force_total_full = np.concatenate([f_on_data[:1], f_roll], axis=0)
+    else:
+        force_total_full = f_on_data
+
+    metrics = compute_validation_metrics(
+        model=model,  # ignored when rollout is provided
+        y_data_t=x_true_t[:, 0],
+        val_vel=v_true_t[:, 0],
+        reduced_velocity=ur_true_t[:, 0],
+        m_eff=mass_value,
+        dt=dt,
+        t=t_np,
+        y_data_raw=x_true_t[:, 0].detach().cpu().numpy(),
+        force_data=f_true_t[:, 0].detach().cpu().numpy(),
+        D=diameter,
+        k=stiffness_value,
+        device=device,
+        rollout={
+            "y_norm": x_pred / float(diameter),
+            "p_norm": v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(diameter)),
+            "force_total": force_total_full,
+        },
+    )
+
+    force_true = f_true_t[:, 0].detach().cpu().numpy()
+    force_std = float(np.std(force_true))
+    if force_std <= 0.0:
+        force_std = 1.0
+    metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((f_on_data - force_true) ** 2))) / force_std
+
+    if log_metrics:
+        for name, value in metrics.items():
+            if np.isfinite(float(value)):
+                writer.add_scalar(f"val/{name}", float(value), epoch)
+
+    if log_plots:
+        y_true = x_true_t[:, 0].detach().cpu().numpy()
+        zoom_mask = create_zoom_mask(t_np)
+        middle_mask = create_window_mask(t_np, middle_time_plot)
+        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
+        ur_val = float(ur_true_t[0, 0].detach().cpu().item())
+        log_displacement_plots(
+            writer,
+            epoch,
+            t_np,
+            y_true / float(diameter),
+            x_pred / float(diameter),
+            v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(diameter)),
+            zoom_mask,
+            middle_mask,
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
+        log_force_plots(
+            writer,
+            epoch,
+            t_np[: min(len(t_np), len(force_total_full), len(force_true))],
+            force_total_full[: min(len(t_np), len(force_total_full), len(force_true))],
+            force_true[: min(len(t_np), len(force_total_full), len(force_true))],
+            create_zoom_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))]),
+            create_window_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))], middle_time_plot),
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
+    return metrics
+
+
 def _vpinn_predict_correction(
     model: nn.Module,
     x: torch.Tensor,
@@ -1638,6 +1794,103 @@ def _vpinn_td_rollout(
     return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1) if fs else x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
 
 
+def _build_td_correction_vpinn_datasets(
+    *,
+    trajs: list[dict[str, np.ndarray]],
+    rollout_steps: int,
+    window_M: int,
+    stride: int,
+    td_mass_source: str,
+) -> tuple[Dataset, Dataset | None]:
+    train_items: list[TensorDataset] = []
+    roll_items: list[TensorDataset] = []
+    window = int(window_M) + 1
+    roll_window = int(rollout_steps) + 1
+    for traj in trajs:
+        x = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
+        v = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
+        f_corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
+        f_td = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
+        ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+        td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
+        mass_value = float(np.asarray(traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
+        damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
+        stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+        mass = torch.full((x.shape[0], 1), mass_value, dtype=torch.float32)
+        damping = torch.full((x.shape[0], 1), damping_value, dtype=torch.float32)
+        stiffness = torch.full((x.shape[0], 1), stiffness_value, dtype=torch.float32)
+        if x.shape[0] >= window:
+            xw = []
+            vw = []
+            cw = []
+            tdw = []
+            urw = []
+            mw = []
+            dw = []
+            kw = []
+            for start in range(0, x.shape[0] - window + 1, int(stride)):
+                end = start + window
+                xw.append(x[start:end])
+                vw.append(v[start:end])
+                cw.append(f_corr[start:end])
+                tdw.append(f_td[start:end])
+                urw.append(ur[start:end])
+                mw.append(mass[start:end])
+                dw.append(damping[start:end])
+                kw.append(stiffness[start:end])
+            train_items.append(
+                TensorDataset(
+                    torch.stack(xw, dim=0),
+                    torch.stack(vw, dim=0),
+                    torch.stack(cw, dim=0),
+                    torch.stack(tdw, dim=0),
+                    torch.stack(urw, dim=0),
+                    torch.stack(mw, dim=0),
+                    torch.stack(dw, dim=0),
+                    torch.stack(kw, dim=0),
+                )
+            )
+        if rollout_steps > 0 and x.shape[0] >= roll_window:
+            x0s = []
+            v0s = []
+            urs = []
+            td0s = []
+            xtr = []
+            vtr = []
+            m0s = []
+            d0s = []
+            k0s = []
+            for start in range(0, x.shape[0] - roll_window + 1, int(stride)):
+                end = start + roll_window
+                x0s.append(x[start])
+                v0s.append(v[start])
+                urs.append(ur[start])
+                td0s.append(td_context[start])
+                xtr.append(x[start:end])
+                vtr.append(v[start:end])
+                m0s.append(mass[start])
+                d0s.append(damping[start])
+                k0s.append(stiffness[start])
+            roll_items.append(
+                TensorDataset(
+                    torch.stack(x0s, dim=0),
+                    torch.stack(v0s, dim=0),
+                    torch.stack(urs, dim=0),
+                    torch.stack(td0s, dim=0),
+                    torch.stack(xtr, dim=0),
+                    torch.stack(vtr, dim=0),
+                    torch.stack(m0s, dim=0),
+                    torch.stack(d0s, dim=0),
+                    torch.stack(k0s, dim=0),
+                )
+            )
+    train_ds = train_items[0] if len(train_items) == 1 else ConcatDataset(train_items)
+    roll_ds = None
+    if roll_items:
+        roll_ds = roll_items[0] if len(roll_items) == 1 else ConcatDataset(roll_items)
+    return train_ds, roll_ds
+
+
 def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     vp = dict(config.vpinn or {})
     data_cfg = config.data
@@ -1702,106 +1955,38 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim).to(device)
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
-    def _windows(trajs: list[dict[str, np.ndarray]], rollout_steps: int) -> tuple[Dataset, Dataset | None]:
-        train_items: list[TensorDataset] = []
-        roll_items: list[TensorDataset] = []
-        window_M = int(vp.get("window_M", 50))
-        stride = max(1, int(vp.get("stride", 1)))
-        window = window_M + 1
-        roll_window = rollout_steps + 1
-        for traj in trajs:
-            x = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
-            v = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
-            f_corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
-            f_td = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
-            ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
-            t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
-            td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
-            mass_value = float(np.asarray(traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
-            damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
-            stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
-            mass = torch.full((x.shape[0], 1), mass_value, dtype=torch.float32)
-            damping = torch.full((x.shape[0], 1), damping_value, dtype=torch.float32)
-            stiffness = torch.full((x.shape[0], 1), stiffness_value, dtype=torch.float32)
-            if x.shape[0] >= window:
-                xw = []
-                vw = []
-                cw = []
-                tdw = []
-                urw = []
-                mw = []
-                dw = []
-                kw = []
-                for start in range(0, x.shape[0] - window + 1, stride):
-                    end = start + window
-                    xw.append(x[start:end])
-                    vw.append(v[start:end])
-                    cw.append(f_corr[start:end])
-                    tdw.append(f_td[start:end])
-                    urw.append(ur[start:end])
-                    mw.append(mass[start:end])
-                    dw.append(damping[start:end])
-                    kw.append(stiffness[start:end])
-                train_items.append(
-                    TensorDataset(
-                        torch.stack(xw, dim=0),
-                        torch.stack(vw, dim=0),
-                        torch.stack(cw, dim=0),
-                        torch.stack(tdw, dim=0),
-                        torch.stack(urw, dim=0),
-                        torch.stack(mw, dim=0),
-                        torch.stack(dw, dim=0),
-                        torch.stack(kw, dim=0),
-                    )
-                )
-            if rollout_steps > 0 and x.shape[0] >= roll_window:
-                x0s = []
-                v0s = []
-                urs = []
-                td0s = []
-                xtr = []
-                vtr = []
-                m0s = []
-                d0s = []
-                k0s = []
-                for start in range(0, x.shape[0] - roll_window + 1, stride):
-                    end = start + roll_window
-                    x0s.append(x[start])
-                    v0s.append(v[start])
-                    urs.append(ur[start])
-                    td0s.append(td_context[start])
-                    xtr.append(x[start:end])
-                    vtr.append(v[start:end])
-                    m0s.append(mass[start])
-                    d0s.append(damping[start])
-                    k0s.append(stiffness[start])
-                roll_items.append(
-                    TensorDataset(
-                        torch.stack(x0s, dim=0),
-                        torch.stack(v0s, dim=0),
-                        torch.stack(urs, dim=0),
-                        torch.stack(td0s, dim=0),
-                        torch.stack(xtr, dim=0),
-                        torch.stack(vtr, dim=0),
-                        torch.stack(m0s, dim=0),
-                        torch.stack(d0s, dim=0),
-                        torch.stack(k0s, dim=0),
-                    )
-                )
-        train_ds = train_items[0] if len(train_items) == 1 else ConcatDataset(train_items)
-        roll_ds = None
-        if roll_items:
-            roll_ds = roll_items[0] if len(roll_items) == 1 else ConcatDataset(roll_items)
-        return train_ds, roll_ds
-
     rollout_weight = float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0))))
     rollout_steps = int(vp.get("rollout_force_steps", int(getattr(loss_cfg, "rollout_det_steps", 0))))
-    train_dataset, _ = _windows(train_trajs, rollout_steps=0)
+    window_M = int(vp.get("window_M", 50))
+    stride = max(1, int(vp.get("stride", 1)))
+    train_dataset, _ = _build_td_correction_vpinn_datasets(
+        trajs=train_trajs,
+        rollout_steps=0,
+        window_M=window_M,
+        stride=stride,
+        td_mass_source=td_mass_source,
+    )
     val_dataset = None
     val_rollout_dataset = None
     if val_trajs:
-        val_dataset, val_rollout_dataset = _windows(val_trajs, rollout_steps=rollout_steps)
-    train_rollout_dataset = _windows(train_trajs, rollout_steps=rollout_steps)[1] if rollout_weight > 0.0 and rollout_steps > 0 else None
+        val_dataset, val_rollout_dataset = _build_td_correction_vpinn_datasets(
+            trajs=val_trajs,
+            rollout_steps=rollout_steps,
+            window_M=window_M,
+            stride=stride,
+            td_mass_source=td_mass_source,
+        )
+    train_rollout_dataset = (
+        _build_td_correction_vpinn_datasets(
+            trajs=train_trajs,
+            rollout_steps=rollout_steps,
+            window_M=window_M,
+            stride=stride,
+            td_mass_source=td_mass_source,
+        )[1]
+        if rollout_weight > 0.0 and rollout_steps > 0
+        else None
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_dataset is not None else None
@@ -1837,6 +2022,24 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
     log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
     print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
+    rollout_every = max(1, int(getattr(monitoring_cfg, "rollout_every_epochs", 1)))
+    cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
+    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+    validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+    async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
+    async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
+    async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
+    async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
+    async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
+    async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
+    async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
+    rollout_target_ur: float | None = None
+    rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
+    if bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False)):
+        excluded_arr = _normalize_ur_filter(vp.get("train_exclude_ur"), key="vpinn.train_exclude_ur")
+        if excluded_arr is not None and excluded_arr.size == 1:
+            rollout_target_ur = float(excluded_arr[0])
     train_instances = len(train_dataset)
     train_steps_per_epoch = len(train_loader)
     val_instances = len(val_dataset) if val_dataset is not None else 0
@@ -1863,11 +2066,20 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             f"val_rollout_windows={val_rollout_instances}, val_rollout_steps={val_rollout_steps_per_epoch}"
         ),
         (
+            f"Monitoring: validate_every={validate_every}, rollout_every={rollout_every}, "
+            f"print_every={print_every}, async_validation={async_validation}, "
+            f"val_samples_per_ur={validation_samples_per_ur}"
+        ),
+        (
             f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)}, amp={amp_enabled}, "
             f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
         ),
     ]
     print("\n".join(startup_lines))
+    async_dir = Path(writer.log_dir) / "async_validation"
+    if async_validation:
+        async_dir.mkdir(parents=True, exist_ok=True)
+    async_processes: list[dict[str, Any]] = []
 
     for epoch in range(epochs):
         model.train()
@@ -1982,7 +2194,46 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 f"Ldata={metrics['loss_data']:.4e}, Lphys={metrics['loss_physics']:.4e}, "
                 f"Lroll={metrics['loss_rollout_det']:.4e}, lr={metrics['lr']:.3e}"
             )
-        if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
+        should_validate = (
+            val_loader is not None
+            and validate_every > 0
+            and ((epoch % validate_every) == 0 or epoch == epochs - 1)
+        )
+        should_rollout = rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == epochs - 1)
+        if async_validation and (should_validate or should_rollout) and (async_do_losses or async_do_rollout):
+            async_processes = _reap_async_processes(async_processes, wait=False)
+            state_source: nn.Module = model
+            if hasattr(model, "_orig_mod"):
+                state_source = getattr(model, "_orig_mod")
+            ckpt_path = async_dir / f"epoch_{epoch + 1:06d}.pt"
+            torch.save(
+                {
+                    "model_state": state_source.state_dict(),
+                    "config": asdict(config),
+                    "run_name": run_name,
+                    "dt": dt,
+                    "method": "vpinn",
+                    "td_correction": True,
+                },
+                ckpt_path,
+            )
+            async_processes = _launch_async_validation(
+                processes=async_processes,
+                max_concurrent=async_max_concurrent,
+                checkpoint_path=ckpt_path,
+                epoch=epoch,
+                writer=writer,
+                async_device=async_device,
+                async_num_workers=async_num_workers,
+                async_num_threads=async_num_threads,
+                rollout_every_epochs=rollout_every,
+                cycle_validation_rollout=cycle_validation_rollout,
+                rollout_target_ur=rollout_target_ur,
+                rollout_target_ur_tol=rollout_target_ur_tol,
+                do_losses=async_do_losses and should_validate,
+                do_rollout=async_do_rollout and should_rollout,
+            )
+        elif should_validate:
             model.eval()
             val_sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma"]}
             val_batches = 0
@@ -2061,6 +2312,83 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
                         roll_batches += 1
                     writer.add_scalar("val/loss_rollout_det", float((roll_sum / float(max(1, roll_batches))).detach().cpu()), epoch + 1)
+
+            if should_rollout and val_trajs:
+                sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+                ur_all = [float(traj["ur"][0]) for traj in val_trajs]
+                sampled_metric_indices = sample_indices_per_ur(
+                    ur_all,
+                    samples_per_ur=validation_samples_per_ur,
+                    seed=sample_seed,
+                )
+                metrics_sum: dict[str, float] = {}
+                metrics_count: dict[str, int] = {}
+                for sidx in sampled_metric_indices:
+                    metrics_roll = _log_td_correction_rollout_validation(
+                        writer=writer,
+                        epoch=epoch + 1,
+                        model=model,
+                        traj=val_trajs[sidx],
+                        dt=dt,
+                        td_mass_source=td_mass_source,
+                        rho=rho,
+                        diameter=diameter,
+                        td_params=td_params,
+                        middle_time_plot=resolve_middle_time_plot(config.data, vp, method_name="vpinn"),
+                        device=device,
+                        sigma_min=sigma_min,
+                        probabilistic=probabilistic,
+                        log_metrics=False,
+                        log_plots=False,
+                    )
+                    for name, value in metrics_roll.items():
+                        if not np.isfinite(float(value)):
+                            continue
+                        metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                        metrics_count[name] = metrics_count.get(name, 0) + 1
+                for name, total in metrics_sum.items():
+                    denom_roll = float(max(1, metrics_count.get(name, 0)))
+                    writer.add_scalar(f"val/{name}", total / denom_roll, epoch + 1)
+
+                selected_indices: list[int] | None = None
+                if rollout_target_ur is not None:
+                    matches = [
+                        idx
+                        for idx, traj in enumerate(val_trajs)
+                        if np.isclose(float(traj["ur"][0]), float(rollout_target_ur), rtol=0.0, atol=float(rollout_target_ur_tol))
+                    ]
+                    if matches:
+                        selected_indices = matches
+                if selected_indices is None:
+                    selected_indices = sample_one_index_per_ur(ur_all, seed=0)
+                    if not selected_indices:
+                        selected_indices = list(range(len(val_trajs)))
+                rollout_idx = (
+                    selected_indices[max(0, (epoch + 1) // max(1, int(rollout_every)) - 1) % len(selected_indices)]
+                    if cycle_validation_rollout
+                    else selected_indices[0]
+                )
+                _log_td_correction_rollout_validation(
+                    writer=writer,
+                    epoch=epoch + 1,
+                    model=model,
+                    traj=val_trajs[rollout_idx],
+                    dt=dt,
+                    td_mass_source=td_mass_source,
+                    rho=rho,
+                    diameter=diameter,
+                    td_params=td_params,
+                    middle_time_plot=resolve_middle_time_plot(config.data, vp, method_name="vpinn"),
+                    device=device,
+                    sigma_min=sigma_min,
+                    probabilistic=probabilistic,
+                    log_metrics=False,
+                    log_plots=True,
+                )
+
+    if async_validation and async_processes:
+        print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
+        async_processes = _reap_async_processes(async_processes, wait=True)
 
     writer.add_text("vpinn/td_correction_config", json.dumps(vp, indent=2, sort_keys=True), 0)
     models_dir = Path("models")

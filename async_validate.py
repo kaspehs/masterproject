@@ -28,6 +28,7 @@ from HNN_helper import (
     PHVIV,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
+    load_td_correction_trajectories,
     lookup_ur_bin_state_scale_tensor,
     build_dataloader_from_series,
     build_rollout_dataloader_from_series,
@@ -42,6 +43,7 @@ from HNN_helper import (
     sample_indices_per_ur,
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
+    resolve_td_correction_params,
 )
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
@@ -55,6 +57,10 @@ from methods.vpinn.trainer import (
     _m_eff_from_model_cfg,
     _test_functions,
     _log_rollout_validation,
+    _log_td_correction_rollout_validation,
+    _build_td_correction_vpinn_datasets,
+    _vpinn_predict_correction,
+    _vpinn_td_rollout,
     rollout_rk4,
     _weak_residual,
 )
@@ -924,6 +930,288 @@ def _run_vpinn_validation(
         )
 
 
+def _run_vpinn_td_correction_validation(
+    *,
+    ckpt: dict[str, Any],
+    cfg: Any,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    rollout_every: int,
+    cycle_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
+    do_losses: bool,
+    do_rollout: bool,
+    num_workers: int,
+) -> None:
+    data_cfg = cfg.data
+    monitoring_cfg = cfg.monitoring
+    vp = dict(cfg.vpinn or {})
+    probabilistic = bool(vp.get("predict_sigma", False))
+    sigma_min = float(vp.get("sigma_min", 1e-6))
+    td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
+    if td_mass_source not in {"dry", "effective"}:
+        raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
+
+    train_series_root = Path(data_cfg.train_series_dir)
+    val_dir = train_series_root / "val"
+    if not val_dir.exists():
+        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_paths = sorted(val_dir.glob("*.npz"))
+    if not val_paths:
+        raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
+
+    val_trajs_np = load_td_correction_trajectories(
+        paths=val_paths,
+        cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
+        reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+        reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+    )
+    dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
+    rho = float(getattr(cfg.model, "rho", 1000.0))
+    diameter = float(getattr(cfg.model, "D", 0.1))
+    td_params = resolve_td_correction_params(vp)
+
+    model = _build_force_model(cfg, input_dim=3, output_dim=(2 if probabilistic else 1)).to(device)
+    _load_state(model, ckpt["model_state"])
+    model.eval()
+
+    window_M = int(vp.get("window_M", 50))
+    stride = max(1, int(vp.get("stride", 1)))
+    rollout_steps = int(vp.get("rollout_force_steps", int(getattr(cfg.loss, "rollout_det_steps", 0))))
+    val_dataset, val_rollout_dataset = _build_td_correction_vpinn_datasets(
+        trajs=val_trajs_np,
+        rollout_steps=rollout_steps,
+        window_M=window_M,
+        stride=stride,
+        td_mass_source=td_mass_source,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=int(cfg.training.batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    val_rollout_loader = (
+        torch.utils.data.DataLoader(
+            val_rollout_dataset,
+            batch_size=int(cfg.training.batch_size),
+            shuffle=False,
+            num_workers=int(num_workers),
+            pin_memory=(device.type == "cuda"),
+            drop_last=False,
+        )
+        if val_rollout_dataset is not None
+        else None
+    )
+
+    mean_reg = float(getattr(cfg.loss, "mean_reg", 0.0))
+    sigma_reg = float(getattr(cfg.loss, "sigma_reg", 0.0))
+    mean_reg_norm = str(getattr(cfg.loss, "mean_reg_norm", "l1")).strip().lower()
+    sigma_reg_norm = str(getattr(cfg.loss, "sigma_reg_norm", "l2")).strip().lower()
+    use_force_loss = bool(vp.get("use_force_loss", True))
+    use_weak_loss = bool(vp.get("use_weak_loss", True))
+    w, wdot, alpha = _test_functions(
+        int(vp.get("window_M", 50)),
+        dt,
+        num_poly=int(vp.get("num_poly_test", 2)),
+        num_sine=int(vp.get("num_sine_test", 0)),
+    )
+    w = w.to(device)
+    wdot = wdot.to(device)
+    alpha = alpha.to(device)
+
+    if do_losses:
+        val_sums = {
+            name: torch.zeros((), device=device)
+            for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma"]
+        }
+        val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = [
+                    item.to(device, non_blocking=(device.type == "cuda")) for item in batch
+                ]
+                mu_corr, sigma_corr = _vpinn_predict_correction(
+                    model,
+                    x_win,
+                    v_win,
+                    ur_win,
+                    probabilistic=probabilistic,
+                    sigma_min=sigma_min,
+                )
+                total_force_mu = td_force + mu_corr
+                if use_force_loss:
+                    if probabilistic:
+                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                        loss_data = torch.mean(0.5 * (((corr_true - mu_corr) ** 2) / var + torch.log(var)))
+                    else:
+                        loss_data = torch.mean((corr_true - mu_corr) ** 2)
+                else:
+                    loss_data = mu_corr.new_tensor(0.0)
+                if use_weak_loss:
+                    R_mean = _weak_residual(
+                        x=x_win,
+                        v=v_win,
+                        f_pred=total_force_mu,
+                        m=m_win[:, 0, :],
+                        c=c_win[:, 0, :],
+                        k=k_win[:, 0, :],
+                        dt=dt,
+                        w=w,
+                        wdot=wdot,
+                        alpha=alpha,
+                        f0=None,
+                    )
+                    if probabilistic:
+                        coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
+                        weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                        weak_var = torch.clamp(weak_var, min=1e-9)
+                        loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
+                    else:
+                        loss_physics = torch.mean(R_mean * R_mean)
+                else:
+                    loss_physics = mu_corr.new_tensor(0.0)
+                mean_reg_loss = torch.mean(torch.abs(mu_corr)) if mean_reg_norm == "l1" else torch.mean(mu_corr * mu_corr)
+                sigma_reg_loss = (
+                    (torch.mean(torch.abs(sigma_corr)) if sigma_reg_norm == "l1" else torch.mean(sigma_corr * sigma_corr))
+                    if probabilistic
+                    else mu_corr.new_tensor(0.0)
+                )
+                total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                val_sums["loss_total"] += total_loss.detach()
+                val_sums["loss_data"] += loss_data.detach()
+                val_sums["loss_physics"] += loss_physics.detach()
+                val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                val_batches += 1
+        val_denom = float(max(1, val_batches))
+        for name, value in val_sums.items():
+            writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch)
+
+        if val_rollout_loader is not None and float(vp.get("rollout_force_weight", float(getattr(cfg.loss, "rollout_det_weight", 0.0)))) > 0.0 and rollout_steps > 0:
+            roll_sum = torch.zeros((), device=device)
+            roll_batches = 0
+            with torch.no_grad():
+                for rb in val_rollout_loader:
+                    x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [
+                        item.to(device, non_blocking=(device.type == "cuda")) for item in rb
+                    ]
+                    x_seq, v_seq, _ = _vpinn_td_rollout(
+                        model=model,
+                        x0=x0,
+                        v0=v0,
+                        ur0=ur0,
+                        td_context0=td0,
+                        steps=int(x_true_seq.shape[1] - 1),
+                        dt=dt,
+                        m=m0,
+                        c=c0,
+                        k=k0,
+                        rho=rho,
+                        diameter=diameter,
+                        td_params=td_params,
+                        probabilistic=probabilistic,
+                        sigma_min=sigma_min,
+                    )
+                    roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
+                    roll_batches += 1
+            writer.add_scalar("val/loss_rollout_det", float((roll_sum / float(max(1, roll_batches))).detach().cpu()), epoch)
+
+    if do_rollout:
+        fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+        validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+        validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+        ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs_np]
+        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sampled_metric_indices = sample_indices_per_ur(
+            ur_values_all,
+            samples_per_ur=validation_samples_per_ur,
+            seed=sample_seed,
+        )
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
+        diverged_count = 0
+        middle_time_plot = resolve_middle_time_plot(data_cfg, vp, method_name="vpinn")
+        val_trajs_plot = []
+        for traj in val_trajs_np:
+            val_trajs_plot.append(
+                {
+                    "name": traj["name"],
+                    "x": torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1),
+                    "v": torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1),
+                    "f": torch.from_numpy(np.ascontiguousarray(traj["force_total"])).float().unsqueeze(1),
+                    "td_force": torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1),
+                    "ur": torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1),
+                    "td_context": torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float(),
+                    "t": torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
+                    "dry_mass_kg": np.asarray(traj["dry_mass_kg"]),
+                    "effective_mass_kg": np.asarray(traj["effective_mass_kg"]),
+                    "damping_c": np.asarray(traj["damping_c"]),
+                    "stiffness_n_m": np.asarray(traj["stiffness_n_m"]),
+                }
+            )
+        for sidx in sampled_metric_indices:
+            metrics = _log_td_correction_rollout_validation(
+                writer=writer,
+                epoch=epoch,
+                model=model,
+                traj=val_trajs_plot[sidx],
+                dt=dt,
+                td_mass_source=td_mass_source,
+                rho=rho,
+                diameter=diameter,
+                td_params=td_params,
+                middle_time_plot=middle_time_plot,
+                device=device,
+                sigma_min=sigma_min,
+                probabilistic=probabilistic,
+                log_metrics=False,
+                log_plots=False,
+            )
+            diverged_flag = float(metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+            if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                diverged_count += 1
+            for name, value in metrics.items():
+                if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
+                    continue
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for name, total in metrics_sum.items():
+            writer.add_scalar(f"val/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch)
+        writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
+
+        rollout_idx = _rollout_index(
+            epoch,
+            rollout_every,
+            len(val_trajs_plot),
+            cycle_rollout,
+            ur_values=ur_values_all,
+            target_ur=rollout_target_ur,
+            target_ur_tol=rollout_target_ur_tol,
+        )
+        _log_td_correction_rollout_validation(
+            writer=writer,
+            epoch=epoch,
+            model=model,
+            traj=val_trajs_plot[rollout_idx],
+            dt=dt,
+            td_mass_source=td_mass_source,
+            rho=rho,
+            diameter=diameter,
+            td_params=td_params,
+            middle_time_plot=middle_time_plot,
+            device=device,
+            sigma_min=sigma_min,
+            probabilistic=probabilistic,
+            log_metrics=False,
+            log_plots=True,
+        )
+
+
 def _evaluate_val_losses(
     *,
     model: PHVIV,
@@ -1516,20 +1804,36 @@ def main() -> None:
                 num_workers=int(args.num_workers),
             )
         elif method == "vpinn":
-            _run_vpinn_validation(
-                ckpt=ckpt,
-                cfg=cfg,
-                device=device,
-                writer=writer,
-                epoch=int(args.epoch),
-                rollout_every=int(args.rollout_every),
-                cycle_rollout=bool(int(args.cycle_rollout)),
-                rollout_target_ur=args.rollout_target_ur,
-                rollout_target_ur_tol=float(args.rollout_target_ur_tol),
-                do_losses=bool(int(args.do_losses)),
-                do_rollout=bool(int(args.do_rollout)),
-                num_workers=int(args.num_workers),
-            )
+            if bool(ckpt.get("td_correction", False)):
+                _run_vpinn_td_correction_validation(
+                    ckpt=ckpt,
+                    cfg=cfg,
+                    device=device,
+                    writer=writer,
+                    epoch=int(args.epoch),
+                    rollout_every=int(args.rollout_every),
+                    cycle_rollout=bool(int(args.cycle_rollout)),
+                    rollout_target_ur=args.rollout_target_ur,
+                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
+                    do_losses=bool(int(args.do_losses)),
+                    do_rollout=bool(int(args.do_rollout)),
+                    num_workers=int(args.num_workers),
+                )
+            else:
+                _run_vpinn_validation(
+                    ckpt=ckpt,
+                    cfg=cfg,
+                    device=device,
+                    writer=writer,
+                    epoch=int(args.epoch),
+                    rollout_every=int(args.rollout_every),
+                    cycle_rollout=bool(int(args.cycle_rollout)),
+                    rollout_target_ur=args.rollout_target_ur,
+                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
+                    do_losses=bool(int(args.do_losses)),
+                    do_rollout=bool(int(args.do_rollout)),
+                    num_workers=int(args.num_workers),
+                )
         else:
             raise ValueError(f"Unsupported method '{method}'.")
         elapsed = time.perf_counter() - validation_start
