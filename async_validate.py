@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from HNN_helper import (
+    FORCE_MAPPING_NRMSE_KEY,
     PHVIV,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
@@ -49,7 +50,7 @@ from HNN_helper import (
     sample_one_index_per_ur,
     resolve_td_correction_params,
 )
-from methods.hnn.trainer import _td_correction_state_rollout
+from methods.hnn.trainer import _build_td_correction_hnn_loaders, _td_correction_state_rollout
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
@@ -325,6 +326,197 @@ def _load_state(model: torch.nn.Module, state: dict[str, Any]) -> None:
     if any(k.startswith("module.") for k in state):
         state = {k.removeprefix("module."): v for k, v in state.items()}
     model.load_state_dict(state, strict=False)
+
+
+def _td_hnn_initial_history(
+    z0: torch.Tensor,
+    ur0: torch.Tensor,
+    history_window: int | None,
+) -> torch.Tensor | None:
+    if history_window is None or int(history_window) <= 0:
+        return None
+    hist_feat = torch.cat([z0, ur0], dim=1)
+    return hist_feat.unsqueeze(1).expand(hist_feat.shape[0], int(history_window), hist_feat.shape[1]).clone()
+
+
+def _td_hnn_traj_to_tensors(
+    traj: dict[str, Any],
+    *,
+    mass_source: str,
+) -> dict[str, Any]:
+    mass_key = "dry_mass_kg" if str(mass_source).strip().lower() == "dry" else "effective_mass_kg"
+    mass_value = float(np.asarray(traj[mass_key]).reshape(()))
+    y_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
+    v_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
+    z_t = torch.cat([y_t, v_t * mass_value], dim=1)
+    return {
+        "name": str(traj.get("name", "")),
+        "y": y_t,
+        "v": v_t,
+        "z": z_t,
+        "f": torch.from_numpy(np.ascontiguousarray(traj["force_total"])).float().unsqueeze(1),
+        "td_force": torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1),
+        "ur": torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1),
+        "td_context": torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float(),
+        "t": torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
+        "mass_value": mass_value,
+        "damping_value": float(np.asarray(traj["damping_c"]).reshape(())),
+        "stiffness_value": float(np.asarray(traj["stiffness_n_m"]).reshape(())),
+    }
+
+
+def _log_td_correction_hnn_rollout_validation(
+    *,
+    writer: SummaryWriter,
+    epoch: int,
+    model: PHVIV,
+    traj: dict[str, Any],
+    dt: float,
+    td_mass_source: str,
+    td_params: dict[str, float],
+    middle_time_plot: list[float] | tuple[float, float],
+    device: torch.device,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    log_metrics: bool = True,
+    log_plots: bool = True,
+    title_suffix: str = "",
+) -> dict[str, float]:
+    traj_t = _td_hnn_traj_to_tensors(traj, mass_source=td_mass_source)
+    y_true_t = traj_t["y"].to(device)
+    v_true_t = traj_t["v"].to(device)
+    z_true_t = traj_t["z"].to(device)
+    f_true_t = traj_t["f"].to(device)
+    td_force_t = traj_t["td_force"].to(device)
+    ur_t = traj_t["ur"].to(device)
+    td_context_t = traj_t["td_context"].to(device)
+    t_np = traj_t["t"].detach().cpu().numpy()
+    mass_value = float(traj_t["mass_value"])
+    damping_value = float(traj_t["damping_value"])
+    stiffness_value = float(traj_t["stiffness_value"])
+    if z_true_t.shape[0] < 2:
+        return {}
+
+    mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
+    damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
+    stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
+    history0 = _td_hnn_initial_history(z_true_t[0:1], ur_t[0:1], int(model.history_window) if model.use_history_tcn else None)
+    if history0 is not None:
+        history0 = history0.to(device)
+
+    z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
+        model=model,
+        z0=z_true_t[0:1],
+        ur0=ur_t[0:1],
+        td_context0=td_context_t[0:1],
+        steps=int(z_true_t.shape[0] - 1),
+        dt=dt,
+        structural_mass=mass_t,
+        damping_c=damping_t,
+        stiffness=stiffness_t,
+        td_params=td_params,
+        history0=history0,
+    )
+    y_pred = z_pred[0, :, 0].detach().cpu().numpy()
+    v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
+    force_roll = total_force_seq[0, :, 0].detach().cpu().numpy()
+    corr_roll = corr_mu_seq[0, :, 0].detach().cpu().numpy()
+    td_roll = force_roll - corr_roll
+
+    with torch.no_grad():
+        history_context0 = model.history_context(z_true_t[0:1], reduced_velocity=ur_t[0:1], history_window=history0)
+        corr0 = model.learned_force(z_true_t[0:1], reduced_velocity=ur_t[0:1], history_context=history_context0)[0, 0]
+        corr_on_data = []
+        for idx in range(int(z_true_t.shape[0])):
+            z_i = z_true_t[idx : idx + 1]
+            ur_i = ur_t[idx : idx + 1]
+            hist_i = _td_hnn_initial_history(z_i, ur_i, int(model.history_window) if model.use_history_tcn else None)
+            if hist_i is not None:
+                hist_i = hist_i.to(device)
+            hist_ctx = model.history_context(z_i, reduced_velocity=ur_i, history_window=hist_i)
+            corr_on_data.append(model.learned_force(z_i, reduced_velocity=ur_i, history_context=hist_ctx)[0, 0].detach())
+        corr_on_data_t = torch.stack(corr_on_data).reshape(-1, 1)
+
+    force_total_full = np.concatenate(
+        [np.asarray([float(td_force_t[0, 0].detach().cpu() + corr0.detach().cpu())]), force_roll],
+        axis=0,
+    )
+    force_td_full = np.concatenate(
+        [td_force_t[:1, 0].detach().cpu().numpy(), td_roll],
+        axis=0,
+    )
+
+    metrics = compute_validation_metrics(
+        model=model,
+        y_data_t=y_true_t[:, 0],
+        val_vel=v_true_t[:, 0],
+        reduced_velocity=ur_t[:, 0],
+        m_eff=mass_value,
+        dt=dt,
+        t=t_np,
+        y_data_raw=y_true_t[:, 0].detach().cpu().numpy(),
+        force_data=f_true_t[:, 0].detach().cpu().numpy(),
+        D=float(model.D),
+        k=stiffness_value,
+        device=device,
+        rollout={
+            "y_norm": y_pred / float(model.D),
+            "p_norm": (v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D))),
+            "force_total": force_total_full,
+        },
+    )
+
+    force_true = f_true_t[:, 0].detach().cpu().numpy()
+    force_model_on_data = (td_force_t + corr_on_data_t.to(device))[:, 0].detach().cpu().numpy()
+    force_std = float(np.std(force_true))
+    if force_std <= 0.0:
+        force_std = 1.0
+    metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((force_model_on_data - force_true) ** 2))) / force_std
+
+    if log_metrics:
+        for name, value in metrics.items():
+            if np.isfinite(float(value)):
+                writer.add_scalar(f"val/{name}", float(value), epoch)
+
+    if log_plots:
+        zoom_mask = create_zoom_mask(t_np)
+        middle_mask = create_window_mask(t_np, middle_time_plot)
+        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
+        ur_val = float(ur_t[0, 0].detach().cpu().item())
+        log_displacement_plots(
+            writer,
+            epoch,
+            t_np,
+            y_true_t[:, 0].detach().cpu().numpy() / float(model.D),
+            y_pred / float(model.D),
+            v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D)),
+            zoom_mask,
+            middle_mask,
+            middle_window,
+            reduced_velocity=ur_val,
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
+        n_force = min(len(t_np), len(force_total_full), len(force_true), len(force_td_full))
+        force_t = t_np[:n_force]
+        log_force_plots(
+            writer,
+            epoch,
+            force_t,
+            force_total_full[:n_force],
+            force_true[:n_force],
+            create_zoom_mask(force_t),
+            create_window_mask(force_t, middle_time_plot),
+            middle_window,
+            reduced_velocity=ur_val,
+            force_coeff_baseline=force_td_full[:n_force],
+            baseline_label="C_F (Vivana-TD)",
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+        )
+    return metrics
 
 
 def _run_hnn_validation(
@@ -688,6 +880,274 @@ def _run_hnn_validation(
 
     print(
         f"[async-val] epoch {epoch}: HNN scalar writes "
+        f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
+    )
+
+
+def _run_hnn_td_correction_validation(
+    *,
+    ckpt: dict[str, Any],
+    cfg: Any,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    rollout_every: int,
+    cycle_rollout: bool,
+    rollout_target_ur: float | None,
+    rollout_target_ur_tol: float,
+    do_losses: bool,
+    do_rollout: bool,
+    num_workers: int,
+) -> None:
+    data_cfg = cfg.data
+    monitoring_cfg = cfg.monitoring
+    hnn_cfg = dict(cfg.hnn or {})
+    loss_cfg = cfg.loss
+    td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
+    if td_mass_source not in {"dry", "effective"}:
+        raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
+
+    train_series_root = Path(data_cfg.train_series_dir)
+    val_dir = train_series_root / "val"
+    if not val_dir.exists():
+        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_paths = sorted(val_dir.glob("*.npz"))
+    if not val_paths:
+        raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
+
+    val_trajs_np = load_td_correction_trajectories(
+        paths=val_paths,
+        cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
+        reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+        reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+    )
+    dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
+    td_params = resolve_td_correction_params(hnn_cfg)
+    predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    history_window = int(getattr(cfg.model, "history_window", 32)) if bool(getattr(cfg.model, "use_history_tcn", False)) else None
+    rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
+    rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
+    rollout_batch_size = int(cfg.training.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
+    force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
+    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
+    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+    validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+
+    model_dict = asdict(cfg.model)
+    first_val_traj = val_trajs_np[0]
+    mass_key = "dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"
+    model_dict["structural_mass"] = float(np.asarray(first_val_traj[mass_key]).reshape(()))
+    model_dict["k"] = float(np.asarray(first_val_traj["stiffness_n_m"]).reshape(()))
+    model_dict["damping_c"] = float(np.asarray(first_val_traj["damping_c"]).reshape(()))
+    model_dict["include_physical_drag"] = False
+    model_dict["use_stochastic_process_noise"] = predict_sigma
+    arch_dict = asdict(cfg.architecture)
+    model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    _load_state(model, ckpt["model_state"])
+    model.eval()
+
+    _train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
+        train_trajs=val_trajs_np,
+        val_trajs=val_trajs_np,
+        mass_source=td_mass_source,
+        history_window=history_window,
+        batch_size=int(cfg.training.batch_size),
+        rollout_batch_size=rollout_batch_size,
+        rollout_steps=rollout_det_steps,
+        num_workers=int(num_workers),
+        pin_memory=(device.type == "cuda"),
+    )
+
+    def _reg(value: torch.Tensor, norm: str) -> torch.Tensor:
+        return torch.mean(torch.abs(value)) if str(norm).strip().lower() == "l1" else torch.mean(value * value)
+
+    num_loss_scalars_written = 0
+    num_rollout_scalars_written = 0
+
+    if do_losses and val_loader is not None:
+        val_sums = {
+            name: torch.zeros((), device=device)
+            for name in ["loss_total", "loss_state", "loss_data", "loss_reg_mean", "loss_reg_sigma"]
+        }
+        val_count = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                if len(batch) == 10:
+                    z_i, _t_i, z_next, _t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
+                    history_i = None
+                elif len(batch) == 11:
+                    z_i, _t_i, z_next, _t_next, ur_i, history_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
+                else:
+                    raise ValueError("Unexpected TD correction HNN batch format.")
+                z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
+                z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
+                ur_i = ur_i.to(device, non_blocking=(device.type == "cuda"))
+                corr_next = corr_next.to(device, non_blocking=(device.type == "cuda"))
+                td_force_next = td_force_next.to(device, non_blocking=(device.type == "cuda"))
+                mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
+                damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
+                stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
+                if history_i is not None:
+                    history_i = history_i.to(device, non_blocking=(device.type == "cuda"))
+
+                history_context = model.history_context(z_i, reduced_velocity=ur_i, history_window=history_i)
+                corr_mu = model.learned_force(z_i, reduced_velocity=ur_i, history_context=history_context)
+                sigma_corr = (
+                    model.sigma_theta(z_i, reduced_velocity=ur_i, history_context=history_context)
+                    if predict_sigma
+                    else corr_mu.new_zeros(corr_mu.shape)
+                )
+                total_force_next = td_force_next + corr_mu
+                velocity_i = z_i[:, 1:2] / mass_i
+                y_next_mean, v_next_mean, _a_next = structural_step_constant_force_torch(
+                    y=z_i[:, 0:1],
+                    velocity=velocity_i,
+                    force=total_force_next,
+                    dt=dt,
+                    mass=mass_i,
+                    damping_c=damping_i,
+                    stiffness=stiffness_i,
+                )
+                z_next_mean = torch.cat([y_next_mean, v_next_mean * mass_i], dim=1)
+                if predict_sigma:
+                    var_p = torch.clamp((float(dt) * sigma_corr) ** 2, min=1e-9)
+                    var_y = torch.clamp(((0.5 * (float(dt) ** 2) / mass_i) * sigma_corr) ** 2, min=1e-9)
+                    nll_y = 0.5 * (((z_next[:, 0:1] - z_next_mean[:, 0:1]) ** 2) / var_y + torch.log(var_y))
+                    nll_p = 0.5 * (((z_next[:, 1:2] - z_next_mean[:, 1:2]) ** 2) / var_p + torch.log(var_p))
+                    state_loss = torch.mean(nll_y + nll_p)
+                else:
+                    state_loss = torch.mean(torch.sum((z_next_mean - z_next) ** 2, dim=1))
+                if use_force_data_loss:
+                    if predict_sigma:
+                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                        data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
+                    else:
+                        data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                else:
+                    data_loss = state_loss.new_tensor(0.0)
+                mean_reg_loss = _reg(corr_mu, mean_reg_norm)
+                sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                val_sums["loss_total"] += total_loss.detach()
+                val_sums["loss_state"] += state_loss.detach()
+                val_sums["loss_data"] += data_loss.detach()
+                val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                val_count += 1
+        val_denom = float(max(1, val_count))
+        for name, value in val_sums.items():
+            writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch)
+            num_loss_scalars_written += 1
+
+        if rollout_loader is not None and rollout_det_weight > 0.0:
+            rollout_loss_sum = torch.zeros((), device=device)
+            rollout_count = 0
+            with torch.no_grad():
+                for rollout_batch in rollout_loader:
+                    if len(rollout_batch) == 8:
+                        z0, _t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
+                        history0 = None
+                    elif len(rollout_batch) == 9:
+                        z0, _t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, history0 = rollout_batch
+                        history0 = history0.to(device, non_blocking=(device.type == "cuda"))
+                    else:
+                        raise ValueError("Unexpected TD correction rollout batch format.")
+                    z0 = z0.to(device, non_blocking=(device.type == "cuda"))
+                    z_traj = z_traj.to(device, non_blocking=(device.type == "cuda"))
+                    ur0 = ur0.to(device, non_blocking=(device.type == "cuda"))
+                    td_context0 = td_context0.to(device, non_blocking=(device.type == "cuda"))
+                    mass0 = mass0.to(device, non_blocking=(device.type == "cuda"))
+                    damping0 = damping0.to(device, non_blocking=(device.type == "cuda"))
+                    stiffness0 = stiffness0.to(device, non_blocking=(device.type == "cuda"))
+                    z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+                        model=model,
+                        z0=z0,
+                        ur0=ur0,
+                        td_context0=td_context0,
+                        steps=int(z_traj.shape[1] - 1),
+                        dt=dt,
+                        structural_mass=mass0,
+                        damping_c=damping0,
+                        stiffness=stiffness0,
+                        td_params=td_params,
+                        history0=history0,
+                    )
+                    rollout_loss_sum += torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2)).detach()
+                    rollout_count += 1
+            writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch)
+            num_loss_scalars_written += 1
+
+    if do_rollout:
+        ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs_np]
+        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else int(epoch)
+        sampled_metric_indices = sample_indices_per_ur(
+            ur_values_all,
+            samples_per_ur=validation_samples_per_ur,
+            seed=sample_seed,
+        )
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
+        diverged_count = 0
+        middle_time_plot = resolve_middle_time_plot(data_cfg, hnn_cfg, method_name="hnn")
+        for sidx in sampled_metric_indices:
+            metrics = _log_td_correction_hnn_rollout_validation(
+                writer=writer,
+                epoch=epoch,
+                model=model,
+                traj=val_trajs_np[sidx],
+                dt=dt,
+                td_mass_source=td_mass_source,
+                td_params=td_params,
+                middle_time_plot=middle_time_plot,
+                device=device,
+                log_metrics=False,
+                log_plots=False,
+            )
+            diverged_flag = float(metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+            if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                diverged_count += 1
+            for name, value in metrics.items():
+                if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
+                    continue
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for name, total in metrics_sum.items():
+            writer.add_scalar(f"val/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch)
+            num_rollout_scalars_written += 1
+        writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
+        num_rollout_scalars_written += 1
+
+        rollout_idx = _rollout_index(
+            epoch,
+            rollout_every,
+            len(val_trajs_np),
+            cycle_rollout,
+            ur_values=ur_values_all,
+            target_ur=rollout_target_ur,
+            target_ur_tol=rollout_target_ur_tol,
+        )
+        _log_td_correction_hnn_rollout_validation(
+            writer=writer,
+            epoch=epoch,
+            model=model,
+            traj=val_trajs_np[rollout_idx],
+            dt=dt,
+            td_mass_source=td_mass_source,
+            td_params=td_params,
+            middle_time_plot=middle_time_plot,
+            device=device,
+            log_metrics=False,
+            log_plots=True,
+        )
+
+    print(
+        f"[async-val] epoch {epoch}: HNN TD scalar writes "
         f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
     )
 
@@ -1106,7 +1566,7 @@ def _run_vpinn_td_correction_validation(
                     x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [
                         item.to(device, non_blocking=(device.type == "cuda")) for item in rb
                     ]
-                    x_seq, v_seq, _ = _vpinn_td_rollout(
+                    x_seq, v_seq, _, _, _ = _vpinn_td_rollout(
                         model=model,
                         x0=x0,
                         v0=v0,
@@ -1778,20 +2238,36 @@ def main() -> None:
     try:
         validation_start = time.perf_counter()
         if method in {"hnn", "phnn"}:
-            _run_hnn_validation(
-                ckpt=ckpt,
-                cfg=cfg,
-                device=device,
-                writer=writer,
-                epoch=int(args.epoch),
-                rollout_every=int(args.rollout_every),
-                cycle_rollout=bool(int(args.cycle_rollout)),
-                rollout_target_ur=args.rollout_target_ur,
-                rollout_target_ur_tol=float(args.rollout_target_ur_tol),
-                do_losses=bool(int(args.do_losses)),
-                do_rollout=bool(int(args.do_rollout)),
-                num_workers=int(args.num_workers),
-            )
+            if bool(ckpt.get("td_correction", False)):
+                _run_hnn_td_correction_validation(
+                    ckpt=ckpt,
+                    cfg=cfg,
+                    device=device,
+                    writer=writer,
+                    epoch=int(args.epoch),
+                    rollout_every=int(args.rollout_every),
+                    cycle_rollout=bool(int(args.cycle_rollout)),
+                    rollout_target_ur=args.rollout_target_ur,
+                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
+                    do_losses=bool(int(args.do_losses)),
+                    do_rollout=bool(int(args.do_rollout)),
+                    num_workers=int(args.num_workers),
+                )
+            else:
+                _run_hnn_validation(
+                    ckpt=ckpt,
+                    cfg=cfg,
+                    device=device,
+                    writer=writer,
+                    epoch=int(args.epoch),
+                    rollout_every=int(args.rollout_every),
+                    cycle_rollout=bool(int(args.cycle_rollout)),
+                    rollout_target_ur=args.rollout_target_ur,
+                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
+                    do_losses=bool(int(args.do_losses)),
+                    do_rollout=bool(int(args.do_rollout)),
+                    num_workers=int(args.num_workers),
+                )
         elif method == "vpinn":
             if bool(ckpt.get("td_correction", False)):
                 _run_vpinn_td_correction_validation(

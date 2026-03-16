@@ -1655,7 +1655,7 @@ def _log_td_correction_rollout_validation(
     c = torch.full((1, d), damping_value, dtype=x_true_t.dtype, device=device)
     k = torch.full((1, d), stiffness_value, dtype=x_true_t.dtype, device=device)
 
-    x_seq, v_seq, f_seq = _vpinn_td_rollout(
+    x_seq, v_seq, f_seq, td_roll_seq, _corr_roll_seq = _vpinn_td_rollout(
         model=model,
         x0=x_true_t[0:1, :],
         v0=v_true_t[0:1, :],
@@ -1675,6 +1675,7 @@ def _log_td_correction_rollout_validation(
     x_pred = x_seq[0, :, 0].detach().cpu().numpy()
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
     f_roll = f_seq[0, :, 0].detach().cpu().numpy()
+    td_roll = td_roll_seq[0, :, 0].detach().cpu().numpy()
 
     with torch.no_grad():
         corr_on_data, _sigma_on_data = _vpinn_predict_correction(
@@ -1689,8 +1690,10 @@ def _log_td_correction_rollout_validation(
 
     if f_roll.size > 0:
         force_total_full = np.concatenate([f_on_data[:1], f_roll], axis=0)
+        force_td_full = np.concatenate([td_true_t[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
     else:
         force_total_full = f_on_data
+        force_td_full = td_true_t[:, 0].detach().cpu().numpy()
 
     metrics = compute_validation_metrics(
         model=model,  # ignored when rollout is provided
@@ -1754,6 +1757,8 @@ def _log_td_correction_rollout_validation(
             create_window_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))], middle_time_plot),
             middle_window,
             reduced_velocity=ur_val,
+            force_coeff_baseline=force_td_full[: min(len(t_np), len(force_total_full), len(force_true))],
+            baseline_label="C_F (Vivana-TD)",
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
@@ -1798,13 +1803,15 @@ def _vpinn_td_rollout(
     td_params: dict[str, float],
     probabilistic: bool,
     sigma_min: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     x = x0
     v = v0
     td_context = td_context0
     xs = [x]
     vs = [v]
-    fs: list[torch.Tensor] = []
+    total_fs: list[torch.Tensor] = []
+    td_fs: list[torch.Tensor] = []
+    corr_fs: list[torch.Tensor] = []
     for _ in range(int(steps)):
         corr_mu, _corr_sigma = _vpinn_predict_correction(
             model,
@@ -1837,8 +1844,17 @@ def _vpinn_td_rollout(
         td_context[:, 0:1] = a_next
         xs.append(x)
         vs.append(v)
-        fs.append(total_force)
-    return torch.stack(xs, dim=1), torch.stack(vs, dim=1), torch.stack(fs, dim=1) if fs else x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
+        total_fs.append(total_force)
+        td_fs.append(td_force_next)
+        corr_fs.append(corr_mu)
+    empty_force = x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
+    return (
+        torch.stack(xs, dim=1),
+        torch.stack(vs, dim=1),
+        torch.stack(total_fs, dim=1) if total_fs else empty_force,
+        torch.stack(td_fs, dim=1) if td_fs else empty_force,
+        torch.stack(corr_fs, dim=1) if corr_fs else empty_force,
+    )
 
 
 def _build_td_correction_vpinn_datasets(
@@ -2191,7 +2207,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         rollout_iter = iter(rollout_loader)
                         rb = next(rollout_iter)
                     x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in rb]
-                    x_seq, v_seq, _f_seq = _vpinn_td_rollout(
+                    x_seq, v_seq, _f_seq, _td_seq, _corr_seq = _vpinn_td_rollout(
                         model=model,
                         x0=x0,
                         v0=v0,
@@ -2339,7 +2355,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     roll_batches = 0
                     for rb in val_rollout_loader:
                         x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in rb]
-                        x_seq, v_seq, _ = _vpinn_td_rollout(
+                        x_seq, v_seq, _, _, _ = _vpinn_td_rollout(
                             model=model,
                             x0=x0,
                             v0=v0,

@@ -3112,6 +3112,8 @@ def log_force_plots(
     middle_window,
     reduced_velocity: float | None = None,
     *,
+    force_coeff_baseline=None,
+    baseline_label: str = "C_F (Vivana-TD)",
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
@@ -3121,6 +3123,8 @@ def log_force_plots(
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
     ax_full.plot(t, force_coeff_true, label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_full.plot(t, force_coeff_pred, label="C_F (pred)", color="tab:purple")
+    if force_coeff_baseline is not None:
+        ax_full.plot(t, force_coeff_baseline, label=baseline_label, color="tab:green", alpha=0.85)
     ax_full.set_xlabel("time")
     ax_full.set_ylabel("C_F")
     ax_full.grid(True, alpha=0.3)
@@ -3129,6 +3133,9 @@ def log_force_plots(
 
     diff_force = force_coeff_pred - force_coeff_true
     ax_diff.plot(t, diff_force, label="ΔC_F", color="tab:orange")
+    if force_coeff_baseline is not None:
+        diff_force_baseline = force_coeff_baseline - force_coeff_true
+        ax_diff.plot(t, diff_force_baseline, label=f"Δ({baseline_label})", color="tab:green", alpha=0.85)
     ax_diff.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
     ax_diff.set_xlabel("time")
     ax_diff.set_ylabel("ΔC_F")
@@ -3138,6 +3145,8 @@ def log_force_plots(
 
     ax_zoom.plot(t[zoom_mask], force_coeff_true[zoom_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_zoom.plot(t[zoom_mask], force_coeff_pred[zoom_mask], label="C_F (pred)", color="tab:purple")
+    if force_coeff_baseline is not None:
+        ax_zoom.plot(t[zoom_mask], force_coeff_baseline[zoom_mask], label=baseline_label, color="tab:green", alpha=0.85)
     ax_zoom.set_xlabel("time")
     ax_zoom.set_ylabel("C_F")
     ax_zoom.grid(True, alpha=0.3)
@@ -3147,6 +3156,14 @@ def log_force_plots(
     mid_start, mid_end = middle_window
     ax_middle.plot(t[middle_mask], force_coeff_true[middle_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_middle.plot(t[middle_mask], force_coeff_pred[middle_mask], label="C_F (pred)", color="tab:purple")
+    if force_coeff_baseline is not None:
+        ax_middle.plot(
+            t[middle_mask],
+            force_coeff_baseline[middle_mask],
+            label=baseline_label,
+            color="tab:green",
+            alpha=0.85,
+        )
     ax_middle.set_xlabel("time")
     ax_middle.set_ylabel("C_F")
     ax_middle.grid(True, alpha=0.3)
