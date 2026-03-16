@@ -11,7 +11,7 @@ data:
   reduction_factor: 5
   middle_time_plot: [15, 17]
   use_generated_train_series: true
-   train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
+  train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
 
 model:
   rho: 1.0
@@ -23,7 +23,7 @@ model:
   damping_c: 1e-4
   max_damping_ratio: 0.2
   include_physical_drag: false
-  force_output: coefficient
+  force_output: force
   learn_hamiltonian: false
   discover_damping: false
   use_pirate_force: false
@@ -174,19 +174,17 @@ monitoring:
   async_validation_do_losses: true
   async_validation_do_rollout: true
 
-hnn:
-  # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
-  use_td_correction: false
-  predict_sigma: false
-  # Structural mass used in TD-correction mode: dry | effective
-  td_mass_source: dry
-
 logging:
   run_dir_root: logs
   run_name: null
   append_timestamp: true
 
 hnn: # file or compute
+  # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
+  use_td_correction: true
+  predict_sigma: false
+  # Structural mass used in TD-correction mode: dry | effective
+  td_mass_source: dry
   velocity_source: file
   # Validation/final rollout sampling:
   # false -> deterministic drift-only rollout
