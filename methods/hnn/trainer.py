@@ -1981,6 +1981,34 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
     log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
     print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
+    train_instances = len(train_loader.dataset)
+    train_steps_per_epoch = len(train_loader)
+    val_instances = len(val_loader.dataset) if val_loader is not None else 0
+    val_steps_per_epoch = len(val_loader) if val_loader is not None else 0
+    train_rollout_instances = len(rollout_loader.dataset) if rollout_loader is not None else 0
+    train_rollout_steps_per_epoch = len(rollout_loader) if rollout_loader is not None else 0
+
+    startup_lines = [
+        f"Run name: {run_name}",
+        (
+            f"HNN TD-correction setup: epochs={epochs}, batch_size={int(training_cfg.batch_size)}, "
+            f"steps_per_epoch={train_steps_per_epoch}, train_instances={train_instances}, "
+            f"train_trajectories={len(train_trajs)}"
+        ),
+        (
+            f"Validation setup: steps={val_steps_per_epoch}, val_instances={val_instances}, "
+            f"val_trajectories={len(val_trajs)}"
+        ),
+        (
+            f"Rollout setup: weight={rollout_det_weight:g}, steps={rollout_det_steps}, "
+            f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}"
+        ),
+        (
+            f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)}, amp={amp_enabled}, "
+            f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
+        ),
+    ]
+    print("\n".join(startup_lines))
 
     for epoch in range(epochs):
         model.train()
