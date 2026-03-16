@@ -220,6 +220,10 @@ def _manifest_row_base(npz_path: Path, payload: dict[str, np.ndarray], td_params
         "num_theta0": int(np.asarray(burnin_config.THETA0_VALUES, dtype=float).size),
         "flow_speed_m_s": float(np.asarray(payload["flow_speed_m_s"]).reshape(())),
         "dt_dim": float(np.asarray(payload["dt_dim"]).reshape(())),
+        "stiffness_n_m": float(np.asarray(payload["stiffness_n_m"]).reshape(())),
+        "effective_mass_kg": float(np.asarray(payload["effective_mass_kg"]).reshape(())),
+        "dry_mass_kg": float(np.asarray(payload["dry_mass_kg"]).reshape(())),
+        "damping_c": float(build_single_paramset_from_burnin_config()["C"]),
         "error": "",
     }
 
@@ -249,6 +253,10 @@ def _write_manifest(rows: list[dict[str, object]], out_dir: Path) -> None:
         "num_theta0",
         "flow_speed_m_s",
         "dt_dim",
+        "stiffness_n_m",
+        "effective_mass_kg",
+        "dry_mass_kg",
+        "damping_c",
         "error",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -291,6 +299,7 @@ def _prepare_output_payload(
     )
     trimmed["burnin_force_std_ref"] = np.asarray(float(force_std_ref), dtype=float)
     trimmed["burnin_detection_status"] = np.asarray(str(detection_status))
+    trimmed["damping_c"] = np.asarray(float(build_single_paramset_from_burnin_config()["C"]), dtype=float)
     return trimmed
 
 

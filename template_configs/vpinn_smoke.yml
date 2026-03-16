@@ -102,6 +102,11 @@ monitoring:
   rollout_target_ur_tol: 1e-6
 
 vpinn:
+  # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
+  use_td_correction: false
+  predict_sigma: false
+  # Structural mass used in TD-correction mode: dry | effective
+  td_mass_source: dry
   # Loss toggles
   use_force_loss: true
   use_weak_loss: true

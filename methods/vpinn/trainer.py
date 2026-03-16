@@ -1163,9 +1163,16 @@ def _weak_residual(
     alpha: torch.Tensor,
     f0: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    m = m.view(1, 1, -1)
-    c = c.view(1, 1, -1)
-    k = k.view(1, 1, -1)
+    def _reshape_param(param: torch.Tensor) -> torch.Tensor:
+        if param.ndim == 1:
+            return param.view(1, 1, -1)
+        if param.ndim == 2:
+            return param.unsqueeze(1)
+        raise ValueError("m, c, and k must have shape (d,) or (B, d).")
+
+    m = _reshape_param(m)
+    c = _reshape_param(c)
+    k = _reshape_param(k)
     if f0 is not None:
         f0 = f0.to(device=x.device, dtype=x.dtype)
         if f0.ndim == 2:
@@ -1533,9 +1540,9 @@ def _vpinn_td_rollout(
     td_context0: torch.Tensor,
     steps: int,
     dt: float,
-    m: float,
-    c: float,
-    k: float,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
     rho: float,
     diameter: float,
     td_params: dict[str, float],
@@ -1621,9 +1628,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     val_trajs = load_td_correction_trajectories(paths=val_paths, cut_start_seconds=val_cut) if val_paths else []
 
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
-    structural_mass = float(getattr(model_cfg, "structural_mass", 16.79))
-    damping_c = float(getattr(model_cfg, "damping_c", 1e-4))
-    stiffness = float(getattr(model_cfg, "k", 1218.0))
+    td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
+    if td_mass_source not in {"dry", "effective"}:
+        raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
     rho = float(getattr(model_cfg, "rho", 1000.0))
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
@@ -1649,12 +1656,21 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
             td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
+            mass_value = float(np.asarray(traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
+            damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
+            stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+            mass = torch.full((x.shape[0], 1), mass_value, dtype=torch.float32)
+            damping = torch.full((x.shape[0], 1), damping_value, dtype=torch.float32)
+            stiffness = torch.full((x.shape[0], 1), stiffness_value, dtype=torch.float32)
             if x.shape[0] >= window:
                 xw = []
                 vw = []
                 cw = []
                 tdw = []
                 urw = []
+                mw = []
+                dw = []
+                kw = []
                 for start in range(0, x.shape[0] - window + 1, stride):
                     end = start + window
                     xw.append(x[start:end])
@@ -1662,6 +1678,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     cw.append(f_corr[start:end])
                     tdw.append(f_td[start:end])
                     urw.append(ur[start:end])
+                    mw.append(mass[start:end])
+                    dw.append(damping[start:end])
+                    kw.append(stiffness[start:end])
                 train_items.append(
                     TensorDataset(
                         torch.stack(xw, dim=0),
@@ -1669,6 +1688,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         torch.stack(cw, dim=0),
                         torch.stack(tdw, dim=0),
                         torch.stack(urw, dim=0),
+                        torch.stack(mw, dim=0),
+                        torch.stack(dw, dim=0),
+                        torch.stack(kw, dim=0),
                     )
                 )
             if rollout_steps > 0 and x.shape[0] >= roll_window:
@@ -1678,6 +1700,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 td0s = []
                 xtr = []
                 vtr = []
+                m0s = []
+                d0s = []
+                k0s = []
                 for start in range(0, x.shape[0] - roll_window + 1, stride):
                     end = start + roll_window
                     x0s.append(x[start])
@@ -1686,6 +1711,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     td0s.append(td_context[start])
                     xtr.append(x[start:end])
                     vtr.append(v[start:end])
+                    m0s.append(mass[start])
+                    d0s.append(damping[start])
+                    k0s.append(stiffness[start])
                 roll_items.append(
                     TensorDataset(
                         torch.stack(x0s, dim=0),
@@ -1694,6 +1722,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         torch.stack(td0s, dim=0),
                         torch.stack(xtr, dim=0),
                         torch.stack(vtr, dim=0),
+                        torch.stack(m0s, dim=0),
+                        torch.stack(d0s, dim=0),
+                        torch.stack(k0s, dim=0),
                     )
                 )
         train_ds = train_items[0] if len(train_items) == 1 else ConcatDataset(train_items)
@@ -1755,12 +1786,15 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         batches = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None else None
         for batch in train_loader:
-            x_win, v_win, corr_true, td_force, ur_win = batch
+            x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = batch
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             corr_true = corr_true.to(device, non_blocking=non_blocking)
             td_force = td_force.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
+            m_win = m_win.to(device, non_blocking=non_blocking)
+            c_win = c_win.to(device, non_blocking=non_blocking)
+            k_win = k_win.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 mu_corr, sigma_corr = _vpinn_predict_correction(model, x_win, v_win, ur_win, probabilistic=probabilistic, sigma_min=sigma_min)
@@ -1778,9 +1812,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         x=x_win,
                         v=v_win,
                         f_pred=total_force_mu,
-                        m=torch.tensor([structural_mass], device=device),
-                        c=torch.tensor([damping_c], device=device),
-                        k=torch.tensor([stiffness], device=device),
+                        m=m_win[:, 0, :],
+                        c=c_win[:, 0, :],
+                        k=k_win[:, 0, :],
                         dt=dt,
                         w=w,
                         wdot=wdot,
@@ -1805,7 +1839,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rb = next(rollout_iter)
-                    x0, v0, ur0, td0, x_true_seq, v_true_seq = [item.to(device, non_blocking=non_blocking) for item in rb]
+                    x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in rb]
                     x_seq, v_seq, _f_seq = _vpinn_td_rollout(
                         model=model,
                         x0=x0,
@@ -1814,9 +1848,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         td_context0=td0,
                         steps=int(x_true_seq.shape[1] - 1),
                         dt=dt,
-                        m=structural_mass,
-                        c=damping_c,
-                        k=stiffness,
+                        m=m0,
+                        c=c0,
+                        k=k0,
                         rho=rho,
                         diameter=diameter,
                         td_params=td_params,
@@ -1862,7 +1896,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             val_batches = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    x_win, v_win, corr_true, td_force, ur_win = [item.to(device, non_blocking=non_blocking) for item in batch]
+                    x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                         mu_corr, sigma_corr = _vpinn_predict_correction(model, x_win, v_win, ur_win, probabilistic=probabilistic, sigma_min=sigma_min)
                         total_force_mu = td_force + mu_corr
@@ -1879,9 +1913,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                                 x=x_win,
                                 v=v_win,
                                 f_pred=total_force_mu,
-                                m=torch.tensor([structural_mass], device=device),
-                                c=torch.tensor([damping_c], device=device),
-                                k=torch.tensor([stiffness], device=device),
+                                m=m_win[:, 0, :],
+                                c=c_win[:, 0, :],
+                                k=k_win[:, 0, :],
                                 dt=dt,
                                 w=w,
                                 wdot=wdot,
@@ -1914,7 +1948,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     roll_sum = torch.zeros((), device=device)
                     roll_batches = 0
                     for rb in val_rollout_loader:
-                        x0, v0, ur0, td0, x_true_seq, v_true_seq = [item.to(device, non_blocking=non_blocking) for item in rb]
+                        x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in rb]
                         x_seq, v_seq, _ = _vpinn_td_rollout(
                             model=model,
                             x0=x0,
@@ -1923,9 +1957,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                             td_context0=td0,
                             steps=int(x_true_seq.shape[1] - 1),
                             dt=dt,
-                            m=structural_mass,
-                            c=damping_c,
-                            k=stiffness,
+                            m=m0,
+                            c=c0,
+                            k=k0,
                             rho=rho,
                             diameter=diameter,
                             td_params=td_params,

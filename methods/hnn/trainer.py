@@ -116,9 +116,9 @@ def _td_correction_state_rollout(
     td_context0: torch.Tensor,
     steps: int,
     dt: float,
-    structural_mass: float,
-    damping_c: float,
-    stiffness: float,
+    structural_mass: torch.Tensor,
+    damping_c: torch.Tensor,
+    stiffness: torch.Tensor,
     td_params: dict[str, float],
     history0: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -139,7 +139,7 @@ def _td_correction_state_rollout(
             reduced_velocity=ur0,
             history_context=history_context,
         )
-        velocity = z[:, 1:2] / float(structural_mass)
+        velocity = z[:, 1:2] / structural_mass
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=velocity,
             acceleration=td_context[:, 0:1],
@@ -159,7 +159,7 @@ def _td_correction_state_rollout(
             damping_c=damping_c,
             stiffness=stiffness,
         )
-        z = torch.cat([y_next, v_next * float(structural_mass)], dim=1)
+        z = torch.cat([y_next, v_next * structural_mass], dim=1)
         td_context = td_context_next.clone()
         td_context[:, 0:1] = a_next
         if history_window is not None:
@@ -181,7 +181,7 @@ def _build_td_correction_hnn_loaders(
     *,
     train_trajs: list[dict[str, np.ndarray]],
     val_trajs: list[dict[str, np.ndarray]],
-    structural_mass: float,
+    mass_source: str,
     history_window: int | None,
     batch_size: int,
     rollout_batch_size: int,
@@ -189,6 +189,24 @@ def _build_td_correction_hnn_loaders(
     num_workers: int,
     pin_memory: bool,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+    mass_key = {
+        "dry": "dry_mass_kg",
+        "effective": "effective_mass_kg",
+    }.get(str(mass_source).strip().lower())
+    if mass_key is None:
+        raise ValueError("td_mass_source must be one of: dry, effective.")
+
+    def _build_history_windows(z: torch.Tensor, ur: torch.Tensor) -> torch.Tensor:
+        hist_features = torch.cat([z, ur], dim=1)
+        hist_full = hist_features.new_zeros((hist_features.shape[0], int(history_window), hist_features.shape[1]))
+        for idx in range(hist_features.shape[0]):
+            start = max(0, idx - int(history_window) + 1)
+            window = hist_features[start : idx + 1]
+            hist_full[idx, -window.shape[0] :, :] = window
+            if window.shape[0] < int(history_window):
+                hist_full[idx, : int(history_window) - window.shape[0], :] = window[0:1]
+        return hist_full
+
     def _one_step_dataset(trajs: list[dict[str, np.ndarray]]) -> TensorDataset | None:
         tensors: list[TensorDataset] = []
         for traj in trajs:
@@ -198,19 +216,15 @@ def _build_td_correction_hnn_loaders(
             ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
             corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
             td_force = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
-            z = torch.stack((y, dy * float(structural_mass)), dim=1)
+            mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
+            damping = torch.full((y.shape[0], 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=torch.float32)
+            stiffness = torch.full((y.shape[0], 1), float(np.asarray(traj["stiffness_n_m"]).reshape(())), dtype=torch.float32)
+            z = torch.cat([y.unsqueeze(1), dy.unsqueeze(1) * mass], dim=1)
             items: list[torch.Tensor] = [z[:-1], t[:-1].unsqueeze(1), z[1:], t[1:].unsqueeze(1), ur[:-1]]
             if history_window is not None and int(history_window) > 0:
-                hist_features = torch.cat([z, ur], dim=1)
-                hist_full = model_history = hist_features.new_zeros((hist_features.shape[0], int(history_window), hist_features.shape[1]))
-                for idx in range(hist_features.shape[0]):
-                    start = max(0, idx - int(history_window) + 1)
-                    window = hist_features[start : idx + 1]
-                    hist_full[idx, -window.shape[0] :, :] = window
-                    if window.shape[0] < int(history_window):
-                        hist_full[idx, : int(history_window) - window.shape[0], :] = window[0:1]
+                hist_full = _build_history_windows(z, ur)
                 items.append(hist_full[:-1])
-            items.extend([corr[1:], td_force[1:]])
+            items.extend([corr[1:], td_force[1:], mass[:-1], damping[:-1], stiffness[:-1]])
             tensors.append(TensorDataset(*items))
         if not tensors:
             return None
@@ -227,7 +241,10 @@ def _build_td_correction_hnn_loaders(
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
             ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
             td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
-            z = torch.stack((y, dy * float(structural_mass)), dim=1)
+            mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
+            damping = torch.full((y.shape[0], 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=torch.float32)
+            stiffness = torch.full((y.shape[0], 1), float(np.asarray(traj["stiffness_n_m"]).reshape(())), dtype=torch.float32)
+            z = torch.cat([y.unsqueeze(1), dy.unsqueeze(1) * mass], dim=1)
             if z.shape[0] < window:
                 continue
             z0_list = []
@@ -235,17 +252,13 @@ def _build_td_correction_hnn_loaders(
             ztraj_list = []
             ur0_list = []
             td0_list = []
+            mass0_list = []
+            damping0_list = []
+            stiffness0_list = []
             hist0_list: list[torch.Tensor] = []
             hist_full = None
             if history_window is not None and int(history_window) > 0:
-                hist_features = torch.cat([z, ur], dim=1)
-                hist_full = hist_features.new_zeros((hist_features.shape[0], int(history_window), hist_features.shape[1]))
-                for idx in range(hist_features.shape[0]):
-                    start = max(0, idx - int(history_window) + 1)
-                    window_hist = hist_features[start : idx + 1]
-                    hist_full[idx, -window_hist.shape[0] :, :] = window_hist
-                    if window_hist.shape[0] < int(history_window):
-                        hist_full[idx, : int(history_window) - window_hist.shape[0], :] = window_hist[0:1]
+                hist_full = _build_history_windows(z, ur)
             for start in range(z.shape[0] - window + 1):
                 end = start + window
                 z0_list.append(z[start])
@@ -253,6 +266,9 @@ def _build_td_correction_hnn_loaders(
                 ztraj_list.append(z[start:end])
                 ur0_list.append(ur[start])
                 td0_list.append(td_context[start])
+                mass0_list.append(mass[start])
+                damping0_list.append(damping[start])
+                stiffness0_list.append(stiffness[start])
                 if hist_full is not None:
                     hist0_list.append(hist_full[start])
             items: list[torch.Tensor] = [
@@ -261,6 +277,9 @@ def _build_td_correction_hnn_loaders(
                 torch.stack(ztraj_list, dim=0),
                 torch.stack(ur0_list, dim=0),
                 torch.stack(td0_list, dim=0),
+                torch.stack(mass0_list, dim=0),
+                torch.stack(damping0_list, dim=0),
+                torch.stack(stiffness0_list, dim=0),
             ]
             if hist0_list:
                 items.append(torch.stack(hist0_list, dim=0))
@@ -1819,9 +1838,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     val_trajs = load_td_correction_trajectories(paths=val_paths, cut_start_seconds=val_cut) if val_paths else []
 
     td_params = resolve_td_correction_params(hnn_cfg)
-    structural_mass = float(getattr(model_cfg, "structural_mass", 16.79))
-    damping_c = float(getattr(model_cfg, "damping_c", 1e-4))
-    stiffness = float(getattr(model_cfg, "k", 1218.0))
+    td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
+    if td_mass_source not in {"dry", "effective"}:
+        raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
     history_window = int(getattr(model_cfg, "history_window", 32)) if bool(getattr(model_cfg, "use_history_tcn", False)) else None
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
@@ -1837,6 +1856,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
 
     model_dict = asdict(model_cfg)
+    first_train_traj = train_trajs[0]
+    model_dict["structural_mass"] = float(np.asarray(first_train_traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
+    model_dict["k"] = float(np.asarray(first_train_traj["stiffness_n_m"]).reshape(()))
+    model_dict["damping_c"] = float(np.asarray(first_train_traj["damping_c"]).reshape(()))
     model_dict["include_physical_drag"] = False
     model_dict["use_stochastic_process_noise"] = predict_sigma
     arch_dict = asdict(config.architecture)
@@ -1846,7 +1869,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
         train_trajs=train_trajs,
         val_trajs=val_trajs,
-        structural_mass=structural_mass,
+        mass_source=td_mass_source,
         history_window=history_window,
         batch_size=int(training_cfg.batch_size),
         rollout_batch_size=rollout_batch_size,
@@ -1882,15 +1905,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
 
-    def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-        if len(batch) == 7:
-            z_i, _t_i, z_next, _t_next, ur_i, corr_next, td_force_next = batch
+    def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(batch) == 10:
+            z_i, _t_i, z_next, _t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
             history_i = None
-        elif len(batch) == 8:
-            z_i, _t_i, z_next, _t_next, ur_i, history_i, corr_next, td_force_next = batch
+        elif len(batch) == 11:
+            z_i, _t_i, z_next, _t_next, ur_i, history_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
         else:
             raise ValueError("Unexpected TD correction HNN batch format.")
-        return z_i, z_next, ur_i, corr_next, history_i, td_force_next, z_next[:, 0:1]
+        return z_i, z_next, ur_i, corr_next, history_i, td_force_next, mass_i, damping_i, stiffness_i
 
     def _state_loss(
         *,
@@ -1899,6 +1922,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         ur_i: torch.Tensor,
         td_force_next: torch.Tensor,
         history_i: torch.Tensor | None,
+        mass_i: torch.Tensor,
+        damping_i: torch.Tensor,
+        stiffness_i: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         history_context = model.history_context(z_i, reduced_velocity=ur_i, history_window=history_i)
         corr_mu = model.learned_force(z_i, reduced_velocity=ur_i, history_context=history_context)
@@ -1908,20 +1934,20 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             else corr_mu.new_zeros(corr_mu.shape)
         )
         total_force_next = td_force_next + corr_mu
-        velocity_i = z_i[:, 1:2] / float(structural_mass)
+        velocity_i = z_i[:, 1:2] / mass_i
         y_next_mean, v_next_mean, _a_next = structural_step_constant_force_torch(
             y=z_i[:, 0:1],
             velocity=velocity_i,
             force=total_force_next,
             dt=dt,
-            mass=structural_mass,
-            damping_c=damping_c,
-            stiffness=stiffness,
+            mass=mass_i,
+            damping_c=damping_i,
+            stiffness=stiffness_i,
         )
-        z_next_mean = torch.cat([y_next_mean, v_next_mean * float(structural_mass)], dim=1)
+        z_next_mean = torch.cat([y_next_mean, v_next_mean * mass_i], dim=1)
         if predict_sigma:
             var_p = torch.clamp((float(dt) * sigma_corr) ** 2, min=1e-9)
-            var_y = torch.clamp(((0.5 * (float(dt) ** 2) / float(structural_mass)) * sigma_corr) ** 2, min=1e-9)
+            var_y = torch.clamp(((0.5 * (float(dt) ** 2) / mass_i) * sigma_corr) ** 2, min=1e-9)
             nll_y = 0.5 * (((z_next[:, 0:1] - z_next_mean[:, 0:1]) ** 2) / var_y + torch.log(var_y))
             nll_p = 0.5 * (((z_next[:, 1:2] - z_next_mean[:, 1:2]) ** 2) / var_p + torch.log(var_p))
             state_loss = torch.mean(nll_y + nll_p)
@@ -1959,12 +1985,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         batch_count = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_det_weight > 0.0 else None
         for batch in train_loader:
-            z_i, z_next, ur_i, corr_next, history_i, td_force_next, _ = _parse_td_train_batch(batch)
+            z_i, z_next, ur_i, corr_next, history_i, td_force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
             corr_next = corr_next.to(device, non_blocking=non_blocking)
             td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+            mass_i = mass_i.to(device, non_blocking=non_blocking)
+            damping_i = damping_i.to(device, non_blocking=non_blocking)
+            stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
             if history_i is not None:
                 history_i = history_i.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
@@ -1975,6 +2004,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     ur_i=ur_i,
                     td_force_next=td_force_next,
                     history_i=history_i,
+                    mass_i=mass_i,
+                    damping_i=damping_i,
+                    stiffness_i=stiffness_i,
                 )
                 if use_force_data_loss:
                     if predict_sigma:
@@ -1998,11 +2030,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rollout_batch = next(rollout_iter)
-                    if len(rollout_batch) == 5:
-                        z0, t_seq, z_traj, ur0, td_context0 = rollout_batch
+                    if len(rollout_batch) == 8:
+                        z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
                         history0 = None
-                    elif len(rollout_batch) == 6:
-                        z0, t_seq, z_traj, ur0, td_context0, history0 = rollout_batch
+                    elif len(rollout_batch) == 9:
+                        z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, history0 = rollout_batch
                         history0 = history0.to(device, non_blocking=non_blocking)
                     else:
                         raise ValueError("Unexpected TD correction rollout batch format.")
@@ -2011,6 +2043,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     z_traj = z_traj.to(device, non_blocking=non_blocking)
                     ur0 = ur0.to(device, non_blocking=non_blocking)
                     td_context0 = td_context0.to(device, non_blocking=non_blocking)
+                    mass0 = mass0.to(device, non_blocking=non_blocking)
+                    damping0 = damping0.to(device, non_blocking=non_blocking)
+                    stiffness0 = stiffness0.to(device, non_blocking=non_blocking)
                     z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
                         model=model,
                         z0=z0,
@@ -2018,9 +2053,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         td_context0=td_context0,
                         steps=int(t_seq.shape[1] - 1),
                         dt=dt,
-                        structural_mass=structural_mass,
-                        damping_c=damping_c,
-                        stiffness=stiffness,
+                        structural_mass=mass0,
+                        damping_c=damping0,
+                        stiffness=stiffness0,
                         td_params=td_params,
                         history0=history0,
                     )
@@ -2071,12 +2106,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             val_count = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    z_i, z_next, ur_i, corr_next, history_i, td_force_next, _ = _parse_td_train_batch(batch)
+                    z_i, z_next, ur_i, corr_next, history_i, td_force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
                     z_i = z_i.to(device, non_blocking=non_blocking)
                     z_next = z_next.to(device, non_blocking=non_blocking)
                     ur_i = ur_i.to(device, non_blocking=non_blocking)
                     corr_next = corr_next.to(device, non_blocking=non_blocking)
                     td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+                    mass_i = mass_i.to(device, non_blocking=non_blocking)
+                    damping_i = damping_i.to(device, non_blocking=non_blocking)
+                    stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
                     if history_i is not None:
                         history_i = history_i.to(device, non_blocking=non_blocking)
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
@@ -2086,6 +2124,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             ur_i=ur_i,
                             td_force_next=td_force_next,
                             history_i=history_i,
+                            mass_i=mass_i,
+                            damping_i=damping_i,
+                            stiffness_i=stiffness_i,
                         )
                         if use_force_data_loss:
                             if predict_sigma:
@@ -2112,16 +2153,19 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     rollout_loss_sum = torch.zeros((), device=device)
                     rollout_count = 0
                     for rollout_batch in rollout_loader:
-                        if len(rollout_batch) == 5:
-                            z0, t_seq, z_traj, ur0, td_context0 = rollout_batch
+                        if len(rollout_batch) == 8:
+                            z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
                             history0 = None
                         else:
-                            z0, t_seq, z_traj, ur0, td_context0, history0 = rollout_batch
+                            z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, history0 = rollout_batch
                             history0 = history0.to(device, non_blocking=non_blocking)
                         z0 = z0.to(device, non_blocking=non_blocking)
                         z_traj = z_traj.to(device, non_blocking=non_blocking)
                         ur0 = ur0.to(device, non_blocking=non_blocking)
                         td_context0 = td_context0.to(device, non_blocking=non_blocking)
+                        mass0 = mass0.to(device, non_blocking=non_blocking)
+                        damping0 = damping0.to(device, non_blocking=non_blocking)
+                        stiffness0 = stiffness0.to(device, non_blocking=non_blocking)
                         z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
                             model=model,
                             z0=z0,
@@ -2129,9 +2173,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             td_context0=td_context0,
                             steps=int(z_traj.shape[1] - 1),
                             dt=dt,
-                            structural_mass=structural_mass,
-                            damping_c=damping_c,
-                            stiffness=stiffness,
+                            structural_mass=mass0,
+                            damping_c=damping0,
+                            stiffness=stiffness0,
                             td_params=td_params,
                             history0=history0,
                         )

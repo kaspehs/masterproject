@@ -3977,6 +3977,14 @@ def _extract_first_present(data: Any, keys: Sequence[str], *, path: Path, requir
     return None
 
 
+def _extract_required_scalar(data: Any, keys: Sequence[str], *, path: Path) -> float:
+    value = _extract_first_present(data, keys, path=path, required=True)
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size != 1 or not np.isfinite(arr[0]):
+        raise ValueError(f"{path} key(s) {list(keys)} must resolve to one finite scalar.")
+    return float(arr[0])
+
+
 def load_td_correction_trajectories(
     *,
     paths: Sequence[Path],
@@ -4012,6 +4020,10 @@ def load_td_correction_trajectories(
             phi_td = np.asarray(_extract_first_present(data, ("phi_vy_td",), path=path), dtype=float).reshape(-1)
             sig_dy_td = np.asarray(_extract_first_present(data, ("sig_dy_loc_td",), path=path), dtype=float).reshape(-1)
             sig_ddy_td = np.asarray(_extract_first_present(data, ("sig_ddy_loc_td",), path=path), dtype=float).reshape(-1)
+            stiffness_n_m = _extract_required_scalar(data, ("stiffness_n_m",), path=path)
+            effective_mass_kg = _extract_required_scalar(data, ("effective_mass_kg",), path=path)
+            dry_mass_kg = _extract_required_scalar(data, ("dry_mass_kg",), path=path)
+            damping_c = _extract_required_scalar(data, ("damping_c",), path=path)
             flow_speed_raw = _extract_first_present(data, ("flow_speed_m_s",), path=path, required=False)
             ur_raw = _extract_first_present(data, ("U_r_computed_series", "U_r"), path=path)
         arrays = [t, y, dy, ddy, force_total, force_td, phi_td, sig_dy_td, sig_ddy_td]
@@ -4068,6 +4080,10 @@ def load_td_correction_trajectories(
                 "ur": np.asarray(ur, dtype=np.float32),
                 "flow_speed": np.asarray(flow_speed, dtype=np.float32),
                 "td_context": np.asarray(td_context, dtype=np.float32),
+                "stiffness_n_m": np.asarray(stiffness_n_m, dtype=np.float32),
+                "effective_mass_kg": np.asarray(effective_mass_kg, dtype=np.float32),
+                "dry_mass_kg": np.asarray(dry_mass_kg, dtype=np.float32),
+                "damping_c": np.asarray(damping_c, dtype=np.float32),
             }
         )
     if not trajectories:
@@ -4131,19 +4147,34 @@ def structural_step_constant_force_torch(
     velocity: torch.Tensor,
     force: torch.Tensor,
     dt: float,
-    mass: float,
-    damping_c: float,
-    stiffness: float,
+    mass: torch.Tensor | float,
+    damping_c: torch.Tensor | float,
+    stiffness: torch.Tensor | float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dt_t = y.new_tensor(float(dt))
     half = y.new_tensor(0.5)
     sixth = y.new_tensor(1.0 / 6.0)
-    mass_f = float(mass)
-    damping_f = float(damping_c)
-    stiffness_f = float(stiffness)
+    mass_t = torch.as_tensor(mass, device=y.device, dtype=y.dtype)
+    damping_t = torch.as_tensor(damping_c, device=y.device, dtype=y.dtype)
+    stiffness_t = torch.as_tensor(stiffness, device=y.device, dtype=y.dtype)
+    if mass_t.ndim == 0:
+        mass_t = mass_t.view(1, 1)
+    elif mass_t.ndim == 1:
+        mass_t = mass_t.view(-1, 1)
+    if damping_t.ndim == 0:
+        damping_t = damping_t.view(1, 1)
+    elif damping_t.ndim == 1:
+        damping_t = damping_t.view(-1, 1)
+    if stiffness_t.ndim == 0:
+        stiffness_t = stiffness_t.view(1, 1)
+    elif stiffness_t.ndim == 1:
+        stiffness_t = stiffness_t.view(-1, 1)
+    mass_t = mass_t.expand_as(y)
+    damping_t = damping_t.expand_as(y)
+    stiffness_t = stiffness_t.expand_as(y)
 
     def accel(y_state: torch.Tensor, v_state: torch.Tensor) -> torch.Tensor:
-        return (force - damping_f * v_state - stiffness_f * y_state) / mass_f
+        return (force - damping_t * v_state - stiffness_t * y_state) / mass_t
 
     k1_y = velocity
     k1_v = accel(y, velocity)
