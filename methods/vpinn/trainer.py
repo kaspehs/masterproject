@@ -2252,17 +2252,20 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     )
                     rollout_det_loss = torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2)
                 total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_weight) * rollout_det_loss
-            if scaler.is_enabled():
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(opt)
+            if total_loss.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(opt)
+                else:
+                    total_loss.backward()
+                grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=float(training_cfg.max_grad_norm))
+                if scaler.is_enabled():
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
             else:
-                total_loss.backward()
-            grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=float(training_cfg.max_grad_norm))
-            if scaler.is_enabled():
-                scaler.step(opt)
-                scaler.update()
-            else:
-                opt.step()
+                grad_norm = torch.zeros((), device=device)
             batches += 1
             sums["loss_total"] += total_loss.detach()
             sums["loss_data"] += loss_data.detach()

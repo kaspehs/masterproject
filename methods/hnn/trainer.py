@@ -2439,17 +2439,20 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     )
                     rollout_det_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
                 total_loss = base_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_det_weight) * rollout_det_loss
-            if scaler.is_enabled():
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(opt)
+            if total_loss.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(opt)
+                else:
+                    total_loss.backward()
+                grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=float(training_cfg.max_grad_norm))
+                if scaler.is_enabled():
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
             else:
-                total_loss.backward()
-            grad_norm = nn_utils.clip_grad_norm_(model.parameters(), max_norm=float(training_cfg.max_grad_norm))
-            if scaler.is_enabled():
-                scaler.step(opt)
-                scaler.update()
-            else:
-                opt.step()
+                grad_norm = torch.zeros((), device=device)
             batch_count += 1
             sums["loss_total"] += total_loss.detach()
             sums["loss_state"] += state_loss.detach()
