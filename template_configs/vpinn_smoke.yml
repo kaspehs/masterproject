@@ -109,6 +109,10 @@ vpinn:
   # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
   use_td_correction: true
   predict_sigma: false
+  # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
+  # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
+  corr_init_mode: zero
+  corr_init_tiny_std: 1.0e-4
   # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.
   force_zero_output: false
   # Structural mass used in TD-correction mode: dry | effective

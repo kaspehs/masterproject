@@ -179,6 +179,70 @@ def _activation_from_string(name: str) -> nn.Module:
     raise ValueError("activation must be one of: tanh, relu, gelu, silu")
 
 
+def _last_linear(module: nn.Module) -> nn.Linear | None:
+    last: nn.Linear | None = None
+    for sub in module.modules():
+        if isinstance(sub, nn.Linear):
+            last = sub
+    return last
+
+
+def _softplus_inverse_scalar(value: float) -> float:
+    val = float(value)
+    if val <= 1.0e-12:
+        return -20.0
+    if val > 20.0:
+        return val
+    return float(math.log(math.expm1(val)))
+
+
+def _resolve_corr_init_settings(vp_cfg: dict[str, Any], model_cfg: Any) -> tuple[str, float]:
+    mode = str(vp_cfg.get("corr_init_mode", getattr(model_cfg, "corr_init_mode", "standard"))).strip().lower()
+    if mode not in {"zero", "tiny", "standard"}:
+        raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
+    tiny_std = float(vp_cfg.get("corr_init_tiny_std", getattr(model_cfg, "corr_init_tiny_std", 1.0e-4)))
+    if not np.isfinite(tiny_std) or tiny_std <= 0.0:
+        raise ValueError("corr_init_tiny_std must be finite and > 0.")
+    return mode, tiny_std
+
+
+def _apply_corr_head_init(
+    model: nn.Module,
+    *,
+    mode: str,
+    tiny_std: float,
+    probabilistic: bool,
+    sigma_min: float,
+) -> None:
+    if mode == "standard":
+        return
+    last = _last_linear(model)
+    if last is None:
+        return
+    out_dim = int(last.weight.shape[0])
+    mean_dim = out_dim if not probabilistic else out_dim // 2
+    sigma_dim = 0 if not probabilistic else out_dim - mean_dim
+    if probabilistic and sigma_dim <= 0:
+        raise ValueError("Probabilistic correction init expects an output layer with mean and sigma channels.")
+    target_sigma = float(sigma_min) if mode == "zero" else max(float(sigma_min), float(tiny_std))
+    target_excess = max(0.0, target_sigma - float(sigma_min))
+    sigma_bias = _softplus_inverse_scalar(target_excess)
+    with torch.no_grad():
+        if mode == "zero":
+            nn.init.zeros_(last.weight[:mean_dim])
+        elif mode == "tiny":
+            nn.init.normal_(last.weight[:mean_dim], mean=0.0, std=float(tiny_std))
+        else:
+            raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
+        nn.init.zeros_(last.bias[:mean_dim])
+        if probabilistic:
+            if mode == "zero":
+                nn.init.zeros_(last.weight[mean_dim:])
+            else:
+                nn.init.normal_(last.weight[mean_dim:], mean=0.0, std=float(tiny_std))
+            nn.init.constant_(last.bias[mean_dim:], sigma_bias)
+
+
 def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn.Module:
     vp = dict(config.vpinn or {})
     use_arch_cfg = bool(vp.get("use_architecture_config", False))
@@ -2035,6 +2099,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     probabilistic = bool(vp.get("predict_sigma", False))
     force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
+    corr_init_mode, corr_init_tiny_std = _resolve_corr_init_settings(vp, model_cfg)
     if sigma_min < 0.0:
         raise ValueError("vpinn.sigma_min must be non-negative.")
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
@@ -2085,6 +2150,13 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     input_dim = 3
     output_dim = 2 if probabilistic else 1
     model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim).to(device)
+    _apply_corr_head_init(
+        model,
+        mode=corr_init_mode,
+        tiny_std=corr_init_tiny_std,
+        probabilistic=probabilistic,
+        sigma_min=sigma_min,
+    )
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
     rollout_weight = float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0))))

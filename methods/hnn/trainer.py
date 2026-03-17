@@ -65,6 +65,81 @@ from HNN_helper import (
 )
 
 
+def _last_linear(module: nn.Module | None) -> nn.Linear | None:
+    if module is None:
+        return None
+    last: nn.Linear | None = None
+    for sub in module.modules():
+        if isinstance(sub, nn.Linear):
+            last = sub
+    return last
+
+
+def _softplus_inverse_scalar(value: float) -> float:
+    val = float(value)
+    if val <= 1.0e-12:
+        return -20.0
+    if val > 20.0:
+        return val
+    return float(math.log(math.expm1(val)))
+
+
+def _init_mean_head(module: nn.Module | None, *, mode: str, tiny_std: float) -> None:
+    last = _last_linear(module)
+    if last is None or mode == "standard":
+        return
+    with torch.no_grad():
+        if mode == "zero":
+            nn.init.zeros_(last.weight)
+        elif mode == "tiny":
+            nn.init.normal_(last.weight, mean=0.0, std=float(tiny_std))
+        else:
+            raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
+        nn.init.zeros_(last.bias)
+
+
+def _init_sigma_head(module: nn.Module | None, *, mode: str, tiny_std: float, sigma_min: float) -> None:
+    last = _last_linear(module)
+    if last is None or mode == "standard":
+        return
+    target_sigma = float(sigma_min) if mode == "zero" else max(float(sigma_min), float(tiny_std))
+    target_excess = max(0.0, target_sigma - float(sigma_min))
+    bias_value = _softplus_inverse_scalar(target_excess)
+    with torch.no_grad():
+        if mode == "zero":
+            nn.init.zeros_(last.weight)
+        elif mode == "tiny":
+            nn.init.normal_(last.weight, mean=0.0, std=float(tiny_std))
+        else:
+            raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
+        nn.init.constant_(last.bias, bias_value)
+
+
+def _resolve_td_correction_init_settings(method_cfg: dict[str, Any], model_cfg: Any) -> tuple[str, float]:
+    mode = str(method_cfg.get("corr_init_mode", getattr(model_cfg, "corr_init_mode", "standard"))).strip().lower()
+    if mode not in {"zero", "tiny", "standard"}:
+        raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
+    tiny_std = float(method_cfg.get("corr_init_tiny_std", getattr(model_cfg, "corr_init_tiny_std", 1.0e-4)))
+    if not np.isfinite(tiny_std) or tiny_std <= 0.0:
+        raise ValueError("corr_init_tiny_std must be finite and > 0.")
+    return mode, tiny_std
+
+
+def _apply_td_correction_head_init(
+    model: PHVIV,
+    *,
+    mode: str,
+    tiny_std: float,
+    predict_sigma: bool,
+) -> None:
+    _init_mean_head(model.u_base_net, mode=mode, tiny_std=tiny_std)
+    _init_mean_head(model.corr_net, mode=mode, tiny_std=tiny_std)
+    if predict_sigma:
+        sigma_min = float(model.sigma_min.detach().cpu())
+        _init_sigma_head(model.sigma_net, mode=mode, tiny_std=tiny_std, sigma_min=sigma_min)
+        _init_sigma_head(model.sigma_history_net, mode=mode, tiny_std=tiny_std, sigma_min=sigma_min)
+
+
 def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     if len(batch) < 5:
         raise ValueError("Unexpected batch format from dataloader.")
@@ -2231,6 +2306,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     history_window = int(getattr(model_cfg, "history_window", 32)) if bool(getattr(model_cfg, "use_history_tcn", False)) else None
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
+    corr_init_mode, corr_init_tiny_std = _resolve_td_correction_init_settings(hnn_cfg, model_cfg)
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
@@ -2252,6 +2328,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     model_dict["use_stochastic_process_noise"] = predict_sigma
     arch_dict = asdict(config.architecture)
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    _apply_td_correction_head_init(
+        model,
+        mode=corr_init_mode,
+        tiny_std=corr_init_tiny_std,
+        predict_sigma=predict_sigma,
+    )
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
     train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
