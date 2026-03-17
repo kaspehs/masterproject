@@ -93,14 +93,6 @@ class ModelConfig:
     use_reduced_velocity: bool = True
     use_stochastic_process_noise: bool = True
     sigma_min: float = 1e-6
-    use_history_tcn: bool = False
-    history_window: int = 32
-    history_tcn_channels: int = 32
-    history_tcn_layers: int = 3
-    history_tcn_kernel_size: int = 3
-    history_tcn_dropout: float = 0.05
-    use_history_correction: bool = True
-    sigma_from_history: bool = False
     corr_init_mode: str = "zero"  # "zero" | "tiny" | "standard"
     corr_init_tiny_std: float = 1e-4
     q_scale: float | None = None
@@ -256,6 +248,18 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     return data
 
 
+_PHNN_HISTORY_MODEL_KEYS = (
+    "use_history_tcn",
+    "history_window",
+    "history_tcn_channels",
+    "history_tcn_layers",
+    "history_tcn_kernel_size",
+    "history_tcn_dropout",
+    "use_history_correction",
+    "sigma_from_history",
+)
+
+
 def parse_config(raw: dict[str, Any]) -> Config:
     method = raw.get("method", "hnn")
     data_cfg = raw.get("data", {}) or {}
@@ -273,6 +277,16 @@ def parse_config(raw: dict[str, Any]) -> Config:
     hnn_block = dict(raw.get("hnn", {}) or {})
     pinn_block = dict(raw.get("pinn", {}) or {})
     vpinn_block = dict(raw.get("vpinn", {}) or {})
+
+    method_key = str(method).strip().lower()
+    if method_key in {"hnn", "phnn"}:
+        forbidden = sorted(key for key in _PHNN_HISTORY_MODEL_KEYS if key in model_cfg)
+        if forbidden:
+            joined = ", ".join(forbidden)
+            raise ValueError(
+                "PHNN is now markovian-only. Remove these history-dependent model keys: "
+                f"{joined}"
+            )
 
     legacy_residual: dict[str, Any] = {}
     if "residual_hidden" in architecture_cfg:
@@ -1373,16 +1387,6 @@ class PHVIV(nn.Module):
         use_reduced_velocity: bool = True,
         use_stochastic_process_noise: bool = True,
         sigma_min: float = 1e-6,
-        use_history_tcn: bool = False,
-        history_window: int = 32,
-        history_tcn_channels: int = 32,
-        history_tcn_layers: int = 3,
-        history_tcn_kernel_size: int = 3,
-        history_tcn_dropout: float = 0.05,
-        use_history_correction: bool = True,
-        sigma_from_history: bool = False,
-        corr_init_mode: str = "zero",
-        corr_init_tiny_std: float = 1e-4,
         ur_scale: float | None = None,
         force_net_type: str | None = None,
         residual_kwargs: dict[str, Any] | None = None,
@@ -1408,26 +1412,6 @@ class PHVIV(nn.Module):
         self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
-        self.use_history_tcn = bool(use_history_tcn)
-        self.history_window = int(history_window)
-        if self.history_window < 1:
-            raise ValueError("history_window must be >= 1.")
-        self.history_tcn_channels = int(history_tcn_channels)
-        self.history_tcn_layers = int(history_tcn_layers)
-        self.history_tcn_kernel_size = int(history_tcn_kernel_size)
-        self.history_tcn_dropout = float(history_tcn_dropout)
-        self.use_history_correction = bool(use_history_correction) and self.use_history_tcn
-        self.sigma_from_history = bool(sigma_from_history)
-        if self.sigma_from_history and not self.use_history_tcn:
-            raise ValueError("sigma_from_history=True requires use_history_tcn=True.")
-        corr_init_key = str(corr_init_mode).strip().lower()
-        if corr_init_key not in {"zero", "tiny", "standard"}:
-            raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
-        self.corr_init_mode = corr_init_key
-        self.corr_init_tiny_std = float(corr_init_tiny_std)
-        if self.corr_init_tiny_std <= 0.0:
-            raise ValueError("corr_init_tiny_std must be > 0.")
-        self._cached_history_context: torch.Tensor | None = None
         sigma_min_val = float(sigma_min)
         if not np.isfinite(sigma_min_val) or sigma_min_val < 0.0:
             raise ValueError(f"sigma_min must be finite and non-negative, got {sigma_min_val}")
@@ -1532,56 +1516,15 @@ class PHVIV(nn.Module):
             mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
             return nn.Sequential(*mlp_layers)
 
-        def _initialize_last_linear(module: nn.Module, mode: str, tiny_std: float) -> None:
-            if mode == "standard":
-                return
-            last_linear: nn.Linear | None = None
-            for sub in module.modules():
-                if isinstance(sub, nn.Linear):
-                    last_linear = sub
-            if last_linear is None:
-                return
-            if mode == "zero":
-                nn.init.zeros_(last_linear.weight)
-            elif mode == "tiny":
-                nn.init.normal_(last_linear.weight, mean=0.0, std=float(tiny_std))
-            nn.init.zeros_(last_linear.bias)
-
         self.u_base_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
         # Backward-compatible alias used throughout the codebase.
         self.u_net = self.u_base_net
-
-        self.history_encoder: CausalTCNEncoder | None = None
-        self.corr_net: nn.Module | None = None
-        self.sigma_history_net: nn.Module | None = None
-        self.history_context_dim = int(self.history_tcn_channels)
-        if self.use_history_tcn:
-            self.history_encoder = CausalTCNEncoder(
-                in_channels=3,
-                channels=self.history_tcn_channels,
-                layers=self.history_tcn_layers,
-                kernel_size=self.history_tcn_kernel_size,
-                dropout=self.history_tcn_dropout,
-            )
-            if self.use_history_correction:
-                self.corr_net = _build_scalar_net(
-                    force_in_features + self.history_context_dim,
-                    use_selected_backbone=True,
-                )
-                _initialize_last_linear(self.corr_net, self.corr_init_mode, self.corr_init_tiny_std)
 
         self.sigma_net = (
             _build_scalar_net(force_in_features, use_selected_backbone=True)
             if self.use_stochastic_process_noise
             else None
         )
-        if self.use_stochastic_process_noise and self.sigma_from_history:
-            if self.history_encoder is None:
-                raise ValueError("sigma_from_history requires a history encoder.")
-            self.sigma_history_net = _build_scalar_net(
-                force_in_features + self.history_context_dim,
-                use_selected_backbone=True,
-            )
 
         if self.learn_hamiltonian:
             h_in_features = self.base_feature_dim
@@ -1646,16 +1589,6 @@ class PHVIV(nn.Module):
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
         use_stochastic_process_noise = bool(cfg.get("use_stochastic_process_noise", True))
         sigma_min = float(cfg.get("sigma_min", 1e-6))
-        use_history_tcn = bool(cfg.get("use_history_tcn", False))
-        history_window = int(cfg.get("history_window", 32))
-        history_tcn_channels = int(cfg.get("history_tcn_channels", 32))
-        history_tcn_layers = int(cfg.get("history_tcn_layers", 3))
-        history_tcn_kernel_size = int(cfg.get("history_tcn_kernel_size", 3))
-        history_tcn_dropout = float(cfg.get("history_tcn_dropout", 0.05))
-        use_history_correction = bool(cfg.get("use_history_correction", True))
-        sigma_from_history = bool(cfg.get("sigma_from_history", False))
-        corr_init_mode = str(cfg.get("corr_init_mode", "zero"))
-        corr_init_tiny_std = float(cfg.get("corr_init_tiny_std", 1e-4))
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         arch_cfg = arch_cfg or {}
@@ -1704,16 +1637,6 @@ class PHVIV(nn.Module):
             use_reduced_velocity=use_reduced_velocity,
             use_stochastic_process_noise=use_stochastic_process_noise,
             sigma_min=sigma_min,
-            use_history_tcn=use_history_tcn,
-            history_window=history_window,
-            history_tcn_channels=history_tcn_channels,
-            history_tcn_layers=history_tcn_layers,
-            history_tcn_kernel_size=history_tcn_kernel_size,
-            history_tcn_dropout=history_tcn_dropout,
-            use_history_correction=use_history_correction,
-            sigma_from_history=sigma_from_history,
-            corr_init_mode=corr_init_mode,
-            corr_init_tiny_std=corr_init_tiny_std,
             ur_scale=ur_scale,
             force_net_type=force_net_type,
             residual_kwargs=residual_kwargs,
@@ -1858,182 +1781,25 @@ class PHVIV(nn.Module):
             base_features = torch.cat([base_features, rv], dim=-1)
         return base_features
 
-    def _history_raw_feature(
-        self,
-        x: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-    ) -> torch.Tensor:
-        if self.use_reduced_velocity:
-            rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=x[..., :1])
-            if rv_raw is None:
-                raise ValueError("reduced_velocity is required when use_reduced_velocity is enabled.")
-        else:
-            rv_raw = torch.zeros_like(x[..., :1])
-        return torch.cat([x[..., :2], rv_raw], dim=-1)
-
-    def _match_history_window_length(self, hist: torch.Tensor) -> torch.Tensor:
-        if hist.ndim != 3 or hist.shape[-1] != 3:
-            raise ValueError("history_window must have shape (B, L, 3).")
-        target_len = int(self.history_window)
-        cur_len = int(hist.shape[1])
-        if cur_len == target_len:
-            return hist
-        if cur_len > target_len:
-            return hist[:, -target_len:, :]
-        pad_len = target_len - cur_len
-        pad = hist[:, :1, :].expand(hist.shape[0], pad_len, hist.shape[-1])
-        return torch.cat([pad, hist], dim=1)
-
-    def _default_history_window(
-        self,
-        x: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-    ) -> torch.Tensor:
-        feat = self._history_raw_feature(x, reduced_velocity=reduced_velocity)
-        return feat.unsqueeze(1).expand(feat.shape[0], int(self.history_window), feat.shape[-1]).contiguous()
-
-    def _prepare_history_window(
-        self,
-        *,
-        x: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        history_window: torch.Tensor | np.ndarray | None = None,
-    ) -> torch.Tensor | None:
-        if not self.use_history_tcn:
-            return None
-        if history_window is None:
-            return self._default_history_window(x, reduced_velocity=reduced_velocity)
-        if torch.is_tensor(history_window):
-            hist = history_window.to(device=x.device, dtype=x.dtype)
-        else:
-            hist = torch.as_tensor(history_window, device=x.device, dtype=x.dtype)
-        if hist.ndim == 2:
-            hist = hist.unsqueeze(0)
-        if hist.ndim != 3 or hist.shape[-1] != 3:
-            raise ValueError("history_window must be a tensor with shape (L, 3) or (B, L, 3).")
-        if hist.shape[0] != x.shape[0]:
-            if hist.shape[0] == 1:
-                hist = hist.expand(x.shape[0], hist.shape[1], hist.shape[2])
-            else:
-                raise ValueError("history_window batch dimension must match the state batch size.")
-        return self._match_history_window_length(hist)
-
-    def _history_window_to_normalized(self, history_window: torch.Tensor) -> torch.Tensor:
-        hist = self._match_history_window_length(history_window)
-        q_scaled = hist[..., 0:1] / float(self.nn_q_scale)
-        p_scaled = hist[..., 1:2] / float(self.nn_p_scale)
-        ur_raw = hist[..., 2:3]
-        if self.use_reduced_velocity:
-            ur_scaled = ur_raw / self.ur_scale.to(device=hist.device, dtype=hist.dtype)
-        else:
-            ur_scaled = ur_raw
-        return torch.cat([q_scaled, p_scaled, ur_scaled], dim=-1)
-
-    def _resolve_history_context(
-        self,
-        x: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        if not self.use_history_tcn:
-            return None
-        if history_context is not None:
-            return history_context.to(device=x.device, dtype=x.dtype)
-        if self.history_encoder is None:
-            raise ValueError("History TCN is enabled but no history encoder is initialized.")
-        hist = self._prepare_history_window(
-            x=x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-        )
-        if hist is None:
-            return None
-        hist_norm = self._history_window_to_normalized(hist)
-        return self.history_encoder(hist_norm)
-
-    def history_context(
-        self,
-        x: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        return self._resolve_history_context(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
-
-    def advance_history_window(
-        self,
-        history_window: torch.Tensor | np.ndarray | None,
-        x_next: torch.Tensor,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-    ) -> torch.Tensor | None:
-        if not self.use_history_tcn:
-            return None
-        hist = self._prepare_history_window(
-            x=x_next,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-        )
-        if hist is None:
-            return None
-        feat_next = self._history_raw_feature(x_next, reduced_velocity=reduced_velocity).unsqueeze(1)
-        return torch.cat([hist[:, 1:, :], feat_next], dim=1)
-
     def _force_net_raw(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
         base_features = self._force_features(x, reduced_velocity=reduced_velocity)
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
-        out = self.u_base_net(features)
-        ctx = self._resolve_history_context(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
-        if self.corr_net is not None and ctx is not None:
-            corr_in = torch.cat([features, ctx], dim=-1)
-            out = out + self.corr_net(corr_in)
-        return out
+        return self.u_base_net(features)
 
     def _sigma_net_raw(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
         if not self.use_stochastic_process_noise:
             like = x[..., :1]
             return torch.zeros_like(like)
         base_features = self._force_features(x, reduced_velocity=reduced_velocity)
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
-        if self.sigma_from_history:
-            if self.sigma_history_net is None:
-                raise ValueError("sigma_from_history is enabled but sigma_history_net is not initialized.")
-            ctx = self._resolve_history_context(
-                x,
-                reduced_velocity=reduced_velocity,
-                history_window=history_window,
-                history_context=history_context,
-            )
-            if ctx is None:
-                raise ValueError("sigma_from_history requires a history context.")
-            sigma_in = torch.cat([features, ctx], dim=-1)
-            return self.sigma_history_net(sigma_in)
         if self.sigma_net is None:
             like = x[..., :1]
             return torch.zeros_like(like)
@@ -2043,18 +1809,10 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
         if not self.use_stochastic_process_noise:
             return torch.zeros_like(x[..., :1])
-        raw = self._sigma_net_raw(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        raw = self._sigma_net_raw(x, reduced_velocity=reduced_velocity)
         sigma_min = self.sigma_min.to(device=raw.device, dtype=raw.dtype)
         sigma = sigma_min + F.softplus(raw)
         if self.force_output == "coefficient":
@@ -2068,16 +1826,8 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        raw = self._force_net_raw(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
             return raw
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
@@ -2087,16 +1837,8 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        raw = self._force_net_raw(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
             return raw * f0
@@ -2111,16 +1853,8 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        coeff = self.learned_force_coeff(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        coeff = self.learned_force_coeff(x, reduced_velocity=reduced_velocity)
         if self.include_physical_drag:
             coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
         return coeff
@@ -2129,79 +1863,37 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        return self.learned_force(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.learned_force(x, reduced_velocity=reduced_velocity)
     
     def u_theta2(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        return self.u_theta1(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        ) + self.drag_force(x)
+        return self.u_theta1(x, reduced_velocity=reduced_velocity) + self.drag_force(x)
     
     def u_theta(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
         if self.force_output == "coefficient":
-            coeff = self.u_theta_coeff(
-                x,
-                reduced_velocity=reduced_velocity,
-                history_window=history_window,
-                history_context=history_context,
-            )
+            coeff = self.u_theta_coeff(x, reduced_velocity=reduced_velocity)
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff, state=x)
             return coeff * f0
         return (
-            self.u_theta2(
-                x,
-                reduced_velocity=reduced_velocity,
-                history_window=history_window,
-                history_context=history_context,
-            )
+            self.u_theta2(x, reduced_velocity=reduced_velocity)
             if self.include_physical_drag
-            else self.u_theta1(
-                x,
-                reduced_velocity=reduced_velocity,
-                history_window=history_window,
-                history_context=history_context,
-            )
+            else self.u_theta1(x, reduced_velocity=reduced_velocity)
         )
     
     def f(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        u = self.u_theta(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        u = self.u_theta(x, reduced_velocity=reduced_velocity)
         g_vec = self.G.squeeze(-1)
         return u * g_vec
 
@@ -2209,9 +1901,6 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
         gH = self.grad_H(x)                         # (..., 2)
         JgH = torch.matmul(gH, self.J.T)
@@ -2221,28 +1910,15 @@ class PHVIV(nn.Module):
         else:
             c_eff = self.fixed_c
         damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
-        return (JgH - damping_term) + self.f(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return (JgH - damping_term) + self.f(x, reduced_velocity=reduced_velocity)
 
     def step_euler(
         self,
         x,
         dt,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        return x + dt * self.g(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return x + dt * self.g(x, reduced_velocity=reduced_velocity)
 
     def step_rk4(
         self,
@@ -2250,18 +1926,8 @@ class PHVIV(nn.Module):
         t,
         dt,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        x_next, _ = self.rk4_step(
-            x,
-            t,
-            dt,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        x_next, _ = self.rk4_step(x, t, dt, reduced_velocity=reduced_velocity)
         return x_next
 
     def step_rk4_stochastic(
@@ -2273,31 +1939,11 @@ class PHVIV(nn.Module):
         *,
         noise: torch.Tensor | None = None,
         noise_scale: float = 1.0,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        context = self._resolve_history_context(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
-        x_next, _ = self.rk4_step(
-            x,
-            t,
-            dt,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=context,
-        )
+        x_next, _ = self.rk4_step(x, t, dt, reduced_velocity=reduced_velocity)
         if not self.use_stochastic_process_noise:
             return x_next
-        sigma = self.sigma_theta(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=context,
-        )
+        sigma = self.sigma_theta(x, reduced_velocity=reduced_velocity)
         if noise is None:
             noise = torch.randn_like(sigma)
         else:
@@ -2315,34 +1961,25 @@ class PHVIV(nn.Module):
         t,
         dt,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
         """
         Perform one Runge-Kutta 4 integration step and return both the next state
         and the averaged force over the step.
         """
-        ctx = self._resolve_history_context(
-            x,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
-        k1 = self.g(x, reduced_velocity=reduced_velocity, history_context=ctx)
-        force1 = self.u_theta(x, reduced_velocity=reduced_velocity, history_context=ctx)
+        k1 = self.g(x, reduced_velocity=reduced_velocity)
+        force1 = self.u_theta(x, reduced_velocity=reduced_velocity)
 
         x2 = x + 0.5 * dt * k1
-        k2 = self.g(x2, reduced_velocity=reduced_velocity, history_context=ctx)
-        force2 = self.u_theta(x2, reduced_velocity=reduced_velocity, history_context=ctx)
+        k2 = self.g(x2, reduced_velocity=reduced_velocity)
+        force2 = self.u_theta(x2, reduced_velocity=reduced_velocity)
 
         x3 = x + 0.5 * dt * k2
-        k3 = self.g(x3, reduced_velocity=reduced_velocity, history_context=ctx)
-        force3 = self.u_theta(x3, reduced_velocity=reduced_velocity, history_context=ctx)
+        k3 = self.g(x3, reduced_velocity=reduced_velocity)
+        force3 = self.u_theta(x3, reduced_velocity=reduced_velocity)
 
         x4 = x + dt * k3
-        k4 = self.g(x4, reduced_velocity=reduced_velocity, history_context=ctx)
-        force4 = self.u_theta(x4, reduced_velocity=reduced_velocity, history_context=ctx)
+        k4 = self.g(x4, reduced_velocity=reduced_velocity)
+        force4 = self.u_theta(x4, reduced_velocity=reduced_velocity)
 
         x_next = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         force_avg = (force1 + 2.0 * force2 + 2.0 * force3 + force4) / 6.0
@@ -2355,7 +1992,6 @@ class PHVIV(nn.Module):
         dt,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         *,
-        history_init: torch.Tensor | np.ndarray | None = None,
         stochastic: bool = False,
         noise_scale: float = 1.0,
         generator: torch.Generator | None = None,
@@ -2367,40 +2003,17 @@ class PHVIV(nn.Module):
         Z_pred: (B, K+1, state_dim)  predictions incl. z0
         F_hist: (B, K+1, 1)          optional, learned force per step
         """
-        B = z0.shape[0]
-        state_dim = z0.shape[-1]
         K = t_seq.shape[1] - 1
 
         Z_pred = [z0]
         F_hist = []
 
         z = z0
-        history_window = self._prepare_history_window(
-            x=z0,
-            reduced_velocity=reduced_velocity,
-            history_window=history_init,
-        )
-        initial_history_window = history_window
         for k in range(K):
             t = t_seq[:, k]
-            ctx = self._resolve_history_context(
-                z,
-                reduced_velocity=reduced_velocity,
-                history_window=history_window,
-            )
-            z_det, Fk = self.rk4_step(
-                z,
-                t,
-                dt,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
+            z_det, Fk = self.rk4_step(z, t, dt, reduced_velocity=reduced_velocity)
             if stochastic and self.use_stochastic_process_noise:
-                sigma = self.sigma_theta(
-                    z,
-                    reduced_velocity=reduced_velocity,
-                    history_context=ctx,
-                )
+                sigma = self.sigma_theta(z, reduced_velocity=reduced_velocity)
                 noise = torch.randn(
                     sigma.shape,
                     device=z_det.device,
@@ -2413,21 +2026,10 @@ class PHVIV(nn.Module):
                 z = z_det
             Z_pred.append(z)
             F_hist.append(Fk)
-            if self.use_history_tcn:
-                history_window = self.advance_history_window(
-                    history_window,
-                    z,
-                    reduced_velocity=reduced_velocity,
-                )
 
         Z_pred = torch.stack(Z_pred, dim=1)            # (B,K+1,D)
         if F_hist:
-            initial_ctx = self._resolve_history_context(
-                z0,
-                reduced_velocity=reduced_velocity,
-                history_window=initial_history_window if self.use_history_tcn else None,
-            )
-            initial_force = self.u_theta(z0, reduced_velocity=reduced_velocity, history_context=initial_ctx)
+            initial_force = self.u_theta(z0, reduced_velocity=reduced_velocity)
             F_hist = torch.stack([initial_force] + F_hist, dim=1)
         else:
             F_hist = None
@@ -2450,19 +2052,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        return self.res_loss_SRK4(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.res_loss_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
     
     def avg_force(
         self,
@@ -2471,19 +2062,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        return self.avg_force_SRK4(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.avg_force_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
 
     def res_loss_per_sample(
         self,
@@ -2492,19 +2072,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.res_loss_SRK4_per_sample(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.res_loss_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
 
     def avg_force_per_sample(
         self,
@@ -2513,19 +2082,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.avg_force_SRK4_per_sample(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.avg_force_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
 
     def avg_force_coeff(
         self,
@@ -2534,19 +2092,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        return self.avg_force_coeff_SRK4(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.avg_force_coeff_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
 
     def avg_force_coeff_per_sample(
         self,
@@ -2555,39 +2102,26 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.avg_force_coeff_SRK4_per_sample(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
+        return self.avg_force_coeff_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
 
     def _srk4_drift_rate(
         self,
         zi: torch.Tensor,
         zin: torch.Tensor,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dt = float(self.dt)
         b = math.sqrt(3.0) / 6.0
         z_mid = 0.5 * (zi + zin)
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity, history_context=history_context)
-        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity, history_context=history_context)
+        g_a_plus = self.g(z_a_plus, reduced_velocity=reduced_velocity)
+        g_a_minus = self.g(z_a_minus, reduced_velocity=reduced_velocity)
         z_corr_minus = z_mid - b * dt * g_a_plus
         z_corr_plus = z_mid + b * dt * g_a_minus
-        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity, history_context=history_context)
-        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity, history_context=history_context)
+        g1 = self.g(z_corr_minus, reduced_velocity=reduced_velocity)
+        g2 = self.g(z_corr_plus, reduced_velocity=reduced_velocity)
         return 0.5 * (g1 + g2), z_mid
 
     def _momentum_transition_stats_srk4(
@@ -2595,19 +2129,12 @@ class PHVIV(nn.Module):
         zi: torch.Tensor,
         zin: torch.Tensor,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        drift_rate, _ = self._srk4_drift_rate(
-            zi,
-            zin,
-            reduced_velocity=reduced_velocity,
-            history_context=history_context,
-        )
+        drift_rate, _ = self._srk4_drift_rate(zi, zin, reduced_velocity=reduced_velocity)
         dp_obs = zin[..., 1:2] - zi[..., 1:2]
         dp_drift = float(self.dt) * drift_rate[..., 1:2]
         innovation = dp_obs - dp_drift
-        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity, history_context=history_context)
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
         var = torch.clamp((sigma * sigma) * float(self.dt), min=1e-12)
         return innovation, sigma, var
 
@@ -2616,15 +2143,8 @@ class PHVIV(nn.Module):
         zi: torch.Tensor,
         zin: torch.Tensor,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        innovation, _sigma, var = self._momentum_transition_stats_srk4(
-            zi,
-            zin,
-            reduced_velocity=reduced_velocity,
-            history_context=history_context,
-        )
+        innovation, _sigma, var = self._momentum_transition_stats_srk4(zi, zin, reduced_velocity=reduced_velocity)
         nll = 0.5 * (innovation * innovation / var + torch.log(var))
         return nll.squeeze(-1)
 
@@ -2633,15 +2153,8 @@ class PHVIV(nn.Module):
         zi: torch.Tensor,
         zin: torch.Tensor,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        drift_rate, z_mid = self._srk4_drift_rate(
-            zi,
-            zin,
-            reduced_velocity=reduced_velocity,
-            history_context=history_context,
-        )
+        drift_rate, z_mid = self._srk4_drift_rate(zi, zin, reduced_velocity=reduced_velocity)
         res = (zin - zi) - float(self.dt) * drift_rate
         res_scaled = res / self.res_scale.to(device=res.device, dtype=res.dtype)
         if self.force_output == "coefficient":
@@ -2661,10 +2174,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity, history_context=history_context)
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
         return torch.mean(torch.square(sigma))
 
     def avg_diffusion_SRK4_per_sample(
@@ -2674,10 +2185,8 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity, history_context=history_context)
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
         return torch.square(sigma).squeeze(-1)
 
     def avg_sigma_reg_SRK4(
@@ -2689,17 +2198,8 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         *,
         norm: str = "l2",
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        per = self.avg_sigma_reg_SRK4_per_sample(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            norm=norm,
-            history_context=history_context,
-        )
+        per = self.avg_sigma_reg_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity, norm=norm)
         return torch.mean(per)
 
     def avg_sigma_reg_SRK4_per_sample(
@@ -2711,9 +2211,8 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         *,
         norm: str = "l2",
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity, history_context=history_context)
+        sigma = self.sigma_theta(zi, reduced_velocity=reduced_velocity)
         norm_key = str(norm).strip().lower()
         if norm_key == "l1":
             return torch.abs(sigma).squeeze(-1)
@@ -2731,17 +2230,9 @@ class PHVIV(nn.Module):
         *,
         norm: str = "l1",
         on_coeff: bool = False,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         per = self.avg_mean_reg_SRK4_per_sample(
-            zi,
-            ti,
-            zin,
-            tin,
-            reduced_velocity=reduced_velocity,
-            norm=norm,
-            on_coeff=on_coeff,
-            history_context=history_context,
+            zi, ti, zin, tin, reduced_velocity=reduced_velocity, norm=norm, on_coeff=on_coeff
         )
         return torch.mean(per)
 
@@ -2755,17 +2246,16 @@ class PHVIV(nn.Module):
         *,
         norm: str = "l1",
         on_coeff: bool = False,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
         if on_coeff:
-            f1 = self.u_theta_coeff(z_a_plus, reduced_velocity=reduced_velocity, history_context=history_context)
-            f2 = self.u_theta_coeff(z_a_minus, reduced_velocity=reduced_velocity, history_context=history_context)
+            f1 = self.u_theta_coeff(z_a_plus, reduced_velocity=reduced_velocity)
+            f2 = self.u_theta_coeff(z_a_minus, reduced_velocity=reduced_velocity)
         else:
-            f1 = self.u_theta(z_a_plus, reduced_velocity=reduced_velocity, history_context=history_context)
-            f2 = self.u_theta(z_a_minus, reduced_velocity=reduced_velocity, history_context=history_context)
+            f1 = self.u_theta(z_a_plus, reduced_velocity=reduced_velocity)
+            f2 = self.u_theta(z_a_minus, reduced_velocity=reduced_velocity)
         norm_key = str(norm).strip().lower()
         if norm_key == "l1":
             r1 = torch.sum(torch.abs(f1), dim=1)
@@ -2784,12 +2274,10 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ):
         dz = (zin-zi)/self.dt
         z_mean = 0.5*(zin+zi)
-        res = dz - self.g(z_mean, reduced_velocity=reduced_velocity, history_context=history_context)
+        res = dz - self.g(z_mean, reduced_velocity=reduced_velocity)
         res_scaled = res / self.res_scale
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(
@@ -2809,11 +2297,9 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_context: torch.Tensor | None = None,
     ):
         z_mean = 0.5*(zin+zi)
-        forces = self.learned_force(z_mean, reduced_velocity=reduced_velocity, history_context=history_context)
+        forces = self.learned_force(z_mean, reduced_velocity=reduced_velocity)
         loss = torch.mean(torch.linalg.norm(forces, ord=1, dim=1))
         return loss
     
@@ -2825,30 +2311,11 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        ctx = self._resolve_history_context(
-            zi,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
         if self.use_stochastic_process_noise:
-            per_sample = self._stochastic_nll_per_sample(
-                zi,
-                zin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
+            per_sample = self._stochastic_nll_per_sample(zi, zin, reduced_velocity=reduced_velocity)
         else:
-            per_sample = self._deterministic_residual_srk4_per_sample(
-                zi,
-                zin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
+            per_sample = self._deterministic_residual_srk4_per_sample(zi, zin, reduced_velocity=reduced_velocity)
         return torch.mean(per_sample)
 
     def res_loss_SRK4_per_sample(
@@ -2858,29 +2325,10 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ctx = self._resolve_history_context(
-            zi,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
         if self.use_stochastic_process_noise:
-            return self._stochastic_nll_per_sample(
-                zi,
-                zin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
-        return self._deterministic_residual_srk4_per_sample(
-            zi,
-            zin,
-            reduced_velocity=reduced_velocity,
-            history_context=ctx,
-        )
+            return self._stochastic_nll_per_sample(zi, zin, reduced_velocity=reduced_velocity)
+        return self._deterministic_residual_srk4_per_sample(zi, zin, reduced_velocity=reduced_velocity)
     
     def avg_force_SRK4(
         self,
@@ -2889,26 +2337,9 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        ctx = self._resolve_history_context(
-            zi,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
         if self.use_stochastic_process_noise:
-            return self.avg_diffusion_SRK4(
-                zi,
-                ti,
-                zin,
-                tin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
-        dt = self.dt
+            return self.avg_diffusion_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         b = math.sqrt(3.0) / 6.0
 
         # same stage points as in res_loss
@@ -2916,8 +2347,8 @@ class PHVIV(nn.Module):
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
         # evaluate learned force at both stages
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, history_context=ctx)    # assume (B, 1) or (B, 2)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, history_context=ctx)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
 
         loss = 0.5 * torch.mean(torch.sum(torch.abs(f1), dim=1)) \
             + 0.5 * torch.mean(torch.sum(torch.abs(f2), dim=1))
@@ -2930,30 +2361,14 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ctx = self._resolve_history_context(
-            zi,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
         if self.use_stochastic_process_noise:
-            return self.avg_diffusion_SRK4_per_sample(
-                zi,
-                ti,
-                zin,
-                tin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
+            return self.avg_diffusion_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, history_context=ctx)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, history_context=ctx)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
         return 0.5 * torch.sum(torch.abs(f1), dim=1) + 0.5 * torch.sum(torch.abs(f2), dim=1)
 
     def avg_force_coeff_SRK4(
@@ -2963,33 +2378,16 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ):
-        ctx = self._resolve_history_context(
-            zi,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
         if self.use_stochastic_process_noise:
-            return self.avg_diffusion_SRK4(
-                zi,
-                ti,
-                zin,
-                tin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
-        dt = self.dt
+            return self.avg_diffusion_SRK4(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         b = math.sqrt(3.0) / 6.0
 
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
 
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, history_context=ctx)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, history_context=ctx)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1, state=z_a_plus)
 
         f1c = f1 / f0
@@ -3005,30 +2403,14 @@ class PHVIV(nn.Module):
         zin,
         tin,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-        *,
-        history_window: torch.Tensor | np.ndarray | None = None,
-        history_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ctx = self._resolve_history_context(
-            zi,
-            reduced_velocity=reduced_velocity,
-            history_window=history_window,
-            history_context=history_context,
-        )
         if self.use_stochastic_process_noise:
-            return self.avg_diffusion_SRK4_per_sample(
-                zi,
-                ti,
-                zin,
-                tin,
-                reduced_velocity=reduced_velocity,
-                history_context=ctx,
-            )
+            return self.avg_diffusion_SRK4_per_sample(zi, ti, zin, tin, reduced_velocity=reduced_velocity)
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity, history_context=ctx)
-        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity, history_context=ctx)
+        f1 = self.f(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.f(z_a_minus, reduced_velocity=reduced_velocity)
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=f1, state=z_a_plus)
         f1c = f1 / f0
         f2c = f2 / f0
@@ -4736,14 +4118,11 @@ def _force_component_coefficients(
     model: "PHVIV",
     state: torch.Tensor,
     reduced_velocity: torch.Tensor,
-    history_context: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     base_features = model._force_features(state, reduced_velocity=reduced_velocity)
     features = model.force_embed(base_features) if model.force_embed is not None else base_features
     base_raw = model.u_base_net(features)
     delta_raw = torch.zeros_like(base_raw)
-    if model.corr_net is not None and history_context is not None:
-        delta_raw = model.corr_net(torch.cat([features, history_context], dim=-1))
 
     force_scale = model._force_scale_from_reduced_velocity(reduced_velocity, like=base_raw, state=state)
     if model.force_output == "coefficient":
@@ -4759,11 +4138,7 @@ def _force_component_coefficients(
         total_coeff = total_coeff + model.drag_force_coeff(state, reduced_velocity=reduced_velocity)
 
     if model.use_stochastic_process_noise:
-        sigma_force = model.sigma_theta(
-            state,
-            reduced_velocity=reduced_velocity,
-            history_context=history_context,
-        )
+        sigma_force = model.sigma_theta(state, reduced_velocity=reduced_velocity)
         sigma_coeff = sigma_force / torch.clamp(force_scale, min=1e-12)
     else:
         sigma_coeff = torch.zeros_like(total_coeff)
@@ -4805,20 +4180,9 @@ def rollout_model(
             raise ValueError("Reduced velocity series must be scalar or match the rollout length.")
 
     observed_states = torch.stack((y_series, vel_series * float(m_eff)), dim=1)
-    warmup_steps = 0
-    observed_history: torch.Tensor | None = None
     state = observed_states[0:1]
-    history_window = None
-    if model.use_history_tcn:
-        warmup_len = min(int(model.history_window), total_steps)
-        history_features = torch.cat([observed_states[:warmup_len], rv_series[:warmup_len]], dim=1)
-        observed_history = _build_causal_feature_windows(history_features, int(model.history_window))
-        warmup_steps = warmup_len - 1
-        state = observed_states[warmup_steps : warmup_steps + 1]
-        history_window = observed_history[warmup_steps : warmup_steps + 1]
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
-    history_contexts: list[torch.Tensor] | None = [] if model.use_history_tcn else None
     force_total: list[torch.Tensor] = []
     force_coeff_total: list[torch.Tensor] = []
     force_coeff_delta: list[torch.Tensor] = []
@@ -4831,79 +4195,17 @@ def rollout_model(
         generator = torch.Generator(device=device)
         generator.manual_seed(int(rollout_seed))
     with torch.no_grad():
-        for step_idx in range(warmup_steps):
-            state_obs = observed_states[step_idx : step_idx + 1]
+        for step_idx in range(total_steps):
             rv_step = rv_series[step_idx : step_idx + 1]
-            hist_step = observed_history[step_idx : step_idx + 1] if observed_history is not None else None
-            ctx = model._resolve_history_context(
-                state_obs,
-                reduced_velocity=rv_step,
-                history_window=hist_step,
-            )
-            y_samples.append(state_obs[0, 0].detach())
-            p_samples.append(state_obs[0, 1].detach())
-            if history_contexts is not None and ctx is not None:
-                history_contexts.append(ctx[0].detach())
-            model_force = model.learned_force(
-                state_obs,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
-            if model.include_physical_drag:
-                drag_force = model.drag_force(state_obs).squeeze().detach()
-            else:
-                drag_force = model_force.new_tensor(0.0)
-            total_force = model.u_theta(
-                state_obs,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
-            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
-                model,
-                state_obs,
-                rv_step,
-                ctx,
-            )
-            H_val = model.H(state_obs).detach()
-            force_model.append(model_force)
-            force_drag.append(drag_force)
-            force_total.append(total_force)
-            force_coeff_total.append(total_coeff.squeeze().detach())
-            force_coeff_delta.append(delta_coeff.squeeze().detach())
-            force_coeff_sigma.append(sigma_coeff.squeeze().detach())
-            hamiltonian_model_vals.append(H_val)
-
-        for step_idx in range(warmup_steps, total_steps):
-            rv_step = rv_series[step_idx : step_idx + 1]
-            ctx = model._resolve_history_context(
-                state,
-                reduced_velocity=rv_step,
-                history_window=history_window,
-            )
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
-            if history_contexts is not None and ctx is not None:
-                history_contexts.append(ctx[0].detach())
-            model_force = model.learned_force(
-                state,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
+            model_force = model.learned_force(state, reduced_velocity=rv_step).squeeze().detach()
             if model.include_physical_drag:
                 drag_force = model.drag_force(state).squeeze().detach()
             else:
                 drag_force = model_force.new_tensor(0.0)
-            total_force = model.u_theta(
-                state,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
-            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
-                model,
-                state,
-                rv_step,
-                ctx,
-            )
+            total_force = model.u_theta(state, reduced_velocity=rv_step).squeeze().detach()
+            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(model, state, rv_step)
             H_val = model.H(state).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
@@ -4929,23 +4231,9 @@ def rollout_model(
                     reduced_velocity=rv_step,
                     noise=noise,
                     noise_scale=noise_scale,
-                    history_context=ctx,
                 )
             else:
-                state = model.step_rk4(
-                    state,
-                    t,
-                    dt,
-                    reduced_velocity=rv_step,
-                    history_context=ctx,
-                )
-            if model.use_history_tcn:
-                rv_next = rv_series[step_idx + 1 : step_idx + 2]
-                history_window = model.advance_history_window(
-                    history_window,
-                    state,
-                    reduced_velocity=rv_next,
-                )
+                state = model.step_rk4(state, t, dt, reduced_velocity=rv_step)
 
     y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
     p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()
@@ -4958,9 +4246,6 @@ def rollout_model(
     force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
     force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
-    history_context_arr = None
-    if history_contexts:
-        history_context_arr = torch.stack(history_contexts).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
@@ -4971,7 +4256,7 @@ def rollout_model(
         "force_drag": force_drag_arr,
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
-        "history_context": history_context_arr,
+        "history_context": None,
     }
 
 
@@ -5017,20 +4302,9 @@ def rollout_model_with_progress(
             raise ValueError("Reduced velocity series must be scalar or match the rollout length.")
 
     observed_states = torch.stack((y_series, vel_series * float(m_eff)), dim=1)
-    warmup_steps = 0
-    observed_history: torch.Tensor | None = None
     state = observed_states[0:1]
-    history_window = None
-    if model.use_history_tcn:
-        warmup_len = min(int(model.history_window), total_steps)
-        history_features = torch.cat([observed_states[:warmup_len], rv_series[:warmup_len]], dim=1)
-        observed_history = _build_causal_feature_windows(history_features, int(model.history_window))
-        warmup_steps = warmup_len - 1
-        state = observed_states[warmup_steps : warmup_steps + 1]
-        history_window = observed_history[warmup_steps : warmup_steps + 1]
     y_samples: list[torch.Tensor] = []
     p_samples: list[torch.Tensor] = []
-    history_contexts: list[torch.Tensor] | None = [] if model.use_history_tcn else None
     force_total: list[torch.Tensor] = []
     force_coeff_total: list[torch.Tensor] = []
     force_coeff_delta: list[torch.Tensor] = []
@@ -5039,82 +4313,17 @@ def rollout_model_with_progress(
     force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
     with torch.no_grad():
-        for step_idx in range(warmup_steps):
-            state_obs = observed_states[step_idx : step_idx + 1]
+        for step_idx in range(total_steps):
             rv_step = rv_series[step_idx : step_idx + 1]
-            hist_step = observed_history[step_idx : step_idx + 1] if observed_history is not None else None
-            ctx = model._resolve_history_context(
-                state_obs,
-                reduced_velocity=rv_step,
-                history_window=hist_step,
-            )
-            y_samples.append(state_obs[0, 0].detach())
-            p_samples.append(state_obs[0, 1].detach())
-            if history_contexts is not None and ctx is not None:
-                history_contexts.append(ctx[0].detach())
-            model_force = model.learned_force(
-                state_obs,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
-            if model.include_physical_drag:
-                drag_force = model.drag_force(state_obs).squeeze().detach()
-            else:
-                drag_force = model_force.new_tensor(0.0)
-            total_force = model.u_theta(
-                state_obs,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
-            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
-                model,
-                state_obs,
-                rv_step,
-                ctx,
-            )
-            H_val = model.H(state_obs).detach()
-            force_model.append(model_force)
-            force_drag.append(drag_force)
-            force_total.append(total_force)
-            force_coeff_total.append(total_coeff.squeeze().detach())
-            force_coeff_delta.append(delta_coeff.squeeze().detach())
-            force_coeff_sigma.append(sigma_coeff.squeeze().detach())
-            hamiltonian_model_vals.append(H_val)
-            completed = step_idx + 1
-            if progress_callback is not None and (completed % every == 0 or completed == total_steps):
-                progress_callback(completed, total_steps)
-
-        for step_idx in range(warmup_steps, total_steps):
-            rv_step = rv_series[step_idx : step_idx + 1]
-            ctx = model._resolve_history_context(
-                state,
-                reduced_velocity=rv_step,
-                history_window=history_window,
-            )
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
-            if history_contexts is not None and ctx is not None:
-                history_contexts.append(ctx[0].detach())
-            model_force = model.learned_force(
-                state,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
+            model_force = model.learned_force(state, reduced_velocity=rv_step).squeeze().detach()
             if model.include_physical_drag:
                 drag_force = model.drag_force(state).squeeze().detach()
             else:
                 drag_force = model_force.new_tensor(0.0)
-            total_force = model.u_theta(
-                state,
-                reduced_velocity=rv_step,
-                history_context=ctx,
-            ).squeeze().detach()
-            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(
-                model,
-                state,
-                rv_step,
-                ctx,
-            )
+            total_force = model.u_theta(state, reduced_velocity=rv_step).squeeze().detach()
+            total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(model, state, rv_step)
             H_val = model.H(state).detach()
             force_model.append(model_force)
             force_drag.append(drag_force)
@@ -5129,15 +4338,7 @@ def rollout_model_with_progress(
                     t,
                     dt,
                     reduced_velocity=rv_step,
-                    history_context=ctx,
                 )
-                if model.use_history_tcn:
-                    rv_next = rv_series[step_idx + 1 : step_idx + 2]
-                    history_window = model.advance_history_window(
-                        history_window,
-                        state,
-                        reduced_velocity=rv_next,
-                    )
 
             completed = step_idx + 1
             if progress_callback is not None and (completed % every == 0 or completed == total_steps):
@@ -5154,9 +4355,6 @@ def rollout_model_with_progress(
     force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
     force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
-    history_context_arr = None
-    if history_contexts:
-        history_context_arr = torch.stack(history_contexts).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
         "p_norm": p_pred_norm,
@@ -5167,5 +4365,5 @@ def rollout_model_with_progress(
         "force_drag": force_drag_arr,
         "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
-        "history_context": history_context_arr,
+        "history_context": None,
     }

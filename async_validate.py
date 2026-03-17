@@ -236,13 +236,11 @@ def _rollout_loss_from_batch(
     ur_bin_size: float = 1e-6,
     return_per_sample: bool = False,
 ) -> torch.Tensor:
-    z0, t_seq, z_traj, ur0, history0, _scale = _parse_rollout_batch(batch)
+    z0, t_seq, z_traj, ur0, _history0, _scale = _parse_rollout_batch(batch)
     z0 = z0.to(device, non_blocking=non_blocking)
     t_seq = t_seq.to(device, non_blocking=non_blocking)
     z_traj = z_traj.to(device, non_blocking=non_blocking)
     ur0 = ur0.to(device, non_blocking=non_blocking)
-    if history0 is not None:
-        history0 = history0.to(device, non_blocking=non_blocking)
     mode_key = str(rollout_loss_mode).strip().lower()
     if mode_key == "stochastic":
         mode_key = "stochastic_nll"
@@ -267,17 +265,11 @@ def _rollout_loss_from_batch(
         t_seq_in = t_seq.unsqueeze(0).expand(samples, *t_seq.shape).reshape(samples * batch_size, *t_seq.shape[1:])
         z_traj_ref = z_traj.unsqueeze(0)
         ur0_in = ur0.unsqueeze(0).expand(samples, *ur0.shape).reshape(samples * batch_size, *ur0.shape[1:])
-        history0_in = None
-        if history0 is not None:
-            history0_in = history0.unsqueeze(0).expand(samples, *history0.shape).reshape(
-                samples * batch_size, *history0.shape[1:]
-            )
         z_pred, _ = model.rollout(
             z0_in,
             t_seq_in,
             float(model.dt),
             reduced_velocity=ur0_in,
-            history_init=history0_in,
             stochastic=True,
             noise_scale=rollout_noise_scale,
         )
@@ -303,7 +295,6 @@ def _rollout_loss_from_batch(
             t_seq,
             float(model.dt),
             reduced_velocity=ur0,
-            history_init=history0,
             stochastic=(mode_key != "deterministic"),
             noise_scale=rollout_noise_scale,
         )
@@ -331,17 +322,6 @@ def _load_state(model: torch.nn.Module, state: dict[str, Any]) -> None:
     if any(k.startswith("module.") for k in state):
         state = {k.removeprefix("module."): v for k, v in state.items()}
     model.load_state_dict(state, strict=False)
-
-
-def _td_hnn_initial_history(
-    z0: torch.Tensor,
-    ur0: torch.Tensor,
-    history_window: int | None,
-) -> torch.Tensor | None:
-    if history_window is None or int(history_window) <= 0:
-        return None
-    hist_feat = torch.cat([z0, ur0], dim=1)
-    return hist_feat.unsqueeze(1).expand(hist_feat.shape[0], int(history_window), hist_feat.shape[1]).clone()
 
 
 def _td_hnn_traj_to_tensors(
@@ -405,9 +385,6 @@ def _log_td_correction_hnn_rollout_validation(
     mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
     damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
     stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-    history0 = _td_hnn_initial_history(z_true_t[0:1], ur_t[0:1], int(model.history_window) if model.use_history_tcn else None)
-    if history0 is not None:
-        history0 = history0.to(device)
 
     z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
         model=model,
@@ -420,7 +397,6 @@ def _log_td_correction_hnn_rollout_validation(
         damping_c=damping_t,
         stiffness=stiffness_t,
         td_params=td_params,
-        history0=history0,
     )
     y_pred = z_pred[0, :, 0].detach().cpu().numpy()
     v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
@@ -429,18 +405,8 @@ def _log_td_correction_hnn_rollout_validation(
     td_roll = force_roll - corr_roll
 
     with torch.no_grad():
-        history_context0 = model.history_context(z_true_t[0:1], reduced_velocity=ur_t[0:1], history_window=history0)
-        corr0 = model.learned_force(z_true_t[0:1], reduced_velocity=ur_t[0:1], history_context=history_context0)[0, 0]
-        corr_on_data = []
-        for idx in range(int(z_true_t.shape[0])):
-            z_i = z_true_t[idx : idx + 1]
-            ur_i = ur_t[idx : idx + 1]
-            hist_i = _td_hnn_initial_history(z_i, ur_i, int(model.history_window) if model.use_history_tcn else None)
-            if hist_i is not None:
-                hist_i = hist_i.to(device)
-            hist_ctx = model.history_context(z_i, reduced_velocity=ur_i, history_window=hist_i)
-            corr_on_data.append(model.learned_force(z_i, reduced_velocity=ur_i, history_context=hist_ctx)[0, 0].detach())
-        corr_on_data_t = torch.stack(corr_on_data).reshape(-1, 1)
+        corr0 = model.learned_force(z_true_t[0:1], reduced_velocity=ur_t[0:1])[0, 0]
+        corr_on_data_t = model.learned_force(z_true_t, reduced_velocity=ur_t)
 
     force_total_full = np.concatenate(
         [np.asarray([float(td_force_t[0, 0].detach().cpu() + corr0.detach().cpu())]), force_roll],
@@ -634,7 +600,6 @@ def _run_hnn_validation(
     _load_state(model, ckpt["model_state"])
     model.eval()
     ur_bin_state_scale_info = ckpt.get("ur_bin_state_scale_info", None)
-    history_window = int(getattr(cfg.model, "history_window", 32)) if bool(getattr(cfg.model, "use_history_tcn", False)) else None
 
     m_eff = float(derived["m_eff"])
     D = float(derived["D"])
@@ -687,7 +652,6 @@ def _run_hnn_validation(
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
-        history_window=history_window,
     )
     val_rollout_loader: Any | None = None
     if rollout_det_weight > 0.0 and rollout_det_steps > 0:
@@ -701,7 +665,6 @@ def _run_hnn_validation(
             shuffle=False,
             num_workers=int(num_workers),
             pin_memory=(device.type == "cuda"),
-            history_window=history_window,
         )
 
     num_loss_scalars_written = 0
@@ -931,7 +894,6 @@ def _run_hnn_td_correction_validation(
     td_params = resolve_td_correction_params(hnn_cfg)
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
-    history_window = int(getattr(cfg.model, "history_window", 32)) if bool(getattr(cfg.model, "use_history_tcn", False)) else None
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
@@ -964,7 +926,6 @@ def _run_hnn_td_correction_validation(
         train_trajs=val_trajs_np,
         val_trajs=val_trajs_np,
         mass_source=td_mass_source,
-        history_window=history_window,
         batch_size=int(cfg.training.batch_size),
         rollout_batch_size=rollout_batch_size,
         rollout_steps=rollout_det_steps,
@@ -986,13 +947,9 @@ def _run_hnn_td_correction_validation(
         val_count = 0
         with torch.no_grad():
             for batch in val_loader:
-                if len(batch) == 10:
-                    z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
-                    history_i = None
-                elif len(batch) == 11:
-                    z_i, t_i, z_next, t_next, ur_i, history_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
-                else:
+                if len(batch) != 10:
                     raise ValueError("Unexpected TD correction HNN batch format.")
+                z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
                 z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
                 t_i = t_i.to(device, non_blocking=(device.type == "cuda"))
                 z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
@@ -1003,16 +960,13 @@ def _run_hnn_td_correction_validation(
                 mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
                 damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
                 stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
-                if history_i is not None:
-                    history_i = history_i.to(device, non_blocking=(device.type == "cuda"))
 
-                corr_mu, sigma_corr, _history_context = _td_predict_correction(
+                corr_mu, sigma_corr = _td_predict_correction(
                     model,
                     z=z_i,
                     reduced_velocity=ur_i,
                     structural_mass=mass_i,
                     stiffness=stiffness_i,
-                    history_window=history_i,
                     predict_sigma=predict_sigma,
                     force_zero_output=force_zero_output,
                 )
@@ -1064,14 +1018,9 @@ def _run_hnn_td_correction_validation(
             rollout_count = 0
             with torch.no_grad():
                 for rollout_batch in rollout_loader:
-                    if len(rollout_batch) == 8:
-                        z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
-                        history0 = None
-                    elif len(rollout_batch) == 9:
-                        z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, history0 = rollout_batch
-                        history0 = history0.to(device, non_blocking=(device.type == "cuda"))
-                    else:
+                    if len(rollout_batch) != 8:
                         raise ValueError("Unexpected TD correction rollout batch format.")
+                    z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
                     z0 = z0.to(device, non_blocking=(device.type == "cuda"))
                     t_seq = t_seq.to(device, non_blocking=(device.type == "cuda"))
                     z_traj = z_traj.to(device, non_blocking=(device.type == "cuda"))
@@ -1092,7 +1041,6 @@ def _run_hnn_td_correction_validation(
                         damping_c=damping0,
                         stiffness=stiffness0,
                         td_params=td_params,
-                        history0=history0,
                         force_zero_output=force_zero_output,
                     )
                     rollout_loss_sum += torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2)).detach()
@@ -1778,31 +1726,23 @@ def _evaluate_val_losses(
     )
     with torch.no_grad():
         for batch in loader:
-            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
+            z_i, t_i, z_next, t_next, ur_i, _history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
-            if history_i is not None:
-                history_i = history_i.to(device, non_blocking=non_blocking)
             if f_i is not None:
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                history_context = model.history_context(
-                    z_i,
-                    reduced_velocity=ur_i,
-                    history_window=history_i,
-                )
                 if equalize_residual_over_ur_bins or normalize_residual_by_ur_bin_std:
                     per_res = scaled_residual_loss_per_sample(
                         model,
                         z_i,
                         z_next,
                         reduced_velocity=ur_i,
-                        history_context=history_context,
                         ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_residual_by_ur_bin_std else None),
                         ur_bin_size=ur_bin_size,
                     )
@@ -1816,7 +1756,6 @@ def _evaluate_val_losses(
                             z_next,
                             t_next,
                             reduced_velocity=ur_i,
-                            history_context=history_context,
                         ),
                         ur_i,
                         ur_bin_counts=residual_ur_bin_counts,
@@ -1832,7 +1771,6 @@ def _evaluate_val_losses(
                             z_next,
                             t_next,
                             reduced_velocity=ur_i,
-                            history_context=history_context,
                         )
                     )
                 sigma_reg_loss = model.avg_sigma_reg_SRK4(
@@ -1842,7 +1780,6 @@ def _evaluate_val_losses(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=sigma_reg_norm,
-                    history_context=history_context,
                 )
                 mean_reg_loss = model.avg_mean_reg_SRK4(
                     z_i,
@@ -1852,7 +1789,6 @@ def _evaluate_val_losses(
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
                     on_coeff=force_reg_on_coeff,
-                    history_context=history_context,
                 )
                 sigma_loss = float(sigma_reg) * sigma_reg_loss
                 mean_loss_reg = float(mean_reg) * mean_reg_loss
@@ -1865,10 +1801,10 @@ def _evaluate_val_losses(
                     f_mid = 0.5 * (f_i + f_next)
                     if getattr(model, "force_output", "force") == "coefficient":
                         f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
-                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
+                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:
-                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
+                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     data_force_loss = torch.mean(per_data)
                 else:
@@ -1877,11 +1813,11 @@ def _evaluate_val_losses(
                 if float(symmetry_weight) > 0.0:
                     z_flip = -z_mid
                     if getattr(model, "force_output", "force") == "coefficient":
-                        f_pos = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
-                        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur_i, history_context=history_context)
+                        f_pos = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur_i)
                     else:
-                        f_pos = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
-                        f_neg = model.u_theta(z_flip, reduced_velocity=ur_i, history_context=history_context)
+                        f_pos = model.u_theta(z_mid, reduced_velocity=ur_i)
+                        f_neg = model.u_theta(z_flip, reduced_velocity=ur_i)
                     sym_res = f_pos + f_neg
                     if sym_res.ndim == 1:
                         sym_res = sym_res.unsqueeze(-1)
@@ -2007,31 +1943,23 @@ def _per_ur_loss_map_hnn(
     }
     with torch.no_grad():
         for batch in loader:
-            z_i, t_i, z_next, t_next, ur_i, history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
+            z_i, t_i, z_next, t_next, ur_i, _history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
-            if history_i is not None:
-                history_i = history_i.to(device, non_blocking=non_blocking)
             if f_i is not None:
                 f_i = f_i.to(device, non_blocking=non_blocking)
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                history_context = model.history_context(
-                    z_i,
-                    reduced_velocity=ur_i,
-                    history_window=history_i,
-                )
                 per_res = (
                     scaled_residual_loss_per_sample(
                         model,
                         z_i,
                         z_next,
                         reduced_velocity=ur_i,
-                        history_context=history_context,
                         ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_residual_by_ur_bin_std else None),
                         ur_bin_size=ur_bin_size,
                     )
@@ -2042,7 +1970,6 @@ def _per_ur_loss_map_hnn(
                         z_next,
                         t_next,
                         reduced_velocity=ur_i,
-                        history_context=history_context,
                     )
                 )
                 per_sigma_reg = model.avg_sigma_reg_SRK4_per_sample(
@@ -2052,7 +1979,6 @@ def _per_ur_loss_map_hnn(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=sigma_reg_norm,
-                    history_context=history_context,
                 )
                 per_mean_reg = model.avg_mean_reg_SRK4_per_sample(
                     z_i,
@@ -2062,7 +1988,6 @@ def _per_ur_loss_map_hnn(
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
                     on_coeff=force_reg_on_coeff,
-                    history_context=history_context,
                 )
                 per_reg = float(sigma_reg) * per_sigma_reg
                 per_reg_mean = float(mean_reg) * per_mean_reg
@@ -2072,10 +1997,10 @@ def _per_ur_loss_map_hnn(
                     f_mid = 0.5 * (f_i + f_next)
                     if force_output_coeff:
                         f0 = model._force_scale_from_reduced_velocity(ur_i, like=f_mid, state=z_mid)
-                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
+                        f_pred = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
                         f_mid = f_mid / f0
                     else:
-                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
+                        f_pred = model.u_theta(z_mid, reduced_velocity=ur_i)
                     per_data = torch.mean((f_pred - f_mid) ** 2, dim=1)
                     per_data = float(force_data_weight) * per_data
                 else:
@@ -2084,11 +2009,11 @@ def _per_ur_loss_map_hnn(
                 if float(symmetry_weight) > 0.0:
                     z_flip = -z_mid
                     if getattr(model, "force_output", "force") == "coefficient":
-                        f_pos = model.u_theta_coeff(z_mid, reduced_velocity=ur_i, history_context=history_context)
-                        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur_i, history_context=history_context)
+                        f_pos = model.u_theta_coeff(z_mid, reduced_velocity=ur_i)
+                        f_neg = model.u_theta_coeff(z_flip, reduced_velocity=ur_i)
                     else:
-                        f_pos = model.u_theta(z_mid, reduced_velocity=ur_i, history_context=history_context)
-                        f_neg = model.u_theta(z_flip, reduced_velocity=ur_i, history_context=history_context)
+                        f_pos = model.u_theta(z_mid, reduced_velocity=ur_i)
+                        f_neg = model.u_theta(z_flip, reduced_velocity=ur_i)
                     sym_res = f_pos + f_neg
                     if sym_res.ndim == 1:
                         sym_res = sym_res.unsqueeze(-1)
