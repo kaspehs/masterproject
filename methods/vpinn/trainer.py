@@ -2681,6 +2681,7 @@ def train(config: Config, config_name: str) -> None:
     rollout_force_weight = float(vp.get("rollout_force_weight", 0.0))
     rollout_force_steps = int(vp.get("rollout_force_steps", 0))
     rollout_force_every = int(vp.get("rollout_force_every", 1))
+    rollout_force_batch_size = int(vp.get("rollout_force_batch_size", 0))
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
         raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
@@ -2940,7 +2941,7 @@ def train(config: Config, config_name: str) -> None:
     if use_rollout_loss:
         startup_lines.append(
             f"Rollout loss: weight={rollout_force_weight:g}, steps={rollout_force_steps}, "
-            f"every={rollout_force_every}"
+            f"batch_size={'full' if rollout_force_batch_size <= 0 else rollout_force_batch_size}"
         )
     print("\n".join(startup_lines))
 
@@ -3009,27 +3010,31 @@ def train(config: Config, config_name: str) -> None:
                 loss_roll = loss_f.new_tensor(0.0)
                 roll_computed = False
                 if rollout_force_weight > 0.0 and rollout_force_steps > 0:
-                    if (step % max(1, int(rollout_force_every))) == 0:
-                        steps_k = min(int(rollout_force_steps), int(M1) - 1)
-                        if steps_k > 0:
-                            f0_step = f0[:, 0, :] if f0 is not None else None
-                            _x_seq, _v_seq, f_seq = rollout_rk4(
-                                model=model,
-                                x0=x_win[:, 0, :],
-                                v0=v_win[:, 0, :],
-                                ur0=ur_win[:, 0, :],
-                                steps=steps_k,
-                                dt=dt,
-                                m=m,
-                                c=c,
-                                k=k,
-                                f0=f0_step,
-                            )
-                            f_roll = f_seq[:, : steps_k + 1, :]
-                            f_true = f_meas[:, : steps_k + 1, :]
-                            per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
-                            loss_roll = torch.mean(per_roll)
-                            roll_computed = True
+                    steps_k = min(int(rollout_force_steps), int(M1) - 1)
+                    rollout_batch_n = int(B) if rollout_force_batch_size <= 0 else min(int(B), int(rollout_force_batch_size))
+                    if steps_k > 0 and rollout_batch_n > 0:
+                        x_roll = x_win[:rollout_batch_n]
+                        v_roll = v_win[:rollout_batch_n]
+                        ur_roll = ur_win[:rollout_batch_n]
+                        f_true_roll = f_meas[:rollout_batch_n]
+                        f0_step = f0[:rollout_batch_n, 0, :] if f0 is not None else None
+                        _x_seq, _v_seq, f_seq = rollout_rk4(
+                            model=model,
+                            x0=x_roll[:, 0, :],
+                            v0=v_roll[:, 0, :],
+                            ur0=ur_roll[:, 0, :],
+                            steps=steps_k,
+                            dt=dt,
+                            m=m,
+                            c=c,
+                            k=k,
+                            f0=f0_step,
+                        )
+                        f_roll = f_seq[:, : steps_k + 1, :]
+                        f_true = f_true_roll[:, : steps_k + 1, :]
+                        per_roll = torch.mean((f_roll - f_true) ** 2, dim=(1, 2))
+                        loss_roll = torch.mean(per_roll)
+                        roll_computed = True
 
                 wf_eff = float(wf) if use_force_loss else 0.0
                 ww_eff = float(ww) if use_weak_loss else 0.0
@@ -3089,7 +3094,7 @@ def train(config: Config, config_name: str) -> None:
             loss_sum = loss_sum + loss.detach()
             loss_f_sum = loss_f_sum + loss_f.detach()
             loss_w_sum = loss_w_sum + loss_w.detach()
-            if rollout_force_weight > 0.0 and rollout_force_steps > 0 and (step % max(1, int(rollout_force_every))) == 0:
+            if rollout_force_weight > 0.0 and rollout_force_steps > 0 and roll_computed:
                 loss_roll_sum = loss_roll_sum + loss_roll.detach()
                 roll_count += 1
             if isinstance(grad_norm, torch.Tensor):

@@ -136,6 +136,7 @@ vpinn:
   rollout_force_weight: 0.0
   rollout_force_steps: 0
   rollout_force_every: 1
+  rollout_force_batch_size: 0
   # Test functions for weak residual: polynomials (degree 0..num_poly_test-1) and sines (k=1..num_sine_test).
   # If num_poly_test is omitted, it defaults to 2 (degree 0 and 1).
   num_poly_test: 3
