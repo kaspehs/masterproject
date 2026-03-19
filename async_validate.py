@@ -44,7 +44,6 @@ from HNN_helper import (
     parse_config,
     preprocess_timeseries,
     resolve_cut_start_seconds,
-    resolve_middle_time_plot,
     sample_indices_per_ur,
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
@@ -53,8 +52,11 @@ from HNN_helper import (
 from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
     _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
+    _td_correction_rollout_loss_from_batch,
     _td_correction_state_rollout,
     _td_predict_correction,
+    _td_state_mse_loss,
+    _td_state_propagated_nll_loss,
 )
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
@@ -72,6 +74,8 @@ from methods.vpinn.trainer import (
     _td_rollout_traj_to_tensors,
     _build_td_correction_vpinn_datasets,
     _vpinn_predict_correction,
+    _vpinn_rollout_state_loss,
+    _vpinn_scale_weak_residual,
     _vpinn_td_rollout,
     rollout_rk4,
     _weak_residual,
@@ -85,35 +89,18 @@ def _set_threading(num_threads: int) -> None:
 
 
 def _rollout_index(
-    epoch: int,
-    rollout_every: int,
     num_series: int,
-    cycle: bool,
     *,
     ur_values: list[float] | None = None,
-    target_ur: float | None = None,
-    target_ur_tol: float = 1e-6,
 ) -> int:
     if num_series <= 0:
         return 0
     selected = list(range(num_series))
     if ur_values is not None and len(ur_values) == num_series:
-        if target_ur is not None:
-            matched = [
-                idx
-                for idx, ur_val in enumerate(ur_values)
-                if np.isclose(float(ur_val), float(target_ur), rtol=0.0, atol=float(target_ur_tol))
-            ]
-            if matched:
-                selected = [matched[0]]
-        else:
-            sampled = sample_one_index_per_ur(ur_values, seed=0)
-            if sampled:
-                selected = sampled
-    if not cycle:
-        return int(selected[0])
-    step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
-    return int(selected[step % len(selected)])
+        sampled = sample_one_index_per_ur(ur_values, seed=0)
+        if sampled:
+            selected = sampled
+    return int(selected[0])
 
 
 def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
@@ -164,63 +151,6 @@ def _parse_rollout_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
     else:
         raise ValueError("Unexpected rollout batch format.")
     return z0, t_seq, z_traj, ur0, history, scale
-
-
-def _ur_bin_id(value: float, ur_bin_size: float) -> int:
-    return int(np.rint(float(value) / float(ur_bin_size)))
-
-
-def _collect_ur_bin_counts_from_dataset(
-    dataset: Any,
-    *,
-    ur_tensor_index: int,
-    ur_bin_size: float,
-) -> dict[int, int]:
-    cache_key = f"ur_bin_counts:{int(ur_tensor_index)}:{float(ur_bin_size):.12g}"
-    cache = getattr(dataset, "_codex_cache", None)
-    if isinstance(cache, dict) and cache_key in cache:
-        return dict(cache[cache_key])
-
-    counts: dict[int, int] = {}
-    if isinstance(dataset, TensorDataset):
-        ur_tensor = dataset.tensors[int(ur_tensor_index)]
-        ur_vals = ur_tensor.reshape(ur_tensor.shape[0], -1)[:, 0].detach().cpu().numpy()
-        for ur_val in ur_vals:
-            key = _ur_bin_id(float(ur_val), ur_bin_size)
-            counts[key] = counts.get(key, 0) + 1
-    elif isinstance(dataset, ConcatDataset):
-        for subdataset in dataset.datasets:
-            sub_counts = _collect_ur_bin_counts_from_dataset(
-                subdataset,
-                ur_tensor_index=ur_tensor_index,
-                ur_bin_size=ur_bin_size,
-            )
-            for key, value in sub_counts.items():
-                counts[key] = counts.get(key, 0) + int(value)
-    else:
-        raise TypeError(f"Unsupported dataset type for U_r bin counting: {type(dataset)!r}")
-
-    if cache is None or not isinstance(cache, dict):
-        cache = {}
-        setattr(dataset, "_codex_cache", cache)
-    cache[cache_key] = dict(counts)
-    return counts
-
-
-def _weighted_mean_by_ur_bins(
-    per_sample: torch.Tensor,
-    ur_values: torch.Tensor,
-    *,
-    ur_bin_counts: dict[int, int] | None,
-    ur_bin_size: float,
-) -> torch.Tensor:
-    if not ur_bin_counts:
-        return torch.mean(per_sample)
-    ur_flat = ur_values.reshape(-1).detach().cpu().numpy()
-    weights = [1.0 / float(max(1, ur_bin_counts.get(_ur_bin_id(float(ur), ur_bin_size), 1))) for ur in ur_flat]
-    weight_t = torch.as_tensor(weights, device=per_sample.device, dtype=per_sample.dtype)
-    denom = torch.clamp(torch.sum(weight_t), min=torch.finfo(weight_t.dtype).eps)
-    return torch.sum(weight_t * per_sample) / denom
 
 
 def _rollout_loss_from_batch(
@@ -359,7 +289,6 @@ def _log_td_correction_hnn_rollout_validation(
     dt: float,
     td_mass_source: str,
     td_params: dict[str, float],
-    middle_time_plot: list[float] | tuple[float, float],
     device: torch.device,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
@@ -451,8 +380,6 @@ def _log_td_correction_hnn_rollout_validation(
 
     if log_plots:
         zoom_mask = create_zoom_mask(t_np)
-        middle_mask = create_window_mask(t_np, middle_time_plot)
-        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
         ur_val = float(ur_t[0, 0].detach().cpu().item())
         log_displacement_plots(
             writer,
@@ -462,8 +389,6 @@ def _log_td_correction_hnn_rollout_validation(
             y_pred / float(model.D),
             v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D)),
             zoom_mask,
-            middle_mask,
-            middle_window,
             reduced_velocity=ur_val,
             tag_prefix=tag_prefix,
             step=step,
@@ -478,8 +403,6 @@ def _log_td_correction_hnn_rollout_validation(
             force_total_full[:n_force],
             force_true[:n_force],
             create_zoom_mask(force_t),
-            create_window_mask(force_t, middle_time_plot),
-            middle_window,
             reduced_velocity=ur_val,
             force_coeff_baseline=force_td_full[:n_force],
             baseline_label="C_F (Vivana-TD)",
@@ -497,10 +420,6 @@ def _run_hnn_validation(
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
-    rollout_every: int,
-    cycle_rollout: bool,
-    rollout_target_ur: float | None,
-    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
@@ -508,7 +427,6 @@ def _run_hnn_validation(
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
-    velocity_source = str(hnn_cfg.get("velocity_source", "compute")).strip().lower()
     rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
     rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
     if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
@@ -516,18 +434,13 @@ def _run_hnn_validation(
     rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
     rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
     loss_cfg = cfg.loss
-    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
-    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
-    equalize_residual_over_ur_bins = bool(getattr(loss_cfg, "equalize_residual_over_ur_bins", False))
-    equalize_rollout_over_ur_bins = bool(getattr(loss_cfg, "equalize_rollout_over_ur_bins", False))
     ur_bin_size = float(getattr(loss_cfg, "ur_bin_size", 1e-6))
-    normalize_residual_by_ur_bin_std = bool(getattr(loss_cfg, "normalize_residual_by_ur_bin_std", False))
-    normalize_rollout_by_ur_bin_std = bool(getattr(loss_cfg, "normalize_rollout_by_ur_bin_std", False))
+    normalize_by_ur_bin_std = bool(getattr(loss_cfg, "normalize_by_ur_bin_std", False))
     ur_bin_scale_eps = float(getattr(loss_cfg, "ur_bin_scale_eps", 1e-6))
     rollout_det_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_det_batch_size = int(cfg.training.batch_size) if rollout_det_batch_size_raw <= 0 else rollout_det_batch_size_raw
@@ -557,16 +470,13 @@ def _run_hnn_validation(
     if rollout_det_batch_size < 1:
         raise ValueError("loss.rollout_det_batch_size must be >= 1 after fallback resolution.")
 
-    if bool(getattr(data_cfg, "use_generated_train_series", False)):
-        val_dir = Path(data_cfg.train_series_dir) / "val"
-        if not val_dir.exists():
-            raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
-        val_files = sorted(val_dir.glob("*.npz"))
-        if not val_files:
-            raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
-        data_path = val_files[0]
-    else:
-        data_path = Path(data_cfg.file)
+    val_dir = Path(data_cfg.train_series_dir) / "val"
+    if not val_dir.exists():
+        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_files = sorted(val_dir.glob("*.npz"))
+    if not val_files:
+        raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
+    data_path = val_files[0]
 
     with np.load(data_path) as data:
         t = np.asarray(data["a"])
@@ -605,50 +515,27 @@ def _run_hnn_validation(
     D = float(derived["D"])
     k = float(derived["k"])
 
-    if bool(getattr(data_cfg, "use_generated_train_series", False)):
-        series_dir = Path(data_cfg.train_series_dir) / "val"
-        val_require_force = bool(getattr(loss_cfg, "use_force_data_loss", False) or has_force_data)
-        val_series_raw, _ = load_training_series(
-            y_data,
-            t,
-            dt,
-            True,
-            series_dir,
-            m_eff,
-            device,
-            smoothing_cfg=cfg.smoothing,
-            velocity_source=velocity_source,
-            eval_velocity=vel_data,
-            eval_reduced_velocity=reduced_velocity,
-            require_force=val_require_force,
-            eval_force=(F_data if has_force_data else None),
-            cut_start_seconds=val_cut,
-        )
-    else:
-        val_require_force = bool(getattr(loss_cfg, "use_force_data_loss", False) or has_force_data)
-        val_series_raw, _ = load_training_series(
-            y_data,
-            t,
-            dt,
-            False,
-            Path("."),
-            m_eff,
-            device,
-            smoothing_cfg=cfg.smoothing,
-            velocity_source=velocity_source,
-            eval_velocity=vel_data,
-            eval_reduced_velocity=reduced_velocity,
-            require_force=val_require_force,
-            eval_force=(F_data if has_force_data else None),
-            cut_start_seconds=val_cut,
-        )
+    series_dir = Path(data_cfg.train_series_dir) / "val"
+    val_require_force = bool(getattr(loss_cfg, "use_force_data_loss", False) or has_force_data)
+    val_series_raw, _ = load_training_series(
+        y_data,
+        t,
+        dt,
+        series_dir,
+        m_eff,
+        device,
+        eval_velocity=vel_data,
+        eval_reduced_velocity=reduced_velocity,
+        require_force=val_require_force,
+        eval_force=(F_data if has_force_data else None),
+        cut_start_seconds=val_cut,
+    )
 
     val_loader, val_sequences, _ = build_dataloader_from_series(
         val_series_raw,
         m_eff=m_eff,
         batch_size=int(cfg.training.batch_size),
         device=device,
-        smoothing_cfg=cfg.smoothing,
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
@@ -660,7 +547,6 @@ def _run_hnn_validation(
             m_eff=m_eff,
             batch_size=rollout_det_batch_size,
             device=device,
-            smoothing_cfg=cfg.smoothing,
             rollout_steps=rollout_det_steps,
             shuffle=False,
             num_workers=int(num_workers),
@@ -693,17 +579,14 @@ def _run_hnn_validation(
             mean_reg_norm=mean_reg_norm,
             sigma_reg=float(loss_cfg.sigma_reg),
             sigma_reg_norm=sigma_reg_norm,
-            equalize_residual_over_ur_bins=equalize_residual_over_ur_bins,
-            equalize_rollout_over_ur_bins=equalize_rollout_over_ur_bins,
             ur_bin_size=ur_bin_size,
-            normalize_residual_by_ur_bin_std=normalize_residual_by_ur_bin_std,
-            normalize_rollout_by_ur_bin_std=normalize_rollout_by_ur_bin_std,
+            normalize_residual_by_ur_bin_std=normalize_by_ur_bin_std,
+            normalize_rollout_by_ur_bin_std=normalize_by_ur_bin_std,
             ur_bin_state_scale_info=ur_bin_state_scale_info,
             rollout_det_weight=rollout_det_weight,
             rollout_loss_mode=rollout_loss_mode,
             rollout_stochastic_samples=rollout_stochastic_samples,
             rollout_noise_scale=rollout_noise_scale,
-            force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
             use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
             force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
             symmetry_weight=symmetry_weight,
@@ -718,40 +601,6 @@ def _run_hnn_validation(
                 continue
             writer.add_scalar(f"val/{name}", value_f, epoch)
             num_loss_scalars_written += 1
-        loss_by_ur = _per_ur_loss_map_hnn(
-            model=model,
-            loader=val_loader,
-            rollout_loader=val_rollout_loader,
-            device=device,
-            non_blocking=(device.type == "cuda"),
-            mean_reg=mean_reg,
-            mean_reg_norm=mean_reg_norm,
-            sigma_reg=float(loss_cfg.sigma_reg),
-            sigma_reg_norm=sigma_reg_norm,
-            normalize_residual_by_ur_bin_std=normalize_residual_by_ur_bin_std,
-            normalize_rollout_by_ur_bin_std=normalize_rollout_by_ur_bin_std,
-            ur_bin_state_scale_info=ur_bin_state_scale_info,
-            ur_bin_size=ur_bin_size,
-            rollout_det_weight=rollout_det_weight,
-            rollout_loss_mode=rollout_loss_mode,
-            rollout_stochastic_samples=rollout_stochastic_samples,
-            rollout_noise_scale=rollout_noise_scale,
-            force_reg_on_coeff=bool(getattr(loss_cfg, "force_reg_on_coeff", False)),
-            use_force_data_loss=bool(getattr(loss_cfg, "use_force_data_loss", False)),
-            force_data_weight=float(getattr(loss_cfg, "force_data_weight", 1.0)),
-            symmetry_weight=symmetry_weight,
-            symmetry_norm=symmetry_norm,
-            amp_enabled=amp_enabled,
-            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-        )
-        log_loss_vs_ur(
-            writer,
-            epoch,
-            loss_by_ur,
-            tag="val/loss_vs_ur",
-            title="Validation loss vs U_r",
-        )
-
     if do_rollout:
         metrics_sum: dict[str, float] = {}
         count = 0
@@ -761,7 +610,7 @@ def _run_hnn_validation(
         for idx in range(total):
             ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
             ur_for_sampling.append(float(ur_arr[0]) if ur_arr.size > 0 else float("nan"))
-        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sample_seed = 1
         sampled_indices = sample_indices_per_ur(
             ur_for_sampling,
             samples_per_ur=validation_samples_per_ur,
@@ -811,13 +660,8 @@ def _run_hnn_validation(
 
         ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
         rollout_idx = _rollout_index(
-            epoch,
-            rollout_every,
             len(val_series_raw),
-            cycle_rollout,
             ur_values=ur_values,
-            target_ur=rollout_target_ur,
-            target_ur_tol=rollout_target_ur_tol,
         )
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[rollout_idx]
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[rollout_idx]
@@ -859,10 +703,6 @@ def _run_hnn_td_correction_validation(
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
-    rollout_every: int,
-    cycle_rollout: bool,
-    rollout_target_ur: float | None,
-    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
@@ -893,6 +733,10 @@ def _run_hnn_td_correction_validation(
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     td_params = resolve_td_correction_params(hnn_cfg)
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
+    state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
+    if state_loss_mode not in {"mse", "propagated_nll"}:
+        raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
@@ -904,8 +748,6 @@ def _run_hnn_td_correction_validation(
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
-    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
-    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
 
     model_dict = asdict(cfg.model)
@@ -915,8 +757,8 @@ def _run_hnn_td_correction_validation(
     model_dict["k"] = float(np.asarray(first_val_traj["stiffness_n_m"]).reshape(()))
     model_dict["damping_c"] = float(np.asarray(first_val_traj["damping_c"]).reshape(()))
     model_dict["Ca"] = 0.0
-    model_dict["include_physical_drag"] = False
     model_dict["use_stochastic_process_noise"] = predict_sigma
+    model_dict["use_td_force_input"] = use_td_force_input
     arch_dict = asdict(cfg.architecture)
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
     _load_state(model, ckpt["model_state"])
@@ -965,6 +807,7 @@ def _run_hnn_td_correction_validation(
                     model,
                     z=z_i,
                     reduced_velocity=ur_i,
+                    td_force_input=td_force_next,
                     structural_mass=mass_i,
                     stiffness=stiffness_i,
                     predict_sigma=predict_sigma,
@@ -972,25 +815,27 @@ def _run_hnn_td_correction_validation(
                 )
                 dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
                 total_force_next = td_force_next + corr_mu
-                velocity_i = z_i[:, 1:2] / mass_i
-                y_next_mean, v_next_mean, _a_next = structural_step_constant_force_torch(
-                    y=z_i[:, 0:1],
-                    velocity=velocity_i,
-                    force=total_force_next,
-                    dt=dt_i,
-                    mass=mass_i,
-                    damping_c=damping_i,
-                    stiffness=stiffness_i,
-                )
-                z_next_mean = torch.cat([y_next_mean, v_next_mean * mass_i], dim=1)
-                if predict_sigma:
-                    var_p = torch.clamp((dt_i * sigma_corr) ** 2, min=1e-9)
-                    var_y = torch.clamp(((0.5 * (dt_i ** 2) / mass_i) * sigma_corr) ** 2, min=1e-9)
-                    nll_y = 0.5 * (((z_next[:, 0:1] - z_next_mean[:, 0:1]) ** 2) / var_y + torch.log(var_y))
-                    nll_p = 0.5 * (((z_next[:, 1:2] - z_next_mean[:, 1:2]) ** 2) / var_p + torch.log(var_p))
-                    state_loss = torch.mean(nll_y + nll_p)
+                if predict_sigma and state_loss_mode == "propagated_nll":
+                    state_loss, _z_next_mean = _td_state_propagated_nll_loss(
+                        z_i=z_i,
+                        dt_i=dt_i,
+                        z_next=z_next,
+                        total_force_next=total_force_next,
+                        sigma_corr=sigma_corr,
+                        mass_i=mass_i,
+                        damping_i=damping_i,
+                        stiffness_i=stiffness_i,
+                    )
                 else:
-                    state_loss = torch.mean(torch.sum((z_next_mean - z_next) ** 2, dim=1))
+                    state_loss, _z_next_mean = _td_state_mse_loss(
+                        z_i=z_i,
+                        dt_i=dt_i,
+                        z_next=z_next,
+                        total_force_next=total_force_next,
+                        mass_i=mass_i,
+                        damping_i=damping_i,
+                        stiffness_i=stiffness_i,
+                    )
                 if use_force_data_loss:
                     if predict_sigma:
                         var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
@@ -1030,27 +875,25 @@ def _run_hnn_td_correction_validation(
                     damping0 = damping0.to(device, non_blocking=(device.type == "cuda"))
                     stiffness0 = stiffness0.to(device, non_blocking=(device.type == "cuda"))
                     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
-                    z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+                    rollout_loss_sum += _td_correction_rollout_loss_from_batch(
                         model=model,
-                        z0=z0,
-                        ur0=ur0,
-                        td_context0=td_context0,
-                        steps=int(z_traj.shape[1] - 1),
-                        dt=dt_roll,
-                        structural_mass=mass0,
-                        damping_c=damping0,
-                        stiffness=stiffness0,
+                        batch=rollout_batch,
+                        device=device,
+                        non_blocking=(device.type == "cuda"),
                         td_params=td_params,
+                        predict_sigma=predict_sigma,
                         force_zero_output=force_zero_output,
-                    )
-                    rollout_loss_sum += torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2)).detach()
+                        rollout_loss_mode=rollout_loss_mode,
+                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
+                    ).detach()
                     rollout_count += 1
             writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch)
             num_loss_scalars_written += 1
 
     if do_rollout:
         ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs_np]
-        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sample_seed = 1
         sampled_metric_indices = sample_indices_per_ur(
             ur_values_all,
             samples_per_ur=validation_samples_per_ur,
@@ -1064,7 +907,6 @@ def _run_hnn_td_correction_validation(
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         diverged_count = 0
-        middle_time_plot = resolve_middle_time_plot(data_cfg, hnn_cfg, method_name="hnn")
         for sidx in sampled_metric_indices:
             metrics = _hnn_td_rollout_validation(
                 writer=writer,
@@ -1074,9 +916,12 @@ def _run_hnn_td_correction_validation(
                 dt=dt,
                 td_mass_source=td_mass_source,
                 td_params=td_params,
-                middle_time_plot=middle_time_plot,
                 device=device,
+                predict_sigma=predict_sigma,
                 force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
                 log_metrics=False,
                 log_plots=False,
             )
@@ -1095,13 +940,8 @@ def _run_hnn_td_correction_validation(
         num_rollout_scalars_written += 1
 
         rollout_idx = _rollout_index(
-            epoch,
-            rollout_every,
             len(val_trajs_np),
-            cycle_rollout,
             ur_values=ur_values_all,
-            target_ur=rollout_target_ur,
-            target_ur_tol=rollout_target_ur_tol,
         )
         rollout_traj = val_trajs_np[rollout_idx]
         rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
@@ -1121,9 +961,12 @@ def _run_hnn_td_correction_validation(
             dt=dt,
             td_mass_source=td_mass_source,
             td_params=td_params,
-            middle_time_plot=middle_time_plot,
             device=device,
+            predict_sigma=predict_sigma,
             force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
             log_metrics=False,
             log_plots=True,
         )
@@ -1141,10 +984,6 @@ def _run_vpinn_validation(
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
-    rollout_every: int,
-    cycle_rollout: bool,
-    rollout_target_ur: float | None,
-    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
@@ -1152,9 +991,6 @@ def _run_vpinn_validation(
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
-    velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
-    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
-    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     force_representation = str(vp.get("force_representation", "force")).strip().lower()
     if force_representation not in {"force", "coefficient"}:
@@ -1162,23 +998,20 @@ def _run_vpinn_validation(
     num_poly = int(vp.get("num_poly_test", 2))
     num_sine = int(vp.get("num_sine_test", 0))
 
-    if bool(getattr(data_cfg, "use_generated_train_series", False)):
-        val_dir = Path(data_cfg.train_series_dir) / "val"
-        if not val_dir.exists():
-            raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
-        val_files = sorted(val_dir.glob("*.npz"))
-        if not val_files:
-            raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
-        sources = val_files
-    else:
-        sources = [Path(data_cfg.file)]
+    val_dir = Path(data_cfg.train_series_dir) / "val"
+    if not val_dir.exists():
+        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_files = sorted(val_dir.glob("*.npz"))
+    if not val_files:
+        raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
+    sources = val_files
 
     val_trajs: list[dict[str, Any]] = []
     dt_ref: Optional[float] = None
     cut_start_seconds = float(
         data_cfg.cut_start_seconds_val
         if getattr(data_cfg, "cut_start_seconds_val", None) is not None
-        else getattr(data_cfg, "cut_start_seconds", 0.0)
+        else 0.0
     )
     dt_target = vp.get("dt_target", None)
     if dt_target is None:
@@ -1191,8 +1024,6 @@ def _run_vpinn_validation(
         traj, dt = _load_trajectory(
             path=path,
             dt_target=dt_target,
-            velocity_source=velocity_source,
-            smoothing_cfg=cfg.smoothing,
             reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
             reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
             cut_start_seconds=cut_start_seconds,
@@ -1289,36 +1120,9 @@ def _run_vpinn_validation(
         if force_map is not None:
             for k_name, v_value in force_map.items():
                 writer.add_scalar(f"val/{k_name}", v_value, epoch)
-        loss_by_ur = _per_ur_loss_map_vpinn(
-            model=model,
-            loader=val_loader,
-            device=device,
-            non_blocking=(device.type == "cuda"),
-            dt=dt,
-            m=m,
-            c=c,
-            k=k,
-            w=w,
-            wdot=wdot,
-            alpha=alpha,
-            use_force_loss=bool(vp.get("use_force_loss", True)),
-            use_weak_loss=bool(vp.get("use_weak_loss", True)),
-            rollout_force_steps=int(vp.get("rollout_force_steps", 0)),
-            expect_f0=(force_representation == "coefficient"),
-            amp_enabled=amp_enabled,
-            amp_dtype=_amp_dtype(cfg.precision.amp_dtype),
-        )
-        log_loss_vs_ur(
-            writer,
-            epoch,
-            loss_by_ur,
-            tag="val/loss_vs_ur",
-            title="Validation loss vs U_r",
-        )
-
     if do_rollout:
         ur_values_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
-        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sample_seed = 1
         sampled_metric_indices = sample_indices_per_ur(
             ur_values_all,
             samples_per_ur=validation_samples_per_ur,
@@ -1353,13 +1157,8 @@ def _run_vpinn_validation(
 
         ur_values = ur_values_all
         rollout_idx = _rollout_index(
-            epoch,
-            rollout_every,
             len(val_trajs),
-            cycle_rollout,
             ur_values=ur_values,
-            target_ur=rollout_target_ur,
-            target_ur_tol=rollout_target_ur_tol,
         )
         _log_rollout_validation(
             writer=writer,
@@ -1385,10 +1184,6 @@ def _run_vpinn_td_correction_validation(
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
-    rollout_every: int,
-    cycle_rollout: bool,
-    rollout_target_ur: float | None,
-    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
@@ -1399,6 +1194,12 @@ def _run_vpinn_td_correction_validation(
     probabilistic = bool(vp.get("predict_sigma", False))
     force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
+    rollout_stochastic = bool(vp.get("rollout_stochastic", False))
+    rollout_noise_scale = float(vp.get("rollout_noise_scale", 1.0))
+    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
+        raise ValueError("vpinn.rollout_noise_scale must be finite and non-negative.")
+    rollout_seed_raw = vp.get("rollout_seed", None)
+    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
     td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
     if td_mass_source not in {"dry", "effective"}:
         raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
@@ -1422,13 +1223,16 @@ def _run_vpinn_td_correction_validation(
     rho = float(getattr(cfg.model, "rho", 1000.0))
     diameter = float(getattr(cfg.model, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
+    use_td_force_input = bool(vp.get("use_td_force_input", False))
 
-    model = _build_force_model(cfg, input_dim=3, output_dim=(2 if probabilistic else 1)).to(device)
+    model = _build_force_model(cfg, input_dim=(4 if use_td_force_input else 3), output_dim=(2 if probabilistic else 1)).to(device)
+    setattr(model, "use_td_force_input", use_td_force_input)
     _load_state(model, ckpt["model_state"])
     model.eval()
 
-    window_M = int(vp.get("window_M", 50))
-    stride = max(1, int(vp.get("stride", 1)))
+    loss_cfg = cfg.loss
+    window_M = int(vp.get("window_M", getattr(loss_cfg, "window_M", 50)))
+    stride = max(1, int(vp.get("stride", getattr(loss_cfg, "stride", 1))))
     rollout_steps = int(vp.get("rollout_force_steps", int(getattr(cfg.loss, "rollout_det_steps", 0))))
     val_dataset, val_rollout_dataset = _build_td_correction_vpinn_datasets(
         trajs=val_trajs_np,
@@ -1458,17 +1262,20 @@ def _run_vpinn_td_correction_validation(
         else None
     )
 
-    mean_reg = float(getattr(cfg.loss, "mean_reg", 0.0))
-    sigma_reg = float(getattr(cfg.loss, "sigma_reg", 0.0))
-    mean_reg_norm = str(getattr(cfg.loss, "mean_reg_norm", "l1")).strip().lower()
-    sigma_reg_norm = str(getattr(cfg.loss, "sigma_reg_norm", "l2")).strip().lower()
-    use_force_loss = bool(vp.get("use_force_loss", True))
-    use_weak_loss = bool(vp.get("use_weak_loss", True))
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
+    ur_bin_size = float(getattr(cfg.loss, "ur_bin_size", 1.0e-6))
+    normalize_by_ur_bin_std = bool(getattr(loss_cfg, "normalize_by_ur_bin_std", False))
+    ur_bin_state_scale_info = ckpt.get("ur_bin_state_scale_info", None)
+    use_force_loss = bool(vp.get("use_force_loss", getattr(loss_cfg, "use_force_loss", True)))
+    use_weak_loss = bool(vp.get("use_weak_loss", getattr(loss_cfg, "use_weak_loss", True)))
     w, wdot, alpha = _test_functions(
-        int(vp.get("window_M", 50)),
+        window_M,
         dt,
-        num_poly=int(vp.get("num_poly_test", 2)),
-        num_sine=int(vp.get("num_sine_test", 0)),
+        num_poly=int(vp.get("num_poly_test", getattr(loss_cfg, "num_poly_test", 2))),
+        num_sine=int(vp.get("num_sine_test", getattr(loss_cfg, "num_sine_test", 0))),
     )
     w = w.to(device)
     wdot = wdot.to(device)
@@ -1490,6 +1297,7 @@ def _run_vpinn_td_correction_validation(
                     x_win,
                     v_win,
                     ur_win,
+                    td_force,
                     probabilistic=probabilistic,
                     sigma_min=sigma_min,
                     force_zero_output=force_zero_output,
@@ -1517,9 +1325,20 @@ def _run_vpinn_td_correction_validation(
                         alpha=alpha,
                         f0=None,
                     )
+                    p_scale = None
+                    if normalize_by_ur_bin_std:
+                        R_mean, p_scale = _vpinn_scale_weak_residual(
+                            R_mean,
+                            ur_values=ur_win[:, 0, :],
+                            mass=m_win[:, 0, :],
+                            scale_info=ur_bin_state_scale_info,
+                            ur_bin_size=ur_bin_size,
+                        )
                     if probabilistic:
                         coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
                         weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                        if p_scale is not None:
+                            weak_var = weak_var / torch.clamp(p_scale.unsqueeze(1) ** 2, min=1e-12)
                         weak_var = torch.clamp(weak_var, min=1e-9)
                         loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
                     else:
@@ -1543,7 +1362,7 @@ def _run_vpinn_td_correction_validation(
         for name, value in val_sums.items():
             writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch)
 
-        if val_rollout_loader is not None and float(vp.get("rollout_force_weight", float(getattr(cfg.loss, "rollout_det_weight", 0.0)))) > 0.0 and rollout_steps > 0:
+        if val_rollout_loader is not None and float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0)))) > 0.0 and rollout_steps > 0:
             roll_sum = torch.zeros((), device=device)
             roll_batches = 0
             with torch.no_grad():
@@ -1569,16 +1388,22 @@ def _run_vpinn_td_correction_validation(
                         sigma_min=sigma_min,
                         force_zero_output=force_zero_output,
                     )
-                    roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
+                    roll_sum += _vpinn_rollout_state_loss(
+                        x_pred=x_seq,
+                        v_pred=v_seq,
+                        x_true=x_true_seq,
+                        v_true=v_true_seq,
+                        ur_values=ur0,
+                        scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
+                        ur_bin_size=ur_bin_size,
+                    ).detach()
                     roll_batches += 1
             writer.add_scalar("val/loss_rollout_det", float((roll_sum / float(max(1, roll_batches))).detach().cpu()), epoch)
 
     if do_rollout:
-        fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
-        validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
         validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
         ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs_np]
-        sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
+        sample_seed = 1
         sampled_metric_indices = sample_indices_per_ur(
             ur_values_all,
             samples_per_ur=validation_samples_per_ur,
@@ -1592,7 +1417,6 @@ def _run_vpinn_td_correction_validation(
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
         diverged_count = 0
-        middle_time_plot = resolve_middle_time_plot(data_cfg, vp, method_name="vpinn")
         val_trajs_plot = [_td_rollout_traj_to_tensors(traj) for traj in val_trajs_np]
         for sidx in sampled_metric_indices:
             metrics = _log_td_correction_rollout_validation(
@@ -1605,11 +1429,13 @@ def _run_vpinn_td_correction_validation(
                 rho=rho,
                 diameter=diameter,
                 td_params=td_params,
-                middle_time_plot=middle_time_plot,
                 device=device,
                 sigma_min=sigma_min,
                 probabilistic=probabilistic,
                 force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
                 log_metrics=False,
                 log_plots=False,
             )
@@ -1626,13 +1452,8 @@ def _run_vpinn_td_correction_validation(
         writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
 
         rollout_idx = _rollout_index(
-            epoch,
-            rollout_every,
             len(val_trajs_plot),
-            cycle_rollout,
             ur_values=ur_values_all,
-            target_ur=rollout_target_ur,
-            target_ur_tol=rollout_target_ur_tol,
         )
         rollout_traj = val_trajs_plot[rollout_idx]
         print(
@@ -1653,11 +1474,13 @@ def _run_vpinn_td_correction_validation(
             rho=rho,
             diameter=diameter,
             td_params=td_params,
-            middle_time_plot=middle_time_plot,
             device=device,
             sigma_min=sigma_min,
             probabilistic=probabilistic,
             force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
             log_metrics=False,
             log_plots=True,
         )
@@ -1674,8 +1497,6 @@ def _evaluate_val_losses(
     mean_reg_norm: str,
     sigma_reg: float,
     sigma_reg_norm: str,
-    equalize_residual_over_ur_bins: bool,
-    equalize_rollout_over_ur_bins: bool,
     ur_bin_size: float,
     normalize_residual_by_ur_bin_std: bool,
     normalize_rollout_by_ur_bin_std: bool,
@@ -1690,7 +1511,6 @@ def _evaluate_val_losses(
     symmetry_norm: str,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-    force_reg_on_coeff: bool,
 ) -> dict[str, float]:
     model.eval()
     # Keep validation rollout-loss estimation deterministic to control cost and variance.
@@ -1706,24 +1526,6 @@ def _evaluate_val_losses(
     rollout_det_sum = torch.zeros((), device=device)
     batches = 0
     rollout_iter = iter(rollout_loader) if (rollout_loader is not None and float(rollout_det_weight) > 0.0) else None
-    residual_ur_bin_counts = (
-        _collect_ur_bin_counts_from_dataset(
-            loader.dataset,
-            ur_tensor_index=4,
-            ur_bin_size=ur_bin_size,
-        )
-        if equalize_residual_over_ur_bins
-        else None
-    )
-    rollout_ur_bin_counts = (
-        _collect_ur_bin_counts_from_dataset(
-            rollout_loader.dataset,
-            ur_tensor_index=3,
-            ur_bin_size=ur_bin_size,
-        )
-        if equalize_rollout_over_ur_bins and rollout_loader is not None and float(rollout_det_weight) > 0.0
-        else None
-    )
     with torch.no_grad():
         for batch in loader:
             z_i, t_i, z_next, t_next, ur_i, _history_i, f_i, f_next, _scale = _parse_hnn_batch(batch)
@@ -1737,7 +1539,7 @@ def _evaluate_val_losses(
             if f_next is not None:
                 f_next = f_next.to(device, non_blocking=non_blocking)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                if equalize_residual_over_ur_bins or normalize_residual_by_ur_bin_std:
+                if normalize_residual_by_ur_bin_std:
                     per_res = scaled_residual_loss_per_sample(
                         model,
                         z_i,
@@ -1748,31 +1550,17 @@ def _evaluate_val_losses(
                     )
                 else:
                     per_res = None
-                if equalize_residual_over_ur_bins:
-                    res_loss = _weighted_mean_by_ur_bins(
-                        per_res if per_res is not None else model.res_loss_per_sample(
-                            z_i,
-                            t_i,
-                            z_next,
-                            t_next,
-                            reduced_velocity=ur_i,
-                        ),
-                        ur_i,
-                        ur_bin_counts=residual_ur_bin_counts,
-                        ur_bin_size=ur_bin_size,
+                res_loss = (
+                    torch.mean(per_res)
+                    if per_res is not None
+                    else model.res_loss(
+                        z_i,
+                        t_i,
+                        z_next,
+                        t_next,
+                        reduced_velocity=ur_i,
                     )
-                else:
-                    res_loss = (
-                        torch.mean(per_res)
-                        if per_res is not None
-                        else model.res_loss(
-                            z_i,
-                            t_i,
-                            z_next,
-                            t_next,
-                            reduced_velocity=ur_i,
-                        )
-                    )
+                )
                 sigma_reg_loss = model.avg_sigma_reg_SRK4(
                     z_i,
                     t_i,
@@ -1788,7 +1576,6 @@ def _evaluate_val_losses(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
-                    on_coeff=force_reg_on_coeff,
                 )
                 sigma_loss = float(sigma_reg) * sigma_reg_loss
                 mean_loss_reg = float(mean_reg) * mean_reg_loss
@@ -1841,38 +1628,17 @@ def _evaluate_val_losses(
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rollout_batch = next(rollout_iter)
-                    if equalize_rollout_over_ur_bins:
-                        per_rollout = _rollout_loss_from_batch(
-                            model=model,
-                            batch=rollout_batch,
-                            device=device,
-                            non_blocking=non_blocking,
-                            rollout_loss_mode=val_rollout_loss_mode,
-                            rollout_stochastic_samples=val_rollout_stochastic_samples,
-                            rollout_noise_scale=rollout_noise_scale,
-                            ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_rollout_by_ur_bin_std else None),
-                            ur_bin_size=ur_bin_size,
-                            return_per_sample=True,
-                        )
-                        _z0, _t_seq, _z_traj, ur0, _history0, _scale = _parse_rollout_batch(rollout_batch)
-                        rollout_det_loss = _weighted_mean_by_ur_bins(
-                            per_rollout,
-                            ur0,
-                            ur_bin_counts=rollout_ur_bin_counts,
-                            ur_bin_size=ur_bin_size,
-                        )
-                    else:
-                        rollout_det_loss = _rollout_loss_from_batch(
-                            model=model,
-                            batch=rollout_batch,
-                            device=device,
-                            non_blocking=non_blocking,
-                            rollout_loss_mode=val_rollout_loss_mode,
-                            rollout_stochastic_samples=val_rollout_stochastic_samples,
-                            rollout_noise_scale=rollout_noise_scale,
-                            ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_rollout_by_ur_bin_std else None),
-                            ur_bin_size=ur_bin_size,
-                        )
+                    rollout_det_loss = _rollout_loss_from_batch(
+                        model=model,
+                        batch=rollout_batch,
+                        device=device,
+                        non_blocking=non_blocking,
+                        rollout_loss_mode=val_rollout_loss_mode,
+                        rollout_stochastic_samples=val_rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
+                        ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_rollout_by_ur_bin_std else None),
+                        ur_bin_size=ur_bin_size,
+                    )
                 else:
                     rollout_det_loss = res_loss.new_tensor(0.0)
                 total = total + float(rollout_det_weight) * rollout_det_loss
@@ -1909,8 +1675,6 @@ def _per_ur_loss_map_hnn(
     mean_reg_norm: str,
     sigma_reg: float,
     sigma_reg_norm: str,
-    equalize_residual_over_ur_bins: bool = False,
-    equalize_rollout_over_ur_bins: bool = False,
     normalize_residual_by_ur_bin_std: bool,
     normalize_rollout_by_ur_bin_std: bool,
     ur_bin_state_scale_info: dict[str, Any] | None,
@@ -1919,7 +1683,6 @@ def _per_ur_loss_map_hnn(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
-    force_reg_on_coeff: bool,
     use_force_data_loss: bool,
     force_data_weight: float,
     symmetry_weight: float,
@@ -1987,7 +1750,6 @@ def _per_ur_loss_map_hnn(
                     t_next,
                     reduced_velocity=ur_i,
                     norm=mean_reg_norm,
-                    on_coeff=force_reg_on_coeff,
                 )
                 per_reg = float(sigma_reg) * per_sigma_reg
                 per_reg_mean = float(mean_reg) * per_mean_reg
@@ -2200,10 +1962,6 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--rollout-every", type=int, default=1)
-    parser.add_argument("--cycle-rollout", type=int, default=0)
-    parser.add_argument("--rollout-target-ur", type=float, default=None)
-    parser.add_argument("--rollout-target-ur-tol", type=float, default=1e-6)
     parser.add_argument("--do-losses", type=int, default=1)
     parser.add_argument("--do-rollout", type=int, default=1)
     args = parser.parse_args()
@@ -2217,67 +1975,31 @@ def main() -> None:
     try:
         validation_start = time.perf_counter()
         if method in {"hnn", "phnn"}:
-            if bool(ckpt.get("td_correction", False)):
-                _run_hnn_td_correction_validation(
-                    ckpt=ckpt,
-                    cfg=cfg,
-                    device=device,
-                    writer=writer,
-                    epoch=int(args.epoch),
-                    rollout_every=int(args.rollout_every),
-                    cycle_rollout=bool(int(args.cycle_rollout)),
-                    rollout_target_ur=args.rollout_target_ur,
-                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
-                    do_losses=bool(int(args.do_losses)),
-                    do_rollout=bool(int(args.do_rollout)),
-                    num_workers=int(args.num_workers),
-                )
-            else:
-                _run_hnn_validation(
-                    ckpt=ckpt,
-                    cfg=cfg,
-                    device=device,
-                    writer=writer,
-                    epoch=int(args.epoch),
-                    rollout_every=int(args.rollout_every),
-                    cycle_rollout=bool(int(args.cycle_rollout)),
-                    rollout_target_ur=args.rollout_target_ur,
-                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
-                    do_losses=bool(int(args.do_losses)),
-                    do_rollout=bool(int(args.do_rollout)),
-                    num_workers=int(args.num_workers),
-                )
+            if not bool(ckpt.get("td_correction", False)):
+                raise ValueError("PHNN async validation now only supports TD-correction checkpoints.")
+            _run_hnn_td_correction_validation(
+                ckpt=ckpt,
+                cfg=cfg,
+                device=device,
+                writer=writer,
+                epoch=int(args.epoch),
+                do_losses=bool(int(args.do_losses)),
+                do_rollout=bool(int(args.do_rollout)),
+                num_workers=int(args.num_workers),
+            )
         elif method == "vpinn":
-            if bool(ckpt.get("td_correction", False)):
-                _run_vpinn_td_correction_validation(
-                    ckpt=ckpt,
-                    cfg=cfg,
-                    device=device,
-                    writer=writer,
-                    epoch=int(args.epoch),
-                    rollout_every=int(args.rollout_every),
-                    cycle_rollout=bool(int(args.cycle_rollout)),
-                    rollout_target_ur=args.rollout_target_ur,
-                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
-                    do_losses=bool(int(args.do_losses)),
-                    do_rollout=bool(int(args.do_rollout)),
-                    num_workers=int(args.num_workers),
-                )
-            else:
-                _run_vpinn_validation(
-                    ckpt=ckpt,
-                    cfg=cfg,
-                    device=device,
-                    writer=writer,
-                    epoch=int(args.epoch),
-                    rollout_every=int(args.rollout_every),
-                    cycle_rollout=bool(int(args.cycle_rollout)),
-                    rollout_target_ur=args.rollout_target_ur,
-                    rollout_target_ur_tol=float(args.rollout_target_ur_tol),
-                    do_losses=bool(int(args.do_losses)),
-                    do_rollout=bool(int(args.do_rollout)),
-                    num_workers=int(args.num_workers),
-                )
+            if not bool(ckpt.get("td_correction", False)):
+                raise ValueError("VPINN async validation now only supports TD-correction checkpoints.")
+            _run_vpinn_td_correction_validation(
+                ckpt=ckpt,
+                cfg=cfg,
+                device=device,
+                writer=writer,
+                epoch=int(args.epoch),
+                do_losses=bool(int(args.do_losses)),
+                do_rollout=bool(int(args.do_rollout)),
+                num_workers=int(args.num_workers),
+            )
         else:
             raise ValueError(f"Unsupported method '{method}'.")
         elapsed = time.perf_counter() - validation_start

@@ -55,19 +55,12 @@ SIGNED_PHASE_CMAP = LinearSegmentedColormap.from_list(
 
 @dataclass
 class DataConfig:
-    file: str = "data.npz"
-    steadystate: bool = False
-    steadystate_time_threshold: float = 10.0
     # Cut away the first N seconds from each time series (relative to the series start).
-    # Applied during both training and validation loading.
-    cut_start_seconds: float = 0.0
-    # Optional overrides for training/validation splits (fallback to cut_start_seconds when unset).
+    # Configure train/validation independently.
     cut_start_seconds_train: float | None = None
     cut_start_seconds_val: float | None = None
     reduce_time: bool = False
     reduction_factor: int = 1
-    middle_time_plot: list[float] = field(default_factory=lambda: [15.0, 17.0])
-    use_generated_train_series: bool = False
     train_series_dir: str = "Data_Gen/generated_series"
 
 @dataclass
@@ -77,21 +70,10 @@ class ModelConfig:
     structural_mass: float = 16.79
     Ca: float = 1.0
     k: float = 1218.0
-    U: float = 0.65
     damping_c: float = 1e-4
-    max_damping_ratio: float = 0.2
-    include_physical_drag: bool = False
     force_output: str = "force"  # "force" or "coefficient"
-    learn_hamiltonian: bool = False
-    discover_damping: bool = False
-    use_pirate_force: bool = False
-    pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
-    use_fourier_features: bool = False
-    fourier_features: int = 64
-    fourier_sigma: float = 1.0
-    use_feature_engineering: bool = False
     use_reduced_velocity: bool = True
-    use_stochastic_process_noise: bool = True
+    use_td_force_input: bool = False
     sigma_min: float = 1e-6
     corr_init_mode: str = "zero"  # "zero" | "tiny" | "standard"
     corr_init_tiny_std: float = 1e-4
@@ -110,15 +92,12 @@ def _default_mlp_kwargs() -> dict[str, Any]:
 @dataclass
 class ArchitectureConfig:
     force_net_type: str = "residual"
+    use_fourier_features: bool = False
+    fourier_features: int = 64
+    fourier_sigma: float = 1.0
     residual_kwargs: dict[str, Any] = field(default_factory=_default_residual_kwargs)
     mlp_kwargs: dict[str, Any] = field(default_factory=_default_mlp_kwargs)
     pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class SmoothingConfig:
-    use_savgol_smoothing: bool = True
-    window_length: int = 15
-    polyorder: int = 4
 
 @dataclass
 class SchedulerConfig:
@@ -147,15 +126,20 @@ class OptimConfig:
 
 @dataclass
 class LossConfig:
+    use_force_loss: bool = True
+    use_weak_loss: bool = True
+    window_M: int = 50
+    stride: int = 1
+    wf: float = 1.0
+    ww: float = 1.0
+    num_poly_test: int = 2
+    num_sine_test: int = 0
     mean_reg: float = 0.0
     mean_reg_norm: str = "l1"  # "l1" or "l2"
     sigma_reg: float = 1e-2
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
-    equalize_residual_over_ur_bins: bool = False
-    equalize_rollout_over_ur_bins: bool = False
     ur_bin_size: float = 1e-6
-    normalize_residual_by_ur_bin_std: bool = False
-    normalize_rollout_by_ur_bin_std: bool = False
+    normalize_by_ur_bin_std: bool = False
     ur_bin_scale_eps: float = 1e-6
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
@@ -164,12 +148,12 @@ class LossConfig:
     rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
-    force_reg_on_coeff: bool = False
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
     gradnorm_eps: float = 1e-8
     gradnorm_min_weight: float = 0.1
     gradnorm_max_weight: float = 10.0
+    gradnorm_update_every_steps: int = 1
     use_force_data_loss: bool = False
     force_data_weight: float = 1.0
     symmetry_weight: float = 0.0
@@ -193,27 +177,18 @@ class CompileConfig:
 
 @dataclass
 class MonitoringConfig:
-    rollout_every_epochs: int = 50
     validate_every_epochs: int = 10
-    rollout_max_trajectories: int = 1
     log_every_epochs: int = 1
     print_every_epochs: int = 1
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
-    cycle_validation_rollout: bool = False
-    fixed_validation_sampling: bool = False
-    validation_sampling_seed: int = 1
     validation_samples_per_ur: int = 1
-    rollout_use_excluded_ur: bool = False
-    rollout_target_ur_tol: float = 1e-6
     final_rollout_all_validation: bool = False
     async_validation: bool = False
     async_validation_device: str = "cpu"
     async_validation_num_workers: int = 0
     async_validation_num_threads: int = 4
     async_validation_max_concurrent: int = 1
-    async_validation_do_losses: bool = True
-    async_validation_do_rollout: bool = True
 
 @dataclass
 class LoggingConfig:
@@ -227,7 +202,6 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
-    smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     loss: LossConfig = field(default_factory=LossConfig)
@@ -265,7 +239,6 @@ def parse_config(raw: dict[str, Any]) -> Config:
     data_cfg = raw.get("data", {}) or {}
     model_cfg = raw.get("model", {}) or {}
     architecture_cfg = dict(raw.get("architecture", {}) or {})
-    smoothing_cfg = raw.get("smoothing", {}) or {}
     training_cfg = dict(raw.get("training", {}) or {})
     optim_cfg = dict(raw.get("optim", {}) or {})
     loss_cfg = dict(raw.get("loss", {}) or {})
@@ -287,6 +260,10 @@ def parse_config(raw: dict[str, Any]) -> Config:
                 "PHNN is now markovian-only. Remove these history-dependent model keys: "
                 f"{joined}"
             )
+
+    for legacy_key in ("use_fourier_features", "fourier_features", "fourier_sigma"):
+        if legacy_key in model_cfg and legacy_key not in architecture_cfg:
+            architecture_cfg[legacy_key] = model_cfg.pop(legacy_key)
 
     legacy_residual: dict[str, Any] = {}
     if "residual_hidden" in architecture_cfg:
@@ -329,20 +306,34 @@ def parse_config(raw: dict[str, Any]) -> Config:
     pirate_kwargs.update(pirate_overrides)
     architecture_cfg["pirate_force_kwargs"] = pirate_kwargs
 
+    if "normalize_by_ur_bin_std" not in loss_cfg:
+        loss_cfg["normalize_by_ur_bin_std"] = bool(
+            loss_cfg.pop("normalize_residual_by_ur_bin_std", False)
+            or loss_cfg.pop("normalize_rollout_by_ur_bin_std", False)
+        )
+    else:
+        loss_cfg.pop("normalize_residual_by_ur_bin_std", None)
+        loss_cfg.pop("normalize_rollout_by_ur_bin_std", None)
+
     # Backwards compatible mapping: allow legacy keys to live under training:
     legacy_training = dict(training_cfg)
     optim_keys = {"lr", "optimizer", "weight_decay", "use_lr_scheduler", "scheduler"}
     loss_keys = {
+        "use_force_loss",
+        "use_weak_loss",
+        "window_M",
+        "stride",
+        "wf",
+        "ww",
+        "num_poly_test",
+        "num_sine_test",
         "mean_reg",
         "mean_reg_norm",
         "sigma_reg",
         "force_reg",
         "sigma_reg_norm",
-        "equalize_residual_over_ur_bins",
-        "equalize_rollout_over_ur_bins",
         "ur_bin_size",
-        "normalize_residual_by_ur_bin_std",
-        "normalize_rollout_by_ur_bin_std",
+        "normalize_by_ur_bin_std",
         "ur_bin_scale_eps",
         "rollout_det_weight",
         "rollout_det_steps",
@@ -351,12 +342,12 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "rollout_det_steps_final",
         "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
-        "force_reg_on_coeff",
         "use_gradnorm",
         "gradnorm_alpha",
         "gradnorm_eps",
         "gradnorm_min_weight",
         "gradnorm_max_weight",
+        "gradnorm_update_every_steps",
         "use_force_data_loss",
         "force_data_weight",
         "symmetry_weight",
@@ -367,18 +358,12 @@ def parse_config(raw: dict[str, Any]) -> Config:
     compile_keys = {"use_compile", "compile_mode"}
     monitoring_keys = {
         "rollout_every_epoch",
-        "rollout_every_epochs",
         "validate_every_epochs",
-        "rollout_max_trajectories",
         "log_every_epochs",
         "print_every_epochs",
         "log_component_grad_norms",
         "log_extra_validation_metrics",
-        "fixed_validation_sampling",
-        "validation_sampling_seed",
         "validation_samples_per_ur",
-        "rollout_use_excluded_ur",
-        "rollout_target_ur_tol",
     }
 
     for key, value in legacy_training.items():
@@ -400,7 +385,6 @@ def parse_config(raw: dict[str, Any]) -> Config:
     data = DataConfig(**data_cfg)
     model = ModelConfig(**model_cfg)
     architecture = ArchitectureConfig(**architecture_cfg)
-    smoothing = SmoothingConfig(**smoothing_cfg)
     training = TrainingConfig(**training_cfg)
 
     scheduler_dict = optim_cfg.get("scheduler", {}) or {}
@@ -414,9 +398,16 @@ def parse_config(raw: dict[str, Any]) -> Config:
     runtime = RuntimeConfig(**runtime_cfg)
     precision = PrecisionConfig(**precision_cfg)
     compile_cfg_obj = CompileConfig(**compile_cfg)
-    # Back-compat key: `rollout_every_epoch` -> `rollout_every_epochs`
-    if "rollout_every_epochs" not in monitoring_cfg and "rollout_every_epoch" in monitoring_cfg:
-        monitoring_cfg["rollout_every_epochs"] = monitoring_cfg.pop("rollout_every_epoch")
+    monitoring_cfg.pop("rollout_every_epoch", None)
+    monitoring_cfg.pop("rollout_every_epochs", None)
+    monitoring_cfg.pop("rollout_max_trajectories", None)
+    monitoring_cfg.pop("cycle_validation_rollout", None)
+    monitoring_cfg.pop("fixed_validation_sampling", None)
+    monitoring_cfg.pop("validation_sampling_seed", None)
+    monitoring_cfg.pop("rollout_use_excluded_ur", None)
+    monitoring_cfg.pop("rollout_target_ur_tol", None)
+    monitoring_cfg.pop("async_validation_do_losses", None)
+    monitoring_cfg.pop("async_validation_do_rollout", None)
     # Removed monitoring toggles: keep old configs loadable by ignoring stale keys.
     monitoring_cfg.pop("rollout_include_disp_nrmse", None)
     monitoring_cfg.pop("rollout_include_force_nrmse", None)
@@ -427,7 +418,6 @@ def parse_config(raw: dict[str, Any]) -> Config:
         data=data,
         model=model,
         architecture=architecture,
-        smoothing=smoothing,
         training=training,
         optim=optim,
         loss=loss,
@@ -649,7 +639,6 @@ def log_validation_epoch(
     D: float,
     k: float,
     device: torch.device,
-    middle_time_plot: list[float] | tuple[float, float],
     hamiltonian_data: np.ndarray | None,
     *,
     log_extra_metrics: bool = False,
@@ -706,7 +695,6 @@ def log_validation_epoch(
                 continue
             writer.add_scalar(f"val/{name}", value, epoch)
     zoom_mask = create_zoom_mask(t)
-    middle_mask = create_window_mask(t, middle_time_plot)
     log_displacement_plots(
         writer,
         epoch,
@@ -715,8 +703,6 @@ def log_validation_epoch(
         rollout["y_norm"],
         rollout["p_norm"],
         zoom_mask,
-        middle_mask,
-        middle_time_plot,
         reduced_velocity=reduced_velocity_scalar,
         tag_prefix=tag_prefix,
         step=step,
@@ -1367,28 +1353,22 @@ class PHVIV(nn.Module):
         dt,
         m=16.79,
         k=1218.0,
-        U=0.65,
         rho=1000.0,
         D=0.1,
         q_scale=0.1,
         p_scale=10.0,
-        max_damping_ratio=0.2,
-        discover_damping: bool = False,
         damping_c: float | None = None,
-        include_physical_drag: bool = True,
         force_output: str = "force",
-        learn_hamiltonian: bool = False,
-        use_pirate_force: bool = False,
-        pirate_force_kwargs: dict | None = None,
         use_fourier_features: bool = False,
         fourier_features: int = 64,
         fourier_sigma: float = 1.0,
-        use_feature_engineering: bool = False,
         use_reduced_velocity: bool = True,
+        use_td_force_input: bool = False,
         use_stochastic_process_noise: bool = True,
         sigma_min: float = 1e-6,
         ur_scale: float | None = None,
         force_net_type: str | None = None,
+        arch_pirate_force_kwargs: dict[str, Any] | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
     ):
@@ -1396,21 +1376,16 @@ class PHVIV(nn.Module):
         self.dt = dt
         self.m = m
         self.k = k
-        self.U = U
         self.rho = rho
         self.D = D
-        self.register_buffer("max_damping_ratio", torch.tensor(float(max_damping_ratio), dtype=torch.float32))
         self.q_scale = q_scale
         self.p_scale = p_scale
-        self.discover_damping = bool(discover_damping)
-        self.include_physical_drag = bool(include_physical_drag)
         force_output = str(force_output).strip().lower()
         if force_output not in {"force", "coefficient"}:
             raise ValueError("force_output must be one of: force, coefficient")
         self.force_output = force_output
-        self.learn_hamiltonian = bool(learn_hamiltonian)
-        self.use_feature_engineering = bool(use_feature_engineering)
         self.use_reduced_velocity = bool(use_reduced_velocity)
+        self.use_td_force_input = bool(use_td_force_input)
         self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
         sigma_min_val = float(sigma_min)
         if not np.isfinite(sigma_min_val) or sigma_min_val < 0.0:
@@ -1420,9 +1395,8 @@ class PHVIV(nn.Module):
         if not np.isfinite(ur_scale_val) or ur_scale_val == 0.0:
             raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
         self.register_buffer("ur_scale", torch.tensor(ur_scale_val, dtype=torch.float32))
-        self.engineered_feature_dim = 7
-        self.base_feature_dim = self.engineered_feature_dim if self.use_feature_engineering else 2
-        self.force_input_dim = self.base_feature_dim + (1 if self.use_reduced_velocity else 0)
+        self.base_feature_dim = 2
+        self.force_input_dim = self.base_feature_dim + (1 if self.use_reduced_velocity else 0) + (1 if self.use_td_force_input else 0)
 
         residual_cfg = _default_residual_kwargs()
         if residual_kwargs:
@@ -1451,14 +1425,13 @@ class PHVIV(nn.Module):
         )
 
         # NNs for instantaneous force u_theta(x) and diffusion sigma_theta(x).
-        pirate_force_kwargs = pirate_force_kwargs or {}
         self.use_fourier_features = bool(use_fourier_features)
         self.fourier_features = int(fourier_features)
         self.fourier_sigma = float(fourier_sigma)
         self.force_embed = None
         base_force_dim = self.force_input_dim
         force_in_features = base_force_dim
-        selected_net = force_net_type if force_net_type not in (None, "") else ("pirate" if use_pirate_force else "residual")
+        selected_net = force_net_type if force_net_type not in (None, "") else "residual"
         net_type = str(selected_net).lower()
         valid_types = {"residual", "mlp", "pirate"}
         if net_type not in valid_types:
@@ -1468,23 +1441,17 @@ class PHVIV(nn.Module):
         if self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
-            if self.use_pirate_force:
-                raise ValueError(
-                    "Random Fourier features are already handled inside ODEPirateNet. "
-                    "Disable use_fourier_features when use_pirate_force is True."
+            if not self.use_pirate_force:
+                self.force_embed = FourierFeatures(
+                    in_dim=base_force_dim,
+                    out_features=self.fourier_features,
+                    sigma=self.fourier_sigma,
+                    dtype=torch.float32,
                 )
-            self.force_embed = FourierFeatures(
-                in_dim=base_force_dim,
-                out_features=self.fourier_features,
-                sigma=self.fourier_sigma,
-                dtype=torch.float32,
-            )
-            force_in_features = 2 * self.fourier_features
-
-        pirate_cfg_base = dict(pirate_force_kwargs) if pirate_force_kwargs is not None else {}
+                force_in_features = 2 * self.fourier_features
 
         def _build_pirate_args(input_size: int) -> dict[str, Any]:
-            pirate_cfg = dict(pirate_cfg_base)
+            pirate_cfg = dict(arch_pirate_force_kwargs or {})
             pirate_args = {
                 "input_size": int(input_size),
                 "output_size": 1,
@@ -1526,33 +1493,10 @@ class PHVIV(nn.Module):
             else None
         )
 
-        if self.learn_hamiltonian:
-            h_in_features = self.base_feature_dim
-            self.h_net = nn.Sequential(
-                nn.Linear(h_in_features, 100),
-                nn.GELU(),
-                nn.Linear(100, 100),
-                nn.GELU(),
-                nn.Linear(100, 1),
-            )
-        else:
-            self.h_net = None
-
-        # damping handling
-        if self.discover_damping:
-            self.zeta0 = torch.tensor(0.01)
-            self.zeta_raw = nn.Parameter(torch.logit(self.zeta0/self.max_damping_ratio))
-            self.register_buffer("fixed_c", torch.tensor(0.0))
-            self.fixed_damping_ratio = None
-        else:
-            if damping_c is None:
-                raise ValueError("damping_c must be provided when discover_damping is False")
-            damping_c = float(damping_c)
-            self.register_buffer("fixed_c", torch.tensor(damping_c, dtype=torch.float32))
-            self.fixed_damping_ratio = float(damping_c / (2.0 * (self.k * self.m) ** 0.5))
-            self.zeta_raw = None
-        #Learable drag coefficient
-        self.log_Cd = nn.Parameter(torch.log(torch.tensor(1.2)))  # start at ~1.2
+        if damping_c is None:
+            raise ValueError("damping_c must be provided for PHVIV.")
+        damping_c = float(damping_c)
+        self.register_buffer("fixed_c", torch.tensor(damping_c, dtype=torch.float32))
 
 
         self.register_buffer("J", torch.tensor([[0.0, 1.0],
@@ -1572,40 +1516,31 @@ class PHVIV(nn.Module):
         D = float(cfg.get("D", 0.1))
         Ca = float(cfg.get("Ca", 1.0))
         k = float(cfg.get("k", 1218.0))
-        U = float(cfg.get("U", 0.65))
         damping_c = float(cfg.get("damping_c", 1e-4))
         structural_mass = float(cfg.get("structural_mass", 16.79))
-        max_damping_ratio = float(cfg.get("max_damping_ratio", 0.2))
-        discover_damping = bool(cfg.get("discover_damping", False))
-        include_physical_drag = bool(cfg.get("include_physical_drag", False))
         force_output = str(cfg.get("force_output", "force")).strip().lower()
-        learn_hamiltonian = bool(cfg.get("learn_hamiltonian", False))
-        use_pirate_force = bool(cfg.get("use_pirate_force", False))
-        pirate_force_kwargs = cfg.get("pirate_force_kwargs", {}) or {}
-        use_fourier_features = bool(cfg.get("use_fourier_features", False))
-        fourier_features = int(cfg.get("fourier_features", 64))
-        fourier_sigma = float(cfg.get("fourier_sigma", 1.0))
-        use_feature_engineering = bool(cfg.get("use_feature_engineering", False))
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
+        use_td_force_input = bool(cfg.get("use_td_force_input", False))
         use_stochastic_process_noise = bool(cfg.get("use_stochastic_process_noise", True))
         sigma_min = float(cfg.get("sigma_min", 1e-6))
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
+        use_fourier_features = bool(arch_cfg.get("use_fourier_features", False))
+        fourier_features = int(arch_cfg.get("fourier_features", 64))
+        fourier_sigma = float(arch_cfg.get("fourier_sigma", 1.0))
         residual_kwargs = _default_residual_kwargs()
         residual_kwargs.update(arch_cfg.get("residual_kwargs", {}) or {})
         mlp_kwargs = _default_mlp_kwargs()
         mlp_kwargs.update(arch_cfg.get("mlp_kwargs", {}) or {})
-        pirate_arch_kwargs = arch_cfg.get("pirate_force_kwargs", {}) or {}
-        combined_pirate_kwargs = dict(pirate_force_kwargs)
-        combined_pirate_kwargs.update(pirate_arch_kwargs)
-        if "activation" not in combined_pirate_kwargs:
-            combined_pirate_kwargs["activation"] = "tanh"
-        if "rwf_mu" not in combined_pirate_kwargs:
-            combined_pirate_kwargs["rwf_mu"] = 1.0
-        if "rwf_sigma" not in combined_pirate_kwargs:
-            combined_pirate_kwargs["rwf_sigma"] = 0.1
+        pirate_arch_kwargs = dict(arch_cfg.get("pirate_force_kwargs", {}) or {})
+        if "activation" not in pirate_arch_kwargs:
+            pirate_arch_kwargs["activation"] = "tanh"
+        if "rwf_mu" not in pirate_arch_kwargs:
+            pirate_arch_kwargs["rwf_mu"] = 1.0
+        if "rwf_sigma" not in pirate_arch_kwargs:
+            pirate_arch_kwargs["rwf_sigma"] = 0.1
         q_scale_val = cfg.get("q_scale")
         q_scale = float(q_scale_val) if q_scale_val is not None else D
         m_a = 0.25 * np.pi * D**2 * rho * Ca
@@ -1617,28 +1552,22 @@ class PHVIV(nn.Module):
             dt=dt,
             m=m_eff,
             k=k,
-            U=U,
             rho=rho,
             D=D,
             q_scale=q_scale,
             p_scale=p_scale,
-            max_damping_ratio=max_damping_ratio,
-            discover_damping=discover_damping,
             damping_c=damping_c,
-            include_physical_drag=include_physical_drag,
             force_output=force_output,
-            learn_hamiltonian=learn_hamiltonian,
-            use_pirate_force=use_pirate_force,
-            pirate_force_kwargs=combined_pirate_kwargs,
             use_fourier_features=use_fourier_features,
             fourier_features=fourier_features,
             fourier_sigma=fourier_sigma,
-            use_feature_engineering=use_feature_engineering,
             use_reduced_velocity=use_reduced_velocity,
+            use_td_force_input=use_td_force_input,
             use_stochastic_process_noise=use_stochastic_process_noise,
             sigma_min=sigma_min,
             ur_scale=ur_scale,
             force_net_type=force_net_type,
+            arch_pirate_force_kwargs=pirate_arch_kwargs,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
         )
@@ -1654,57 +1583,22 @@ class PHVIV(nn.Module):
         return model, derived
 
     def H(self, x):
-        if not self.learn_hamiltonian:
-            q = x[..., 0]
-            p = x[..., 1]
-            return 0.5 * self.k * q**2 + 0.5 * p**2 / self.m
-        features = self._base_features(x)
-        return self.h_net(features).squeeze(-1)
+        q = x[..., 0]
+        p = x[..., 1]
+        return 0.5 * self.k * q**2 + 0.5 * p**2 / self.m
 
     def grad_H(self, x):
-        if not self.learn_hamiltonian:
-            q = x[..., 0]
-            p = x[..., 1]
-            return torch.stack((self.k * q, p / self.m), dim=-1)
-        grad_enabled = torch.is_grad_enabled()
-        with torch.enable_grad():
-            x_req = x.detach().requires_grad_(True)
-            H_val = self.H(x_req)
-            grad = torch.autograd.grad(
-                H_val.sum(),
-                x_req,
-                create_graph=grad_enabled,
-                retain_graph=grad_enabled,
-            )[0]
-        return grad
+        q = x[..., 0]
+        p = x[..., 1]
+        return torch.stack((self.k * q, p / self.m), dim=-1)
 
     def R(self, x):
         R = torch.zeros(*x.shape[:-1], 2, 2, device=x.device, dtype=x.dtype)
-        if self.discover_damping:
-            zeta = torch.sigmoid(self.zeta_raw) * self.max_damping_ratio
-            c_eff = 2.0 * zeta * self.sqrt_km
-        else:
-            c_eff = self.fixed_c
-        R[..., 1, 1] = c_eff
+        R[..., 1, 1] = self.fixed_c.to(device=x.device, dtype=x.dtype)
         return R
-    
-    def drag_force(self, x):
-        """
-        Morison-like cross-flow drag: Fd = -0.5 * rho * D * Cd * |v| * v
-        x: (..., 2)
-        returns: (..., 1)
-        """
-        v = x[..., 1] / self.m
-        U = torch.full_like(v, self.U)
-        Cd = torch.exp(self.log_Cd)  # keep it positive
-        rel_vel = torch.sqrt(v**2 + U**2)
-        Fd = -0.5 * self.rho * self.D * Cd * torch.abs(rel_vel) * v
-        return Fd.unsqueeze(-1)
 
 
     def _base_features(self, x):
-        if self.use_feature_engineering:
-            return self.feature_engineering(x)
         q_scaled = x[..., 0] / self.nn_q_scale
         p_scaled = x[..., 1] / self.nn_p_scale
         return torch.stack((q_scaled, p_scaled), dim=-1)
@@ -1763,30 +1657,65 @@ class PHVIV(nn.Module):
         # `state` is intentionally unused; kept for backward-compatible call sites.
         rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
         if rv_raw is None:
-            u_flow = like.new_full(like.shape[:-1] + (1,), float(self.U))
-        else:
-            omega_n = torch.sqrt(
-                torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
-            )
-            f_n = omega_n / (2.0 * math.pi)
-            u_flow = rv_raw * f_n * float(self.D)
+            raise ValueError("reduced_velocity is required to compute the PHNN force scale.")
+        omega_n = torch.sqrt(
+            torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
+        )
+        f_n = omega_n / (2.0 * math.pi)
+        u_flow = rv_raw * f_n * float(self.D)
         # Dynamic-pressure force scale (unit span): f0 = 0.5 * rho * D * U^2
         f0 = 0.5 * float(self.rho) * float(self.D) * (u_flow**2)
         return torch.clamp(f0, min=1e-12)
 
-    def _force_features(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
+    def _force_features(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_force_scale: torch.Tensor | None = None,
+    ):
         base_features = self._base_features(x)
         if self.use_reduced_velocity:
             rv = self._prepare_reduced_velocity(reduced_velocity, like=base_features)
             base_features = torch.cat([base_features, rv], dim=-1)
+        if self.use_td_force_input:
+            if td_force_input is None:
+                raise ValueError("td_force_input is required when model.use_td_force_input is enabled.")
+            if torch.is_tensor(td_force_input):
+                td_force = td_force_input.to(device=base_features.device, dtype=base_features.dtype)
+            else:
+                td_force = torch.as_tensor(td_force_input, device=base_features.device, dtype=base_features.dtype)
+            if td_force.ndim == base_features.ndim - 1:
+                td_force = td_force.unsqueeze(-1)
+            if td_force.ndim != base_features.ndim or td_force.shape[-1] != 1:
+                raise ValueError("td_force_input must be a scalar or have shape (..., 1).")
+            if td_force.shape[:-1] != base_features.shape[:-1]:
+                td_force = td_force.expand(base_features.shape[:-1] + (1,))
+            if td_force_scale is None:
+                if self.force_output == "coefficient":
+                    td_force_scale = self._force_scale_from_reduced_velocity(reduced_velocity, like=td_force, state=x)
+                else:
+                    td_force_scale = torch.full_like(td_force, float(self.k) * float(self.D))
+            td_force_feat = td_force / torch.clamp(
+                td_force_scale.to(device=td_force.device, dtype=td_force.dtype),
+                min=1e-12,
+            )
+            base_features = torch.cat([base_features, td_force_feat], dim=-1)
         return base_features
 
     def _force_net_raw(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_force_scale: torch.Tensor | None = None,
     ):
-        base_features = self._force_features(x, reduced_velocity=reduced_velocity)
+        base_features = self._force_features(
+            x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            td_force_scale=td_force_scale,
+        )
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
         return self.u_base_net(features)
 
@@ -1794,11 +1723,18 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_force_scale: torch.Tensor | None = None,
     ):
         if not self.use_stochastic_process_noise:
             like = x[..., :1]
             return torch.zeros_like(like)
-        base_features = self._force_features(x, reduced_velocity=reduced_velocity)
+        base_features = self._force_features(
+            x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            td_force_scale=td_force_scale,
+        )
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
         if self.sigma_net is None:
             like = x[..., :1]
@@ -1844,34 +1780,12 @@ class PHVIV(nn.Module):
             return raw * f0
         return raw * self.k * self.D
 
-    def drag_force_coeff(self, x, reduced_velocity: torch.Tensor | np.ndarray | float | None = None):
-        drag = self.drag_force(x)
-        f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=drag, state=x)
-        return drag / f0
-
     def u_theta_coeff(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     ):
-        coeff = self.learned_force_coeff(x, reduced_velocity=reduced_velocity)
-        if self.include_physical_drag:
-            coeff = coeff + self.drag_force_coeff(x, reduced_velocity=reduced_velocity)
-        return coeff
-
-    def u_theta1(
-        self,
-        x,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-    ):
-        return self.learned_force(x, reduced_velocity=reduced_velocity)
-    
-    def u_theta2(
-        self,
-        x,
-        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
-    ):
-        return self.u_theta1(x, reduced_velocity=reduced_velocity) + self.drag_force(x)
+        return self.learned_force_coeff(x, reduced_velocity=reduced_velocity)
     
     def u_theta(
         self,
@@ -1882,11 +1796,7 @@ class PHVIV(nn.Module):
             coeff = self.u_theta_coeff(x, reduced_velocity=reduced_velocity)
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=coeff, state=x)
             return coeff * f0
-        return (
-            self.u_theta2(x, reduced_velocity=reduced_velocity)
-            if self.include_physical_drag
-            else self.u_theta1(x, reduced_velocity=reduced_velocity)
-        )
+        return self.learned_force(x, reduced_velocity=reduced_velocity)
     
     def f(
         self,
@@ -1904,11 +1814,7 @@ class PHVIV(nn.Module):
     ):
         gH = self.grad_H(x)                         # (..., 2)
         JgH = torch.matmul(gH, self.J.T)
-        if self.discover_damping:
-            zeta = torch.sigmoid(self.zeta_raw) * self.max_damping_ratio
-            c_eff = 2.0 * zeta * self.sqrt_km
-        else:
-            c_eff = self.fixed_c
+        c_eff = self.fixed_c.to(device=x.device, dtype=x.dtype)
         damping_term = torch.stack((torch.zeros_like(gH[..., 0]), c_eff * gH[..., 1]), dim=-1)
         return (JgH - damping_term) + self.f(x, reduced_velocity=reduced_velocity)
 
@@ -2229,10 +2135,9 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         *,
         norm: str = "l1",
-        on_coeff: bool = False,
     ) -> torch.Tensor:
         per = self.avg_mean_reg_SRK4_per_sample(
-            zi, ti, zin, tin, reduced_velocity=reduced_velocity, norm=norm, on_coeff=on_coeff
+            zi, ti, zin, tin, reduced_velocity=reduced_velocity, norm=norm
         )
         return torch.mean(per)
 
@@ -2245,17 +2150,12 @@ class PHVIV(nn.Module):
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         *,
         norm: str = "l1",
-        on_coeff: bool = False,
     ) -> torch.Tensor:
         b = math.sqrt(3.0) / 6.0
         z_a_plus = (0.5 + b) * zi + (0.5 - b) * zin
         z_a_minus = (0.5 - b) * zi + (0.5 + b) * zin
-        if on_coeff:
-            f1 = self.u_theta_coeff(z_a_plus, reduced_velocity=reduced_velocity)
-            f2 = self.u_theta_coeff(z_a_minus, reduced_velocity=reduced_velocity)
-        else:
-            f1 = self.u_theta(z_a_plus, reduced_velocity=reduced_velocity)
-            f2 = self.u_theta(z_a_minus, reduced_velocity=reduced_velocity)
+        f1 = self.u_theta_coeff(z_a_plus, reduced_velocity=reduced_velocity)
+        f2 = self.u_theta_coeff(z_a_minus, reduced_velocity=reduced_velocity)
         norm_key = str(norm).strip().lower()
         if norm_key == "l1":
             r1 = torch.sum(torch.abs(f1), dim=1)
@@ -2416,24 +2316,6 @@ class PHVIV(nn.Module):
         f2c = f2 / f0
         return 0.5 * torch.sum(torch.abs(f1c), dim=1) + 0.5 * torch.sum(torch.abs(f2c), dim=1)
     
-    def feature_engineering(self, z):
-        q_scaled = z[..., 0] / self.nn_q_scale
-        p_scaled = z[..., 1] / self.nn_p_scale
-        theta = torch.atan2(p_scaled, q_scaled)
-        z_eng = torch.stack(
-            (
-                q_scaled,
-                q_scaled**2,
-                p_scaled,
-                p_scaled**2,
-                q_scaled * p_scaled,
-                torch.cos(theta),
-                torch.sin(theta),
-            ),
-            dim=-1,
-        )
-        return z_eng
-
 def log_displacement_plots(
     writer,
     epoch,
@@ -2442,8 +2324,6 @@ def log_displacement_plots(
     y_pred_norm,
     p_pred_norm,
     zoom_mask,
-    middle_mask,
-    middle_window,
     reduced_velocity: float | None = None,
     *,
     tag_prefix: str = "val/rollout",
@@ -2490,8 +2370,6 @@ def log_force_plots(
     force_coeff_pred,
     force_coeff_true,
     zoom_mask,
-    middle_mask,
-    middle_window,
     reduced_velocity: float | None = None,
     *,
     force_coeff_baseline=None,
@@ -2500,8 +2378,8 @@ def log_force_plots(
     step: int | None = None,
     title_suffix: str = "",
 ):
-    fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
-    ax_full, ax_diff, ax_zoom, ax_middle = axes
+    fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
+    ax_full, ax_diff, ax_zoom = axes
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
     ax_full.plot(t, force_coeff_true, label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_full.plot(t, force_coeff_pred, label="C_F (pred)", color="tab:purple")
@@ -2534,23 +2412,6 @@ def log_force_plots(
     ax_zoom.grid(True, alpha=0.3)
     ax_zoom.set_title(f"Force coefficient rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_zoom.legend(loc="upper right")
-
-    mid_start, mid_end = middle_window
-    ax_middle.plot(t[middle_mask], force_coeff_true[middle_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
-    ax_middle.plot(t[middle_mask], force_coeff_pred[middle_mask], label="C_F (pred)", color="tab:purple")
-    if force_coeff_baseline is not None:
-        ax_middle.plot(
-            t[middle_mask],
-            force_coeff_baseline[middle_mask],
-            label=baseline_label,
-            color="tab:green",
-            alpha=0.85,
-        )
-    ax_middle.set_xlabel("time")
-    ax_middle.set_ylabel("C_F")
-    ax_middle.grid(True, alpha=0.3)
-    ax_middle.set_title(f"Force coefficient rollout ({mid_start}-{mid_end}s) epoch {epoch+1}{ur_title}{title_suffix}")
-    ax_middle.legend(loc="upper right")
 
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
@@ -2694,6 +2555,40 @@ def _phase_plot_extent(
     return q_vals, p_vals
 
 
+def build_phase_plot_grid(
+    q_norm: np.ndarray,
+    p_norm: np.ndarray,
+    *,
+    bins: int = 96,
+    extent_scale: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    q_vals, p_vals = _phase_plot_extent(q_norm, p_norm, bins=bins, extent_scale=extent_scale)
+    return np.meshgrid(q_vals, p_vals, indexing="xy")
+
+
+def nearest_phase_series_values(
+    q_grid: np.ndarray,
+    p_grid: np.ndarray,
+    q_ref: np.ndarray,
+    p_ref: np.ndarray,
+    values_ref: np.ndarray,
+) -> np.ndarray:
+    q_ref_arr = np.asarray(q_ref, dtype=float).reshape(-1)
+    p_ref_arr = np.asarray(p_ref, dtype=float).reshape(-1)
+    values_arr = np.asarray(values_ref, dtype=float).reshape(-1)
+    mask = np.isfinite(q_ref_arr) & np.isfinite(p_ref_arr) & np.isfinite(values_arr)
+    q_ref_arr = q_ref_arr[mask]
+    p_ref_arr = p_ref_arr[mask]
+    values_arr = values_arr[mask]
+    if q_ref_arr.size < 1:
+        raise ValueError("Need at least one finite reference sample to build a phase-map value grid.")
+    ref = np.stack([q_ref_arr, p_ref_arr], axis=1)
+    grid = np.stack([np.asarray(q_grid, dtype=float).reshape(-1), np.asarray(p_grid, dtype=float).reshape(-1)], axis=1)
+    dist2 = np.sum((grid[:, None, :] - ref[None, :, :]) ** 2, axis=2)
+    nearest = np.argmin(dist2, axis=1)
+    return values_arr[nearest].reshape(np.asarray(q_grid).shape)
+
+
 def _nearest_history_context_grid(
     q_grid: np.ndarray,
     p_grid: np.ndarray,
@@ -2814,6 +2709,277 @@ def log_phase_component_plots(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_phase_components", fig, epoch + 1 if step is None else step)
     plt.close(fig)
+
+
+def log_signed_phase_output_plot(
+    writer: SummaryWriter,
+    epoch: int,
+    *,
+    q_grid: np.ndarray,
+    p_grid: np.ndarray,
+    values: np.ndarray,
+    q_true: np.ndarray,
+    p_true: np.ndarray,
+    q_pred: np.ndarray,
+    p_pred: np.ndarray,
+    reduced_velocity: float | None = None,
+    output_label: str = "Correction output",
+    sigma_values: np.ndarray | None = None,
+    sigma_label: str = "Sigma",
+    tag: str = "final_val/phase_output",
+    step: int | None = None,
+    title_suffix: str = "",
+) -> None:
+    q_grid_arr = np.asarray(q_grid, dtype=float)
+    p_grid_arr = np.asarray(p_grid, dtype=float)
+    values_arr = np.asarray(values, dtype=float)
+    finite_vals = values_arr[np.isfinite(values_arr)]
+    vmax = float(np.max(np.abs(finite_vals))) if finite_vals.size > 0 else 1.0
+    vmax = max(vmax, 1e-12)
+    levels = np.linspace(-vmax, vmax, 25)
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+
+    q_true_arr = np.asarray(q_true, dtype=float).reshape(-1)
+    p_true_arr = np.asarray(p_true, dtype=float).reshape(-1)
+    q_pred_arr = np.asarray(q_pred, dtype=float).reshape(-1)
+    p_pred_arr = np.asarray(p_pred, dtype=float).reshape(-1)
+    sigma_arr = None if sigma_values is None else np.asarray(sigma_values, dtype=float)
+    show_sigma = sigma_arr is not None
+    ncols = 2 if show_sigma else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(6.4 * ncols, 5.4), sharex=True, sharey=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+
+    contour = axes[0].contourf(q_grid_arr, p_grid_arr, values_arr, levels=levels, cmap=SIGNED_PHASE_CMAP, norm=norm)
+    axes[0].plot(q_true_arr, p_true_arr, color="white", linewidth=1.7, linestyle="--", alpha=0.95, label="Ground truth")
+    axes[0].plot(q_pred_arr, p_pred_arr, color="black", linewidth=1.4, alpha=0.95, label="Predicted rollout")
+    if q_pred_arr.size > 0:
+        axes[0].plot(q_pred_arr[0], p_pred_arr[0], marker="o", color="black", markersize=3)
+    axes[0].set_title(f"{output_label} phase map{ur_title}{title_suffix}")
+    axes[0].set_xlabel("y/D")
+    axes[0].set_ylabel("v/(omega D)")
+    axes[0].set_xlim(float(np.min(q_grid_arr)), float(np.max(q_grid_arr)))
+    axes[0].set_ylim(float(np.min(p_grid_arr)), float(np.max(p_grid_arr)))
+    axes[0].grid(True, alpha=0.15)
+    axes[0].legend(loc="upper right")
+    cbar = fig.colorbar(contour, ax=axes[0])
+    cbar.set_label(output_label)
+
+    if show_sigma:
+        finite_sigma = sigma_arr[np.isfinite(sigma_arr)]
+        sigma_vmin = float(np.min(finite_sigma)) if finite_sigma.size > 0 else 0.0
+        sigma_vmax = float(np.max(finite_sigma)) if finite_sigma.size > 0 else 1.0
+        if not np.isfinite(sigma_vmin):
+            sigma_vmin = 0.0
+        if not np.isfinite(sigma_vmax) or sigma_vmax <= sigma_vmin:
+            sigma_vmax = sigma_vmin + 1e-12
+        sigma_levels = np.linspace(sigma_vmin, sigma_vmax, 25)
+        sigma_cmap = LinearSegmentedColormap.from_list(
+            "sigma_phase_subplot",
+            [(0.0, "#b8b8b8"), (1.0, "#2ca02c")],
+        )
+        sigma_norm = Normalize(vmin=sigma_vmin, vmax=sigma_vmax)
+        sigma_contour = axes[1].contourf(
+            q_grid_arr,
+            p_grid_arr,
+            sigma_arr,
+            levels=sigma_levels,
+            cmap=sigma_cmap,
+            norm=sigma_norm,
+        )
+        axes[1].plot(q_true_arr, p_true_arr, color="white", linewidth=1.7, linestyle="--", alpha=0.95, label="Ground truth")
+        axes[1].plot(q_pred_arr, p_pred_arr, color="black", linewidth=1.4, alpha=0.95, label="Predicted rollout")
+        if q_pred_arr.size > 0:
+            axes[1].plot(q_pred_arr[0], p_pred_arr[0], marker="o", color="black", markersize=3)
+        axes[1].set_title(f"{sigma_label} phase map{ur_title}{title_suffix}")
+        axes[1].set_xlabel("y/D")
+        axes[1].set_ylabel("v/(omega D)")
+        axes[1].set_xlim(float(np.min(q_grid_arr)), float(np.max(q_grid_arr)))
+        axes[1].set_ylim(float(np.min(p_grid_arr)), float(np.max(p_grid_arr)))
+        axes[1].grid(True, alpha=0.15)
+        axes[1].legend(loc="upper right")
+        sigma_cbar = fig.colorbar(sigma_contour, ax=axes[1])
+        sigma_cbar.set_label(sigma_label)
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
+def log_correction_on_data_plot(
+    writer: SummaryWriter,
+    epoch: int,
+    *,
+    t: np.ndarray,
+    corr_true: np.ndarray,
+    corr_pred: np.ndarray,
+    sigma: np.ndarray | None = None,
+    reduced_velocity: float | None = None,
+    value_label: str = "Correction",
+    sigma_label: str = "Sigma",
+    tag: str = "final_val/correction_on_data",
+    step: int | None = None,
+    title_suffix: str = "",
+) -> None:
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    corr_true_arr = np.asarray(corr_true, dtype=float).reshape(-1)
+    corr_pred_arr = np.asarray(corr_pred, dtype=float).reshape(-1)
+    n = int(min(t_arr.size, corr_true_arr.size, corr_pred_arr.size))
+    if n <= 1:
+        return
+    t_arr = t_arr[:n]
+    corr_true_arr = corr_true_arr[:n]
+    corr_pred_arr = corr_pred_arr[:n]
+    err_arr = corr_pred_arr - corr_true_arr
+    sigma_arr = None
+    if sigma is not None:
+        sigma_arr = np.asarray(sigma, dtype=float).reshape(-1)[:n]
+
+    nrows = 3 if sigma_arr is not None else 2
+    fig, axes = plt.subplots(nrows, 1, figsize=(7.2, 3.0 * nrows), sharex=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+
+    axes[0].plot(t_arr, corr_true_arr, color="tab:blue", linewidth=1.5, label="Target correction")
+    axes[0].plot(t_arr, corr_pred_arr, color="tab:orange", linewidth=1.3, label="Predicted correction")
+    if sigma_arr is not None and np.any(np.isfinite(sigma_arr)):
+        sigma_plot = np.nan_to_num(sigma_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        axes[0].fill_between(
+            t_arr,
+            corr_pred_arr - sigma_plot,
+            corr_pred_arr + sigma_plot,
+            color="tab:orange",
+            alpha=0.2,
+            linewidth=0.0,
+            label="Predicted ± sigma",
+        )
+    axes[0].set_ylabel(value_label)
+    axes[0].set_title(f"{value_label} on measured trajectory{ur_title}{title_suffix}")
+    axes[0].grid(True, alpha=0.2)
+    axes[0].legend(loc="upper right")
+
+    axes[1].plot(t_arr, err_arr, color="tab:red", linewidth=1.2, label="Prediction error")
+    axes[1].axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+    axes[1].set_ylabel("Error")
+    axes[1].set_title("Correction error (pred - target)")
+    axes[1].grid(True, alpha=0.2)
+    axes[1].legend(loc="upper right")
+
+    if sigma_arr is not None:
+        axes[2].plot(t_arr, sigma_arr, color="tab:green", linewidth=1.2, label=sigma_label)
+        axes[2].set_ylabel(sigma_label)
+        axes[2].set_title(f"{sigma_label} on measured trajectory")
+        axes[2].grid(True, alpha=0.2)
+        axes[2].legend(loc="upper right")
+
+    axes[-1].set_xlabel("time")
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
+def log_output_distribution_vs_ur(
+    writer: SummaryWriter,
+    epoch: int,
+    *,
+    ur_values: Sequence[float],
+    mean_series: Sequence[np.ndarray],
+    sigma_series: Sequence[np.ndarray] | None = None,
+    mean_label: str = "Correction output",
+    sigma_label: str = "Sigma",
+    tag: str = "final_val/output_distribution_vs_ur",
+) -> None:
+    if not ur_values or not mean_series:
+        return
+    items: list[tuple[float, np.ndarray, np.ndarray | None]] = []
+    sigma_seq = list(sigma_series) if sigma_series is not None else [None] * len(ur_values)
+    for ur_val, mean_arr, sigma_arr in zip(ur_values, mean_series, sigma_seq):
+        mean_np = np.asarray(mean_arr, dtype=float).reshape(-1)
+        mean_np = mean_np[np.isfinite(mean_np)]
+        sigma_np = None
+        if sigma_arr is not None:
+            sigma_np = np.asarray(sigma_arr, dtype=float).reshape(-1)
+            sigma_np = sigma_np[np.isfinite(sigma_np)]
+            if sigma_np.size == 0:
+                sigma_np = None
+        if mean_np.size == 0:
+            continue
+        items.append((float(ur_val), mean_np, sigma_np))
+    if not items:
+        return
+    items.sort(key=lambda x: x[0])
+    positions = [item[0] for item in items]
+    mean_data = [item[1] for item in items]
+    sigma_data = [item[2] for item in items]
+    show_sigma = any(arr is not None for arr in sigma_data)
+    nrows = 2 if show_sigma else 1
+    fig, axes = plt.subplots(nrows, 1, figsize=(8.0, 3.6 * nrows), sharex=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+
+    finite_positions = np.asarray(positions, dtype=float)
+    if finite_positions.size > 1:
+        diffs = np.diff(np.sort(finite_positions))
+        positive = diffs[diffs > 0.0]
+        width = 0.25 * float(np.min(positive)) if positive.size > 0 else 0.2
+    else:
+        width = 0.2
+    width = max(width, 0.05)
+
+    mean_box = axes[0].boxplot(
+        mean_data,
+        positions=positions,
+        widths=width,
+        whis=(0, 100),
+        showmeans=True,
+        patch_artist=True,
+        manage_ticks=False,
+    )
+    for patch in mean_box["boxes"]:
+        patch.set(facecolor="#f4a261", alpha=0.45, edgecolor="#b5651d")
+    for median in mean_box["medians"]:
+        median.set(color="#7f2704", linewidth=1.3)
+    for mean_marker in mean_box["means"]:
+        mean_marker.set(marker="o", markerfacecolor="#7f2704", markeredgecolor="#7f2704", markersize=4)
+    axes[0].set_ylabel(mean_label)
+    axes[0].set_title(f"{mean_label} distribution vs U_r")
+    axes[0].grid(True, alpha=0.2)
+
+    if show_sigma:
+        sigma_positions: list[float] = []
+        sigma_plot_data: list[np.ndarray] = []
+        for pos, arr in zip(positions, sigma_data):
+            if arr is None:
+                continue
+            sigma_positions.append(pos)
+            sigma_plot_data.append(arr)
+        sigma_box = axes[1].boxplot(
+            sigma_plot_data,
+            positions=sigma_positions,
+            widths=width,
+            whis=(0, 100),
+            showmeans=True,
+            patch_artist=True,
+            manage_ticks=False,
+        )
+        for patch in sigma_box["boxes"]:
+            patch.set(facecolor="#8ecf9a", alpha=0.5, edgecolor="#2d6a4f")
+        for median in sigma_box["medians"]:
+            median.set(color="#1b4332", linewidth=1.3)
+        for mean_marker in sigma_box["means"]:
+            mean_marker.set(marker="o", markerfacecolor="#1b4332", markeredgecolor="#1b4332", markersize=4)
+        axes[1].set_ylabel(sigma_label)
+        axes[1].set_title(f"{sigma_label} distribution vs U_r")
+        axes[1].grid(True, alpha=0.2)
+
+    axes[-1].set_xlabel("U_r")
+    axes[-1].set_xticks(positions)
+    axes[-1].set_xticklabels([f"{pos:.3f}" for pos in positions], rotation=0)
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
 
 def log_hamiltonian_plots(
     writer,
@@ -3048,13 +3214,11 @@ def preprocess_timeseries(
         raise ValueError("Velocity array must have the same length as the time vector.")
     mask = np.ones_like(t, dtype=bool)
     if cut_start_seconds is None:
-        cut_start_seconds = float(getattr(data_cfg, "cut_start_seconds", 0.0))
+        cut_start_seconds = 0.0
     cut_start_seconds = float(cut_start_seconds)
     if cut_start_seconds > 0.0:
         t0 = float(np.asarray(t)[0])
         mask &= t >= (t0 + cut_start_seconds)
-    if data_cfg.steadystate:
-        mask &= t > float(data_cfg.steadystate_time_threshold)
     t_proc = t[mask]
     y_proc = y[mask]
     f_proc = force[mask]
@@ -3080,7 +3244,7 @@ def preprocess_timeseries(
     if t_proc.size < 2:
         raise ValueError(
             "After trimming/reduction, too few samples remain to infer dt. "
-            f"(cut_start_seconds={cut_start_seconds}, steadystate={bool(data_cfg.steadystate)}, "
+            f"(cut_start_seconds={cut_start_seconds}, "
             f"reduce_time={bool(data_cfg.reduce_time)}, reduction_factor={int(data_cfg.reduction_factor)})"
         )
     dt_value = float(t_proc[1] - t_proc[0]) if t_proc.size > 1 else float("nan")
@@ -3089,7 +3253,6 @@ def preprocess_timeseries(
 
 def resolve_cut_start_seconds(data_cfg: DataConfig, split: str) -> float:
     split = str(split).strip().lower()
-    default_cut = float(getattr(data_cfg, "cut_start_seconds", 0.0))
     if split == "train":
         override = getattr(data_cfg, "cut_start_seconds_train", None)
     elif split == "val":
@@ -3097,7 +3260,7 @@ def resolve_cut_start_seconds(data_cfg: DataConfig, split: str) -> float:
     else:
         override = None
     if override is None:
-        return default_cut
+        return 0.0
     return float(override)
 
 
@@ -3203,7 +3366,6 @@ def build_dataloader_from_series(
     m_eff: float,
     batch_size: int,
     device: torch.device,
-    smoothing_cfg: SmoothingConfig | None = None,
     shuffle: bool = True,
     *,
     num_workers: int = 0,
@@ -3224,7 +3386,6 @@ def build_dataloader_from_series(
             dt_value,
             m_eff,
             device,
-            smoothing_cfg=smoothing_cfg,
             vel_np=vel_np,
         )
         ur_arr = np.asarray(ur_np, dtype=float)
@@ -3276,7 +3437,6 @@ def prepare_sequence_tensors(
     dt: float,
     m_eff: float,
     device: torch.device,
-    smoothing_cfg: SmoothingConfig | None = None,
     vel_np: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     y_arr = np.asarray(y_np, dtype=float)
@@ -3289,20 +3449,11 @@ def prepare_sequence_tensors(
         dt_value = float(t_arr[1] - t_arr[0])
     else:
         dt_value = 1.0
-    if smoothing_cfg is None:
-        smoothing_cfg = SmoothingConfig()
     if vel_np is None:
-        vel_arr = compute_velocity_numpy(
-            y_arr,
-            dt_value,
-            use_savgol=smoothing_cfg.use_savgol_smoothing,
-            savgol_window=smoothing_cfg.window_length,
-            savgol_polyorder=smoothing_cfg.polyorder,
-        )
-    else:
-        vel_arr = np.asarray(vel_np, dtype=float)
-        if vel_arr.shape[0] != y_arr.shape[0]:
-            raise ValueError("Provided velocity array must have the same length as displacement.")
+        raise ValueError("Velocity must be provided in-file for training/validation series.")
+    vel_arr = np.asarray(vel_np, dtype=float)
+    if vel_arr.shape[0] != y_arr.shape[0]:
+        raise ValueError("Provided velocity array must have the same length as displacement.")
     # Keep dataset tensors on CPU and move per-batch in the training loop.
     # This avoids VRAM blow-ups and enables pinned-memory transfers on CUDA.
     y_tensor = torch.from_numpy(y_arr).float()
@@ -3732,13 +3883,10 @@ def load_training_series(
     y_eval: np.ndarray,
     t_eval: np.ndarray,
     dt_eval: float,
-    use_generated: bool,
     series_dir: Path,
     m_eff: float,
     device: torch.device,
-    smoothing_cfg: SmoothingConfig | None = None,
     *,
-    velocity_source: str = "compute",
     eval_velocity: np.ndarray | None = None,
     eval_reduced_velocity: np.ndarray | float | None = None,
     velocity_key_candidates: Sequence[str] = ("e", "dy", "v"),
@@ -3754,115 +3902,97 @@ def load_training_series(
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
     train_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] = []
-    vel_source = str(velocity_source).strip().lower()
-    if vel_source not in {"compute", "file", "auto"}:
-        raise ValueError("velocity_source must be one of: compute, file, auto")
-    if vel_source == "file" and eval_velocity is None:
-        raise ValueError("velocity_source is 'file' but no eval_velocity was provided.")
-    if require_force and eval_force is None and not use_generated:
-        raise ValueError("require_force is True but no eval_force was provided for the eval series.")
-    if use_generated:
-        if not series_dir.exists():
-            raise FileNotFoundError(f"Training series directory '{series_dir}' does not exist.")
-        series_files = sorted(series_dir.glob("*.npz"))
-        if not series_files:
-            raise FileNotFoundError(f"No '.npz' files found in training series directory '{series_dir}'.")
-        include_ur = _normalize_ur_filter(include_reduced_velocity, name="include_reduced_velocity")
-        exclude_ur = _normalize_ur_filter(exclude_reduced_velocity, name="exclude_reduced_velocity")
-        tol = float(ur_filter_tol)
-        if tol < 0.0:
-            raise ValueError("ur_filter_tol must be non-negative.")
-        cut_start_seconds = max(0.0, float(cut_start_seconds))
-        for series_file in series_files:
-            with np.load(series_file) as series_data:
-                series_t = np.asarray(series_data["a"])
-                series_y = np.asarray(series_data["b"])
-                series_vel: np.ndarray | None = None
-                if vel_source in {"file", "auto"}:
-                    for key in velocity_key_candidates:
-                        if key in series_data:
-                            series_vel = np.asarray(series_data[key])
-                            break
-                    if series_vel is None and vel_source == "file":
-                        raise KeyError(
-                            f"Series '{series_file}' is missing velocity. Tried keys: {list(velocity_key_candidates)}"
-                        )
-                series_force: np.ndarray | None = None
-                if require_force:
-                    for key in force_key_candidates:
-                        if key in series_data:
-                            series_force = np.asarray(series_data[key])
-                            break
-                    if series_force is None:
-                        raise KeyError(
-                            f"Series '{series_file}' is missing force data. Tried keys: {list(force_key_candidates)}"
-                        )
-                if "U_r" not in series_data:
-                    raise KeyError(f"Series '{series_file}' is missing reduced velocity 'U_r'.")
-                series_ur = _prepare_reduced_velocity_series(series_data["U_r"], series_t.shape[0], name=str(series_file))
-                ur_val = float(np.asarray(series_ur).reshape(-1)[0])
-            if include_ur is not None and include_ur.size > 0 and not _ur_in_filter(ur_val, include_ur, tol=tol):
-                continue
-            if exclude_ur is not None and exclude_ur.size > 0 and _ur_in_filter(ur_val, exclude_ur, tol=tol):
-                continue
-            if series_t.ndim != 1 or series_y.ndim != 1:
-                raise ValueError(f"Series '{series_file}' must contain 1D 'a' and 'b' arrays.")
-            if series_t.shape[0] != series_y.shape[0]:
-                raise ValueError(f"Series '{series_file}' has mismatched lengths.")
-            if series_t.shape[0] < 2:
-                raise ValueError(f"Series '{series_file}' is too short to build training samples.")
-            if series_vel is not None and series_vel.shape[0] != series_t.shape[0]:
-                raise ValueError(f"Series '{series_file}' has mismatched velocity length.")
-            if series_force is not None and series_force.shape[0] != series_t.shape[0]:
-                raise ValueError(f"Series '{series_file}' has mismatched force length.")
-            series_dt = float(series_t[1] - series_t[0])
-            if not np.allclose(np.diff(series_t), series_dt, rtol=1e-6, atol=1e-9):
-                raise ValueError(f"Series '{series_file}' time vector is not uniform.")
-            if not np.isclose(series_dt, dt_eval, rtol=1e-6, atol=1e-9):
-                series_y, series_t_resampled = resample_uniform_series(series_t, series_y, dt_eval)
-                if series_vel is not None:
-                    series_vel = np.interp(series_t_resampled, series_t, series_vel)
-                if series_force is not None:
-                    series_force = np.interp(series_t_resampled, series_t, series_force)
-                series_ur = np.full((series_t_resampled.shape[0],), ur_val, dtype=float)
-                series_t = series_t_resampled
-                series_dt = dt_eval
-            if cut_start_seconds > 0.0:
-                series_t0 = float(series_t[0])
-                cut_mask = series_t >= (series_t0 + cut_start_seconds)
-                series_t = series_t[cut_mask]
-                series_y = series_y[cut_mask]
-                if series_vel is not None:
-                    series_vel = np.asarray(series_vel)[cut_mask]
-                if series_force is not None:
-                    series_force = np.asarray(series_force)[cut_mask]
-                series_ur = np.full((series_t.shape[0],), ur_val, dtype=float)
-                if series_t.shape[0] < 2:
-                    raise ValueError(
-                        f"Series '{series_file}' became too short after cut_start_seconds={cut_start_seconds}."
+    if eval_velocity is None:
+        raise ValueError("Evaluation velocity must be provided in-file.")
+    if not series_dir.exists():
+        raise FileNotFoundError(f"Training series directory '{series_dir}' does not exist.")
+    series_files = sorted(series_dir.glob("*.npz"))
+    if not series_files:
+        raise FileNotFoundError(f"No '.npz' files found in training series directory '{series_dir}'.")
+    include_ur = _normalize_ur_filter(include_reduced_velocity, name="include_reduced_velocity")
+    exclude_ur = _normalize_ur_filter(exclude_reduced_velocity, name="exclude_reduced_velocity")
+    tol = float(ur_filter_tol)
+    if tol < 0.0:
+        raise ValueError("ur_filter_tol must be non-negative.")
+    cut_start_seconds = max(0.0, float(cut_start_seconds))
+    for series_file in series_files:
+        with np.load(series_file) as series_data:
+            series_t = np.asarray(series_data["a"])
+            series_y = np.asarray(series_data["b"])
+            series_vel: np.ndarray | None = None
+            for key in velocity_key_candidates:
+                if key in series_data:
+                    series_vel = np.asarray(series_data[key])
+                    break
+            if series_vel is None:
+                raise KeyError(
+                    f"Series '{series_file}' is missing velocity. Tried keys: {list(velocity_key_candidates)}"
+                )
+            series_force: np.ndarray | None = None
+            if require_force:
+                for key in force_key_candidates:
+                    if key in series_data:
+                        series_force = np.asarray(series_data[key])
+                        break
+                if series_force is None:
+                    raise KeyError(
+                        f"Series '{series_file}' is missing force data. Tried keys: {list(force_key_candidates)}"
                     )
-                series_dt = float(series_t[1] - series_t[0])
-            if series_force is None:
-                train_series_raw.append((series_y, series_t, series_dt, series_vel, None, series_ur))
-            else:
-                train_series_raw.append((series_y, series_t, series_dt, series_vel, series_force, series_ur))
-        if not train_series_raw:
-            raise ValueError(
-                "No training series left after U_r filtering. "
-                f"include_reduced_velocity={include_reduced_velocity}, "
-                f"exclude_reduced_velocity={exclude_reduced_velocity}, "
-                f"series_dir='{series_dir}'."
-            )
-    else:
-        train_series_raw.append(
-            (
-                y_eval,
-                t_eval,
-                dt_eval,
-                eval_velocity if vel_source in {"file", "auto"} else None,
-                np.asarray(eval_force) if require_force else None,
-                _prepare_reduced_velocity_series(eval_reduced_velocity, t_eval.shape[0], name="eval series"),
-            )
+            if "U_r" not in series_data:
+                raise KeyError(f"Series '{series_file}' is missing reduced velocity 'U_r'.")
+            series_ur = _prepare_reduced_velocity_series(series_data["U_r"], series_t.shape[0], name=str(series_file))
+            ur_val = float(np.asarray(series_ur).reshape(-1)[0])
+        if include_ur is not None and include_ur.size > 0 and not _ur_in_filter(ur_val, include_ur, tol=tol):
+            continue
+        if exclude_ur is not None and exclude_ur.size > 0 and _ur_in_filter(ur_val, exclude_ur, tol=tol):
+            continue
+        if series_t.ndim != 1 or series_y.ndim != 1:
+            raise ValueError(f"Series '{series_file}' must contain 1D 'a' and 'b' arrays.")
+        if series_t.shape[0] != series_y.shape[0]:
+            raise ValueError(f"Series '{series_file}' has mismatched lengths.")
+        if series_t.shape[0] < 2:
+            raise ValueError(f"Series '{series_file}' is too short to build training samples.")
+        if series_vel is not None and series_vel.shape[0] != series_t.shape[0]:
+            raise ValueError(f"Series '{series_file}' has mismatched velocity length.")
+        if series_force is not None and series_force.shape[0] != series_t.shape[0]:
+            raise ValueError(f"Series '{series_file}' has mismatched force length.")
+        series_dt = float(series_t[1] - series_t[0])
+        if not np.allclose(np.diff(series_t), series_dt, rtol=1e-6, atol=1e-9):
+            raise ValueError(f"Series '{series_file}' time vector is not uniform.")
+        if not np.isclose(series_dt, dt_eval, rtol=1e-6, atol=1e-9):
+            series_y, series_t_resampled = resample_uniform_series(series_t, series_y, dt_eval)
+            if series_vel is not None:
+                series_vel = np.interp(series_t_resampled, series_t, series_vel)
+            if series_force is not None:
+                series_force = np.interp(series_t_resampled, series_t, series_force)
+            series_ur = np.full((series_t_resampled.shape[0],), ur_val, dtype=float)
+            series_t = series_t_resampled
+            series_dt = dt_eval
+        if cut_start_seconds > 0.0:
+            series_t0 = float(series_t[0])
+            cut_mask = series_t >= (series_t0 + cut_start_seconds)
+            series_t = series_t[cut_mask]
+            series_y = series_y[cut_mask]
+            if series_vel is not None:
+                series_vel = np.asarray(series_vel)[cut_mask]
+            if series_force is not None:
+                series_force = np.asarray(series_force)[cut_mask]
+            series_ur = np.full((series_t.shape[0],), ur_val, dtype=float)
+            if series_t.shape[0] < 2:
+                raise ValueError(
+                    f"Series '{series_file}' became too short after cut_start_seconds={cut_start_seconds}."
+                )
+            series_dt = float(series_t[1] - series_t[0])
+        if series_force is None:
+            train_series_raw.append((series_y, series_t, series_dt, series_vel, None, series_ur))
+        else:
+            train_series_raw.append((series_y, series_t, series_dt, series_vel, series_force, series_ur))
+    if not train_series_raw:
+        raise ValueError(
+            "No training series left after U_r filtering. "
+            f"include_reduced_velocity={include_reduced_velocity}, "
+            f"exclude_reduced_velocity={exclude_reduced_velocity}, "
+            f"series_dir='{series_dir}'."
         )
 
     eval_tensors = prepare_sequence_tensors(
@@ -3871,8 +4001,7 @@ def load_training_series(
         dt_eval,
         m_eff,
         device,
-        smoothing_cfg=smoothing_cfg,
-        vel_np=eval_velocity if vel_source in {"file", "auto"} else None,
+        vel_np=eval_velocity,
     )
     eval_ur = _prepare_reduced_velocity_series(eval_reduced_velocity, t_eval.shape[0], name="eval series")
     eval_ur_tensor = torch.from_numpy(np.ascontiguousarray(eval_ur)).float()
@@ -4011,7 +4140,6 @@ def build_rollout_dataloader_from_series(
     m_eff: float,
     batch_size: int,
     device: torch.device,
-    smoothing_cfg: SmoothingConfig | None = None,
     *,
     rollout_steps: int,
     shuffle: bool = True,
@@ -4034,7 +4162,6 @@ def build_rollout_dataloader_from_series(
             dt_value,
             m_eff,
             device,
-            smoothing_cfg=smoothing_cfg,
             vel_np=vel_np,
         )
         ur_arr = np.asarray(ur_np, dtype=float)
@@ -4134,8 +4261,6 @@ def _force_component_coefficients(
         delta_coeff = delta_raw * coeff_scale
 
     total_coeff = base_coeff + delta_coeff
-    if model.include_physical_drag:
-        total_coeff = total_coeff + model.drag_force_coeff(state, reduced_velocity=reduced_velocity)
 
     if model.use_stochastic_process_noise:
         sigma_force = model.sigma_theta(state, reduced_velocity=reduced_velocity)
@@ -4187,8 +4312,6 @@ def rollout_model(
     force_coeff_total: list[torch.Tensor] = []
     force_coeff_delta: list[torch.Tensor] = []
     force_coeff_sigma: list[torch.Tensor] = []
-    force_drag: list[torch.Tensor] = []
-    force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
     generator: torch.Generator | None = None
     if rollout_seed is not None:
@@ -4199,16 +4322,9 @@ def rollout_model(
             rv_step = rv_series[step_idx : step_idx + 1]
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
-            model_force = model.learned_force(state, reduced_velocity=rv_step).squeeze().detach()
-            if model.include_physical_drag:
-                drag_force = model.drag_force(state).squeeze().detach()
-            else:
-                drag_force = model_force.new_tensor(0.0)
             total_force = model.u_theta(state, reduced_velocity=rv_step).squeeze().detach()
             total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(model, state, rv_step)
             H_val = model.H(state).detach()
-            force_model.append(model_force)
-            force_drag.append(drag_force)
             force_total.append(total_force)
             force_coeff_total.append(total_coeff.squeeze().detach())
             force_coeff_delta.append(delta_coeff.squeeze().detach())
@@ -4243,8 +4359,6 @@ def rollout_model(
     force_coeff_total_arr = torch.stack(force_coeff_total).detach().cpu().numpy()
     force_coeff_delta_arr = torch.stack(force_coeff_delta).detach().cpu().numpy()
     force_coeff_sigma_arr = torch.stack(force_coeff_sigma).detach().cpu().numpy()
-    force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
-    force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
@@ -4253,8 +4367,6 @@ def rollout_model(
         "force_coeff_total": force_coeff_total_arr,
         "force_coeff_delta": force_coeff_delta_arr,
         "force_coeff_sigma": force_coeff_sigma_arr,
-        "force_drag": force_drag_arr,
-        "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
         "history_context": None,
     }
@@ -4309,24 +4421,15 @@ def rollout_model_with_progress(
     force_coeff_total: list[torch.Tensor] = []
     force_coeff_delta: list[torch.Tensor] = []
     force_coeff_sigma: list[torch.Tensor] = []
-    force_drag: list[torch.Tensor] = []
-    force_model: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
     with torch.no_grad():
         for step_idx in range(total_steps):
             rv_step = rv_series[step_idx : step_idx + 1]
             y_samples.append(state[0, 0].detach())
             p_samples.append(state[0, 1].detach())
-            model_force = model.learned_force(state, reduced_velocity=rv_step).squeeze().detach()
-            if model.include_physical_drag:
-                drag_force = model.drag_force(state).squeeze().detach()
-            else:
-                drag_force = model_force.new_tensor(0.0)
             total_force = model.u_theta(state, reduced_velocity=rv_step).squeeze().detach()
             total_coeff, delta_coeff, sigma_coeff = _force_component_coefficients(model, state, rv_step)
             H_val = model.H(state).detach()
-            force_model.append(model_force)
-            force_drag.append(drag_force)
             force_total.append(total_force)
             force_coeff_total.append(total_coeff.squeeze().detach())
             force_coeff_delta.append(delta_coeff.squeeze().detach())
@@ -4352,8 +4455,6 @@ def rollout_model_with_progress(
     force_coeff_total_arr = torch.stack(force_coeff_total).detach().cpu().numpy()
     force_coeff_delta_arr = torch.stack(force_coeff_delta).detach().cpu().numpy()
     force_coeff_sigma_arr = torch.stack(force_coeff_sigma).detach().cpu().numpy()
-    force_drag_arr = torch.stack(force_drag).detach().cpu().numpy()
-    force_model_arr = torch.stack(force_model).detach().cpu().numpy()
     hamiltonian_model_arr = torch.stack(hamiltonian_model_vals).detach().cpu().numpy()
     return {
         "y_norm": y_pred_norm,
@@ -4362,8 +4463,6 @@ def rollout_model_with_progress(
         "force_coeff_total": force_coeff_total_arr,
         "force_coeff_delta": force_coeff_delta_arr,
         "force_coeff_sigma": force_coeff_sigma_arr,
-        "force_drag": force_drag_arr,
-        "force_model": force_model_arr,
         "hamiltonian_model": hamiltonian_model_arr,
         "history_context": None,
     }

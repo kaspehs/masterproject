@@ -84,10 +84,6 @@ def _load_split_trajectories(config: Any, split: str) -> list[dict[str, np.ndarr
         method_cfg = {}
     ur_source = str(method_cfg.get("td_mass_source", "dry")).strip().lower()
     split = str(split).strip().lower()
-    if not bool(getattr(data_cfg, "use_generated_train_series", False)):
-        raise ValueError(
-            "Vivana-TD baseline evaluation expects data.use_generated_train_series=true so the train/val split is explicit."
-        )
     split_dir = Path(data_cfg.train_series_dir) / split
     if not split_dir.exists():
         raise FileNotFoundError(f"Expected split directory '{split_dir}'.")

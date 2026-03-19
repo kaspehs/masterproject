@@ -33,17 +33,22 @@ from HNN_helper import (
     GradNormBalancer,
     MEAN_DISP_AMP_REL_ERROR_KEY,
     Residual,
+    build_phase_plot_grid,
     compute_validation_metrics,
-    compute_velocity_numpy,
     create_window_mask,
     create_zoom_mask,
     dominant_frequency,
     format_loss_vs_ur_text,
     log_final_rollout_errors_vs_ur,
     log_loss_vs_ur,
+    log_correction_on_data_plot,
     log_displacement_plots,
     log_force_plots,
+    log_output_distribution_vs_ur,
+    log_signed_phase_output_plot,
+    lookup_ur_bin_state_scale_tensor,
     mean_displacement_amplitude,
+    nearest_phase_series_values,
     resolve_middle_time_plot,
     relative_error,
     resample_uniform_series,
@@ -55,44 +60,179 @@ from HNN_helper import (
     structural_step_constant_force_torch,
     td_baseline_step_torch,
 )
-from architectures import ODEPirateNet
+from architectures import FourierFeatures, ODEPirateNet
 
 
-class ForceMLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        hidden_dim: int,
-        depth: int,
-        activation: str,
-    ) -> None:
-        super().__init__()
-        if depth < 1:
-            raise ValueError("depth must be >= 1")
-        act = activation.strip().lower()
-        if act == "tanh":
-            act_cls: type[nn.Module] = nn.Tanh
-        elif act == "relu":
-            act_cls = nn.ReLU
-        elif act == "gelu":
-            act_cls = nn.GELU
-        elif act == "silu":
-            act_cls = nn.SiLU
+def _vpinn_ur_bin_id(value: float, ur_bin_size: float) -> int:
+    return int(np.rint(float(value) / float(ur_bin_size)))
+
+
+def _build_vpinn_ur_bin_state_scale_info(
+    trajs: list[dict[str, np.ndarray]],
+    *,
+    ur_bin_size: float,
+    eps: float = 1e-6,
+) -> dict[str, Any]:
+    stats_by_bin: dict[int, dict[str, Any]] = {}
+    global_count = 0
+    global_sum = np.zeros(2, dtype=np.float64)
+    global_sumsq = np.zeros(2, dtype=np.float64)
+
+    def _finalize(count: int, sum_vec: np.ndarray, sumsq_vec: np.ndarray) -> np.ndarray:
+        denom = float(max(int(count), 1))
+        mean = sum_vec / denom
+        var = np.maximum(sumsq_vec / denom - mean * mean, 0.0)
+        return np.sqrt(var)
+
+    for traj in trajs:
+        x = np.asarray(traj["y"], dtype=np.float64).reshape(-1)
+        v = np.asarray(traj["dy"], dtype=np.float64).reshape(-1)
+        ur = np.asarray(traj["ur"], dtype=np.float64).reshape(-1)
+        n = min(int(x.shape[0]), int(v.shape[0]))
+        if n < 1:
+            continue
+        if ur.size == 1:
+            ur = np.repeat(ur, n)
         else:
-            raise ValueError("activation must be one of: tanh, relu, gelu, silu")
+            ur = ur[:n]
+        states = np.stack([x[:n], v[:n]], axis=1)
+        for ur_val, state_vec in zip(ur, states):
+            key = _vpinn_ur_bin_id(float(ur_val), ur_bin_size)
+            stat = stats_by_bin.setdefault(
+                key,
+                {"count": 0, "sum": np.zeros(2, dtype=np.float64), "sumsq": np.zeros(2, dtype=np.float64)},
+            )
+            vec = np.asarray(state_vec, dtype=np.float64)
+            stat["count"] += 1
+            stat["sum"] += vec
+            stat["sumsq"] += vec * vec
+            global_count += 1
+            global_sum += vec
+            global_sumsq += vec * vec
 
-        layers: list[nn.Module] = []
-        in_features = int(input_dim)
-        for _ in range(int(depth)):
-            layers.append(nn.Linear(in_features, int(hidden_dim)))
-            layers.append(act_cls())
-            in_features = int(hidden_dim)
-        layers.append(nn.Linear(in_features, int(output_dim)))
-        self.net = nn.Sequential(*layers)
+    global_scale = _finalize(global_count, global_sum, global_sumsq)
+    global_scale = np.maximum(global_scale, float(eps))
+    by_bin: dict[str, list[float]] = {}
+    for key, stat in stats_by_bin.items():
+        scale = _finalize(int(stat["count"]), stat["sum"], stat["sumsq"])
+        if not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
+            scale = global_scale.copy()
+        scale = np.maximum(scale, float(eps))
+        by_bin[str(int(key))] = [float(scale[0]), float(scale[1])]
+    return {
+        "global": [float(global_scale[0]), float(global_scale[1])],
+        "by_bin": by_bin,
+    }
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+
+def _vpinn_lookup_state_scale(
+    ur_values: torch.Tensor,
+    *,
+    scale_info: dict[str, Any] | None,
+    ur_bin_size: float,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return lookup_ur_bin_state_scale_tensor(
+        ur_values,
+        scale_info=scale_info,
+        ur_bin_size=ur_bin_size,
+        batch_size=batch_size,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _vpinn_scale_weak_residual(
+    residual: torch.Tensor,
+    *,
+    ur_values: torch.Tensor,
+    mass: torch.Tensor,
+    scale_info: dict[str, Any] | None,
+    ur_bin_size: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if scale_info is None:
+        return residual, None
+    batch_size = int(residual.shape[0])
+    state_scale = _vpinn_lookup_state_scale(
+        ur_values,
+        scale_info=scale_info,
+        ur_bin_size=ur_bin_size,
+        batch_size=batch_size,
+        device=residual.device,
+        dtype=residual.dtype,
+    )
+    p_scale = torch.clamp(
+        mass.to(device=residual.device, dtype=residual.dtype) * state_scale[..., 1:2],
+        min=1e-12,
+    )
+    return residual / p_scale.unsqueeze(1), p_scale
+
+
+def _vpinn_rollout_state_loss(
+    *,
+    x_pred: torch.Tensor,
+    v_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    v_true: torch.Tensor,
+    ur_values: torch.Tensor,
+    scale_info: dict[str, Any] | None,
+    ur_bin_size: float,
+) -> torch.Tensor:
+    per = _vpinn_rollout_state_loss_per_sample(
+        x_pred=x_pred,
+        v_pred=v_pred,
+        x_true=x_true,
+        v_true=v_true,
+        ur_values=ur_values,
+        scale_info=scale_info,
+        ur_bin_size=ur_bin_size,
+    )
+    return torch.mean(per)
+
+
+def _vpinn_rollout_state_loss_per_sample(
+    *,
+    x_pred: torch.Tensor,
+    v_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    v_true: torch.Tensor,
+    ur_values: torch.Tensor,
+    scale_info: dict[str, Any] | None,
+    ur_bin_size: float,
+) -> torch.Tensor:
+    if scale_info is None:
+        return torch.mean((x_pred - x_true) ** 2 + (v_pred - v_true) ** 2, dim=(1, 2))
+    batch_size = int(x_pred.shape[0])
+    state_scale = _vpinn_lookup_state_scale(
+        ur_values,
+        scale_info=scale_info,
+        ur_bin_size=ur_bin_size,
+        batch_size=batch_size,
+        device=x_pred.device,
+        dtype=x_pred.dtype,
+    )
+    x_scale = torch.clamp(state_scale[..., 0:1], min=1e-12).unsqueeze(1)
+    v_scale = torch.clamp(state_scale[..., 1:2], min=1e-12).unsqueeze(1)
+    return torch.mean(((x_pred - x_true) / x_scale) ** 2 + ((v_pred - v_true) / v_scale) ** 2, dim=(1, 2))
+
+
+def _scheduled_rollout_det_steps(
+    *,
+    epoch: int,
+    base_steps: int,
+    final_steps: int,
+    warmup_epochs: int,
+) -> int:
+    target_steps = base_steps if final_steps <= 0 else final_steps
+    if target_steps <= base_steps:
+        return int(base_steps)
+    if warmup_epochs <= 0:
+        return int(target_steps)
+    progress = min(1.0, float(max(0, epoch)) / float(max(1, warmup_epochs)))
+    steps = int(np.floor(float(base_steps) + progress * float(target_steps - base_steps)))
+    return max(int(base_steps), min(int(target_steps), steps))
 
 
 class ScaledForceWrapper(nn.Module):
@@ -164,6 +304,16 @@ class ScaledForceWrapper(nn.Module):
         s_tilde = torch.cat([x_tilde, v_tilde, ur_tilde], dim=-1)
         f_tilde = self.base(s_tilde)
         return f_tilde * f_scale
+
+
+class FourierForceWrapper(nn.Module):
+    def __init__(self, base: nn.Module, *, input_dim: int, fourier_features: int, sigma: float) -> None:
+        super().__init__()
+        self.ff = FourierFeatures(int(input_dim), int(fourier_features), float(sigma), torch.float32)
+        self.base = base
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return self.base(self.ff(x))
 
 
 def _activation_from_string(name: str) -> nn.Module:
@@ -244,28 +394,16 @@ def _apply_corr_head_init(
 
 
 def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn.Module:
-    vp = dict(config.vpinn or {})
-    use_arch_cfg = bool(vp.get("use_architecture_config", False))
-    if not use_arch_cfg:
-        net_hidden = int(vp.get("hidden_dim", 128))
-        net_depth = int(vp.get("depth", 3))
-        activation = str(vp.get("activation", "tanh"))
-        return ForceMLP(
-            input_dim=input_dim,
-            output_dim=output_dim,
-            hidden_dim=net_hidden,
-            depth=net_depth,
-            activation=activation,
-        )
-
     if config.architecture is None:
-        raise ValueError("vpinn.use_architecture_config is True but config has no 'architecture:' block.")
+        raise ValueError("VPINN requires a shared 'architecture:' block.")
     arch = config.architecture
     net_type = str(getattr(arch, "force_net_type", "residual")).strip().lower()
+    use_fourier_features = bool(getattr(arch, "use_fourier_features", False))
+    fourier_features = int(getattr(arch, "fourier_features", 64))
+    fourier_sigma = float(getattr(arch, "fourier_sigma", 1.0))
 
     if net_type == "pirate":
         pirate_kwargs = {}
-        pirate_kwargs.update(getattr(config.model, "pirate_force_kwargs", {}) or {})
         pirate_kwargs.update(getattr(arch, "pirate_force_kwargs", {}) or {})
         pirate_kwargs.setdefault("depth", 2)
         pirate_kwargs.setdefault("fourier_features", 64)
@@ -282,11 +420,22 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         hidden = int(cfg.get("hidden", 128))
         layers = int(cfg.get("layers", 2))
         activation = str(cfg.get("activation", "gelu"))
-        layers_list: list[nn.Module] = [nn.Linear(int(input_dim), hidden)]
+        if use_fourier_features and fourier_features < 1:
+            raise ValueError("architecture.fourier_features must be >= 1 when use_fourier_features is True.")
+        model_input_dim = 2 * fourier_features if use_fourier_features else int(input_dim)
+        layers_list: list[nn.Module] = [nn.Linear(model_input_dim, hidden)]
         for _ in range(max(1, layers)):
             layers_list.append(Residual(hidden, activation=activation))
         layers_list.append(nn.Linear(hidden, int(output_dim)))
-        return nn.Sequential(*layers_list)
+        base = nn.Sequential(*layers_list)
+        if use_fourier_features:
+            return FourierForceWrapper(
+                base,
+                input_dim=int(input_dim),
+                fourier_features=fourier_features,
+                sigma=fourier_sigma,
+            )
+        return base
 
     if net_type == "mlp":
         cfg = dict(getattr(arch, "mlp_kwargs", {}) or {})
@@ -294,19 +443,45 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         layers = int(cfg.get("layers", 2))
         activation = _activation_from_string(str(cfg.get("activation", "gelu")))
         modules: list[nn.Module] = []
-        in_features = int(input_dim)
+        if use_fourier_features and fourier_features < 1:
+            raise ValueError("architecture.fourier_features must be >= 1 when use_fourier_features is True.")
+        in_features = 2 * fourier_features if use_fourier_features else int(input_dim)
         for _ in range(max(1, layers)):
             modules.append(nn.Linear(in_features, hidden))
             modules.append(activation)
             in_features = hidden
         modules.append(nn.Linear(in_features, int(output_dim)))
-        return nn.Sequential(*modules)
+        base = nn.Sequential(*modules)
+        if use_fourier_features:
+            return FourierForceWrapper(
+                base,
+                input_dim=int(input_dim),
+                fourier_features=fourier_features,
+                sigma=fourier_sigma,
+            )
+        return base
 
     raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate")
 
 
-def _vpinn_force(model: nn.Module, x: torch.Tensor, v: torch.Tensor, ur: torch.Tensor) -> torch.Tensor:
-    return model(torch.cat([x, v, ur], dim=-1))
+def _vpinn_model_uses_td_force_input(model: nn.Module) -> bool:
+    base = getattr(model, "_orig_mod", model)
+    return bool(getattr(base, "use_td_force_input", False))
+
+
+def _vpinn_force(
+    model: nn.Module,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    ur: torch.Tensor,
+    td_force_input: torch.Tensor | None = None,
+) -> torch.Tensor:
+    parts = [x, v, ur]
+    if _vpinn_model_uses_td_force_input(model):
+        if td_force_input is None:
+            raise ValueError("td_force_input is required when vpinn.use_td_force_input is enabled.")
+        parts.append(td_force_input)
+    return model(torch.cat(parts, dim=-1))
 
 
 def _force_mapping_nrmse_over_trajs(
@@ -559,10 +734,6 @@ def _launch_async_validation(
     async_device: str,
     async_num_workers: int,
     async_num_threads: int,
-    rollout_every_epochs: int,
-    cycle_validation_rollout: bool,
-    rollout_target_ur: float | None,
-    rollout_target_ur_tol: float,
     do_losses: bool,
     do_rollout: bool,
 ) -> list[dict[str, Any]]:
@@ -590,19 +761,11 @@ def _launch_async_validation(
         str(async_num_threads),
         "--num-workers",
         str(async_num_workers),
-        "--rollout-every",
-        str(int(rollout_every_epochs)),
-        "--cycle-rollout",
-        "1" if cycle_validation_rollout else "0",
-        "--rollout-target-ur-tol",
-        str(float(rollout_target_ur_tol)),
         "--do-losses",
         "1" if do_losses else "0",
         "--do-rollout",
         "1" if do_rollout else "0",
     ]
-    if rollout_target_ur is not None:
-        args.extend(["--rollout-target-ur", str(float(rollout_target_ur))])
     epoch_num = int(epoch + 1)
     proc = subprocess.Popen(args, env=env)
     processes.append(
@@ -740,55 +903,6 @@ def _try_load_metadata_map(meta_path: Path) -> Optional[dict[str, float]]:
         return None
 
 
-def _normalize_ur_filter(values: Any, *, key: str) -> np.ndarray | None:
-    if values is None:
-        return None
-    arr = np.asarray(values, dtype=float).reshape(-1)
-    if arr.size == 0:
-        return np.empty((0,), dtype=float)
-    if not np.all(np.isfinite(arr)):
-        raise ValueError(f"{key} must contain only finite numeric values.")
-    return arr
-
-
-def _ur_in_filter(ur_value: float, ur_filter: np.ndarray, *, tol: float) -> bool:
-    if ur_filter.size == 0:
-        return False
-    return bool(np.any(np.isclose(float(ur_value), ur_filter, rtol=0.0, atol=float(tol))))
-
-
-def _read_reduced_velocity_from_npz(path: Path) -> float:
-    with np.load(path) as data:
-        if "U_r" not in data:
-            raise ValueError(f"{path} is missing reduced velocity 'U_r'.")
-        ur_arr = np.asarray(data["U_r"], dtype=float)
-    if ur_arr.ndim == 0:
-        return float(ur_arr)
-    ur_flat = ur_arr.reshape(-1)
-    ur_flat = ur_flat[np.isfinite(ur_flat)]
-    if ur_flat.size == 0:
-        raise ValueError(f"{path} has an empty/non-finite reduced velocity array.")
-    return float(np.mean(ur_flat))
-
-
-def _filter_paths_by_ur(
-    paths: Sequence[Path],
-    *,
-    include_ur: np.ndarray | None,
-    exclude_ur: np.ndarray | None,
-    tol: float,
-) -> list[Path]:
-    filtered: list[Path] = []
-    for path in paths:
-        ur_val = _read_reduced_velocity_from_npz(path)
-        if include_ur is not None and include_ur.size > 0 and not _ur_in_filter(ur_val, include_ur, tol=tol):
-            continue
-        if exclude_ur is not None and exclude_ur.size > 0 and _ur_in_filter(ur_val, exclude_ur, tol=tol):
-            continue
-        filtered.append(path)
-    return filtered
-
-
 def _infer_dt_target_from_data_cfg(data_cfg: Any) -> Optional[float]:
     def _dt_from_npz(path: Path) -> Optional[float]:
         if not path.exists():
@@ -804,40 +918,28 @@ def _infer_dt_target_from_data_cfg(data_cfg: Any) -> Optional[float]:
             return None
         return float(t[1] - t[0])
 
-    # Prefer generated training-series dt when available.
-    if bool(getattr(data_cfg, "use_generated_train_series", False)):
-        series_dir = Path(getattr(data_cfg, "train_series_dir", ""))
-        if series_dir and not series_dir.is_absolute():
-            series_dir = (Path.cwd() / series_dir).resolve()
-        if series_dir.exists():
-            candidates: list[Path] = []
-            train_dir = series_dir / "train"
-            val_dir = series_dir / "val"
-            if train_dir.exists() or val_dir.exists():
-                if train_dir.exists():
-                    candidates.extend(sorted(train_dir.glob("*.npz")))
-                if val_dir.exists():
-                    candidates.extend(sorted(val_dir.glob("*.npz")))
-            else:
-                candidates.extend(sorted(series_dir.glob("*.npz")))
-            for path in candidates:
-                dt_val = _dt_from_npz(path)
-                if dt_val is not None:
-                    return dt_val
-
-    # Fallback to data file dt (legacy single-series mode).
-    data_path = Path(getattr(data_cfg, "file", ""))
-    if not data_path:
+    series_dir = Path(getattr(data_cfg, "train_series_dir", ""))
+    if not series_dir:
         return None
-    if not data_path.is_absolute():
-        data_path = (Path.cwd() / data_path).resolve()
-    dt_val = _dt_from_npz(data_path)
-    if dt_val is None:
+    if not series_dir.is_absolute():
+        series_dir = (Path.cwd() / series_dir).resolve()
+    if not series_dir.exists():
         return None
-    if bool(getattr(data_cfg, "reduce_time", False)):
-        rf = max(1, int(getattr(data_cfg, "reduction_factor", 1)))
-        dt_val = float(dt_val * rf)
-    return dt_val
+    train_dir = series_dir / "train"
+    val_dir = series_dir / "val"
+    candidates: list[Path] = []
+    if train_dir.exists():
+        candidates.extend(sorted(train_dir.glob("*.npz")))
+    if val_dir.exists():
+        candidates.extend(sorted(val_dir.glob("*.npz")))
+    for path in candidates:
+        dt_val = _dt_from_npz(path)
+        if dt_val is not None:
+            if bool(getattr(data_cfg, "reduce_time", False)):
+                rf = max(1, int(getattr(data_cfg, "reduction_factor", 1)))
+                dt_val = float(dt_val * rf)
+            return dt_val
+    return None
 
 def _maybe_reduce_time(
     t: np.ndarray,
@@ -873,8 +975,6 @@ def _load_trajectory(
     *,
     path: Path,
     dt_target: Optional[float],
-    velocity_source: str,
-    smoothing_cfg: Any,
     reduce_time: bool,
     reduction_factor: int,
     cut_start_seconds: float,
@@ -922,26 +1022,9 @@ def _load_trajectory(
         if t.size < 2:
             raise ValueError(f"{path.name}: too few samples remain after cut_start_seconds={cut_start_seconds}.")
 
-    if velocity_source == "file":
-        if v_file is None:
-            raise ValueError(f"{path.name} has no 'dy' but vpinn.velocity_source='file'.")
-        v = v_file
-    elif velocity_source == "compute":
-        if x.shape[1] != 1:
-            raise ValueError(
-                "vpinn.velocity_source='compute' currently supports only d=1 displacement. "
-                "Provide dy in-file for d>1 or extend compute_velocity_numpy to ND."
-            )
-        v_1d = compute_velocity_numpy(
-            x[:, 0],
-            dt,
-            use_savgol=smoothing_cfg.use_savgol_smoothing,
-            savgol_window=smoothing_cfg.window_length,
-            savgol_polyorder=smoothing_cfg.polyorder,
-        )
-        v = v_1d[:, None]
-    else:
-        raise ValueError("vpinn.velocity_source must be 'compute' or 'file'.")
+    if v_file is None:
+        raise ValueError(f"{path.name} has no 'dy'; in-file velocity is required.")
+    v = v_file
 
     force_representation = str(force_representation).strip().lower()
     if force_representation not in {"force", "coefficient"}:
@@ -994,29 +1077,6 @@ def _resample_uniform_nd(t: np.ndarray, y: np.ndarray, target_dt: float) -> tupl
                 raise ValueError("Resample produced inconsistent time grids across dimensions")
     assert t_out is not None
     return np.stack(ys, axis=1), t_out
-
-
-def _split_by_trajectory(
-    trajectories: list[dict[str, Any]],
-    *,
-    val_fraction: float,
-    seed: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not (0.0 <= val_fraction < 1.0):
-        raise ValueError("vpinn.val_fraction must be in [0, 1).")
-    if not trajectories:
-        raise ValueError("No trajectories to split.")
-    if val_fraction == 0.0:
-        return trajectories, []
-    rng = np.random.default_rng(int(seed))
-    idx = np.arange(len(trajectories))
-    rng.shuffle(idx)
-    n_val = int(round(val_fraction * len(trajectories)))
-    n_val = min(max(n_val, 1), len(trajectories) - 1)
-    val_idx = set(idx[:n_val].tolist())
-    train = [traj for i, traj in enumerate(trajectories) if i not in val_idx]
-    val = [traj for i, traj in enumerate(trajectories) if i in val_idx]
-    return train, val
 
 
 class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
@@ -1072,143 +1132,6 @@ class WindowDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
             f0 = traj["f0"][start:end]
             items.append(f0)
         return tuple(items)  # type: ignore[return-value]
-
-
-def _prepare_trajectories(config: Config) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
-    data_cfg = config.data
-    smoothing_cfg = config.smoothing
-    vp = dict(config.vpinn or {})
-
-    velocity_source = str(vp.get("velocity_source", "compute")).strip().lower()
-    force_representation = str(vp.get("force_representation", "force")).strip().lower()
-    if force_representation not in {"force", "coefficient"}:
-        raise ValueError("vpinn.force_representation must be one of: force, coefficient.")
-    dt_target = vp.get("dt_target", None)
-    if dt_target is None:
-        dt_target = _infer_dt_target_from_data_cfg(data_cfg)
-    dt_target = None if dt_target is None else float(dt_target)
-    train_include_ur = _normalize_ur_filter(vp.get("train_include_ur"), key="vpinn.train_include_ur")
-    train_exclude_ur = _normalize_ur_filter(vp.get("train_exclude_ur"), key="vpinn.train_exclude_ur")
-    train_ur_filter_tol = float(vp.get("train_ur_filter_tol", 1e-6))
-    if train_ur_filter_tol < 0.0:
-        raise ValueError("vpinn.train_ur_filter_tol must be non-negative.")
-
-    coeff_k = float(getattr(config.model, "k", 1218.0))
-    coeff_m_eff = float(_m_eff_from_model_cfg(config.model))
-
-    if data_cfg.use_generated_train_series:
-        series_dir = Path(data_cfg.train_series_dir)
-        if not series_dir.is_absolute():
-            series_dir = (Path.cwd() / series_dir).resolve()
-        if not series_dir.exists():
-            raise FileNotFoundError(f"Training series directory '{series_dir}' does not exist.")
-        train_dir = series_dir / "train"
-        val_dir = series_dir / "val"
-        if train_dir.exists() or val_dir.exists():
-            if not train_dir.exists() or not val_dir.exists():
-                raise FileNotFoundError(f"Expected both train/ and val/ under '{series_dir}'.")
-            train_files = sorted(train_dir.glob("*.npz"))
-            val_files = sorted(val_dir.glob("*.npz"))
-            if not train_files:
-                raise FileNotFoundError(f"No '.npz' files found in '{train_dir}'.")
-            if not val_files:
-                raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
-            sources: list[Path] = list(train_files)
-            val_sources: list[Path] = list(val_files)
-        else:
-            files = sorted(series_dir.glob("*.npz"))
-            if not files:
-                raise FileNotFoundError(f"No '.npz' files found in '{series_dir}'.")
-            sources = list(files)
-            val_sources = []
-    else:
-        data_path = Path(data_cfg.file)
-        if not data_path.is_absolute():
-            data_path = (Path.cwd() / data_path).resolve()
-        sources = [data_path]
-        val_sources = []
-
-    if data_cfg.use_generated_train_series:
-        has_include = train_include_ur is not None and train_include_ur.size > 0
-        has_exclude = train_exclude_ur is not None and train_exclude_ur.size > 0
-        if has_include or has_exclude:
-            print(
-                "Applying VPINN training U_r filter: "
-                f"include={None if train_include_ur is None else train_include_ur.tolist()}, "
-                f"exclude={None if train_exclude_ur is None else train_exclude_ur.tolist()}, "
-                f"tol={train_ur_filter_tol:g}"
-            )
-        sources = _filter_paths_by_ur(
-            sources,
-            include_ur=train_include_ur,
-            exclude_ur=train_exclude_ur,
-            tol=train_ur_filter_tol,
-        )
-        if not sources:
-            raise ValueError(
-                "No VPINN training series left after U_r filtering. "
-                f"include={vp.get('train_include_ur')}, "
-                f"exclude={vp.get('train_exclude_ur')}, "
-                f"series_dir='{getattr(data_cfg, 'train_series_dir', '')}'."
-            )
-
-    trajectories: list[dict[str, Any]] = []
-    val_trajectories: list[dict[str, Any]] = []
-    dt_ref: Optional[float] = None
-    train_cut_start_seconds = float(
-        data_cfg.cut_start_seconds_train
-        if getattr(data_cfg, "cut_start_seconds_train", None) is not None
-        else getattr(data_cfg, "cut_start_seconds", 0.0)
-    )
-    val_cut_start_seconds = float(
-        data_cfg.cut_start_seconds_val
-        if getattr(data_cfg, "cut_start_seconds_val", None) is not None
-        else getattr(data_cfg, "cut_start_seconds", 0.0)
-    )
-    for path in sources:
-        traj, dt = _load_trajectory(
-            path=path,
-            dt_target=dt_target,
-            velocity_source=velocity_source,
-            smoothing_cfg=smoothing_cfg,
-            reduce_time=False,
-            reduction_factor=1,
-            cut_start_seconds=train_cut_start_seconds,
-            force_representation=force_representation,
-            rho=float(getattr(config.model, "rho", 1000.0)),
-            D=float(getattr(config.model, "D", 0.1)),
-            k=coeff_k,
-            m_eff=coeff_m_eff,
-        )
-        if dt_ref is None:
-            dt_ref = dt
-        elif not np.isclose(dt, float(dt_ref), rtol=1e-9, atol=1e-12):
-            raise ValueError(f"{path} has dt={dt} but expected dt={dt_ref}.")
-        trajectories.append(traj)
-    for path in val_sources:
-        traj, dt = _load_trajectory(
-            path=path,
-            dt_target=dt_target,
-            velocity_source=velocity_source,
-            smoothing_cfg=smoothing_cfg,
-            reduce_time=False,
-            reduction_factor=1,
-            cut_start_seconds=val_cut_start_seconds,
-            force_representation=force_representation,
-            rho=float(getattr(config.model, "rho", 1000.0)),
-            D=float(getattr(config.model, "D", 0.1)),
-            k=coeff_k,
-            m_eff=coeff_m_eff,
-        )
-        if dt_ref is None:
-            dt_ref = dt
-        elif not np.isclose(dt, float(dt_ref), rtol=1e-9, atol=1e-12):
-            raise ValueError(f"{path} has dt={dt} but expected dt={dt_ref}.")
-        val_trajectories.append(traj)
-
-    if dt_ref is None:
-        raise ValueError("No trajectories loaded.")
-    return trajectories, val_trajectories, float(dt_ref)
 
 
 def _test_functions(
@@ -1515,7 +1438,6 @@ def _log_rollout_validation(
     c: torch.Tensor,
     k: torch.Tensor,
     D: float,
-    middle_time_plot: Sequence[float],
     device: torch.device,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
@@ -1589,8 +1511,6 @@ def _log_rollout_validation(
         p_pred_norm = v_pred / denom
 
         zoom_mask = create_zoom_mask(t_np)
-        middle_mask = create_window_mask(t_np, middle_time_plot)
-        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
         ur_val = float(ur_true_t[0, 0].detach().cpu().item())
         log_displacement_plots(
             writer,
@@ -1600,8 +1520,6 @@ def _log_rollout_validation(
             y_pred_norm,
             p_pred_norm,
             zoom_mask,
-            middle_mask,
-            middle_window,
             reduced_velocity=ur_val,
             tag_prefix=tag_prefix,
             step=step,
@@ -1614,8 +1532,6 @@ def _log_rollout_validation(
             f_pred,
             f_true,
             zoom_mask,
-            middle_mask,
-            middle_window,
             reduced_velocity=ur_val,
             tag_prefix=tag_prefix,
             step=step,
@@ -1681,15 +1597,19 @@ def _log_td_correction_rollout_validation(
     rho: float,
     diameter: float,
     td_params: dict[str, float],
-    middle_time_plot: Sequence[float],
     device: torch.device,
     sigma_min: float,
     probabilistic: bool,
     force_zero_output: bool = False,
+    rollout_stochastic: bool = False,
+    rollout_noise_scale: float = 1.0,
+    rollout_seed: int | None = None,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     log_metrics: bool = True,
     log_plots: bool = True,
+    log_phase_map: bool = False,
+    log_correction_on_data: bool = False,
     title_suffix: str = "",
 ) -> dict[str, float]:
     traj_t = _td_rollout_traj_to_tensors(traj)
@@ -1737,6 +1657,9 @@ def _log_td_correction_rollout_validation(
         probabilistic=probabilistic,
         sigma_min=sigma_min,
         force_zero_output=force_zero_output,
+        rollout_stochastic=rollout_stochastic,
+        rollout_noise_scale=rollout_noise_scale,
+        rollout_seed=rollout_seed,
     )
     x_pred = x_seq[0, :, 0].detach().cpu().numpy()
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
@@ -1744,11 +1667,12 @@ def _log_td_correction_rollout_validation(
     td_roll = td_roll_seq[0, :, 0].detach().cpu().numpy()
 
     with torch.no_grad():
-        corr_on_data, _sigma_on_data = _vpinn_predict_correction(
+        corr_on_data, sigma_on_data = _vpinn_predict_correction(
             model,
             x_true_t,
             v_true_t,
             ur_true_t,
+            td_true_t,
             probabilistic=probabilistic,
             sigma_min=sigma_min,
             force_zero_output=force_zero_output,
@@ -1796,19 +1720,20 @@ def _log_td_correction_rollout_validation(
     if log_plots:
         y_true = x_true_t[:, 0].detach().cpu().numpy()
         zoom_mask = create_zoom_mask(t_np)
-        middle_mask = create_window_mask(t_np, middle_time_plot)
-        middle_window = (float(middle_time_plot[0]), float(middle_time_plot[1]))
         ur_val = float(ur_true_t[0, 0].detach().cpu().item())
+        omega = float(np.sqrt(stiffness_value / mass_value))
+        q_true_norm = y_true / float(diameter)
+        p_true_norm = v_true_t[:, 0].detach().cpu().numpy() / (omega * float(diameter))
+        q_pred_norm = x_pred / float(diameter)
+        p_pred_norm = v_pred / (omega * float(diameter))
         log_displacement_plots(
             writer,
             epoch,
             t_np,
-            y_true / float(diameter),
-            x_pred / float(diameter),
-            v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(diameter)),
+            q_true_norm,
+            q_pred_norm,
+            p_pred_norm,
             zoom_mask,
-            middle_mask,
-            middle_window,
             reduced_velocity=ur_val,
             tag_prefix=tag_prefix,
             step=step,
@@ -1821,8 +1746,6 @@ def _log_td_correction_rollout_validation(
             force_total_full[: min(len(t_np), len(force_total_full), len(force_true))],
             force_true[: min(len(t_np), len(force_total_full), len(force_true))],
             create_zoom_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))]),
-            create_window_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))], middle_time_plot),
-            middle_window,
             reduced_velocity=ur_val,
             force_coeff_baseline=force_td_full[: min(len(t_np), len(force_total_full), len(force_true))],
             baseline_label="C_F (Vivana-TD)",
@@ -1830,6 +1753,103 @@ def _log_td_correction_rollout_validation(
             step=step,
             title_suffix=title_suffix,
         )
+        if log_correction_on_data:
+            output_label = (
+                "Correction coefficient"
+                if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
+                else "Correction force"
+            )
+            log_correction_on_data_plot(
+                writer,
+                epoch,
+                t=t_np,
+                corr_true=(f_true_t[:, 0] - td_true_t[:, 0]).detach().cpu().numpy(),
+                corr_pred=corr_on_data[:, 0].detach().cpu().numpy(),
+                sigma=(
+                    sigma_on_data[:, 0].detach().cpu().numpy()
+                    if probabilistic
+                    else None
+                ),
+                reduced_velocity=ur_val,
+                value_label=output_label,
+                sigma_label=(
+                    "Sigma coefficient"
+                    if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
+                    else "Sigma force"
+                ),
+                tag="final_val/correction_on_data",
+                step=step,
+                title_suffix=title_suffix,
+            )
+        if log_phase_map:
+            q_grid, p_grid = build_phase_plot_grid(q_true_norm, p_true_norm, bins=96, extent_scale=2.0)
+            x_grid = torch.as_tensor(
+                (q_grid.reshape(-1) * float(diameter)).reshape(-1, 1),
+                dtype=x_true_t.dtype,
+                device=device,
+            )
+            v_grid = torch.as_tensor(
+                (p_grid.reshape(-1) * (omega * float(diameter))).reshape(-1, 1),
+                dtype=x_true_t.dtype,
+                device=device,
+            )
+            ur_grid = torch.full((x_grid.shape[0], 1), ur_val, dtype=x_true_t.dtype, device=device)
+            td_force_grid = None
+            if _vpinn_model_uses_td_force_input(model):
+                td_force_grid_np = nearest_phase_series_values(
+                    q_grid,
+                    p_grid,
+                    q_true_norm,
+                    p_true_norm,
+                    td_true_t[:, 0].detach().cpu().numpy(),
+                )
+                td_force_grid = torch.as_tensor(
+                    td_force_grid_np.reshape(-1, 1),
+                    dtype=x_true_t.dtype,
+                    device=device,
+                )
+            with torch.no_grad():
+                corr_grid, sigma_grid = _vpinn_predict_correction(
+                    model,
+                    x_grid,
+                    v_grid,
+                    ur_grid,
+                    td_force_grid,
+                    probabilistic=probabilistic,
+                    sigma_min=sigma_min,
+                    force_zero_output=force_zero_output,
+                )
+            output_label = (
+                "Correction coefficient"
+                if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
+                else "Correction force"
+            )
+            log_signed_phase_output_plot(
+                writer,
+                epoch,
+                q_grid=q_grid,
+                p_grid=p_grid,
+                values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
+                q_true=q_true_norm,
+                p_true=p_true_norm,
+                q_pred=q_pred_norm,
+                p_pred=p_pred_norm,
+                reduced_velocity=ur_val,
+                output_label=output_label,
+                sigma_values=(
+                    sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
+                    if probabilistic
+                    else None
+                ),
+                sigma_label=(
+                    "Sigma coefficient"
+                    if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
+                    else "Sigma force"
+                ),
+                tag="final_val/phase_output",
+                step=step,
+                title_suffix=title_suffix,
+            )
     return metrics
 
 
@@ -1838,6 +1858,7 @@ def _vpinn_predict_correction(
     x: torch.Tensor,
     v: torch.Tensor,
     ur: torch.Tensor,
+    td_force_input: torch.Tensor | None = None,
     *,
     probabilistic: bool,
     sigma_min: float,
@@ -1851,7 +1872,7 @@ def _vpinn_predict_correction(
         else:
             sigma = torch.zeros_like(mu)
         return mu, sigma
-    out = _vpinn_force(model, x, v, ur)
+    out = _vpinn_force(model, x, v, ur, td_force_input)
     d = int(x.shape[-1])
     if not probabilistic:
         return out, torch.zeros_like(out)
@@ -1880,6 +1901,9 @@ def _vpinn_td_rollout(
     probabilistic: bool,
     sigma_min: float,
     force_zero_output: bool = False,
+    rollout_stochastic: bool = False,
+    rollout_noise_scale: float = 1.0,
+    rollout_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     x = x0
     v = v0
@@ -1889,16 +1913,11 @@ def _vpinn_td_rollout(
     total_fs: list[torch.Tensor] = []
     td_fs: list[torch.Tensor] = []
     corr_fs: list[torch.Tensor] = []
+    generator: torch.Generator | None = None
+    if rollout_seed is not None:
+        generator = torch.Generator(device=x0.device)
+        generator.manual_seed(int(rollout_seed))
     for _ in range(int(steps)):
-        corr_mu, _corr_sigma = _vpinn_predict_correction(
-            model,
-            x,
-            v,
-            ur0,
-            probabilistic=probabilistic,
-            sigma_min=sigma_min,
-            force_zero_output=force_zero_output,
-        )
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=v,
             acceleration=td_context[:, 0:1],
@@ -1908,7 +1927,26 @@ def _vpinn_td_rollout(
             diameter=diameter,
             params=td_params,
         )
-        total_force = td_force_next + corr_mu
+        corr_mu, corr_sigma = _vpinn_predict_correction(
+            model,
+            x,
+            v,
+            ur0,
+            td_force_next,
+            probabilistic=probabilistic,
+            sigma_min=sigma_min,
+            force_zero_output=force_zero_output,
+        )
+        corr_force = corr_mu
+        if rollout_stochastic:
+            noise = torch.randn(
+                corr_mu.shape,
+                device=corr_mu.device,
+                dtype=corr_mu.dtype,
+                generator=generator,
+            )
+            corr_force = corr_mu + float(rollout_noise_scale) * corr_sigma * noise
+        total_force = td_force_next + corr_force
         x, v, a_next = structural_step_constant_force_torch(
             y=x,
             velocity=v,
@@ -1924,7 +1962,7 @@ def _vpinn_td_rollout(
         vs.append(v)
         total_fs.append(total_force)
         td_fs.append(td_force_next)
-        corr_fs.append(corr_mu)
+        corr_fs.append(corr_force)
     empty_force = x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
     return (
         torch.stack(xs, dim=1),
@@ -1932,6 +1970,135 @@ def _vpinn_td_rollout(
         torch.stack(total_fs, dim=1) if total_fs else empty_force,
         torch.stack(td_fs, dim=1) if td_fs else empty_force,
         torch.stack(corr_fs, dim=1) if corr_fs else empty_force,
+    )
+
+
+def _vpinn_td_rollout_loss_from_batch(
+    *,
+    model: nn.Module,
+    batch: Any,
+    device: torch.device,
+    non_blocking: bool,
+    dt: float,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+    probabilistic: bool,
+    sigma_min: float,
+    force_zero_output: bool,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
+    rollout_noise_scale: float,
+    ur_bin_state_scale_info: dict[str, Any] | None,
+    ur_bin_size: float,
+) -> torch.Tensor:
+    x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in batch]
+    mode_key = str(rollout_loss_mode).strip().lower()
+    if mode_key == "stochastic":
+        mode_key = "stochastic_nll"
+    if mode_key not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
+        raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse.")
+    samples = max(1, int(rollout_stochastic_samples))
+    steps = int(x_true_seq.shape[1] - 1)
+    if mode_key in {"stochastic_nll", "stochastic_mse"} and samples > 1:
+        batch_size = int(x0.shape[0])
+        x0_in = x0.unsqueeze(0).expand(samples, *x0.shape).reshape(samples * batch_size, *x0.shape[1:])
+        v0_in = v0.unsqueeze(0).expand(samples, *v0.shape).reshape(samples * batch_size, *v0.shape[1:])
+        ur0_in = ur0.unsqueeze(0).expand(samples, *ur0.shape).reshape(samples * batch_size, *ur0.shape[1:])
+        td0_in = td0.unsqueeze(0).expand(samples, *td0.shape).reshape(samples * batch_size, *td0.shape[1:])
+        m0_in = m0.unsqueeze(0).expand(samples, *m0.shape).reshape(samples * batch_size, *m0.shape[1:])
+        c0_in = c0.unsqueeze(0).expand(samples, *c0.shape).reshape(samples * batch_size, *c0.shape[1:])
+        k0_in = k0.unsqueeze(0).expand(samples, *k0.shape).reshape(samples * batch_size, *k0.shape[1:])
+        x_pred, v_pred, _, _, _ = _vpinn_td_rollout(
+            model=model,
+            x0=x0_in,
+            v0=v0_in,
+            ur0=ur0_in,
+            td_context0=td0_in,
+            steps=steps,
+            dt=dt,
+            m=m0_in,
+            c=c0_in,
+            k=k0_in,
+            rho=rho,
+            diameter=diameter,
+            td_params=td_params,
+            probabilistic=probabilistic,
+            sigma_min=sigma_min,
+            force_zero_output=force_zero_output,
+            rollout_stochastic=True,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=None,
+        )
+        x_pred = x_pred.reshape(samples, batch_size, *x_pred.shape[1:])
+        v_pred = v_pred.reshape(samples, batch_size, *v_pred.shape[1:])
+        state_scale = None
+        if ur_bin_state_scale_info is not None:
+            state_scale = _vpinn_lookup_state_scale(
+                ur0,
+                scale_info=ur_bin_state_scale_info,
+                ur_bin_size=ur_bin_size,
+                batch_size=batch_size,
+                device=x_pred.device,
+                dtype=x_pred.dtype,
+            )
+        if state_scale is None:
+            x_scale = x_pred.new_ones((1, batch_size, 1, 1))
+            v_scale = x_pred.new_ones((1, batch_size, 1, 1))
+        else:
+            x_scale = torch.clamp(state_scale[..., 0:1], min=1e-12).view(1, batch_size, 1, 1)
+            v_scale = torch.clamp(state_scale[..., 1:2], min=1e-12).view(1, batch_size, 1, 1)
+        x_true_ref = x_true_seq.unsqueeze(0)
+        v_true_ref = v_true_seq.unsqueeze(0)
+        if mode_key == "stochastic_nll":
+            x_pred_scaled = x_pred / x_scale
+            v_pred_scaled = v_pred / v_scale
+            x_true_scaled = x_true_ref / x_scale
+            v_true_scaled = v_true_ref / v_scale
+            mu_x = torch.mean(x_pred_scaled, dim=0)
+            mu_v = torch.mean(v_pred_scaled, dim=0)
+            var_x = torch.mean((x_pred_scaled - mu_x.unsqueeze(0)) ** 2, dim=0)
+            var_v = torch.mean((v_pred_scaled - mu_v.unsqueeze(0)) ** 2, dim=0)
+            var_x = torch.clamp(var_x, min=1e-6)
+            var_v = torch.clamp(var_v, min=1e-6)
+            nll_x = 0.5 * (((x_true_scaled - mu_x) ** 2) / var_x + torch.log(var_x))
+            nll_v = 0.5 * (((v_true_scaled - mu_v) ** 2) / var_v + torch.log(var_v))
+            per = torch.mean(nll_x, dim=(1, 2)) + torch.mean(nll_v, dim=(1, 2))
+            return torch.mean(per)
+        err_x = (x_pred - x_true_ref) / x_scale
+        err_v = (v_pred - v_true_ref) / v_scale
+        per_samples = torch.mean(err_x * err_x, dim=(2, 3)) + torch.mean(err_v * err_v, dim=(2, 3))
+        return torch.mean(torch.mean(per_samples, dim=0))
+
+    x_pred, v_pred, _, _, _ = _vpinn_td_rollout(
+        model=model,
+        x0=x0,
+        v0=v0,
+        ur0=ur0,
+        td_context0=td0,
+        steps=steps,
+        dt=dt,
+        m=m0,
+        c=c0,
+        k=k0,
+        rho=rho,
+        diameter=diameter,
+        td_params=td_params,
+        probabilistic=probabilistic,
+        sigma_min=sigma_min,
+        force_zero_output=force_zero_output,
+        rollout_stochastic=False,
+        rollout_noise_scale=rollout_noise_scale,
+        rollout_seed=None,
+    )
+    return _vpinn_rollout_state_loss(
+        x_pred=x_pred,
+        v_pred=v_pred,
+        x_true=x_true_seq,
+        v_true=v_true_seq,
+        ur_values=ur0,
+        scale_info=ur_bin_state_scale_info,
+        ur_bin_size=ur_bin_size,
     )
 
 
@@ -2099,6 +2266,12 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     probabilistic = bool(vp.get("predict_sigma", False))
     force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
+    rollout_stochastic = bool(vp.get("rollout_stochastic", False))
+    rollout_noise_scale = float(vp.get("rollout_noise_scale", 1.0))
+    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
+        raise ValueError("vpinn.rollout_noise_scale must be finite and non-negative.")
+    rollout_seed_raw = vp.get("rollout_seed", None)
+    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
     corr_init_mode, corr_init_tiny_std = _resolve_corr_init_settings(vp, model_cfg)
     if sigma_min < 0.0:
         raise ValueError("vpinn.sigma_min must be non-negative.")
@@ -2109,8 +2282,6 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     non_blocking = device.type == "cuda"
 
     train_series_root = Path(data_cfg.train_series_dir)
-    if not data_cfg.use_generated_train_series:
-        raise ValueError("vpinn.use_td_correction currently expects data.use_generated_train_series=true.")
     train_dir = train_series_root / "train"
     val_dir = train_series_root / "val"
     train_paths = sorted(train_dir.glob("*.npz"))
@@ -2120,8 +2291,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
     if td_mass_source not in {"dry", "effective"}:
         raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
-    train_cut = float(getattr(data_cfg, "cut_start_seconds_train", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
-    val_cut = float(getattr(data_cfg, "cut_start_seconds_val", getattr(data_cfg, "cut_start_seconds", 0.0)) or 0.0)
+    train_cut = float(getattr(data_cfg, "cut_start_seconds_train", 0.0) or 0.0)
+    val_cut = float(getattr(data_cfg, "cut_start_seconds_val", 0.0) or 0.0)
     train_trajs = load_td_correction_trajectories(
         paths=train_paths,
         cut_start_seconds=train_cut,
@@ -2145,11 +2316,14 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     rho = float(getattr(model_cfg, "rho", 1000.0))
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
+    use_td_force_input = bool(vp.get("use_td_force_input", False))
 
     d = int(np.asarray(train_trajs[0]["y"]).ndim == 1)
-    input_dim = 3
+    input_dim = 4 if use_td_force_input else 3
     output_dim = 2 if probabilistic else 1
     model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim).to(device)
+    setattr(model, "use_td_force_input", use_td_force_input)
+    setattr(model, "force_representation", str(vp.get("force_representation", "force")).strip().lower())
     _apply_corr_head_init(
         model,
         mode=corr_init_mode,
@@ -2161,8 +2335,41 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
 
     rollout_weight = float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0))))
     rollout_steps = int(vp.get("rollout_force_steps", int(getattr(loss_cfg, "rollout_det_steps", 0))))
-    window_M = int(vp.get("window_M", 50))
-    stride = max(1, int(vp.get("stride", 1)))
+    rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
+    rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
+    rollout_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
+    rollout_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
+    rollout_steps_final = rollout_steps if rollout_steps_final_raw <= 0 else rollout_steps_final_raw
+    rollout_batch_size_raw = int(vp.get("rollout_force_batch_size", int(getattr(loss_cfg, "rollout_det_batch_size", 0))))
+    rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
+    if rollout_loss_mode == "stochastic":
+        rollout_loss_mode = "stochastic_nll"
+    if rollout_loss_mode not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
+        raise ValueError("loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse.")
+    if rollout_stochastic_samples < 1:
+        raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
+    if rollout_steps < 0:
+        raise ValueError("loss.rollout_det_steps must be non-negative.")
+    if rollout_weight < 0.0:
+        raise ValueError("loss.rollout_det_weight must be non-negative.")
+    if rollout_steps_final < 0:
+        raise ValueError("loss.rollout_det_steps_final must be non-negative.")
+    if rollout_steps_warmup_epochs < 0:
+        raise ValueError("loss.rollout_det_steps_warmup_epochs must be non-negative.")
+    if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_weight > 0.0 and rollout_stochastic_samples < 2:
+        raise ValueError(
+            "loss.rollout_stochastic_samples must be >= 2 when loss.rollout_loss_mode is stochastic_nll or stochastic_mse."
+        )
+    if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_weight > 0.0 and not probabilistic:
+        raise ValueError(
+            "VPINN rollout stochastic loss modes require vpinn.predict_sigma=true."
+        )
+    if rollout_weight > 0.0 and rollout_steps < 1 and rollout_steps_final < 1:
+        raise ValueError(
+            "loss.rollout_det_steps or loss.rollout_det_steps_final must be >= 1 when loss.rollout_det_weight > 0."
+        )
+    window_M = int(vp.get("window_M", getattr(loss_cfg, "window_M", 50)))
+    stride = max(1, int(vp.get("stride", getattr(loss_cfg, "stride", 1))))
     train_dataset, _ = _build_td_correction_vpinn_datasets(
         trajs=train_trajs,
         rollout_steps=0,
@@ -2171,31 +2378,64 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         td_mass_source=td_mass_source,
     )
     val_dataset = None
-    val_rollout_dataset = None
     if val_trajs:
-        val_dataset, val_rollout_dataset = _build_td_correction_vpinn_datasets(
+        val_dataset, _ = _build_td_correction_vpinn_datasets(
             trajs=val_trajs,
-            rollout_steps=rollout_steps,
+            rollout_steps=0,
             window_M=window_M,
             stride=stride,
             td_mass_source=td_mass_source,
         )
-    train_rollout_dataset = (
-        _build_td_correction_vpinn_datasets(
-            trajs=train_trajs,
-            rollout_steps=rollout_steps,
-            window_M=window_M,
-            stride=stride,
-            td_mass_source=td_mass_source,
-        )[1]
-        if rollout_weight > 0.0 and rollout_steps > 0
-        else None
-    )
 
     train_loader = DataLoader(train_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_dataset is not None else None
-    rollout_loader = DataLoader(train_rollout_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if train_rollout_dataset is not None else None
-    val_rollout_loader = DataLoader(val_rollout_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_rollout_dataset is not None else None
+    current_rollout_steps = _scheduled_rollout_det_steps(
+        epoch=0,
+        base_steps=rollout_steps,
+        final_steps=rollout_steps_final,
+        warmup_epochs=rollout_steps_warmup_epochs,
+    )
+
+    def _rebuild_rollout_loaders(steps: int) -> tuple[Dataset | None, DataLoader | None, Dataset | None, DataLoader | None]:
+        train_roll_ds = None
+        train_roll_loader = None
+        val_roll_ds = None
+        val_roll_loader = None
+        if rollout_weight > 0.0 and steps > 0:
+            train_roll_ds = _build_td_correction_vpinn_datasets(
+                trajs=train_trajs,
+                rollout_steps=steps,
+                window_M=window_M,
+                stride=stride,
+                td_mass_source=td_mass_source,
+            )[1]
+            if train_roll_ds is not None:
+                train_roll_loader = DataLoader(
+                    train_roll_ds,
+                    batch_size=rollout_batch_size,
+                    shuffle=True,
+                    num_workers=int(runtime_cfg.num_workers),
+                    pin_memory=(device.type == "cuda"),
+                )
+            if val_trajs:
+                val_roll_ds = _build_td_correction_vpinn_datasets(
+                    trajs=val_trajs,
+                    rollout_steps=steps,
+                    window_M=window_M,
+                    stride=stride,
+                    td_mass_source=td_mass_source,
+                )[1]
+                if val_roll_ds is not None:
+                    val_roll_loader = DataLoader(
+                        val_roll_ds,
+                        batch_size=rollout_batch_size,
+                        shuffle=False,
+                        num_workers=int(runtime_cfg.num_workers),
+                        pin_memory=(device.type == "cuda"),
+                    )
+        return train_roll_ds, train_roll_loader, val_roll_ds, val_roll_loader
+
+    train_rollout_dataset, rollout_loader, val_rollout_dataset, val_rollout_loader = _rebuild_rollout_loaders(current_rollout_steps)
 
     opt, lr_scheduler = setup_optimizer_and_scheduler(model, optim_cfg=optim_cfg, scheduler_cfg=optim_cfg.scheduler, epochs=int(training_cfg.epochs))
     amp_enabled, amp_dtype, scaler = setup_amp(device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype))
@@ -2212,11 +2452,26 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
     mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
-    use_force_loss = bool(vp.get("use_force_loss", True))
-    use_weak_loss = bool(vp.get("use_weak_loss", True))
+    ur_bin_size = float(getattr(loss_cfg, "ur_bin_size", 1.0e-6))
+    normalize_by_ur_bin_std = bool(getattr(loss_cfg, "normalize_by_ur_bin_std", False))
+    ur_bin_scale_eps = float(getattr(loss_cfg, "ur_bin_scale_eps", 1.0e-6))
+    ur_bin_state_scale_info: dict[str, Any] | None = None
+    if normalize_by_ur_bin_std:
+        ur_bin_state_scale_info = _build_vpinn_ur_bin_state_scale_info(
+            train_trajs,
+            ur_bin_size=ur_bin_size,
+            eps=ur_bin_scale_eps,
+        )
+    use_force_loss = bool(vp.get("use_force_loss", getattr(loss_cfg, "use_force_loss", True)))
+    use_weak_loss = bool(vp.get("use_weak_loss", getattr(loss_cfg, "use_weak_loss", True)))
     if not (use_force_loss or use_weak_loss):
-        raise ValueError("vpinn.use_td_correction requires at least one of use_force_loss/use_weak_loss.")
-    w, wdot, alpha = _test_functions(int(vp.get("window_M", 50)), dt, num_poly=int(vp.get("num_poly_test", 2)), num_sine=int(vp.get("num_sine_test", 0)))
+        raise ValueError("VPINN TD-correction training requires at least one of use_force_loss/use_weak_loss.")
+    w, wdot, alpha = _test_functions(
+        window_M,
+        dt,
+        num_poly=int(vp.get("num_poly_test", getattr(loss_cfg, "num_poly_test", 2))),
+        num_sine=int(vp.get("num_sine_test", getattr(loss_cfg, "num_sine_test", 0))),
+    )
     w = w.to(device)
     wdot = wdot.to(device)
     alpha = alpha.to(device)
@@ -2228,24 +2483,13 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
     log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
     print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
-    rollout_every = max(1, int(getattr(monitoring_cfg, "rollout_every_epochs", 1)))
-    cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
-    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
-    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
+    rollout_every = validate_every
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
     async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
     async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
-    async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
-    async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
-    rollout_target_ur: float | None = None
-    rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
-    if bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False)):
-        excluded_arr = _normalize_ur_filter(vp.get("train_exclude_ur"), key="vpinn.train_exclude_ur")
-        if excluded_arr is not None and excluded_arr.size == 1:
-            rollout_target_ur = float(excluded_arr[0])
     train_instances = len(train_dataset)
     train_steps_per_epoch = len(train_loader)
     val_instances = len(val_dataset) if val_dataset is not None else 0
@@ -2254,6 +2498,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     train_rollout_steps_per_epoch = len(rollout_loader) if rollout_loader is not None else 0
     val_rollout_instances = len(val_rollout_dataset) if val_rollout_dataset is not None else 0
     val_rollout_steps_per_epoch = len(val_rollout_loader) if val_rollout_loader is not None else 0
+    final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
 
     startup_lines = [
         f"Run name: {run_name}",
@@ -2280,7 +2525,30 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)}, amp={amp_enabled}, "
             f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
         ),
+        (
+            f"Rollout sampling: stochastic={rollout_stochastic}, "
+            f"noise_scale={rollout_noise_scale:g}, seed={rollout_seed}"
+        ),
     ]
+    if rollout_weight > 0.0:
+        rollout_mode_msg = rollout_loss_mode
+        if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}:
+            rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
+        startup_lines.append(
+            "Rollout loss mode: "
+            f"{rollout_mode_msg}, batch_size={rollout_batch_size}, "
+            f"scheduled_steps={current_rollout_steps}"
+        )
+        if rollout_steps_final > rollout_steps and rollout_steps_warmup_epochs > 0:
+            startup_lines.append(
+                "Rollout schedule: "
+                f"{rollout_steps}->{rollout_steps_final} over {rollout_steps_warmup_epochs} epoch(s)"
+            )
+    if normalize_by_ur_bin_std:
+        startup_lines.append(
+            "U_r loss scaling: "
+            f"enabled=true, bin_size={ur_bin_size:g}, eps={ur_bin_scale_eps:g}"
+        )
     print("\n".join(startup_lines))
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
@@ -2292,6 +2560,18 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         if bool(optim_cfg.use_lr_scheduler):
             for group in opt.param_groups:
                 group["lr"] = lr_scheduler.get_lr(epoch)
+        scheduled_rollout_steps = _scheduled_rollout_det_steps(
+            epoch=epoch,
+            base_steps=rollout_steps,
+            final_steps=rollout_steps_final,
+            warmup_epochs=rollout_steps_warmup_epochs,
+        )
+        if scheduled_rollout_steps != current_rollout_steps:
+            current_rollout_steps = scheduled_rollout_steps
+            train_rollout_dataset, rollout_loader, val_rollout_dataset, val_rollout_loader = _rebuild_rollout_loaders(current_rollout_steps)
+            print(
+                f"Epoch {epoch}: updated rollout loss horizon to {current_rollout_steps} step(s)."
+            )
         sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_rollout_det", "grad_norm"]}
         batches = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None else None
@@ -2312,6 +2592,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     x_win,
                     v_win,
                     ur_win,
+                    td_force,
                     probabilistic=probabilistic,
                     sigma_min=sigma_min,
                     force_zero_output=force_zero_output,
@@ -2339,9 +2620,20 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         alpha=alpha,
                         f0=None,
                     )
+                    p_scale = None
+                    if normalize_by_ur_bin_std:
+                        R_mean, p_scale = _vpinn_scale_weak_residual(
+                            R_mean,
+                            ur_values=ur_win[:, 0, :],
+                            mass=m_win[:, 0, :],
+                            scale_info=ur_bin_state_scale_info,
+                            ur_bin_size=ur_bin_size,
+                        )
                     if probabilistic:
                         coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
                         weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                        if p_scale is not None:
+                            weak_var = weak_var / torch.clamp(p_scale.unsqueeze(1) ** 2, min=1e-12)
                         weak_var = torch.clamp(weak_var, min=1e-9)
                         loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
                     else:
@@ -2351,32 +2643,30 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 mean_reg_loss = _reg(mu_corr, mean_reg_norm)
                 sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
                 rollout_det_loss = mu_corr.new_tensor(0.0)
-                if rollout_iter is not None and rollout_weight > 0.0 and rollout_steps > 0:
+                if rollout_iter is not None and rollout_weight > 0.0 and current_rollout_steps > 0:
                     try:
                         rb = next(rollout_iter)
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rb = next(rollout_iter)
-                    x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in rb]
-                    x_seq, v_seq, _f_seq, _td_seq, _corr_seq = _vpinn_td_rollout(
+                    rollout_det_loss = _vpinn_td_rollout_loss_from_batch(
                         model=model,
-                        x0=x0,
-                        v0=v0,
-                        ur0=ur0,
-                        td_context0=td0,
-                        steps=int(x_true_seq.shape[1] - 1),
+                        batch=rb,
+                        device=device,
+                        non_blocking=non_blocking,
                         dt=dt,
-                        m=m0,
-                        c=c0,
-                        k=k0,
                         rho=rho,
                         diameter=diameter,
                         td_params=td_params,
                         probabilistic=probabilistic,
                         sigma_min=sigma_min,
                         force_zero_output=force_zero_output,
+                        rollout_loss_mode=rollout_loss_mode,
+                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
+                        ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
+                        ur_bin_size=ur_bin_size,
                     )
-                    rollout_det_loss = torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2)
                 total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_weight) * rollout_det_loss
             if total_loss.requires_grad:
                 if scaler.is_enabled():
@@ -2417,8 +2707,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             and validate_every > 0
             and ((epoch % validate_every) == 0 or epoch == epochs - 1)
         )
-        should_rollout = rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == epochs - 1)
-        if async_validation and (should_validate or should_rollout) and (async_do_losses or async_do_rollout):
+        should_rollout = should_validate
+        if async_validation and (should_validate or should_rollout):
             async_processes = _reap_async_processes(async_processes, wait=False)
             state_source: nn.Module = model
             if hasattr(model, "_orig_mod"):
@@ -2432,6 +2722,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     "dt": dt,
                     "method": "vpinn",
                     "td_correction": True,
+                    "ur_bin_state_scale_info": ur_bin_state_scale_info,
                 },
                 ckpt_path,
             )
@@ -2444,12 +2735,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 async_device=async_device,
                 async_num_workers=async_num_workers,
                 async_num_threads=async_num_threads,
-                rollout_every_epochs=rollout_every,
-                cycle_validation_rollout=cycle_validation_rollout,
-                rollout_target_ur=rollout_target_ur,
-                rollout_target_ur_tol=rollout_target_ur_tol,
-                do_losses=async_do_losses and should_validate,
-                do_rollout=async_do_rollout and should_rollout,
+                do_losses=should_validate,
+                do_rollout=should_rollout,
             )
         elif should_validate:
             model.eval()
@@ -2464,6 +2751,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                             x_win,
                             v_win,
                             ur_win,
+                            td_force,
                             probabilistic=probabilistic,
                             sigma_min=sigma_min,
                             force_zero_output=force_zero_output,
@@ -2491,9 +2779,20 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                                 alpha=alpha,
                                 f0=None,
                             )
+                            p_scale = None
+                            if normalize_by_ur_bin_std:
+                                R_mean, p_scale = _vpinn_scale_weak_residual(
+                                    R_mean,
+                                    ur_values=ur_win[:, 0, :],
+                                    mass=m_win[:, 0, :],
+                                    scale_info=ur_bin_state_scale_info,
+                                    ur_bin_size=ur_bin_size,
+                                )
                             if probabilistic:
                                 coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
                                 weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                                if p_scale is not None:
+                                    weak_var = weak_var / torch.clamp(p_scale.unsqueeze(1) ** 2, min=1e-12)
                                 weak_var = torch.clamp(weak_var, min=1e-9)
                                 loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
                             else:
@@ -2512,41 +2811,38 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             val_denom = float(max(1, val_batches))
             for name, value in val_sums.items():
                 writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch + 1)
-            if val_rollout_loader is not None and rollout_weight > 0.0 and rollout_steps > 0:
+            if val_rollout_loader is not None and rollout_weight > 0.0 and current_rollout_steps > 0:
                 with torch.no_grad():
                     roll_sum = torch.zeros((), device=device)
                     roll_batches = 0
                     for rb in val_rollout_loader:
-                        x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [item.to(device, non_blocking=non_blocking) for item in rb]
-                        x_seq, v_seq, _, _, _ = _vpinn_td_rollout(
+                        roll_sum += _vpinn_td_rollout_loss_from_batch(
                             model=model,
-                            x0=x0,
-                            v0=v0,
-                            ur0=ur0,
-                            td_context0=td0,
-                            steps=int(x_true_seq.shape[1] - 1),
+                            batch=rb,
+                            device=device,
+                            non_blocking=non_blocking,
                             dt=dt,
-                            m=m0,
-                            c=c0,
-                            k=k0,
                             rho=rho,
                             diameter=diameter,
                             td_params=td_params,
                             probabilistic=probabilistic,
                             sigma_min=sigma_min,
                             force_zero_output=force_zero_output,
-                        )
-                        roll_sum += torch.mean((x_seq - x_true_seq) ** 2 + (v_seq - v_true_seq) ** 2).detach()
+                            rollout_loss_mode="deterministic",
+                            rollout_stochastic_samples=1,
+                            rollout_noise_scale=rollout_noise_scale,
+                            ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
+                            ur_bin_size=ur_bin_size,
+                        ).detach()
                         roll_batches += 1
                     writer.add_scalar("val/loss_rollout_det", float((roll_sum / float(max(1, roll_batches))).detach().cpu()), epoch + 1)
 
             if should_rollout and val_trajs:
-                sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
                 ur_all = [float(traj["ur"][0]) for traj in val_trajs]
                 sampled_metric_indices = sample_indices_per_ur(
                     ur_all,
                     samples_per_ur=validation_samples_per_ur,
-                    seed=sample_seed,
+                    seed=1,
                 )
                 sampled_names = [str(val_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
                 print(
@@ -2566,11 +2862,13 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         rho=rho,
                         diameter=diameter,
                         td_params=td_params,
-                        middle_time_plot=resolve_middle_time_plot(config.data, vp, method_name="vpinn"),
                         device=device,
                         sigma_min=sigma_min,
                         probabilistic=probabilistic,
                         force_zero_output=force_zero_output,
+                        rollout_stochastic=rollout_stochastic,
+                        rollout_noise_scale=rollout_noise_scale,
+                        rollout_seed=rollout_seed,
                         log_metrics=False,
                         log_plots=False,
                     )
@@ -2583,24 +2881,10 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     denom_roll = float(max(1, metrics_count.get(name, 0)))
                     writer.add_scalar(f"val/{name}", total / denom_roll, epoch + 1)
 
-                selected_indices: list[int] | None = None
-                if rollout_target_ur is not None:
-                    matches = [
-                        idx
-                        for idx, traj in enumerate(val_trajs)
-                        if np.isclose(float(traj["ur"][0]), float(rollout_target_ur), rtol=0.0, atol=float(rollout_target_ur_tol))
-                    ]
-                    if matches:
-                        selected_indices = matches
-                if selected_indices is None:
-                    selected_indices = sample_one_index_per_ur(ur_all, seed=0)
-                    if not selected_indices:
-                        selected_indices = list(range(len(val_trajs)))
-                rollout_idx = (
-                    selected_indices[max(0, (epoch + 1) // max(1, int(rollout_every)) - 1) % len(selected_indices)]
-                    if cycle_validation_rollout
-                    else selected_indices[0]
-                )
+                selected_indices = sample_one_index_per_ur(ur_all, seed=0)
+                if not selected_indices:
+                    selected_indices = list(range(len(val_trajs)))
+                rollout_idx = selected_indices[0]
                 rollout_traj = val_trajs[rollout_idx]
                 print(
                     f"[td-val][vpinn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
@@ -2620,11 +2904,13 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     rho=rho,
                     diameter=diameter,
                     td_params=td_params,
-                    middle_time_plot=resolve_middle_time_plot(config.data, vp, method_name="vpinn"),
                     device=device,
                     sigma_min=sigma_min,
                     probabilistic=probabilistic,
                     force_zero_output=force_zero_output,
+                    rollout_stochastic=rollout_stochastic,
+                    rollout_noise_scale=rollout_noise_scale,
+                    rollout_seed=rollout_seed,
                     log_metrics=False,
                     log_plots=True,
                 )
@@ -2632,6 +2918,105 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
         async_processes = _reap_async_processes(async_processes, wait=True)
+
+    if final_rollout_all_validation and val_trajs:
+        print("Final validation rollout (all trajectories) started.")
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
+        ur_values: list[float] = []
+        metrics_list: list[dict[str, float]] = []
+        output_ur_values: list[float] = []
+        corr_series_list: list[np.ndarray] = []
+        sigma_series_list: list[np.ndarray] = []
+        selected_trajs: list[dict[str, Any]] = []
+        seen_ur: set[float] = set()
+        for traj in val_trajs:
+            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
+            ur_key = round(ur_val, 6)
+            if ur_key in seen_ur:
+                continue
+            seen_ur.add(ur_key)
+            selected_trajs.append(traj)
+        for idx, traj in enumerate(selected_trajs):
+            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
+            traj_t = _td_rollout_traj_to_tensors(traj)
+            x_true_t = traj_t["x"].to(device)
+            v_true_t = traj_t["v"].to(device)
+            td_true_t = traj_t["td_force"].to(device)
+            ur_true_t = traj_t["ur"].to(device)
+            with torch.no_grad():
+                corr_on_data, sigma_on_data = _vpinn_predict_correction(
+                    model,
+                    x_true_t,
+                    v_true_t,
+                    ur_true_t,
+                    td_true_t,
+                    probabilistic=probabilistic,
+                    sigma_min=sigma_min,
+                    force_zero_output=force_zero_output,
+                )
+            output_ur_values.append(ur_val)
+            corr_series_list.append(corr_on_data[:, 0].detach().cpu().numpy())
+            if probabilistic:
+                sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
+
+            metrics = _log_td_correction_rollout_validation(
+                writer=writer,
+                epoch=max(0, epochs - 1),
+                model=model,
+                traj=traj,
+                dt=dt,
+                td_mass_source=td_mass_source,
+                rho=rho,
+                diameter=diameter,
+                td_params=td_params,
+                device=device,
+                sigma_min=sigma_min,
+                probabilistic=probabilistic,
+                force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
+                tag_prefix="final_val/rollout",
+                step=idx,
+                log_metrics=False,
+                log_plots=True,
+                log_correction_on_data=True,
+                log_phase_map=True,
+                title_suffix=f" [final {idx + 1}/{len(selected_trajs)}]",
+            )
+            filtered = {name: float(value) for name, value in metrics.items() if np.isfinite(float(value))}
+            if filtered:
+                ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
+                metrics_list.append(filtered)
+            for name, value in filtered.items():
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        avg_metrics = {
+            name: metrics_sum[name] / float(metrics_count[name])
+            for name in metrics_sum
+            if metrics_count.get(name, 0) > 0
+        }
+        if avg_metrics:
+            summary_lines = [f"Final rollout over {len(selected_trajs)} validation trajectories (unique U_r):"]
+            for name in sorted(avg_metrics):
+                summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
+                writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
+            writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
+        if ur_values and metrics_list:
+            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
+        if output_ur_values and corr_series_list:
+            force_mode = str(getattr(model, "force_representation", "force")).strip().lower()
+            log_output_distribution_vs_ur(
+                writer,
+                epochs,
+                ur_values=output_ur_values,
+                mean_series=corr_series_list,
+                sigma_series=(sigma_series_list if probabilistic else None),
+                mean_label=("Correction coefficient" if force_mode == "coefficient" else "Correction force"),
+                sigma_label=("Sigma coefficient" if force_mode == "coefficient" else "Sigma force"),
+                tag="final_val/output_distribution_vs_ur",
+            )
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -2647,6 +3032,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             "dt": dt,
             "method": "vpinn",
             "td_correction": True,
+            "ur_bin_state_scale_info": ur_bin_state_scale_info,
         },
         model_path,
     )
@@ -2656,11 +3042,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
 
 
 def train(config: Config, config_name: str) -> None:
-    if bool(dict(config.vpinn or {}).get("use_td_correction", False)):
-        _train_td_correction_vpinn(config, config_name)
-        return
-
     vp = dict(config.vpinn or {})
+    if "use_td_correction" in vp and not bool(vp.get("use_td_correction", True)):
+        raise ValueError("VPINN now only supports TD-correction training. Remove vpinn.use_td_correction or set it to true.")
+    _train_td_correction_vpinn(config, config_name)
+    return
     runtime_cfg = config.runtime
     precision_cfg = config.precision
     compile_cfg = config.compile
@@ -2691,12 +3077,12 @@ def train(config: Config, config_name: str) -> None:
     if not (use_force_loss or use_weak_loss):
         raise ValueError("vpinn must enable at least one of: use_force_loss, use_weak_loss.")
 
-    use_gradnorm = bool(vp.get("use_gradnorm", False))
-    gradnorm_alpha = float(vp.get("gradnorm_alpha", 0.9))
-    gradnorm_eps = float(vp.get("gradnorm_eps", 1e-8))
-    gradnorm_min_weight = float(vp.get("gradnorm_min_weight", 0.1))
-    gradnorm_max_weight = float(vp.get("gradnorm_max_weight", 10.0))
-    gradnorm_update_every_steps = int(vp.get("gradnorm_update_every_steps", 1))
+    use_gradnorm = bool(vp.get("use_gradnorm", getattr(loss_cfg, "use_gradnorm", False)))
+    gradnorm_alpha = float(vp.get("gradnorm_alpha", getattr(loss_cfg, "gradnorm_alpha", 0.9)))
+    gradnorm_eps = float(vp.get("gradnorm_eps", getattr(loss_cfg, "gradnorm_eps", 1e-8)))
+    gradnorm_min_weight = float(vp.get("gradnorm_min_weight", getattr(loss_cfg, "gradnorm_min_weight", 0.1)))
+    gradnorm_max_weight = float(vp.get("gradnorm_max_weight", getattr(loss_cfg, "gradnorm_max_weight", 10.0)))
+    gradnorm_update_every_steps = int(vp.get("gradnorm_update_every_steps", getattr(loss_cfg, "gradnorm_update_every_steps", 1)))
     gradnorm_update_every_steps = max(1, gradnorm_update_every_steps)
 
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
@@ -2706,49 +3092,10 @@ def train(config: Config, config_name: str) -> None:
     non_blocking = device.type == "cuda"
 
     train_trajs, val_trajs, dt = _prepare_trajectories(config)
-    validation_only_data_file = bool(vp.get("validation_only_data_file", False))
-    use_data_file_for_validation = bool(vp.get("use_data_file_for_validation", False))
-    if val_trajs:
-        validation_only_data_file = False
-        use_data_file_for_validation = False
-    if validation_only_data_file:
-        val_trajs = []
-    else:
-        if not val_trajs:
-            train_trajs, val_trajs = _split_by_trajectory(train_trajs, val_fraction=val_fraction, seed=split_seed)
+    if not val_trajs:
+        train_trajs, val_trajs = _split_by_trajectory(train_trajs, val_fraction=val_fraction, seed=split_seed)
     if not train_trajs:
         raise ValueError("Empty training split. Reduce vpinn.val_fraction or provide more trajectories.")
-    if use_data_file_for_validation:
-        data_path = Path(config.data.file)
-        if not data_path.is_absolute():
-            data_path = (Path.cwd() / data_path).resolve()
-        val_reduce_time = bool(getattr(config.data, "reduce_time", False))
-        val_reduction_factor = int(getattr(config.data, "reduction_factor", 1))
-        cut_start_seconds = float(
-            config.data.cut_start_seconds_val
-            if getattr(config.data, "cut_start_seconds_val", None) is not None
-            else getattr(config.data, "cut_start_seconds", 0.0)
-        )
-        val_traj, val_dt = _load_trajectory(
-            path=data_path,
-            dt_target=dt,
-            velocity_source=str(vp.get("velocity_source", "compute")).strip().lower(),
-            smoothing_cfg=config.smoothing,
-            reduce_time=val_reduce_time,
-            reduction_factor=val_reduction_factor,
-            cut_start_seconds=cut_start_seconds,
-            force_representation=force_representation,
-            rho=float(getattr(config.model, "rho", 1000.0)),
-            D=float(getattr(config.model, "D", 0.1)),
-            k=coeff_k,
-            m_eff=coeff_m_eff,
-        )
-        if val_dt != dt:
-            raise ValueError(f"Validation data dt={val_dt} does not match training dt={dt}.")
-        if val_trajs is None:
-            val_trajs = []
-        # Put `data.npz` first so rollout validation uses it by default.
-        val_trajs = [val_traj] + list(val_trajs)
 
     batch_size = int(training_cfg.batch_size)
     epochs = int(training_cfg.epochs)
@@ -2773,7 +3120,8 @@ def train(config: Config, config_name: str) -> None:
         v_scale = omega * float(x_scale)
         # Reduce velocity is dimensionless; scale it to O(1) for the force network.
         ur_scale = float(vp.get("ur_scale", 10.0))
-        # Typical force scale: k * D (unless output is force coefficient).
+        # In force mode, use a typical force scale k*D. In coefficient mode,
+        # the network outputs C_F directly, so keep the wrapper output scale at 1.
         f_scale = 1.0 if use_force_coeff else k * float(x_scale)
         model = ScaledForceWrapper(
             model,
@@ -2783,9 +3131,10 @@ def train(config: Config, config_name: str) -> None:
             ur_scale=ur_scale,
             f_scale=f_scale,
         )
+        force_scale_msg = "f_scale=1 (coefficient output)" if use_force_coeff else "f_scale=kD"
         print(
             f"VPINN scaling enabled: x/D (D={x_scale:g}), v/(sqrt(k/m)D), U_r/{ur_scale:g}, "
-            f"f_scale=kD."
+            f"{force_scale_msg}."
         )
 
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
@@ -2868,31 +3217,13 @@ def train(config: Config, config_name: str) -> None:
     log_every = int(getattr(monitoring_cfg, "log_every_epochs", 1))
     print_every = int(getattr(monitoring_cfg, "print_every_epochs", 1))
     validate_every = int(getattr(monitoring_cfg, "validate_every_epochs", 1))
-    rollout_every = int(getattr(monitoring_cfg, "rollout_every_epochs", 0))
-    rollout_max_trajs = int(getattr(monitoring_cfg, "rollout_max_trajectories", 1))
-    cycle_validation_rollout = bool(getattr(monitoring_cfg, "cycle_validation_rollout", False))
-    fixed_validation_sampling = bool(getattr(monitoring_cfg, "fixed_validation_sampling", False))
-    validation_sampling_seed = int(getattr(monitoring_cfg, "validation_sampling_seed", 1))
-    rollout_use_excluded_ur = bool(getattr(monitoring_cfg, "rollout_use_excluded_ur", False))
-    rollout_target_ur_tol = float(getattr(monitoring_cfg, "rollout_target_ur_tol", 1e-6))
+    rollout_every = validate_every
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
     async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
     async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
     async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
     async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
-    async_do_losses = bool(getattr(monitoring_cfg, "async_validation_do_losses", True))
-    async_do_rollout = bool(getattr(monitoring_cfg, "async_validation_do_rollout", True))
-    rollout_target_ur: float | None = None
-    if rollout_use_excluded_ur:
-        excluded_arr = _normalize_ur_filter(vp.get("train_exclude_ur"), key="vpinn.train_exclude_ur")
-        if excluded_arr is not None and excluded_arr.size == 1:
-            rollout_target_ur = float(excluded_arr[0])
-        else:
-            warnings.warn(
-                "monitoring.rollout_use_excluded_ur is enabled, but vpinn.train_exclude_ur "
-                "must contain exactly one value. Falling back to default rollout selection."
-            )
 
     writer, run_name = setup_writer(
         config.logging.run_dir_root,
@@ -3139,7 +3470,7 @@ def train(config: Config, config_name: str) -> None:
         )
         should_rollout = rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == (epochs - 1))
 
-        if async_validation and (should_validate or should_rollout) and (async_do_losses or async_do_rollout):
+        if async_validation and (should_validate or should_rollout):
             async_processes = _reap_async_processes(async_processes, wait=False)
             state_source: nn.Module = model
             if hasattr(model, "_orig_mod"):
@@ -3165,12 +3496,8 @@ def train(config: Config, config_name: str) -> None:
                 async_device=async_device,
                 async_num_workers=async_num_workers,
                 async_num_threads=async_num_threads,
-                rollout_every_epochs=rollout_every,
-                cycle_validation_rollout=cycle_validation_rollout,
-                rollout_target_ur=rollout_target_ur,
-                rollout_target_ur_tol=rollout_target_ur_tol,
-                do_losses=async_do_losses and should_validate,
-                do_rollout=async_do_rollout and should_rollout,
+                do_losses=should_validate,
+                do_rollout=should_rollout,
             )
         elif should_validate and not async_validation:
             val_metrics = _evaluate_epoch(
@@ -3199,40 +3526,12 @@ def train(config: Config, config_name: str) -> None:
             if force_map is not None:
                 for k_name, v_value in force_map.items():
                     writer.add_scalar(f"val/{k_name}", v_value, epoch)
-            loss_by_ur = _per_ur_loss_map_vpinn(
-                model=model,
-                loader=val_loader,
-                device=device,
-                non_blocking=non_blocking,
-                dt=dt,
-                m=m,
-                c=c,
-                k=k,
-                w=w,
-                wdot=wdot,
-                alpha=alpha,
-                use_force_loss=use_force_loss,
-                use_weak_loss=use_weak_loss,
-                rollout_force_steps=rollout_force_steps if use_rollout_loss else 0,
-                expect_f0=use_force_coeff,
-                amp_enabled=amp_enabled,
-                amp_dtype=amp_dtype,
-            )
-            log_loss_vs_ur(
-                writer,
-                epoch,
-                loss_by_ur,
-                tag="val/loss_vs_ur",
-                title="Validation loss vs U_r",
-            )
-
         if should_rollout and not async_validation:
             candidates = val_trajs if val_trajs else train_trajs
             if not candidates:
                 continue
             ur_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in candidates]
-            sample_seed = int(validation_sampling_seed) if fixed_validation_sampling else (int(epoch) + 1)
-            sampled_metric_indices = sample_one_index_per_ur(ur_all, seed=sample_seed)
+            sampled_metric_indices = sample_one_index_per_ur(ur_all, seed=1)
             metrics_sum: dict[str, float] = {}
             metrics_count: dict[str, int] = {}
             for sidx in sampled_metric_indices:
@@ -3260,33 +3559,8 @@ def train(config: Config, config_name: str) -> None:
                 denom = float(max(1, metrics_count.get(name, 0)))
                 writer.add_scalar(f"val/{name}", total / denom, epoch)
 
-            selected_indices: list[int] | None = None
-            if rollout_target_ur is not None:
-                matches: list[int] = []
-                for idx, traj in enumerate(candidates):
-                    ur_val = float(traj["ur"][0, 0].detach().cpu().item())
-                    if np.isclose(
-                        ur_val,
-                        float(rollout_target_ur),
-                        rtol=0.0,
-                        atol=float(rollout_target_ur_tol),
-                    ):
-                        matches.append(idx)
-                if matches:
-                    selected_indices = matches
-                else:
-                    warnings.warn(
-                        "monitoring.rollout_use_excluded_ur is enabled but no validation rollout "
-                        f"trajectory matched U_r={float(rollout_target_ur):.6g} "
-                        f"(tol={float(rollout_target_ur_tol):.3g}); falling back to default rollout selection."
-                    )
-            if selected_indices is None:
-                selected_indices = list(range(len(candidates)))
-            if cycle_validation_rollout:
-                step = max(0, (epoch + 1) // max(1, int(rollout_every)) - 1)
-                rollout_idx = selected_indices[step % len(selected_indices)]
-            else:
-                rollout_idx = selected_indices[0]
+            selected_indices = list(range(len(candidates)))
+            rollout_idx = selected_indices[0]
             for traj in candidates[rollout_idx : rollout_idx + 1]:
                 _log_rollout_validation(
                     writer=writer,
@@ -3368,7 +3642,7 @@ def train(config: Config, config_name: str) -> None:
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
-    if val_loader is not None:
+    if final_rollout_all_validation and val_loader is not None:
         final_loss_by_ur = _per_ur_loss_map_vpinn(
             model=model,
             loader=val_loader,

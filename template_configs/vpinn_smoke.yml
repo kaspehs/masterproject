@@ -1,12 +1,8 @@
 method: vpinn
 
 data:
-  # Use the same training-series setup as `HNNrunconfigs/pirate_smoke.yml`.
-  file: data.npz
-  cut_start_seconds: 0.0
   cut_start_seconds_train: 0.0
   cut_start_seconds_val: 0.0
-  use_generated_train_series: true
   train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
   reduce_time: true
   reduction_factor: 5
@@ -19,14 +15,11 @@ model:
   k: 1218.0
   damping_c: 1e-4
 
-smoothing:
-  # Only used when vpinn.velocity_source=compute
-  use_savgol_smoothing: true
-  window_length: 7
-  polyorder: 3
-
 architecture:
-  # Used when `vpinn.use_architecture_config: true`
+  # VPINN always uses the shared architecture block below.
+  use_fourier_features: false
+  fourier_features: 64
+  fourier_sigma: 1.0
   force_net_type: mlp
   residual_kwargs:
     hidden: 128
@@ -59,6 +52,50 @@ optim:
     min_lr: 0.0001
     scheduler_type: cosine
 
+loss:
+  # Active losses
+  use_force_loss: true
+  use_weak_loss: true
+
+  # Windowing / weak-form setup
+  window_M: 10
+  stride: 2
+  wf: 1.0
+  ww: 1.0
+  num_poly_test: 3
+  num_sine_test: 0
+
+  # Regularization
+  mean_reg: 0.0
+  mean_reg_norm: l1
+  sigma_reg: 0.0
+  sigma_reg_norm: l2
+
+  # U_r-bin normalization
+  ur_bin_size: 1.0e-6
+  normalize_by_ur_bin_std: false
+  ur_bin_scale_eps: 1.0e-6
+
+  # Rollout loss
+  rollout_det_weight: 0.0
+  rollout_det_steps: 0
+  # Rollout loss mode: deterministic | stochastic_nll | stochastic_mse
+  rollout_loss_mode: deterministic
+  # Number of stochastic rollout samples K. Must be >= 2 for stochastic_nll/stochastic_mse.
+  rollout_stochastic_samples: 1
+  # Optional linear rollout-length schedule. <=0 keeps rollout_det_steps fixed.
+  rollout_det_steps_final: 0
+  rollout_det_steps_warmup_epochs: 0
+  rollout_det_batch_size: 0
+
+  # GradNorm balancing
+  use_gradnorm: true
+  gradnorm_alpha: 0.9
+  gradnorm_eps: 1.0e-8
+  gradnorm_min_weight: 0.001
+  gradnorm_max_weight: 1000.0
+  gradnorm_update_every_steps: 10
+
 runtime:
   device: cuda
   num_workers: 4
@@ -85,12 +122,6 @@ monitoring:
   validate_every_epochs: 10
 
   # Rollout validation plots (dynamics check)
-  rollout_every_epochs: 10
-  rollout_max_trajectories: 1
-  cycle_validation_rollout: false
-  # If true, validation metric sampling uses a fixed seed across epochs for stability.
-  fixed_validation_sampling: true
-  validation_sampling_seed: 1
   validation_samples_per_ur: 2
   final_rollout_all_validation: true
   async_validation: true
@@ -98,77 +129,36 @@ monitoring:
   async_validation_num_workers: 0
   async_validation_num_threads: 1
   async_validation_max_concurrent: 6
-  async_validation_do_losses: true
-  async_validation_do_rollout: true
-  # If true and exactly one train_exclude_ur is configured, validation rollout
-  # targets that excluded U_r from the validation set (if available).
-  rollout_use_excluded_ur: true
-  rollout_target_ur_tol: 1e-6
 
 vpinn:
   # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
-  use_td_correction: true
   predict_sigma: false
+  # If true, include the current Vivana-TD predicted force as an extra force-network input.
+  use_td_force_input: false
+
   # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
   # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
   corr_init_mode: zero
   corr_init_tiny_std: 1.0e-4
+
+  # Debug / structural convention
   # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.
   force_zero_output: false
   # Structural mass used in TD-correction mode: dry | effective
   td_mass_source: dry
-  # Loss toggles
-  use_force_loss: true
-  use_weak_loss: true
-  use_gradnorm: true
-  gradnorm_alpha: 0.9
-  gradnorm_eps: 1.0e-8
-  gradnorm_min_weight: 0.001
-  gradnorm_max_weight: 1000.0
-  gradnorm_update_every_steps: 10
-  window_M: 10
-  stride: 2
-  val_fraction: 0.0
-  split_seed: 0
-  wf: 1.0
-  ww: 1.0
-  # Optional short rollout force loss (applied every N batches).
-  rollout_force_weight: 0.0
-  rollout_force_steps: 0
-  rollout_force_every: 1
-  rollout_force_batch_size: 0
-  # Test functions for weak residual: polynomials (degree 0..num_poly_test-1) and sines (k=1..num_sine_test).
-  # If num_poly_test is omitted, it defaults to 2 (degree 0 and 1).
-  num_poly_test: 3
-  num_sine_test: 0
 
-  # Network architecture
-  # If true, uses the shared `architecture:` block (force_net_type + *_kwargs) like HNN.
-  # If false, uses vpinn.hidden_dim/depth/activation below.
-  use_architecture_config: true
+  # Rollout behavior
+  # Validation/final rollout sampling:
+  # false -> deterministic correction rollout
+  # true  -> stochastic correction rollout using learned sigma_corr
+  rollout_stochastic: false
+  rollout_noise_scale: 1.0
+  rollout_seed: null
 
-  # Network
-  hidden_dim: 128
-  depth: 2
-  activation: tanh
-
-  # Data interpretation
-  # Generated series contain x and f, but not dy, so we compute v from x.
-  velocity_source: file
-  # Optional VPINN-specific rollout plotting window [start_s, end_s].
-  # Overrides data.middle_time_plot when set.
-  middle_time_plot: [15, 17]
-  # Optional training-only U_r filtering when using generated series.
-  # Validation loading is unchanged.
-  train_include_ur: null
-  train_exclude_ur: [5.75]
-  train_ur_filter_tol: 1e-6
-  use_data_file_for_validation: true
-  validation_only_data_file: true
-
-  # Input/output scaling (recommended): x/D, v/(sqrt(k/m)D), U_r/ur_scale, and f_scale=kD.
+  # Scaling / force convention
+  # Input scaling (recommended): x/D, v/(sqrt(k/m)D), U_r/ur_scale.
+  # In force mode the wrapper uses f_scale=kD; in coefficient mode it outputs C_F directly.
   use_input_scaling: true
   ur_scale: 10.0
-
   # Force representation: "force" (default) or "coefficient" (C = F/F0).
   force_representation: coefficient

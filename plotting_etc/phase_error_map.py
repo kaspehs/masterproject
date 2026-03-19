@@ -268,8 +268,6 @@ def _load_config_from_checkpoint(model_path: Path):
 
 
 def _load_training_points_from_config(cfg) -> tuple[np.ndarray, np.ndarray]:
-    if not getattr(cfg.data, "use_generated_train_series", False):
-        return np.array([]), np.array([])
     series_dir = Path(getattr(cfg.data, "train_series_dir", ""))
     if not series_dir:
         return np.array([]), np.array([])

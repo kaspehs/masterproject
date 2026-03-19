@@ -33,17 +33,10 @@ def evaluate_series(
     disp: np.ndarray,
     force: np.ndarray,
     reduced_velocity: float,
-    smoothing_cfg,
     device: torch.device,
 ) -> dict[str, float]:
     dt = float(t[1] - t[0]) if t.size > 1 else derived["D"]
-    vel = compute_velocity_numpy(
-        disp,
-        dt,
-        use_savgol=smoothing_cfg.use_savgol_smoothing,
-        savgol_window=smoothing_cfg.window_length,
-        savgol_polyorder=smoothing_cfg.polyorder,
-    )
+    vel = compute_velocity_numpy(disp, dt)
     y_tensor = torch.from_numpy(disp).float().to(device)
     vel_tensor = torch.from_numpy(vel).float().to(device)
     rollout = rollout_model(
@@ -122,11 +115,10 @@ def main():
         )
     model.eval()
 
-    smoothing_cfg = cfg.smoothing
     results = []
     for amplitude, freq in CASES:
         t, disp, force, ur_val = simulate_series(amplitude, freq, SIM_DT, SIM_T, SIM_INTEGRATOR)
-        metrics = evaluate_series(model, derived, t, disp, force, ur_val, smoothing_cfg, device)
+        metrics = evaluate_series(model, derived, t, disp, force, ur_val, device)
         entry = {
             "amplitude": amplitude,
             "frequency": freq,

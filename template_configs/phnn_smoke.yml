@@ -1,16 +1,10 @@
 method: hnn
 
 data:
-  file: data.npz
-  steadystate: false
-  steadystate_time_threshold: 10.0
-  cut_start_seconds: 0.0
   cut_start_seconds_train: 0.0
   cut_start_seconds_val: 0.0
   reduce_time: true
   reduction_factor: 5
-  middle_time_plot: [15, 17]
-  use_generated_train_series: true
   train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
 
 model:
@@ -19,31 +13,15 @@ model:
   structural_mass: 16.79
   Ca: 1.0
   k: 1218.0
-  U: 0.65
   damping_c: 1e-4
-  max_damping_ratio: 0.2
-  include_physical_drag: false
   force_output: coefficient
-  learn_hamiltonian: false
-  discover_damping: false
-  use_pirate_force: false
-  pirate_force_kwargs: {}
+  sigma_min: 1.0e-6
+  ur_scale: 10.0
+
+architecture:
   use_fourier_features: false
   fourier_features: 64
   fourier_sigma: 1.0
-  use_feature_engineering: false
-  # Learn heteroscedastic process noise in the momentum channel (PHNN-only).
-  use_stochastic_process_noise: false
-  sigma_min: 1.0e-6
-  # PHNN is markovian-only; history-dependent formulation is not supported.
-  ur_scale: 10.0
-
-smoothing:
-  use_savgol_smoothing: true
-  window_length: 7
-  polyorder: 3
-
-architecture:
   force_net_type: mlp
   residual_kwargs:
     hidden: 128
@@ -78,46 +56,35 @@ optim:
     scheduler_type: cosine
 
 loss:
-  # Mean-force regularization weight (independent of sigma regularization).
+  # Regularization
   mean_reg: 0.0
-  # Norm for mean-force regularizer: l1 | l2
   mean_reg_norm: l1
-  # Sigma regularization weight (for stochastic PHNN this regularizes diffusion sigma).
   sigma_reg: 0.0
-  # Norm for sigma regularizer: l1 | l2
   sigma_reg_norm: l2
-  # If true, average the residual/physics loss equally over reduced-velocity bins.
-  equalize_residual_over_ur_bins: false
-  # If true, average the rollout loss equally over reduced-velocity bins.
-  equalize_rollout_over_ur_bins: false
-  # Global reduced-velocity bin size used by the equalized loss aggregation above.
+
+  # U_r-bin normalization
   ur_bin_size: 1.0e-6
-  # If true, normalize residual/physics loss by fixed training-set state std per U_r bin.
-  normalize_residual_by_ur_bin_std: false
-  # If true, normalize rollout loss by fixed training-set state std per U_r bin.
-  normalize_rollout_by_ur_bin_std: false
-  # Minimum positive floor for the per-bin state std used above.
+  normalize_by_ur_bin_std: false
   ur_bin_scale_eps: 1.0e-6
-  # Optional multi-step rollout loss.
+
+  # Rollout loss
   rollout_det_weight: 0.0
   rollout_det_steps: 0
   # Rollout loss mode: deterministic | stochastic_nll | stochastic_mse
   rollout_loss_mode: deterministic
-  # Number of stochastic rollout samples K used for stochastic rollout losses.
-  # Must be >= 2 when rollout_loss_mode is stochastic_nll or stochastic_mse.
+  # Number of stochastic rollout samples K. Must be >= 2 for stochastic_nll/stochastic_mse.
   rollout_stochastic_samples: 1
-  # Optional linear schedule for rollout length. <=0 keeps rollout_det_steps fixed.
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
-  # Batch size for deterministic rollout loss windows (<=0 uses training.batch_size).
   rollout_det_batch_size: 0
-  # If true, mean regularizer is applied on force coefficient instead of force units.
-  force_reg_on_coeff: true
+
+  # Data / symmetry losses
   use_force_data_loss: false
   force_data_weight: 0.0
-  # Odd-symmetry regularization on force map: F(-z, U_r) ~= -F(z, U_r)
   symmetry_weight: 0.0
   symmetry_norm: l2
+
+  # GradNorm balancing
   use_gradnorm: false
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.001
@@ -137,18 +104,8 @@ compile:
   compile_mode: reduce-overhead
 
 monitoring:
-  rollout_every_epochs: 50
   validate_every_epochs: 50
-  rollout_max_trajectories: 1
-  cycle_validation_rollout: false
-  # If true, validation metric sampling uses a fixed seed across epochs for stability.
-  fixed_validation_sampling: true
-  validation_sampling_seed: 1
   validation_samples_per_ur: 2
-  # If true and exactly one train_exclude_ur is configured, validation rollout
-  # will target that excluded U_r.
-  rollout_use_excluded_ur: true
-  rollout_target_ur_tol: 1e-6
   final_rollout_all_validation: true
   log_every_epochs: 10
   print_every_epochs: 50
@@ -158,36 +115,38 @@ monitoring:
   async_validation_num_workers: 0
   async_validation_num_threads: 1
   async_validation_max_concurrent: 6
-  async_validation_do_losses: true
-  async_validation_do_rollout: true
 
 logging:
   run_dir_root: logs
   run_name: null
   append_timestamp: true
 
-hnn: # file or compute
+hnn:
   # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
-  use_td_correction: true
+  # If true, learn sigma on the correction force/coefficient output head.
   predict_sigma: false
+  # If true, include the current Vivana-TD predicted force as an extra force-network input.
+  use_td_force_input: false
+  # One-step state loss: mse | propagated_nll
+  state_loss_mode: mse
+
   # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
   # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
   corr_init_mode: zero
   corr_init_tiny_std: 1.0e-4
+
+  # Debug / structural convention
   # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.
   force_zero_output: false
   # Structural mass used in TD-correction mode: dry | effective
   td_mass_source: dry
-  velocity_source: file
+
+  # Rollout behavior
   # Validation/final rollout sampling:
   # false -> deterministic drift-only rollout
-  # true  -> stochastic momentum rollout using learned sigma_theta
+  # true  -> stochastic correction rollout using learned sigma_corr
   rollout_stochastic: false
   rollout_noise_scale: 1.0
   rollout_seed: null
-  # Optional training-only U_r filtering when using generated series.
-  # Validation loading is unchanged.
-  train_include_ur: null
-  train_exclude_ur: [5.75]
-  train_ur_filter_tol: 1e-6
+
 pinn: {}
