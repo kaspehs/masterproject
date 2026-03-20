@@ -2933,16 +2933,57 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         output_ur_values: list[float] = []
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
-        selected_trajs: list[dict[str, Any]] = []
-        seen_ur: set[float] = set()
+        metric_trajs: list[dict[str, Any]] = []
+        seen_metric_ur: set[float] = set()
         for traj in val_trajs:
             ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
             ur_key = round(ur_val, 6)
-            if ur_key in seen_ur:
+            if ur_key in seen_metric_ur:
                 continue
-            seen_ur.add(ur_key)
-            selected_trajs.append(traj)
-        for idx, traj in enumerate(selected_trajs):
+            seen_metric_ur.add(ur_key)
+            metric_trajs.append(traj)
+        plot_trajs = list(metric_trajs)
+        seen_plot_ur = set(seen_metric_ur)
+        for traj in train_trajs:
+            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
+            ur_key = round(ur_val, 6)
+            if ur_key in seen_plot_ur:
+                continue
+            seen_plot_ur.add(ur_key)
+            plot_trajs.append(traj)
+        plot_trajs.sort(key=lambda traj: round(float(np.asarray(traj["ur"]).reshape(-1)[0]), 6))
+        for traj in metric_trajs:
+            metrics = _log_td_correction_rollout_validation(
+                writer=writer,
+                epoch=max(0, epochs - 1),
+                model=model,
+                traj=traj,
+                dt=dt,
+                td_mass_source=td_mass_source,
+                rho=rho,
+                diameter=diameter,
+                td_params=td_params,
+                device=device,
+                sigma_min=sigma_min,
+                probabilistic=probabilistic,
+                force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
+                tag_prefix="final_val/rollout",
+                log_metrics=False,
+                log_plots=False,
+                log_correction_on_data=False,
+                log_phase_map=False,
+            )
+            filtered = {name: float(value) for name, value in metrics.items() if np.isfinite(float(value))}
+            if filtered:
+                ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
+                metrics_list.append(filtered)
+            for name, value in filtered.items():
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for idx, traj in enumerate(plot_trajs, start=1):
             ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
             traj_t = _td_rollout_traj_to_tensors(traj)
             x_true_t = traj_t["x"].to(device)
@@ -2965,7 +3006,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             if probabilistic:
                 sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
 
-            metrics = _log_td_correction_rollout_validation(
+            _log_td_correction_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
                 model=model,
@@ -2988,22 +3029,15 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 log_plots=True,
                 log_correction_on_data=True,
                 log_phase_map=True,
-                title_suffix=f" [final {idx + 1}/{len(selected_trajs)}]",
+                title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
-            filtered = {name: float(value) for name, value in metrics.items() if np.isfinite(float(value))}
-            if filtered:
-                ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
-                metrics_list.append(filtered)
-            for name, value in filtered.items():
-                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-                metrics_count[name] = metrics_count.get(name, 0) + 1
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
             for name in metrics_sum
             if metrics_count.get(name, 0) > 0
         }
         if avg_metrics:
-            summary_lines = [f"Final rollout over {len(selected_trajs)} validation trajectories (unique U_r):"]
+            summary_lines = [f"Final rollout over {len(metric_trajs)} validation trajectories (unique U_r):"]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
@@ -3600,16 +3634,52 @@ def train(config: Config, config_name: str) -> None:
         used = 0
         ur_values: list[float] = []
         metrics_list: list[dict[str, float]] = []
-        selected_trajs: list[dict[str, Any]] = []
-        seen_ur: set[float] = set()
+        metric_trajs: list[dict[str, Any]] = []
+        seen_metric_ur: set[float] = set()
         for traj in val_trajs:
             ur_val = float(traj["ur"][0, 0].detach().cpu().item())
             ur_key = round(ur_val, 6)
-            if ur_key in seen_ur:
+            if ur_key in seen_metric_ur:
                 continue
-            seen_ur.add(ur_key)
-            selected_trajs.append(traj)
-        for idx, traj in enumerate(selected_trajs):
+            seen_metric_ur.add(ur_key)
+            metric_trajs.append(traj)
+        plot_trajs = list(metric_trajs)
+        seen_plot_ur = set(seen_metric_ur)
+        for traj in train_trajs:
+            ur_val = float(traj["ur"][0, 0].detach().cpu().item())
+            ur_key = round(ur_val, 6)
+            if ur_key in seen_plot_ur:
+                continue
+            seen_plot_ur.add(ur_key)
+            plot_trajs.append(traj)
+        plot_trajs.sort(key=lambda traj: round(float(traj["ur"][0, 0].detach().cpu().item()), 6))
+        for traj in metric_trajs:
+            metrics = _log_rollout_validation(
+                writer=writer,
+                epoch=max(0, epochs - 1),
+                model=model,
+                traj=traj,
+                dt=dt,
+                m=m,
+                c=c,
+                k=k,
+                D=D_val,
+                middle_time_plot=middle_time_plot,
+                device=device,
+                tag_prefix="final_val/rollout",
+                log_metrics=False,
+                log_plots=False,
+            )
+            if metrics:
+                used += 1
+                ur_values.append(float(traj["ur"][0, 0].detach().cpu().item()))
+                metrics_list.append(metrics)
+            for name, value in metrics.items():
+                if not np.isfinite(value):
+                    continue
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for idx, traj in enumerate(plot_trajs, start=1):
             metrics = _log_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
@@ -3625,17 +3695,8 @@ def train(config: Config, config_name: str) -> None:
                 tag_prefix="final_val/rollout",
                 step=idx,
                 log_metrics=False,
-                title_suffix=f" [final {idx+1}/{len(selected_trajs)}]",
+                title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
-            if metrics:
-                used += 1
-                ur_values.append(float(traj["ur"][0, 0].detach().cpu().item()))
-                metrics_list.append(metrics)
-            for name, value in metrics.items():
-                if not np.isfinite(value):
-                    continue
-                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-                metrics_count[name] = metrics_count.get(name, 0) + 1
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
             for name in metrics_sum

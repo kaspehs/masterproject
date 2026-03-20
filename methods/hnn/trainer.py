@@ -1561,30 +1561,49 @@ def _log_final_rollouts_all(
     rollout_stochastic: bool,
     rollout_noise_scale: float,
     rollout_seed: int | None,
+    extra_series_raw: list[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray]] | None = None,
+    extra_sequences: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[dict[str, float], int, list[float], list[dict[str, float]]]:
     total = min(len(val_series_raw), len(val_sequences))
     if total <= 0:
         return {}, 0, [], []
-    selected_indices: list[int] = []
-    seen_ur: set[float] = set()
+    metric_pairs: list[tuple[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = []
+    seen_metric_ur: set[float] = set()
     for idx in range(total):
-        ur_np = val_series_raw[idx][5]
-        ur_val = float(np.asarray(ur_np).reshape(-1)[0])
-        ur_key = round(ur_val, 6)
-        if ur_key in seen_ur:
+        ur_arr = np.asarray(val_series_raw[idx][5]).reshape(-1)
+        if ur_arr.size == 0:
             continue
-        seen_ur.add(ur_key)
-        selected_indices.append(idx)
-    if not selected_indices:
+        ur_key = round(float(ur_arr[0]), 6)
+        if ur_key in seen_metric_ur:
+            continue
+        seen_metric_ur.add(ur_key)
+        metric_pairs.append((val_series_raw[idx], val_sequences[idx]))
+    if not metric_pairs:
         return {}, 0, [], []
+    plot_pairs_by_ur: dict[float, tuple[tuple[np.ndarray, np.ndarray, float, np.ndarray | None, np.ndarray | None, np.ndarray], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
+    for series_raw, sequence in metric_pairs:
+        ur_arr = np.asarray(series_raw[5]).reshape(-1)
+        if ur_arr.size == 0:
+            continue
+        plot_pairs_by_ur[round(float(ur_arr[0]), 6)] = (series_raw, sequence)
+    if extra_series_raw is not None and extra_sequences is not None:
+        extra_total = min(len(extra_series_raw), len(extra_sequences))
+        for idx in range(extra_total):
+            ur_arr = np.asarray(extra_series_raw[idx][5]).reshape(-1)
+            if ur_arr.size == 0:
+                continue
+            ur_key = round(float(ur_arr[0]), 6)
+            if ur_key not in plot_pairs_by_ur:
+                plot_pairs_by_ur[ur_key] = (extra_series_raw[idx], extra_sequences[idx])
+    plot_pairs = [plot_pairs_by_ur[key] for key in sorted(plot_pairs_by_ur)]
     metrics_sum: dict[str, float] = {}
     metrics_count: dict[str, int] = {}
     used = 0
     ur_values: list[float] = []
     metrics_list: list[dict[str, float]] = []
-    for step_idx, idx in enumerate(selected_indices):
-        y_np, t_np, dt_value, _vel_np, force_np, _ur_np = val_series_raw[idx]
-        y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[idx]
+    for series_raw, sequence in metric_pairs:
+        y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
+        y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
         ur_val = float(np.asarray(ur_tensor.detach().cpu()).reshape(-1)[0])
         metrics = log_validation_epoch(
             writer,
@@ -1606,12 +1625,54 @@ def _log_final_rollouts_all(
             None,
             log_extra_metrics=log_extra_validation_metrics,
             log_metrics=False,
+            log_plots=False,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
+        )
+        filtered_metrics = {
+            name: float(value)
+            for name, value in metrics.items()
+            if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+        }
+        if filtered_metrics:
+            ur_values.append(ur_val)
+            metrics_list.append(filtered_metrics)
+        for name, value in filtered_metrics.items():
+            metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+            metrics_count[name] = metrics_count.get(name, 0) + 1
+        used += 1
+    for step_idx, (series_raw, sequence) in enumerate(plot_pairs, start=1):
+        y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
+        y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
+        ur_val = float(np.asarray(ur_tensor.detach().cpu()).reshape(-1)[0])
+        log_validation_epoch(
+            writer,
+            epoch,
+            model,
+            y_tensor,
+            vel_tensor,
+            ur_tensor,
+            m_eff,
+            dt_value,
+            t_np,
+            y_np / D,
+            y_np,
+            force_np,
+            D,
+            k,
+            device,
+            middle_time_plot,
+            None,
+            log_extra_metrics=log_extra_validation_metrics,
+            log_metrics=False,
+            log_plots=True,
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
             tag_prefix="final_val/rollout",
             step=step_idx,
-            title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
+            title_suffix=f" [final {step_idx}/{len(plot_pairs)}]",
         )
         rollout = rollout_model(
             model,
@@ -1643,20 +1704,8 @@ def _log_final_rollouts_all(
             device=device,
             tag_prefix="final_val/phase",
             step=step_idx,
-            title_suffix=f" [final {step_idx+1}/{len(selected_indices)}]",
+            title_suffix=f" [final {step_idx}/{len(plot_pairs)}]",
         )
-        filtered_metrics = {
-            name: float(value)
-            for name, value in metrics.items()
-            if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
-        }
-        if filtered_metrics:
-            ur_values.append(ur_val)
-            metrics_list.append(filtered_metrics)
-        for name, value in filtered_metrics.items():
-            metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-            metrics_count[name] = metrics_count.get(name, 0) + 1
-        used += 1
     averaged = {
         name: metrics_sum[name] / float(metrics_count[name])
         for name in metrics_sum
@@ -2740,16 +2789,58 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         output_ur_values: list[float] = []
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
-        selected_trajs: list[dict[str, Any]] = []
-        seen_ur: set[float] = set()
+        metric_trajs: list[dict[str, Any]] = []
+        seen_metric_ur: set[float] = set()
         for traj in val_trajs:
             ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
             ur_key = round(ur_val, 6)
-            if ur_key in seen_ur:
+            if ur_key in seen_metric_ur:
                 continue
-            seen_ur.add(ur_key)
-            selected_trajs.append(traj)
-        for idx, traj in enumerate(selected_trajs):
+            seen_metric_ur.add(ur_key)
+            metric_trajs.append(traj)
+        plot_trajs = list(metric_trajs)
+        seen_plot_ur = set(seen_metric_ur)
+        for traj in train_trajs:
+            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
+            ur_key = round(ur_val, 6)
+            if ur_key in seen_plot_ur:
+                continue
+            seen_plot_ur.add(ur_key)
+            plot_trajs.append(traj)
+        plot_trajs.sort(key=lambda traj: round(float(np.asarray(traj["ur"]).reshape(-1)[0]), 6))
+        for traj in metric_trajs:
+            metrics = _log_td_correction_rollout_validation(
+                writer=writer,
+                epoch=max(0, epochs - 1),
+                model=model,
+                traj=traj,
+                dt=dt,
+                td_mass_source=td_mass_source,
+                td_params=td_params,
+                device=device,
+                predict_sigma=predict_sigma,
+                force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
+                tag_prefix="final_val/rollout",
+                log_metrics=False,
+                log_plots=False,
+                log_correction_on_data=False,
+                log_phase_map=False,
+            )
+            filtered = {
+                name: float(value)
+                for name, value in metrics.items()
+                if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+            }
+            if filtered:
+                ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
+                metrics_list.append(filtered)
+            for name, value in filtered.items():
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for idx, traj in enumerate(plot_trajs, start=1):
             ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
             mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
             mass_value = float(np.asarray(traj[mass_key]).reshape(()))
@@ -2775,7 +2866,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             if predict_sigma:
                 sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
 
-            metrics = _log_td_correction_rollout_validation(
+            _log_td_correction_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
                 model=model,
@@ -2795,26 +2886,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_plots=True,
                 log_correction_on_data=True,
                 log_phase_map=True,
-                title_suffix=f" [final {idx + 1}/{len(selected_trajs)}]",
+                title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
-            filtered = {
-                name: float(value)
-                for name, value in metrics.items()
-                if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
-            }
-            if filtered:
-                ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
-                metrics_list.append(filtered)
-            for name, value in filtered.items():
-                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-                metrics_count[name] = metrics_count.get(name, 0) + 1
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
             for name in metrics_sum
             if metrics_count.get(name, 0) > 0
         }
         if avg_metrics:
-            summary_lines = [f"Final rollout over {len(selected_trajs)} validation trajectories (unique U_r):"]
+            summary_lines = [f"Final rollout over {len(metric_trajs)} validation trajectories (unique U_r):"]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
@@ -3375,6 +3455,7 @@ def train(config: Config, config_name: str) -> None:
                     "run_name": run_name,
                     "dt": dt,
                     "method": str(config.method),
+                    "td_correction": True,
                 },
                 ckpt_path,
             )
@@ -3463,6 +3544,8 @@ def train(config: Config, config_name: str) -> None:
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
+            extra_series_raw=train_series_raw,
+            extra_sequences=train_sequences,
         )
         if used > 0 and avg_metrics:
             summary_lines = [f"Final rollout over {used} validation trajectories (unique U_r):"]
