@@ -3497,32 +3497,9 @@ def resolve_td_correction_params(raw_cfg: dict[str, Any] | None) -> dict[str, fl
     missing = [name for name, key in keys.items() if key not in cfg]
     if missing:
         defaults = dict(fallback_defaults)
-        burnin_n_memory = float(fallback_defaults["n_memory"])
-        try:
-            try:
-                td_hidden = importlib.import_module("Data_Gen.td_hidden_state")
-            except ModuleNotFoundError:
-                try:
-                    td_hidden = importlib.import_module("CFD_Data.td_hidden_state")
-                except ModuleNotFoundError:
-                    td_hidden = importlib.import_module("td_hidden_state")
-            defaults.update(td_hidden.build_single_paramset_from_burnin_config())
-        except (ModuleNotFoundError, AttributeError, ValueError):
-            pass
-        try:
-            try:
-                burnin = importlib.import_module("Data_Gen.analyze_vivana_td_burnin")
-            except ModuleNotFoundError:
-                try:
-                    burnin = importlib.import_module("CFD_Data.analyze_vivana_td_burnin")
-                except ModuleNotFoundError:
-                    burnin = importlib.import_module("analyze_vivana_td_burnin")
-            burnin_n_memory = float(getattr(burnin, "N_MEMORY", burnin_n_memory))
-        except ModuleNotFoundError:
-            pass
         for name in ("Cv", "Cd", "Ca", "fhat0", "fhat_min", "fhat_max"):
             out[name] = float(cfg.get(keys[name], defaults[name]))
-        out["n_memory"] = float(cfg.get("td_n_memory", burnin_n_memory))
+        out["n_memory"] = float(cfg.get("td_n_memory", defaults["n_memory"]))
     else:
         for name, key in keys.items():
             out[name] = float(cfg[key])

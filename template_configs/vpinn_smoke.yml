@@ -132,6 +132,13 @@ monitoring:
 
 vpinn:
   # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
+  td_cv: 1.2
+  td_cd: 1.1
+  td_ca: 1.0
+  td_fhat0: 0.18
+  td_fhat_min: 0.11
+  td_fhat_max: 0.26
+  td_n_memory: 500
   predict_sigma: false
   # If true, include the current Vivana-TD predicted force as an extra force-network input.
   use_td_force_input: false
