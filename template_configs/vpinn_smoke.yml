@@ -17,6 +17,9 @@ model:
 
 architecture:
   # VPINN always uses the shared architecture block below.
+  # If true, enforce odd force symmetry by construction: f(-state, U_r) = -f(state, U_r).
+  # Requires vpinn.use_td_force_input: false.
+  hard_force_symmetry: false
   use_fourier_features: false
   fourier_features: 64
   fourier_sigma: 1.0

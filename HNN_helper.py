@@ -92,6 +92,7 @@ def _default_mlp_kwargs() -> dict[str, Any]:
 @dataclass
 class ArchitectureConfig:
     force_net_type: str = "residual"
+    hard_force_symmetry: bool = False
     use_fourier_features: bool = False
     fourier_features: int = 64
     fourier_sigma: float = 1.0
@@ -1359,6 +1360,7 @@ class PHVIV(nn.Module):
         sigma_min: float = 1e-6,
         ur_scale: float | None = None,
         force_net_type: str | None = None,
+        hard_force_symmetry: bool = False,
         arch_pirate_force_kwargs: dict[str, Any] | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
@@ -1377,6 +1379,12 @@ class PHVIV(nn.Module):
         self.force_output = force_output
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
+        self.hard_force_symmetry = bool(hard_force_symmetry)
+        if self.hard_force_symmetry and self.use_td_force_input:
+            raise ValueError(
+                "architecture.hard_force_symmetry requires use_td_force_input=false "
+                "because the TD-force input does not have a defined sign-flip symmetry."
+            )
         self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
         sigma_min_val = float(sigma_min)
         if not np.isfinite(sigma_min_val) or sigma_min_val < 0.0:
@@ -1518,6 +1526,7 @@ class PHVIV(nn.Module):
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
+        hard_force_symmetry = bool(arch_cfg.get("hard_force_symmetry", False))
         use_fourier_features = bool(arch_cfg.get("use_fourier_features", False))
         fourier_features = int(arch_cfg.get("fourier_features", 64))
         fourier_sigma = float(arch_cfg.get("fourier_sigma", 1.0))
@@ -1558,6 +1567,7 @@ class PHVIV(nn.Module):
             sigma_min=sigma_min,
             ur_scale=ur_scale,
             force_net_type=force_net_type,
+            hard_force_symmetry=hard_force_symmetry,
             arch_pirate_force_kwargs=pirate_arch_kwargs,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
@@ -1708,7 +1718,16 @@ class PHVIV(nn.Module):
             td_force_scale=td_force_scale,
         )
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
-        return self.u_base_net(features)
+        if not self.hard_force_symmetry:
+            return self.u_base_net(features)
+        neg_base_features = self._force_features(
+            -x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            td_force_scale=td_force_scale,
+        )
+        neg_features = self.force_embed(neg_base_features) if self.force_embed is not None else neg_base_features
+        return 0.5 * (self.u_base_net(features) - self.u_base_net(neg_features))
 
     def _sigma_net_raw(
         self,

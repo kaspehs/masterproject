@@ -1613,8 +1613,8 @@ def _log_final_rollouts_all(
     metrics_sum: dict[str, float] = {}
     metrics_count: dict[str, int] = {}
     used = 0
-    ur_values: list[float] = []
-    metrics_list: list[dict[str, float]] = []
+    plot_ur_values: list[float] = []
+    plot_metrics_list: list[dict[str, float]] = []
     for series_raw, sequence in metric_pairs:
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
         y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
@@ -1649,9 +1649,6 @@ def _log_final_rollouts_all(
             for name, value in metrics.items()
             if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
         }
-        if filtered_metrics:
-            ur_values.append(ur_val)
-            metrics_list.append(filtered_metrics)
         for name, value in filtered_metrics.items():
             metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
             metrics_count[name] = metrics_count.get(name, 0) + 1
@@ -1660,7 +1657,7 @@ def _log_final_rollouts_all(
         y_np, t_np, dt_value, _vel_np, force_np, _ur_np = series_raw
         y_tensor, vel_tensor, _t_tensor, ur_tensor = sequence
         ur_val = float(np.asarray(ur_tensor.detach().cpu()).reshape(-1)[0])
-        log_validation_epoch(
+        plot_metrics = log_validation_epoch(
             writer,
             epoch,
             model,
@@ -1688,6 +1685,14 @@ def _log_final_rollouts_all(
             step=step_idx,
             title_suffix=f" [final {step_idx}/{len(plot_pairs)}]",
         )
+        filtered_plot_metrics = {
+            name: float(value)
+            for name, value in plot_metrics.items()
+            if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+        }
+        if filtered_plot_metrics:
+            plot_ur_values.append(ur_val)
+            plot_metrics_list.append(filtered_plot_metrics)
         rollout = rollout_model(
             model,
             y_tensor,
@@ -1725,7 +1730,7 @@ def _log_final_rollouts_all(
         for name in metrics_sum
         if metrics_count.get(name, 0) > 0
     }
-    return averaged, used, ur_values, metrics_list
+    return averaged, used, plot_ur_values, plot_metrics_list
 
 
 def _reap_async_processes(
@@ -2800,6 +2805,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         metrics_count: dict[str, int] = {}
         ur_values: list[float] = []
         metrics_list: list[dict[str, float]] = []
+        plot_ur_values: list[float] = []
+        plot_metrics_list: list[dict[str, float]] = []
         output_ur_values: list[float] = []
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
@@ -2880,7 +2887,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             if predict_sigma:
                 sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
 
-            _log_td_correction_rollout_validation(
+            plot_metrics = _log_td_correction_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
                 model=model,
@@ -2902,6 +2909,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
+            filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
+            if filtered_plot_metrics:
+                plot_ur_values.append(ur_val)
+                plot_metrics_list.append(filtered_plot_metrics)
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
             for name in metrics_sum
@@ -2913,7 +2924,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
-        if ur_values and metrics_list:
+        if plot_ur_values and plot_metrics_list:
             reference_ur_values = [
                 float(np.asarray(traj["ur"]).reshape(-1)[0])
                 for traj in [*val_trajs, *train_trajs]
@@ -2921,8 +2932,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             ]
             log_final_rollout_errors_vs_ur(
                 writer,
-                ur_values,
-                metrics_list,
+                plot_ur_values,
+                plot_metrics_list,
                 epochs,
                 reference_ur_values=reference_ur_values,
             )

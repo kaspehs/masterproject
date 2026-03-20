@@ -316,6 +316,49 @@ class FourierForceWrapper(nn.Module):
         return self.base(self.ff(x))
 
 
+class OddSymmetricForceWrapper(nn.Module):
+    """
+    Enforce odd symmetry in the force mean by construction:
+        f(s) = 0.5 * (g(s) - g(T(s)))
+    where T flips the state coordinates [x, v] -> [-x, -v] and keeps U_r fixed.
+
+    If the wrapped model outputs extra non-force channels (e.g. probabilistic sigma
+    parameters), those channels are averaged evenly instead of antisymmetrized.
+    """
+
+    def __init__(self, base: nn.Module, *, input_dim: int, state_dim: int, mean_output_dim: int) -> None:
+        super().__init__()
+        self.base = base
+        self.input_dim = int(input_dim)
+        self.state_dim = int(state_dim)
+        self.mean_output_dim = int(mean_output_dim)
+        if self.state_dim < 1:
+            raise ValueError("OddSymmetricForceWrapper requires state_dim >= 1.")
+        if self.input_dim != 2 * self.state_dim + 1:
+            raise ValueError(
+                "OddSymmetricForceWrapper expects inputs of the form [x, v, U_r] with no extra channels."
+            )
+        if self.mean_output_dim < 1:
+            raise ValueError("OddSymmetricForceWrapper requires mean_output_dim >= 1.")
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if int(s.shape[-1]) != self.input_dim:
+            raise ValueError(f"Expected input dim {self.input_dim}, got {int(s.shape[-1])}.")
+        d = self.state_dim
+        s_flip = torch.cat([-(s[..., :d]), -(s[..., d : 2 * d]), s[..., 2 * d :]], dim=-1)
+        out_pos = self.base(s)
+        out_neg = self.base(s_flip)
+        if int(out_pos.shape[-1]) < self.mean_output_dim:
+            raise ValueError(
+                f"Wrapped model output dim {int(out_pos.shape[-1])} is smaller than mean_output_dim={self.mean_output_dim}."
+            )
+        mean = 0.5 * (out_pos[..., : self.mean_output_dim] - out_neg[..., : self.mean_output_dim])
+        if int(out_pos.shape[-1]) == self.mean_output_dim:
+            return mean
+        rest = 0.5 * (out_pos[..., self.mean_output_dim :] + out_neg[..., self.mean_output_dim :])
+        return torch.cat([mean, rest], dim=-1)
+
+
 def _activation_from_string(name: str) -> nn.Module:
     key = str(name).strip().lower()
     if key == "tanh":
@@ -393,14 +436,21 @@ def _apply_corr_head_init(
             nn.init.constant_(last.bias[mean_dim:], sigma_bias)
 
 
-def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn.Module:
+def _build_force_model(config: Config, *, input_dim: int, output_dim: int, mean_output_dim: int | None = None) -> nn.Module:
     if config.architecture is None:
         raise ValueError("VPINN requires a shared 'architecture:' block.")
     arch = config.architecture
     net_type = str(getattr(arch, "force_net_type", "residual")).strip().lower()
+    hard_force_symmetry = bool(getattr(arch, "hard_force_symmetry", False))
     use_fourier_features = bool(getattr(arch, "use_fourier_features", False))
     fourier_features = int(getattr(arch, "fourier_features", 64))
     fourier_sigma = float(getattr(arch, "fourier_sigma", 1.0))
+    resolved_mean_output_dim = int(output_dim if mean_output_dim is None else mean_output_dim)
+    if hard_force_symmetry and ((int(input_dim) - 1) % 2 != 0):
+        raise ValueError(
+            "architecture.hard_force_symmetry only supports VPINN inputs of the form [x, v, U_r]. "
+            "Disable use_td_force_input to use this constraint."
+        )
 
     if net_type == "pirate":
         pirate_kwargs = {}
@@ -409,11 +459,19 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         pirate_kwargs.setdefault("fourier_features", 64)
         pirate_kwargs.setdefault("sigma", 1.0)
         pirate_kwargs.setdefault("activation", "tanh")
-        return ODEPirateNet(
+        model = ODEPirateNet(
             input_size=int(input_dim),
             output_size=int(output_dim),
             **pirate_kwargs,
         )
+        if hard_force_symmetry:
+            return OddSymmetricForceWrapper(
+                model,
+                input_dim=int(input_dim),
+                state_dim=(int(input_dim) - 1) // 2,
+                mean_output_dim=resolved_mean_output_dim,
+            )
+        return model
 
     if net_type == "residual":
         cfg = dict(getattr(arch, "residual_kwargs", {}) or {})
@@ -429,13 +487,22 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         layers_list.append(nn.Linear(hidden, int(output_dim)))
         base = nn.Sequential(*layers_list)
         if use_fourier_features:
-            return FourierForceWrapper(
+            model = FourierForceWrapper(
                 base,
                 input_dim=int(input_dim),
                 fourier_features=fourier_features,
                 sigma=fourier_sigma,
             )
-        return base
+        else:
+            model = base
+        if hard_force_symmetry:
+            return OddSymmetricForceWrapper(
+                model,
+                input_dim=int(input_dim),
+                state_dim=(int(input_dim) - 1) // 2,
+                mean_output_dim=resolved_mean_output_dim,
+            )
+        return model
 
     if net_type == "mlp":
         cfg = dict(getattr(arch, "mlp_kwargs", {}) or {})
@@ -453,13 +520,22 @@ def _build_force_model(config: Config, *, input_dim: int, output_dim: int) -> nn
         modules.append(nn.Linear(in_features, int(output_dim)))
         base = nn.Sequential(*modules)
         if use_fourier_features:
-            return FourierForceWrapper(
+            model = FourierForceWrapper(
                 base,
                 input_dim=int(input_dim),
                 fourier_features=fourier_features,
                 sigma=fourier_sigma,
             )
-        return base
+        else:
+            model = base
+        if hard_force_symmetry:
+            return OddSymmetricForceWrapper(
+                model,
+                input_dim=int(input_dim),
+                state_dim=(int(input_dim) - 1) // 2,
+                mean_output_dim=resolved_mean_output_dim,
+            )
+        return model
 
     raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate")
 
@@ -2319,13 +2395,25 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
+    hard_force_symmetry = bool(getattr(config.architecture, "hard_force_symmetry", False))
+    if hard_force_symmetry and use_td_force_input:
+        raise ValueError(
+            "architecture.hard_force_symmetry requires vpinn.use_td_force_input=false "
+            "because the TD-force input does not have a defined sign-flip symmetry."
+        )
 
     d = int(np.asarray(train_trajs[0]["y"]).ndim == 1)
     input_dim = 4 if use_td_force_input else 3
     output_dim = 2 if probabilistic else 1
-    model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim).to(device)
+    model = _build_force_model(
+        config,
+        input_dim=input_dim,
+        output_dim=output_dim,
+        mean_output_dim=1,
+    ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
     setattr(model, "force_representation", str(vp.get("force_representation", "force")).strip().lower())
+    setattr(model, "hard_force_symmetry", hard_force_symmetry)
     _apply_corr_head_init(
         model,
         mode=corr_init_mode,
@@ -2932,6 +3020,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         metrics_count: dict[str, int] = {}
         ur_values: list[float] = []
         metrics_list: list[dict[str, float]] = []
+        plot_ur_values: list[float] = []
+        plot_metrics_list: list[dict[str, float]] = []
         output_ur_values: list[float] = []
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
@@ -3008,7 +3098,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             if probabilistic:
                 sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
 
-            _log_td_correction_rollout_validation(
+            plot_metrics = _log_td_correction_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
                 model=model,
@@ -3033,6 +3123,10 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
+            filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
+            if filtered_plot_metrics:
+                plot_ur_values.append(ur_val)
+                plot_metrics_list.append(filtered_plot_metrics)
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
             for name in metrics_sum
@@ -3044,7 +3138,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
-        if ur_values and metrics_list:
+        if plot_ur_values and plot_metrics_list:
             reference_ur_values = [
                 float(np.asarray(traj["ur"]).reshape(-1)[0])
                 for traj in [*val_trajs, *train_trajs]
@@ -3052,8 +3146,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             ]
             log_final_rollout_errors_vs_ur(
                 writer,
-                ur_values,
-                metrics_list,
+                plot_ur_values,
+                plot_metrics_list,
                 epochs,
                 reference_ur_values=reference_ur_values,
             )
@@ -3160,8 +3254,14 @@ def train(config: Config, config_name: str) -> None:
 
     input_dim = 2 * d + 1
     output_dim = d
-    model = _build_force_model(config, input_dim=input_dim, output_dim=output_dim)
+    model = _build_force_model(
+        config,
+        input_dim=input_dim,
+        output_dim=output_dim,
+        mean_output_dim=d,
+    )
     model = model.to(device)
+    setattr(model, "hard_force_symmetry", bool(getattr(config.architecture, "hard_force_symmetry", False)))
 
     use_input_scaling = bool(vp.get("use_input_scaling", False))
     if use_input_scaling:
@@ -3647,6 +3747,8 @@ def train(config: Config, config_name: str) -> None:
         used = 0
         ur_values: list[float] = []
         metrics_list: list[dict[str, float]] = []
+        plot_ur_values: list[float] = []
+        plot_metrics_list: list[dict[str, float]] = []
         metric_trajs: list[dict[str, Any]] = []
         seen_metric_ur: set[float] = set()
         for traj in val_trajs:
@@ -3710,6 +3812,10 @@ def train(config: Config, config_name: str) -> None:
                 log_metrics=False,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
+            filtered_plot_metrics = {name: float(value) for name, value in metrics.items() if np.isfinite(float(value))}
+            if filtered_plot_metrics:
+                plot_ur_values.append(float(traj["ur"][0, 0].detach().cpu().item()))
+                plot_metrics_list.append(filtered_plot_metrics)
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
             for name in metrics_sum
@@ -3721,15 +3827,15 @@ def train(config: Config, config_name: str) -> None:
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
-        if ur_values and metrics_list:
+        if plot_ur_values and plot_metrics_list:
             reference_ur_values = [
                 float(traj["ur"][0, 0].detach().cpu().item())
                 for traj in [*val_trajs, *train_trajs]
             ]
             log_final_rollout_errors_vs_ur(
                 writer,
-                ur_values,
-                metrics_list,
+                plot_ur_values,
+                plot_metrics_list,
                 epochs,
                 reference_ur_values=reference_ur_values,
             )
