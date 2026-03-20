@@ -1782,7 +1782,9 @@ def _log_td_correction_rollout_validation(
                 title_suffix=title_suffix,
             )
         if log_phase_map:
-            q_grid, p_grid = build_phase_plot_grid(q_true_norm, p_true_norm, bins=96, extent_scale=2.0)
+            q_extent = np.concatenate([np.asarray(q_true_norm, dtype=float), np.asarray(q_pred_norm, dtype=float)])
+            p_extent = np.concatenate([np.asarray(p_true_norm, dtype=float), np.asarray(p_pred_norm, dtype=float)])
+            q_grid, p_grid = build_phase_plot_grid(q_extent, p_extent, bins=96, extent_scale=1.2)
             x_grid = torch.as_tensor(
                 (q_grid.reshape(-1) * float(diameter)).reshape(-1, 1),
                 dtype=x_true_t.dtype,
@@ -3043,7 +3045,18 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
         if ur_values and metrics_list:
-            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
+            reference_ur_values = [
+                float(np.asarray(traj["ur"]).reshape(-1)[0])
+                for traj in [*val_trajs, *train_trajs]
+                if np.asarray(traj["ur"]).reshape(-1).size > 0
+            ]
+            log_final_rollout_errors_vs_ur(
+                writer,
+                ur_values,
+                metrics_list,
+                epochs,
+                reference_ur_values=reference_ur_values,
+            )
         if output_ur_values and corr_series_list:
             force_mode = str(getattr(model, "force_representation", "force")).strip().lower()
             log_output_distribution_vs_ur(
@@ -3709,7 +3722,17 @@ def train(config: Config, config_name: str) -> None:
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
         if ur_values and metrics_list:
-            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
+            reference_ur_values = [
+                float(traj["ur"][0, 0].detach().cpu().item())
+                for traj in [*val_trajs, *train_trajs]
+            ]
+            log_final_rollout_errors_vs_ur(
+                writer,
+                ur_values,
+                metrics_list,
+                epochs,
+                reference_ur_values=reference_ur_values,
+            )
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 

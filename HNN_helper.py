@@ -2620,9 +2620,21 @@ def log_phase_component_plots(
     step: int | None = None,
     title_suffix: str = "",
     bins: int = 96,
-    extent_scale: float = 2.0,
+    extent_scale: float = 1.2,
 ):
-    q_vals, p_vals = _phase_plot_extent(q_norm_true, p_norm_true, bins=bins, extent_scale=extent_scale)
+    q_extent = np.concatenate(
+        [
+            np.asarray(q_norm_true, dtype=float).reshape(-1),
+            np.asarray(q_norm_pred, dtype=float).reshape(-1),
+        ]
+    )
+    p_extent = np.concatenate(
+        [
+            np.asarray(p_norm_true, dtype=float).reshape(-1),
+            np.asarray(p_norm_pred, dtype=float).reshape(-1),
+        ]
+    )
+    q_vals, p_vals = _phase_plot_extent(q_extent, p_extent, bins=bins, extent_scale=extent_scale)
     q_grid, p_grid = np.meshgrid(q_vals, p_vals, indexing="xy")
     omega = math.sqrt(float(k) / float(m_eff))
     q_phys = q_grid.reshape(-1) * float(D)
@@ -3076,13 +3088,23 @@ def format_loss_vs_ur_text(
     *,
     title: str = "Validation loss vs U_r",
     empty_message: str = "No per-U_r losses were available.",
+    ur_values: Sequence[float] | None = None,
 ) -> str:
     if not losses_by_ur:
         return f"{title}\n\n{empty_message}"
     names = [name for name, ur_map in losses_by_ur.items() if ur_map]
     if not names:
         return f"{title}\n\n{empty_message}"
-    ur_values = sorted({float(ur) for name in names for ur in losses_by_ur[name].keys()})
+    if ur_values is None:
+        ur_values = sorted({float(ur) for name in names for ur in losses_by_ur[name].keys()})
+    else:
+        ur_values = sorted(
+            {
+                float(np.round(float(ur), 6))
+                for ur in ur_values
+                if np.isfinite(float(ur))
+            }
+        )
     if not ur_values:
         return f"{title}\n\n{empty_message}"
 
@@ -3107,6 +3129,7 @@ def log_final_rollout_errors_vs_ur(
     epoch: int,
     *,
     tag: str = "final_val/errors_vs_ur",
+    reference_ur_values: Sequence[float] | None = None,
 ) -> None:
     pairs = []
     for ur_val, metrics in zip(ur_values, metrics_list):
@@ -3140,6 +3163,24 @@ def log_final_rollout_errors_vs_ur(
         if not by_ur:
             continue
         errors_by_ur[key] = {ur: float(np.mean(vals)) for ur, vals in by_ur.items() if vals}
+    plot_ur_values = sorted(
+        {
+            float(np.round(float(ur), 6))
+            for ur in x_all
+            if np.isfinite(float(ur))
+        }
+    )
+    if reference_ur_values is not None:
+        plot_ur_values = sorted(
+            {
+                *plot_ur_values,
+                *(
+                    float(np.round(float(ur), 6))
+                    for ur in reference_ur_values
+                    if np.isfinite(float(ur))
+                ),
+            }
+        )
     for metric_name, by_ur in errors_by_ur.items():
         for ur_key, value in sorted(by_ur.items()):
             writer.add_scalar(f"final_val/by_ur/{metric_name}/U_r={ur_key:.6g}", float(value), epoch)
@@ -3149,6 +3190,7 @@ def log_final_rollout_errors_vs_ur(
             errors_by_ur,
             title="Final rollout errors vs U_r",
             empty_message="No per-U_r errors were available.",
+            ur_values=plot_ur_values,
         ),
         epoch,
     )
@@ -3174,6 +3216,17 @@ def log_final_rollout_errors_vs_ur(
         plt.close(fig)
         return
 
+    if plot_ur_values:
+        for ur_val in plot_ur_values:
+            ax.axvline(ur_val, color="0.85", linewidth=0.8, alpha=0.6, zorder=0)
+        ax.set_xticks(plot_ur_values)
+        ax.set_xticklabels([f"{ur_val:.6g}" for ur_val in plot_ur_values], rotation=45, ha="right")
+        if len(plot_ur_values) == 1:
+            ax.set_xlim(plot_ur_values[0] - 0.1, plot_ur_values[0] + 0.1)
+        else:
+            span = float(plot_ur_values[-1] - plot_ur_values[0])
+            pad = max(0.02, 0.05 * span)
+            ax.set_xlim(plot_ur_values[0] - pad, plot_ur_values[-1] + pad)
     ax.set_xlabel("Reduced velocity (U_r)")
     ax.set_ylabel("Error")
     ax.set_yscale("log")

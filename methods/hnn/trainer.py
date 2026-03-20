@@ -880,7 +880,9 @@ def _log_td_correction_rollout_validation(
                 title_suffix=title_suffix,
             )
         if log_phase_map:
-            q_grid, p_grid = build_phase_plot_grid(q_true_norm, p_true_norm, bins=96, extent_scale=2.0)
+            q_extent = np.concatenate([np.asarray(q_true_norm, dtype=float), np.asarray(q_pred_norm, dtype=float)])
+            p_extent = np.concatenate([np.asarray(p_true_norm, dtype=float), np.asarray(p_pred_norm, dtype=float)])
+            q_grid, p_grid = build_phase_plot_grid(q_extent, p_extent, bins=96, extent_scale=1.2)
             y_grid = torch.as_tensor(
                 (q_grid.reshape(-1) * float(model.D)).reshape(-1, 1),
                 dtype=z_true_t.dtype,
@@ -1117,6 +1119,7 @@ def _train_one_epoch(
     mean_grad_component_sum = torch.zeros((), device=device)
     gradnorm_res_weight_sum = torch.zeros((), device=device)
     gradnorm_data_weight_sum = torch.zeros((), device=device) if use_force_data_loss else None
+    gradnorm_sym_weight_sum = torch.zeros((), device=device) if float(symmetry_weight) > 0.0 else None
     gradnorm_weight_count = 0
 
     force_output_coeff = getattr(model, "force_output", "force") == "coefficient"
@@ -1211,20 +1214,26 @@ def _train_one_epoch(
                 }
                 if "data" in gradnorm_balancer.names:
                     loss_inputs["data"] = data_force_loss.float()
+                if "symmetry" in gradnorm_balancer.names:
+                    loss_inputs["symmetry"] = sym_loss.float()
                 weights = gradnorm_balancer.update(loss_inputs)
                 res_weight = weights["residual"]
                 sigma_weight = res_loss.new_tensor(1.0)
                 mean_weight = res_loss.new_tensor(1.0)
                 data_weight = weights.get("data", res_loss.new_tensor(1.0))
+                sym_weight = weights.get("symmetry", res_loss.new_tensor(1.0))
                 gradnorm_res_weight_sum = gradnorm_res_weight_sum + res_weight
                 if gradnorm_data_weight_sum is not None:
                     gradnorm_data_weight_sum = gradnorm_data_weight_sum + data_weight
+                if gradnorm_sym_weight_sum is not None:
+                    gradnorm_sym_weight_sum = gradnorm_sym_weight_sum + sym_weight
                 gradnorm_weight_count += 1
             else:
                 res_weight = res_loss.new_tensor(1.0)
                 sigma_weight = res_loss.new_tensor(1.0)
                 mean_weight = res_loss.new_tensor(1.0)
                 data_weight = res_loss.new_tensor(1.0)
+                sym_weight = res_loss.new_tensor(1.0)
 
             # GradNorm balances raw branch losses first; user multipliers are applied after.
             gradnorm_weighted_res = res_weight * res_loss
@@ -1235,7 +1244,8 @@ def _train_one_epoch(
             weighted_sigma = float(sigma_reg) * gradnorm_weighted_sigma
             weighted_mean = float(mean_reg) * gradnorm_weighted_mean
             weighted_data = float(force_data_weight) * gradnorm_weighted_data
-            weighted_sym = float(symmetry_weight) * sym_loss
+            gradnorm_weighted_sym = sym_weight * sym_loss
+            weighted_sym = float(symmetry_weight) * gradnorm_weighted_sym
             if rollout_iter is not None:
                 try:
                     rollout_batch = next(rollout_iter)
@@ -1342,6 +1352,10 @@ def _train_one_epoch(
         if gradnorm_data_weight_sum is not None:
             metrics["mean_gradnorm_weight_data"] = float(
                 (gradnorm_data_weight_sum / float(gradnorm_weight_count)).detach().cpu()
+            )
+        if gradnorm_sym_weight_sum is not None:
+            metrics["mean_gradnorm_weight_symmetry"] = float(
+                (gradnorm_sym_weight_sum / float(gradnorm_weight_count)).detach().cpu()
             )
     return metrics
 
@@ -2900,7 +2914,18 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
         if ur_values and metrics_list:
-            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
+            reference_ur_values = [
+                float(np.asarray(traj["ur"]).reshape(-1)[0])
+                for traj in [*val_trajs, *train_trajs]
+                if np.asarray(traj["ur"]).reshape(-1).size > 0
+            ]
+            log_final_rollout_errors_vs_ur(
+                writer,
+                ur_values,
+                metrics_list,
+                epochs,
+                reference_ur_values=reference_ur_values,
+            )
         if output_ur_values and corr_series_list:
             force_mode = str(getattr(model, "force_output", "force"))
             log_output_distribution_vs_ur(
@@ -3263,6 +3288,8 @@ def train(config: Config, config_name: str) -> None:
         names = ["residual"]
         if use_force_data_loss and force_data_weight > 0.0:
             names.append("data")
+        if symmetry_weight > 0.0:
+            names.append("symmetry")
         if len(names) >= 2:
             gradnorm_balancer = GradNormBalancer(
                 model,
@@ -3554,7 +3581,18 @@ def train(config: Config, config_name: str) -> None:
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
         if ur_values and metrics_list:
-            log_final_rollout_errors_vs_ur(writer, ur_values, metrics_list, epochs)
+            reference_ur_values = [
+                float(np.asarray(series_raw[5]).reshape(-1)[0])
+                for series_raw in [*val_series_raw, *train_series_raw]
+                if np.asarray(series_raw[5]).reshape(-1).size > 0
+            ]
+            log_final_rollout_errors_vs_ur(
+                writer,
+                ur_values,
+                metrics_list,
+                epochs,
+                reference_ur_values=reference_ur_values,
+            )
         elapsed = time.perf_counter() - final_start
         print(f"Final validation rollout finished in {elapsed:.2f}s.")
 
