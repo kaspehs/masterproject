@@ -36,9 +36,9 @@ FORCE_SPECTRAL_REL_ERROR_KEY = "Force spectral relative error"
 ROLLOUT_DIVERGED_KEY = "Rollout diverged"
 ROLLOUT_DIVERGED_COUNT_KEY = "Rollout diverged count"
 
-SPECTRAL_ERROR_FMIN_HZ = 0.1
-SPECTRAL_ERROR_FMAX_HZ = 5.0
-SPECTRAL_ERROR_NPERSEG = 1024
+SPECTRAL_ERROR_FMIN_HZ = 0.0
+SPECTRAL_ERROR_FMAX_HZ = float("inf")
+SPECTRAL_ERROR_NPERSEG = 0
 ROLLOUT_DIVERGENCE_ABS_Y_NORM_LIMIT = 1e3
 ROLLOUT_DIVERGENCE_REL_Y_NORM_MULTIPLIER = 20.0
 
@@ -1132,8 +1132,8 @@ def spectral_relative_error(
     eps: float = 1e-12,
 ) -> float:
     """
-    Compute a normalized PSD-shape error in [0, 1] using Welch spectra.
-    Uses total-variation distance between band-limited, area-normalized PSDs.
+    Compute a normalized PSD-shape error in [0, 1] using full-record Welch spectra.
+    Uses total-variation distance between area-normalized PSDs.
     """
     if dt <= 0.0:
         return float("nan")
@@ -1149,15 +1149,15 @@ def spectral_relative_error(
 
     if welch is not None:
         fs = 1.0 / float(dt)
-        seg = int(max(8, min(int(nperseg), length)))
-        ov = seg // 2
+        seg = int(length) if int(nperseg) <= 0 else int(max(8, min(int(nperseg), length)))
+        ov = 0 if seg < 16 else min(seg // 2, seg - 1)
         freqs, true_psd = welch(
             true_proc,
             fs=fs,
             window="hann",
             nperseg=seg,
             noverlap=ov,
-            detrend=False,
+            detrend="constant",
             scaling="density",
         )
         _, model_psd = welch(
@@ -1166,7 +1166,7 @@ def spectral_relative_error(
             window="hann",
             nperseg=seg,
             noverlap=ov,
-            detrend=False,
+            detrend="constant",
             scaling="density",
         )
     else:
@@ -1179,9 +1179,6 @@ def spectral_relative_error(
         return float("nan")
 
     band = np.isfinite(freqs)
-    band = band & (freqs >= float(fmin_hz))
-    if np.isfinite(float(fmax_hz)) and float(fmax_hz) > 0.0:
-        band = band & (freqs <= float(fmax_hz))
     if np.count_nonzero(band) < 2:
         return float("nan")
 
@@ -1211,7 +1208,7 @@ def spectral_l2_relative_error(
     nperseg: int = SPECTRAL_ERROR_NPERSEG,
     eps: float = 1e-12,
 ) -> float:
-    """Compute L2 relative error between band-limited PSDs."""
+    """Compute L2 relative error between full-record Welch PSDs."""
     if dt <= 0.0:
         return float("nan")
     true_signal = np.asarray(true_signal, dtype=float).reshape(-1)
@@ -1226,15 +1223,15 @@ def spectral_l2_relative_error(
 
     if welch is not None:
         fs = 1.0 / float(dt)
-        seg = int(max(8, min(int(nperseg), length)))
-        ov = seg // 2
+        seg = int(length) if int(nperseg) <= 0 else int(max(8, min(int(nperseg), length)))
+        ov = 0 if seg < 16 else min(seg // 2, seg - 1)
         freqs, true_psd = welch(
             true_proc,
             fs=fs,
             window="hann",
             nperseg=seg,
             noverlap=ov,
-            detrend=False,
+            detrend="constant",
             scaling="density",
         )
         _, model_psd = welch(
@@ -1243,7 +1240,7 @@ def spectral_l2_relative_error(
             window="hann",
             nperseg=seg,
             noverlap=ov,
-            detrend=False,
+            detrend="constant",
             scaling="density",
         )
     else:
@@ -1255,9 +1252,6 @@ def spectral_l2_relative_error(
         return float("nan")
 
     band = np.isfinite(freqs)
-    band = band & (freqs >= float(fmin_hz))
-    if np.isfinite(float(fmax_hz)) and float(fmax_hz) > 0.0:
-        band = band & (freqs <= float(fmax_hz))
     if np.count_nonzero(band) < 2:
         return float("nan")
 
@@ -1281,7 +1275,7 @@ def spectral_l1_relative_error(
     nperseg: int = SPECTRAL_ERROR_NPERSEG,
     eps: float = 1e-12,
 ) -> float:
-    """Compute L1 relative error between band-limited PSDs."""
+    """Compute L1 relative error between full-record Welch PSDs."""
     if dt <= 0.0:
         return float("nan")
     true_signal = np.asarray(true_signal, dtype=float).reshape(-1)
@@ -1296,15 +1290,15 @@ def spectral_l1_relative_error(
 
     if welch is not None:
         fs = 1.0 / float(dt)
-        seg = int(max(8, min(int(nperseg), length)))
-        ov = seg // 2
+        seg = int(length) if int(nperseg) <= 0 else int(max(8, min(int(nperseg), length)))
+        ov = 0 if seg < 16 else min(seg // 2, seg - 1)
         freqs, true_psd = welch(
             true_proc,
             fs=fs,
             window="hann",
             nperseg=seg,
             noverlap=ov,
-            detrend=False,
+            detrend="constant",
             scaling="density",
         )
         _, model_psd = welch(
@@ -1313,7 +1307,7 @@ def spectral_l1_relative_error(
             window="hann",
             nperseg=seg,
             noverlap=ov,
-            detrend=False,
+            detrend="constant",
             scaling="density",
         )
     else:
@@ -1325,9 +1319,6 @@ def spectral_l1_relative_error(
         return float("nan")
 
     band = np.isfinite(freqs)
-    band = band & (freqs >= float(fmin_hz))
-    if np.isfinite(float(fmax_hz)) and float(fmax_hz) > 0.0:
-        band = band & (freqs <= float(fmax_hz))
     if np.count_nonzero(band) < 2:
         return float("nan")
 

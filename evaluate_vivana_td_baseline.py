@@ -592,12 +592,14 @@ def main() -> None:
 
     method = str(getattr(config, "method", "hnn")).strip().lower()
     if method == "hnn":
-        if not bool(dict(config.hnn or {}).get("use_td_correction", False)):
-            raise ValueError("This script expects hnn.use_td_correction=true for method=hnn.")
+        hnn_cfg = dict(config.hnn or {})
+        if "use_td_correction" in hnn_cfg and not bool(hnn_cfg.get("use_td_correction", True)):
+            raise ValueError("PHNN now only supports TD-correction baseline evaluation. Remove hnn.use_td_correction or set it to true.")
         rows = _evaluate_hnn_baseline(config, trajs)
     elif method == "vpinn":
-        if not bool(dict(config.vpinn or {}).get("use_td_correction", False)):
-            raise ValueError("This script expects vpinn.use_td_correction=true for method=vpinn.")
+        vpinn_cfg = dict(config.vpinn or {})
+        if "use_td_correction" in vpinn_cfg and not bool(vpinn_cfg.get("use_td_correction", True)):
+            raise ValueError("VPINN now only supports TD-correction baseline evaluation. Remove vpinn.use_td_correction or set it to true.")
         rows = _evaluate_vpinn_baseline(config, trajs)
     else:
         raise ValueError("This script currently supports only method=hnn or method=vpinn in TD-correction mode.")
