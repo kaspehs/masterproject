@@ -3484,21 +3484,45 @@ def resolve_td_correction_params(raw_cfg: dict[str, Any] | None) -> dict[str, fl
         "fhat_max": "td_fhat_max",
         "n_memory": "td_n_memory",
     }
+    fallback_defaults = {
+        "Cv": 1.2,
+        "Cd": 1.1,
+        "Ca": 1.0,
+        "fhat0": 0.18,
+        "fhat_min": 0.11,
+        "fhat_max": 0.26,
+        "n_memory": 500.0,
+    }
     out: dict[str, float] = {}
     missing = [name for name, key in keys.items() if key not in cfg]
     if missing:
+        defaults = dict(fallback_defaults)
+        burnin_n_memory = float(fallback_defaults["n_memory"])
         try:
-            td_hidden = importlib.import_module("Data_Gen.td_hidden_state")
-        except ModuleNotFoundError:
-            td_hidden = importlib.import_module("td_hidden_state")
-        defaults = td_hidden.build_single_paramset_from_burnin_config()
+            try:
+                td_hidden = importlib.import_module("Data_Gen.td_hidden_state")
+            except ModuleNotFoundError:
+                try:
+                    td_hidden = importlib.import_module("CFD_Data.td_hidden_state")
+                except ModuleNotFoundError:
+                    td_hidden = importlib.import_module("td_hidden_state")
+            defaults.update(td_hidden.build_single_paramset_from_burnin_config())
+        except (ModuleNotFoundError, AttributeError, ValueError):
+            pass
         try:
-            burnin = importlib.import_module("Data_Gen.analyze_vivana_td_burnin")
+            try:
+                burnin = importlib.import_module("Data_Gen.analyze_vivana_td_burnin")
+            except ModuleNotFoundError:
+                try:
+                    burnin = importlib.import_module("CFD_Data.analyze_vivana_td_burnin")
+                except ModuleNotFoundError:
+                    burnin = importlib.import_module("analyze_vivana_td_burnin")
+            burnin_n_memory = float(getattr(burnin, "N_MEMORY", burnin_n_memory))
         except ModuleNotFoundError:
-            burnin = importlib.import_module("analyze_vivana_td_burnin")
+            pass
         for name in ("Cv", "Cd", "Ca", "fhat0", "fhat_min", "fhat_max"):
             out[name] = float(cfg.get(keys[name], defaults[name]))
-        out["n_memory"] = float(cfg.get("td_n_memory", getattr(burnin, "N_MEMORY", 500)))
+        out["n_memory"] = float(cfg.get("td_n_memory", burnin_n_memory))
     else:
         for name, key in keys.items():
             out[name] = float(cfg[key])

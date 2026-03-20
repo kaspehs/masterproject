@@ -7,12 +7,12 @@ from pathlib import Path
 
 def _load_impl():
     try:
-        return importlib.import_module("CFD_Data.td_hidden_state")
+        return importlib.import_module("CFD_Data.analyze_vivana_td_burnin_timeseries")
     except ModuleNotFoundError:
-        module_path = Path(__file__).resolve().parents[1] / "CFD_Data" / "td_hidden_state.py"
-        spec = importlib.util.spec_from_file_location("CFD_Data.td_hidden_state", module_path)
+        module_path = Path(__file__).resolve().parents[1] / "CFD_Data" / "analyze_vivana_td_burnin_timeseries.py"
+        spec = importlib.util.spec_from_file_location("CFD_Data.analyze_vivana_td_burnin_timeseries", module_path)
         if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load TD hidden-state module from {module_path}")
+            raise ImportError(f"Could not load burn-in timeseries module from {module_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
