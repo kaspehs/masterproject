@@ -2708,6 +2708,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             and ((epoch % validate_every) == 0 or epoch == epochs - 1)
         )
         should_rollout = should_validate
+        sync_validation_start: float | None = None
+        if not async_validation and (should_validate or should_rollout):
+            sync_validation_start = time.perf_counter()
         if async_validation and (should_validate or should_rollout):
             async_processes = _reap_async_processes(async_processes, wait=False)
             state_source: nn.Module = model
@@ -2914,6 +2917,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                 )
+            if sync_validation_start is not None:
+                writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - sync_validation_start, epoch + 1)
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
@@ -3469,6 +3474,9 @@ def train(config: Config, config_name: str) -> None:
             and ((epoch % validate_every) == 0 or epoch == (epochs - 1))
         )
         should_rollout = rollout_every > 0 and ((epoch % rollout_every) == 0 or epoch == (epochs - 1))
+        sync_validation_start: float | None = None
+        if not async_validation and (should_validate or should_rollout):
+            sync_validation_start = time.perf_counter()
 
         if async_validation and (should_validate or should_rollout):
             async_processes = _reap_async_processes(async_processes, wait=False)
@@ -3577,6 +3585,8 @@ def train(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                 )
+        if sync_validation_start is not None:
+            writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - sync_validation_start, epoch)
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")

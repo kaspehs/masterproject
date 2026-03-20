@@ -1668,6 +1668,7 @@ def _log_final_rollouts_all(
 def _reap_async_processes(
     processes: list[dict[str, Any]],
     *,
+    writer: SummaryWriter | None = None,
     wait: bool = False,
 ) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
@@ -1690,6 +1691,8 @@ def _reap_async_processes(
             print(
                 f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s"
             )
+            if writer is not None and epoch > 0:
+                writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(epoch))
         else:
             print(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
@@ -1718,7 +1721,7 @@ def _launch_async_validation(
     do_losses: bool,
     do_rollout: bool,
 ) -> list[dict[str, Any]]:
-    processes = _reap_async_processes(processes, wait=False)
+    processes = _reap_async_processes(processes, writer=writer, wait=False)
     if max_concurrent > 0 and len(processes) >= max_concurrent:
         return processes
     script_path = Path(__file__).resolve().parents[2] / "async_validate.py"
@@ -3356,7 +3359,7 @@ def train(config: Config, config_name: str) -> None:
         )
         should_validate_rollout = should_validate_losses
         if async_validation and (should_validate_losses or should_validate_rollout):
-            async_processes = _reap_async_processes(async_processes, wait=False)
+            async_processes = _reap_async_processes(async_processes, writer=writer, wait=False)
             state_source = model
             if hasattr(model, "_orig_mod"):
                 state_source = getattr(model, "_orig_mod")
@@ -3438,7 +3441,7 @@ def train(config: Config, config_name: str) -> None:
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
-        async_processes = _reap_async_processes(async_processes, wait=True)
+        async_processes = _reap_async_processes(async_processes, writer=writer, wait=True)
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
 
