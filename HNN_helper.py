@@ -3605,6 +3605,7 @@ def _maybe_reduce_time_td(
     arrays: dict[str, np.ndarray],
     enabled: bool,
     reduction_factor: int,
+    offset: int = 0,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     if not enabled:
         return t, arrays
@@ -3615,7 +3616,10 @@ def _maybe_reduce_time_td(
             "Reduction factor was too large for the current TD trajectory; "
             f"using step={rf} instead of {rf_requested} to keep at least two samples."
         )
-    sl = slice(None, None, rf)
+    offset_i = max(0, int(offset))
+    if offset_i >= rf:
+        raise ValueError(f"reduce_time offset must satisfy 0 <= offset < {rf}, got {offset_i}.")
+    sl = slice(offset_i, None, rf)
     t_out = t[sl]
     arrays_out = {name: np.asarray(value)[sl] for name, value in arrays.items()}
     if t_out.size < 2:
@@ -3629,6 +3633,7 @@ def load_td_correction_trajectories(
     cut_start_seconds: float = 0.0,
     reduce_time: bool = False,
     reduction_factor: int = 1,
+    stagger_reduced_time: bool = False,
     ur_source: str = "stored",
 ) -> list[dict[str, np.ndarray]]:
     trajectories: list[dict[str, np.ndarray]] = []
@@ -3762,82 +3767,113 @@ def load_td_correction_trajectories(
             ur = ur_label
         else:
             raise ValueError("ur_source must be one of: stored, dry, effective, label.")
-        t, reduced = _maybe_reduce_time_td(
-            t=t,
-            arrays={
-                "y": y,
-                "dy": dy,
-                "ddy": ddy,
-                "force_per_m": force_per_m,
-                "force_td_per_m": force_td_per_m,
-                "phi_td": phi_td,
-                "sig_dy_td": sig_dy_td,
-                "sig_ddy_td": sig_ddy_td,
-                "ur": ur,
-                "ur_stored": ur_stored,
-                **({"ur_label": ur_label} if ur_label is not None else {}),
-                "flow_speed": flow_speed,
-            },
-            enabled=bool(reduce_time),
-            reduction_factor=int(reduction_factor),
-        )
-        y = reduced["y"]
-        dy = reduced["dy"]
-        ddy = reduced["ddy"]
-        force_per_m = reduced["force_per_m"]
-        force_td_per_m = reduced["force_td_per_m"]
-        phi_td = reduced["phi_td"]
-        sig_dy_td = reduced["sig_dy_td"]
-        sig_ddy_td = reduced["sig_ddy_td"]
-        ur = reduced["ur"]
-        ur_stored = reduced["ur_stored"]
-        if ur_label is not None:
-            ur_label = reduced["ur_label"]
-        flow_speed = reduced["flow_speed"]
-        if cut_start_seconds > 0.0:
-            t0 = float(t[0])
-            mask = t >= (t0 + float(cut_start_seconds))
-            if int(np.count_nonzero(mask)) < 2:
-                raise ValueError(f"{path} became too short after cut_start_seconds={cut_start_seconds}.")
-            t = t[mask]
-            y = y[mask]
-            dy = dy[mask]
-            ddy = ddy[mask]
-            force_per_m = force_per_m[mask]
-            force_td_per_m = force_td_per_m[mask]
-            phi_td = phi_td[mask]
-            sig_dy_td = sig_dy_td[mask]
-            sig_ddy_td = sig_ddy_td[mask]
-            ur = ur[mask]
-            ur_stored = ur_stored[mask]
-            if ur_label is not None:
-                ur_label = ur_label[mask]
-            flow_speed = flow_speed[mask]
-        td_context = np.stack([ddy, phi_td, sig_dy_td, sig_ddy_td, flow_speed], axis=1)
-        trajectories.append(
-            {
-                "name": path.name,
-                "t": np.asarray(t, dtype=np.float32),
-                "y": np.asarray(y, dtype=np.float32),
-                "dy": np.asarray(dy, dtype=np.float32),
-                "ddy": np.asarray(ddy, dtype=np.float32),
-                "force_total": np.asarray(force_per_m, dtype=np.float32),
-                "force_per_m": np.asarray(force_per_m, dtype=np.float32),
-                "force_td": np.asarray(force_td_per_m, dtype=np.float32),
-                "force_td_per_m": np.asarray(force_td_per_m, dtype=np.float32),
-                "force_corr": np.asarray(force_per_m - force_td_per_m, dtype=np.float32),
-                "force_corr_per_m": np.asarray(force_per_m - force_td_per_m, dtype=np.float32),
-                "ur": np.asarray(ur, dtype=np.float32),
-                "ur_stored": np.asarray(ur_stored, dtype=np.float32),
-                "ur_label": (None if ur_label is None else np.asarray(ur_label, dtype=np.float32)),
-                "flow_speed": np.asarray(flow_speed, dtype=np.float32),
-                "td_context": np.asarray(td_context, dtype=np.float32),
-                "stiffness_n_m": np.asarray(stiffness_n_m, dtype=np.float32),
-                "effective_mass_kg": np.asarray(effective_mass_kg, dtype=np.float32),
-                "dry_mass_kg": np.asarray(dry_mass_kg, dtype=np.float32),
-                "damping_c": np.asarray(damping_c, dtype=np.float32),
-            }
-        )
+        reduction_offsets = [0]
+        if bool(reduce_time):
+            rf = min(max(1, int(reduction_factor)), max(1, int(t.shape[0]) - 1))
+            if bool(stagger_reduced_time) and rf > 1:
+                reduction_offsets = list(range(rf))
+
+        num_valid_reductions = 0
+        for reduction_offset in reduction_offsets:
+            try:
+                t_reduced, reduced = _maybe_reduce_time_td(
+                    t=t,
+                    arrays={
+                        "y": y,
+                        "dy": dy,
+                        "ddy": ddy,
+                        "force_per_m": force_per_m,
+                        "force_td_per_m": force_td_per_m,
+                        "phi_td": phi_td,
+                        "sig_dy_td": sig_dy_td,
+                        "sig_ddy_td": sig_ddy_td,
+                        "ur": ur,
+                        "ur_stored": ur_stored,
+                        **({"ur_label": ur_label} if ur_label is not None else {}),
+                        "flow_speed": flow_speed,
+                    },
+                    enabled=bool(reduce_time),
+                    reduction_factor=int(reduction_factor),
+                    offset=int(reduction_offset),
+                )
+            except ValueError:
+                if len(reduction_offsets) == 1:
+                    raise
+                continue
+            y_reduced = reduced["y"]
+            dy_reduced = reduced["dy"]
+            ddy_reduced = reduced["ddy"]
+            force_per_m_reduced = reduced["force_per_m"]
+            force_td_per_m_reduced = reduced["force_td_per_m"]
+            phi_td_reduced = reduced["phi_td"]
+            sig_dy_td_reduced = reduced["sig_dy_td"]
+            sig_ddy_td_reduced = reduced["sig_ddy_td"]
+            ur_reduced = reduced["ur"]
+            ur_stored_reduced = reduced["ur_stored"]
+            ur_label_reduced = None if ur_label is None else reduced["ur_label"]
+            flow_speed_reduced = reduced["flow_speed"]
+            if cut_start_seconds > 0.0:
+                t0 = float(t_reduced[0])
+                mask = t_reduced >= (t0 + float(cut_start_seconds))
+                if int(np.count_nonzero(mask)) < 2:
+                    if len(reduction_offsets) == 1:
+                        raise ValueError(f"{path} became too short after cut_start_seconds={cut_start_seconds}.")
+                    continue
+                t_reduced = t_reduced[mask]
+                y_reduced = y_reduced[mask]
+                dy_reduced = dy_reduced[mask]
+                ddy_reduced = ddy_reduced[mask]
+                force_per_m_reduced = force_per_m_reduced[mask]
+                force_td_per_m_reduced = force_td_per_m_reduced[mask]
+                phi_td_reduced = phi_td_reduced[mask]
+                sig_dy_td_reduced = sig_dy_td_reduced[mask]
+                sig_ddy_td_reduced = sig_ddy_td_reduced[mask]
+                ur_reduced = ur_reduced[mask]
+                ur_stored_reduced = ur_stored_reduced[mask]
+                if ur_label_reduced is not None:
+                    ur_label_reduced = ur_label_reduced[mask]
+                flow_speed_reduced = flow_speed_reduced[mask]
+            td_context = np.stack(
+                [ddy_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced, flow_speed_reduced],
+                axis=1,
+            )
+            name = path.name
+            if bool(reduce_time) and bool(stagger_reduced_time) and len(reduction_offsets) > 1:
+                name = f"{path.stem}__rf{int(reduction_factor)}_offset{int(reduction_offset)}{path.suffix}"
+            trajectories.append(
+                {
+                    "name": name,
+                    "source_name": path.name,
+                    "reduction_factor": np.asarray(int(max(1, int(reduction_factor))), dtype=np.int32),
+                    "reduction_offset": np.asarray(int(reduction_offset), dtype=np.int32),
+                    "t": np.asarray(t_reduced, dtype=np.float32),
+                    "y": np.asarray(y_reduced, dtype=np.float32),
+                    "dy": np.asarray(dy_reduced, dtype=np.float32),
+                    "ddy": np.asarray(ddy_reduced, dtype=np.float32),
+                    "force_total": np.asarray(force_per_m_reduced, dtype=np.float32),
+                    "force_per_m": np.asarray(force_per_m_reduced, dtype=np.float32),
+                    "force_td": np.asarray(force_td_per_m_reduced, dtype=np.float32),
+                    "force_td_per_m": np.asarray(force_td_per_m_reduced, dtype=np.float32),
+                    "force_corr": np.asarray(force_per_m_reduced - force_td_per_m_reduced, dtype=np.float32),
+                    "force_corr_per_m": np.asarray(force_per_m_reduced - force_td_per_m_reduced, dtype=np.float32),
+                    "ur": np.asarray(ur_reduced, dtype=np.float32),
+                    "ur_stored": np.asarray(ur_stored_reduced, dtype=np.float32),
+                    "ur_label": (
+                        None if ur_label_reduced is None else np.asarray(ur_label_reduced, dtype=np.float32)
+                    ),
+                    "flow_speed": np.asarray(flow_speed_reduced, dtype=np.float32),
+                    "td_context": np.asarray(td_context, dtype=np.float32),
+                    "stiffness_n_m": np.asarray(stiffness_n_m, dtype=np.float32),
+                    "effective_mass_kg": np.asarray(effective_mass_kg, dtype=np.float32),
+                    "dry_mass_kg": np.asarray(dry_mass_kg, dtype=np.float32),
+                    "damping_c": np.asarray(damping_c, dtype=np.float32),
+                }
+            )
+            num_valid_reductions += 1
+        if num_valid_reductions == 0:
+            raise ValueError(
+                f"{path} did not produce any valid TD-correction trajectories after reduce_time processing."
+            )
     if not trajectories:
         raise ValueError("No TD correction trajectories were loaded.")
     return trajectories

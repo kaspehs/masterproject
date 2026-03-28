@@ -2371,19 +2371,31 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
     train_cut = float(getattr(data_cfg, "cut_start_seconds_train", 0.0) or 0.0)
     val_cut = float(getattr(data_cfg, "cut_start_seconds_val", 0.0) or 0.0)
+    reduce_time_enabled = bool(getattr(data_cfg, "reduce_time", False))
+    reduction_factor = int(getattr(data_cfg, "reduction_factor", 1))
+    stagger_train_reduce = bool(
+        getattr(
+            data_cfg,
+            "stagger_reduced_time_train",
+            reduce_time_enabled and max(1, reduction_factor) > 1,
+        )
+    )
+    stagger_val_reduce = bool(getattr(data_cfg, "stagger_reduced_time_val", False))
     train_trajs = load_td_correction_trajectories(
         paths=train_paths,
         cut_start_seconds=train_cut,
-        reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
-        reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        reduce_time=reduce_time_enabled,
+        reduction_factor=reduction_factor,
+        stagger_reduced_time=stagger_train_reduce,
         ur_source=td_mass_source,
     )
     val_trajs = (
         load_td_correction_trajectories(
             paths=val_paths,
             cut_start_seconds=val_cut,
-            reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
-            reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+            stagger_reduced_time=stagger_val_reduce,
             ur_source=td_mass_source,
         )
         if val_paths
