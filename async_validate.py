@@ -274,7 +274,6 @@ def _td_hnn_traj_to_tensors(
         "ur": torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1),
         "td_context": torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float(),
         "t": torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
-        "span_value": float(np.asarray(traj["span_m"]).reshape(())),
         "mass_value": mass_value,
         "damping_value": float(np.asarray(traj["damping_c"]).reshape(())),
         "stiffness_value": float(np.asarray(traj["stiffness_n_m"]).reshape(())),
@@ -315,7 +314,6 @@ def _log_td_correction_hnn_rollout_validation(
     mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
     damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
     stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-    span_t = torch.full((1, 1), float(traj_t["span_value"]), dtype=z_true_t.dtype, device=device)
 
     z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
         model=model,
@@ -327,7 +325,6 @@ def _log_td_correction_hnn_rollout_validation(
         structural_mass=mass_t,
         damping_c=damping_t,
         stiffness=stiffness_t,
-        span=span_t,
         td_params=td_params,
     )
     y_pred = z_pred[0, :, 0].detach().cpu().numpy()
@@ -866,9 +863,9 @@ def _run_hnn_td_correction_validation(
             rollout_count = 0
             with torch.no_grad():
                 for rollout_batch in rollout_loader:
-                    if len(rollout_batch) != 9:
+                    if len(rollout_batch) != 8:
                         raise ValueError("Unexpected TD correction rollout batch format.")
-                    z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0, _span0 = rollout_batch
+                    z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
                     z0 = z0.to(device, non_blocking=(device.type == "cuda"))
                     t_seq = t_seq.to(device, non_blocking=(device.type == "cuda"))
                     z_traj = z_traj.to(device, non_blocking=(device.type == "cuda"))
@@ -1370,7 +1367,7 @@ def _run_vpinn_td_correction_validation(
             roll_batches = 0
             with torch.no_grad():
                 for rb in val_rollout_loader:
-                    x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0, span0 = [
+                    x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [
                         item.to(device, non_blocking=(device.type == "cuda")) for item in rb
                     ]
                     x_seq, v_seq, _, _, _ = _vpinn_td_rollout(
@@ -1384,7 +1381,6 @@ def _run_vpinn_td_correction_validation(
                         m=m0,
                         c=c0,
                         k=k0,
-                        span=span0,
                         rho=rho,
                         diameter=diameter,
                         td_params=td_params,
