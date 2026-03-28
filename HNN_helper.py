@@ -3634,6 +3634,26 @@ def load_td_correction_trajectories(
     trajectories: list[dict[str, np.ndarray]] = []
     for path in paths:
         with np.load(path, allow_pickle=True) as data:
+            def _preferred_scalar(keys: Sequence[str], *, required: bool = True) -> float | None:
+                for key in keys:
+                    if key not in data:
+                        continue
+                    arr = np.asarray(data[key], dtype=float).reshape(-1)
+                    if arr.size == 1 and np.isfinite(arr[0]):
+                        return float(arr[0])
+                if required:
+                    raise KeyError(f"{path} is missing a finite scalar for keys {list(keys)}.")
+                return None
+
+            def _preferred_numeric_value(keys: Sequence[str]) -> np.ndarray | None:
+                for key in keys:
+                    if key not in data:
+                        continue
+                    arr = np.asarray(data[key], dtype=float)
+                    if np.any(np.isfinite(arr)):
+                        return arr
+                return None
+
             t = np.asarray(
                 _extract_first_present(data, ("time_dim", "a", "time"), path=path),
                 dtype=float,
@@ -3650,23 +3670,46 @@ def load_td_correction_trajectories(
                 _extract_first_present(data, ("y_acc_dim", "ddy"), path=path),
                 dtype=float,
             ).reshape(-1)
-            force_total = np.asarray(
-                _extract_first_present(data, ("y_force_dim", "c", "F_total", "force_total", "force"), path=path),
-                dtype=float,
-            ).reshape(-1)
-            force_td = np.asarray(
-                _extract_first_present(data, ("F_total_td",), path=path),
-                dtype=float,
-            ).reshape(-1)
+            force_per_m_raw = _preferred_numeric_value(("y_force_per_m_dim", "force_per_m_dim"))
+            force_total_raw = _preferred_numeric_value(("y_force_dim", "c", "F_total", "force_total", "force"))
+            if force_per_m_raw is None and force_total_raw is None:
+                raise KeyError(f"{path} is missing CFD force channels for TD correction loading.")
+            if force_per_m_raw is not None:
+                force_per_m = np.asarray(force_per_m_raw, dtype=float).reshape(-1)
+            else:
+                span_scale = _preferred_scalar(
+                    ("physical_span_m", "raw_force_span_scale_applied", "span_m"),
+                    required=False,
+                )
+                span_scale = 1.0 if span_scale is None else float(span_scale)
+                if not np.isfinite(span_scale) or span_scale <= 0.0:
+                    raise ValueError(f"{path} has invalid force span scale {span_scale!r}.")
+                force_per_m = np.asarray(force_total_raw, dtype=float).reshape(-1) / span_scale
+
+            force_td_per_m_raw = _preferred_numeric_value(("F_total_td_per_m", "F_total_td"))
+            force_td_total_raw = _preferred_numeric_value(("F_total_td_total",))
+            if force_td_per_m_raw is None and force_td_total_raw is None:
+                raise KeyError(f"{path} is missing TD force channels for TD correction loading.")
+            if force_td_per_m_raw is not None:
+                force_td_per_m = np.asarray(force_td_per_m_raw, dtype=float).reshape(-1)
+            else:
+                span_scale = _preferred_scalar(
+                    ("physical_span_m", "raw_force_span_scale_applied", "span_m"),
+                    required=False,
+                )
+                span_scale = 1.0 if span_scale is None else float(span_scale)
+                if not np.isfinite(span_scale) or span_scale <= 0.0:
+                    raise ValueError(f"{path} has invalid TD force span scale {span_scale!r}.")
+                force_td_per_m = np.asarray(force_td_total_raw, dtype=float).reshape(-1) / span_scale
             phi_td = np.asarray(_extract_first_present(data, ("phi_vy_td",), path=path), dtype=float).reshape(-1)
             sig_dy_td = np.asarray(_extract_first_present(data, ("sig_dy_loc_td",), path=path), dtype=float).reshape(-1)
             sig_ddy_td = np.asarray(_extract_first_present(data, ("sig_ddy_loc_td",), path=path), dtype=float).reshape(-1)
-            stiffness_n_m = _extract_required_scalar(data, ("stiffness_n_m",), path=path)
-            effective_mass_kg = _extract_required_scalar(data, ("effective_mass_kg",), path=path)
-            dry_mass_kg = _extract_required_scalar(data, ("dry_mass_kg",), path=path)
-            damping_c = _extract_required_scalar(data, ("damping_c",), path=path)
-            diameter_m = _extract_required_scalar(data, ("diameter_m",), path=path)
-            flow_speed_raw = _extract_first_present(data, ("flow_speed_m_s",), path=path, required=False)
+            stiffness_n_m = float(_preferred_scalar(("python_stiffness_n_m", "model_stiffness_n_m", "training_stiffness_n_m", "stiffness_n_m")))
+            effective_mass_kg = float(_preferred_scalar(("python_effective_mass_kg", "model_effective_mass_kg", "training_effective_mass_kg", "effective_mass_kg")))
+            dry_mass_kg = float(_preferred_scalar(("python_dry_mass_kg", "python_mass_kg", "model_dry_mass_kg", "training_dry_mass_kg", "dry_mass_kg")))
+            damping_c = float(_preferred_scalar(("python_damping_c", "model_damping_c", "training_damping_c", "damping_c")))
+            diameter_m = float(_preferred_scalar(("python_diameter_m", "diameter_m")))
+            flow_speed_raw = _preferred_numeric_value(("python_flow_speed_m_s", "model_flow_speed_m_s", "training_flow_speed_m_s", "flow_speed_m_s"))
             ur_raw = _extract_first_present(data, ("U_r_computed_series", "U_r"), path=path)
             ur_label_raw = _extract_first_present(
                 data,
@@ -3674,7 +3717,7 @@ def load_td_correction_trajectories(
                 path=path,
                 required=False,
             )
-        arrays = [t, y, dy, ddy, force_total, force_td, phi_td, sig_dy_td, sig_ddy_td]
+        arrays = [t, y, dy, ddy, force_per_m, force_td_per_m, phi_td, sig_dy_td, sig_ddy_td]
         n = t.shape[0]
         if any(arr.shape[0] != n for arr in arrays[1:]):
             raise ValueError(f"{path} has mismatched TD correction array lengths.")
@@ -3725,8 +3768,8 @@ def load_td_correction_trajectories(
                 "y": y,
                 "dy": dy,
                 "ddy": ddy,
-                "force_total": force_total,
-                "force_td": force_td,
+                "force_per_m": force_per_m,
+                "force_td_per_m": force_td_per_m,
                 "phi_td": phi_td,
                 "sig_dy_td": sig_dy_td,
                 "sig_ddy_td": sig_ddy_td,
@@ -3741,8 +3784,8 @@ def load_td_correction_trajectories(
         y = reduced["y"]
         dy = reduced["dy"]
         ddy = reduced["ddy"]
-        force_total = reduced["force_total"]
-        force_td = reduced["force_td"]
+        force_per_m = reduced["force_per_m"]
+        force_td_per_m = reduced["force_td_per_m"]
         phi_td = reduced["phi_td"]
         sig_dy_td = reduced["sig_dy_td"]
         sig_ddy_td = reduced["sig_ddy_td"]
@@ -3760,8 +3803,8 @@ def load_td_correction_trajectories(
             y = y[mask]
             dy = dy[mask]
             ddy = ddy[mask]
-            force_total = force_total[mask]
-            force_td = force_td[mask]
+            force_per_m = force_per_m[mask]
+            force_td_per_m = force_td_per_m[mask]
             phi_td = phi_td[mask]
             sig_dy_td = sig_dy_td[mask]
             sig_ddy_td = sig_ddy_td[mask]
@@ -3778,9 +3821,12 @@ def load_td_correction_trajectories(
                 "y": np.asarray(y, dtype=np.float32),
                 "dy": np.asarray(dy, dtype=np.float32),
                 "ddy": np.asarray(ddy, dtype=np.float32),
-                "force_total": np.asarray(force_total, dtype=np.float32),
-                "force_td": np.asarray(force_td, dtype=np.float32),
-                "force_corr": np.asarray(force_total - force_td, dtype=np.float32),
+                "force_total": np.asarray(force_per_m, dtype=np.float32),
+                "force_per_m": np.asarray(force_per_m, dtype=np.float32),
+                "force_td": np.asarray(force_td_per_m, dtype=np.float32),
+                "force_td_per_m": np.asarray(force_td_per_m, dtype=np.float32),
+                "force_corr": np.asarray(force_per_m - force_td_per_m, dtype=np.float32),
+                "force_corr_per_m": np.asarray(force_per_m - force_td_per_m, dtype=np.float32),
                 "ur": np.asarray(ur, dtype=np.float32),
                 "ur_stored": np.asarray(ur_stored, dtype=np.float32),
                 "ur_label": (None if ur_label is None else np.asarray(ur_label, dtype=np.float32)),

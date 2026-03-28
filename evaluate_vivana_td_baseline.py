@@ -263,7 +263,7 @@ def _save_rollout_plots(
     case_name = Path(str(traj["name"])).stem
     t = np.asarray(traj["t"], dtype=float).reshape(-1)
     y_true = np.asarray(traj["y"], dtype=float).reshape(-1)
-    force_true = np.asarray(traj["force_total"], dtype=float).reshape(-1)
+    force_true = np.asarray(traj["force_per_m"], dtype=float).reshape(-1)
     dt = float(t[1] - t[0]) if t.size > 1 else float("nan")
     ur_value = float(np.asarray(traj["ur"]).reshape(-1)[0])
 
@@ -292,7 +292,7 @@ def _save_rollout_plots(
     ax.plot(t[:f_len], force_pred[:f_len], label="Vivana-TD", linewidth=1.2)
     ax.set_title("Force Rollout")
     ax.set_xlabel("Time [s]")
-    ax.set_ylabel("Force")
+    ax.set_ylabel("Force per meter")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
@@ -371,7 +371,6 @@ def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> l
             mass_value = float(np.asarray(traj[mass_key]).reshape(()))
             damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
             stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
-
             z = torch.cat(
                 [
                     y.unsqueeze(1),
@@ -409,15 +408,15 @@ def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> l
                 dt=dt,
                 t=np.asarray(traj["t"], dtype=float),
                 y_data_raw=np.asarray(traj["y"], dtype=float),
-                force_data=np.asarray(traj["force_total"], dtype=float),
+                force_data=np.asarray(traj["force_per_m"], dtype=float),
                 D=float(diameter),
                 k=float(stiffness_value),
                 device=device,
                 rollout=rollout,
             )
             metrics[FORCE_MAPPING_NRMSE_KEY] = _force_mapping_nrmse(
-                np.asarray(traj["force_td"], dtype=float),
-                np.asarray(traj["force_total"], dtype=float),
+                np.asarray(traj["force_td_per_m"], dtype=float),
+                np.asarray(traj["force_per_m"], dtype=float),
             )
             if PLOT_OUTPUT_DIR is not None:
                 _save_rollout_plots(
@@ -465,7 +464,6 @@ def _evaluate_vpinn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) ->
             mass_value = float(np.asarray(traj[mass_key]).reshape(()))
             damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
             stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
-
             x_seq, v_seq, f_seq = _baseline_vpinn_rollout(
                 x0=x[0:1],
                 v0=v[0:1],
@@ -497,15 +495,15 @@ def _evaluate_vpinn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) ->
                 dt=dt,
                 t=np.asarray(traj["t"], dtype=float),
                 y_data_raw=np.asarray(traj["y"], dtype=float),
-                force_data=np.asarray(traj["force_total"], dtype=float),
+                force_data=np.asarray(traj["force_per_m"], dtype=float),
                 D=float(diameter),
                 k=float(stiffness_value),
                 device=device,
                 rollout=rollout,
             )
             metrics[FORCE_MAPPING_NRMSE_KEY] = _force_mapping_nrmse(
-                np.asarray(traj["force_td"], dtype=float),
-                np.asarray(traj["force_total"], dtype=float),
+                np.asarray(traj["force_td_per_m"], dtype=float),
+                np.asarray(traj["force_per_m"], dtype=float),
             )
             if PLOT_OUTPUT_DIR is not None:
                 _save_rollout_plots(

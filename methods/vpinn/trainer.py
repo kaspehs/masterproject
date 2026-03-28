@@ -1650,8 +1650,8 @@ def _td_rollout_traj_to_tensors(traj: dict[str, Any]) -> dict[str, Any]:
         "name": str(traj.get("name", "")),
         "x": torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1),
         "v": torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1),
-        "f": torch.from_numpy(np.ascontiguousarray(traj["force_total"])).float().unsqueeze(1),
-        "td_force": torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1),
+        "f": torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1),
+        "td_force": torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1),
         "ur": torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1),
         "td_context": torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float(),
         "t": torch.from_numpy(np.ascontiguousarray(traj["t"])).float(),
@@ -2247,8 +2247,8 @@ def _build_td_correction_vpinn_datasets(
     for traj in trajs:
         x = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
         v = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
-        f_corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
-        f_td = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
+        f_corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr_per_m"])).float().unsqueeze(1)
+        f_td = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1)
         ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
         td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
         mass_value = float(np.asarray(traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
@@ -2666,7 +2666,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         batches = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None else None
         for batch in train_loader:
-            x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = batch
+            x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win, span_win = batch
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
             corr_true = corr_true.to(device, non_blocking=non_blocking)
@@ -2675,6 +2675,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             m_win = m_win.to(device, non_blocking=non_blocking)
             c_win = c_win.to(device, non_blocking=non_blocking)
             k_win = k_win.to(device, non_blocking=non_blocking)
+            span_win = span_win.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 mu_corr, sigma_corr = _vpinn_predict_correction(
@@ -2700,7 +2701,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     R_mean = _weak_residual(
                         x=x_win,
                         v=v_win,
-                        f_pred=total_force_mu,
+                        f_pred=total_force_mu * span_win,
                         m=m_win[:, 0, :],
                         c=c_win[:, 0, :],
                         k=k_win[:, 0, :],
@@ -2837,7 +2838,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             val_batches = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
+                    x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win, span_win = [item.to(device, non_blocking=non_blocking) for item in batch]
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                         mu_corr, sigma_corr = _vpinn_predict_correction(
                             model,
@@ -2862,7 +2863,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                             R_mean = _weak_residual(
                                 x=x_win,
                                 v=v_win,
-                                f_pred=total_force_mu,
+                                f_pred=total_force_mu * span_win,
                                 m=m_win[:, 0, :],
                                 c=c_win[:, 0, :],
                                 k=k_win[:, 0, :],

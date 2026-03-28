@@ -602,8 +602,8 @@ def _build_td_correction_hnn_loaders(
             dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
             ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
-            corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr"])).float().unsqueeze(1)
-            td_force = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1)
+            corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr_per_m"])).float().unsqueeze(1)
+            td_force = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1)
             mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
             damping = torch.full((y.shape[0], 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=torch.float32)
             stiffness = torch.full((y.shape[0], 1), float(np.asarray(traj["stiffness_n_m"]).reshape(())), dtype=torch.float32)
@@ -738,8 +738,8 @@ def _log_td_correction_rollout_validation(
     y_true_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1).to(device)
     v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
     z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
-    f_true_t = torch.from_numpy(np.ascontiguousarray(traj["force_total"])).float().unsqueeze(1).to(device)
-    td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1).to(device)
+    f_true_t = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1).to(device)
+    td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
     ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
     td_context_t = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float().to(device)
     t_np = np.asarray(traj["t"], dtype=float).reshape(-1)
@@ -750,7 +750,6 @@ def _log_td_correction_rollout_validation(
     mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
     damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
     stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-
     z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
         model=model,
         z0=z_true_t[0:1],
@@ -2869,7 +2868,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             y_true_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1).to(device)
             v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
             z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
-            td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td"])).float().unsqueeze(1).to(device)
+            td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
             ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
             with torch.no_grad():
                 corr_on_data, sigma_on_data = _td_predict_correction(
