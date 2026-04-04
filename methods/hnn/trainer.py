@@ -45,6 +45,7 @@ from HNN_helper import (
     load_training_series,
     lookup_ur_bin_state_scale_tensor,
     format_loss_vs_ur_text,
+    build_td_parameter_model,
     create_window_mask,
     create_zoom_mask,
     log_loss_vs_ur,
@@ -69,6 +70,7 @@ from HNN_helper import (
     resolve_cut_start_seconds,
     sample_indices_per_ur,
     sample_one_index_per_ur,
+    warn_ignored_td_delta_keys,
 )
 
 
@@ -361,7 +363,7 @@ def _td_state_propagated_nll_loss(
 
 def _td_correction_rollout_loss_from_batch(
     *,
-    model: PHVIV,
+    model: torch.nn.Module,
     batch: Any,
     device: torch.device,
     non_blocking: bool,
@@ -383,77 +385,27 @@ def _td_correction_rollout_loss_from_batch(
     mass0 = mass0.to(device, non_blocking=non_blocking)
     damping0 = damping0.to(device, non_blocking=non_blocking)
     stiffness0 = stiffness0.to(device, non_blocking=non_blocking)
-
-    mode_key = str(rollout_loss_mode).strip().lower()
-    if mode_key == "stochastic":
-        mode_key = "stochastic_nll"
-    if mode_key not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
-        raise ValueError(
-            "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
-        )
+    del td_params, predict_sigma, force_zero_output, rollout_loss_mode, rollout_stochastic_samples, rollout_noise_scale
     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
-    if mode_key == "deterministic" or not predict_sigma:
-        z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
-            model=model,
-            z0=z0,
-            ur0=ur0,
-            td_context0=td_context0,
-            steps=int(z_traj.shape[1] - 1),
-            dt=dt_roll,
-            structural_mass=mass0,
-            damping_c=damping0,
-            stiffness=stiffness0,
-            td_params=td_params,
-            predict_sigma=False,
-            force_zero_output=force_zero_output,
-        )
-        return torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
-
-    samples = max(1, int(rollout_stochastic_samples))
-    batch_size = int(z0.shape[0])
-    z0_in = z0.unsqueeze(0).expand(samples, *z0.shape).reshape(samples * batch_size, *z0.shape[1:])
-    t_seq_in = t_seq.unsqueeze(0).expand(samples, *t_seq.shape).reshape(samples * batch_size, *t_seq.shape[1:])
-    z_traj_ref = z_traj.unsqueeze(0)
-    ur0_in = ur0.unsqueeze(0).expand(samples, *ur0.shape).reshape(samples * batch_size, *ur0.shape[1:])
-    td_context0_in = td_context0.unsqueeze(0).expand(samples, *td_context0.shape).reshape(samples * batch_size, *td_context0.shape[1:])
-    mass0_in = mass0.unsqueeze(0).expand(samples, *mass0.shape).reshape(samples * batch_size, *mass0.shape[1:])
-    damping0_in = damping0.unsqueeze(0).expand(samples, *damping0.shape).reshape(samples * batch_size, *damping0.shape[1:])
-    stiffness0_in = stiffness0.unsqueeze(0).expand(samples, *stiffness0.shape).reshape(samples * batch_size, *stiffness0.shape[1:])
-    dt_roll_in = dt_roll.unsqueeze(0).expand(samples, *dt_roll.shape).reshape(samples * batch_size, *dt_roll.shape[1:])
-
-    z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+    z_pred, _force_seq, _unused = _td_correction_state_rollout(
         model=model,
-        z0=z0_in,
-        ur0=ur0_in,
-        td_context0=td_context0_in,
+        z0=z0,
+        ur0=ur0,
+        td_context0=td_context0,
         steps=int(z_traj.shape[1] - 1),
-        dt=dt_roll_in,
-        structural_mass=mass0_in,
-        damping_c=damping0_in,
-        stiffness=stiffness0_in,
-        td_params=td_params,
-        predict_sigma=True,
-        force_zero_output=force_zero_output,
-        rollout_stochastic=True,
-        rollout_noise_scale=rollout_noise_scale,
+        dt=dt_roll,
+        structural_mass=mass0,
+        damping_c=damping0,
+        stiffness=stiffness0,
+        rho=float(getattr(model, "rho", 1.0)),
+        diameter=float(getattr(model, "diameter", 1.0)),
     )
-    z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
-    if mode_key == "stochastic_mse":
-        err = z_pred - z_traj_ref
-        per_samples = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
-        return torch.mean(torch.mean(per_samples, dim=0))
-
-    mu = torch.mean(z_pred, dim=0)
-    var = torch.mean((z_pred - mu.unsqueeze(0)) ** 2, dim=0)
-    var = torch.clamp(var, min=1e-6)
-    nll = 0.5 * (((z_traj - mu) ** 2) / var + torch.log(var))
-    per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
-    return torch.mean(per)
+    return torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
 
 
 def _td_correction_state_rollout(
     *,
-    model: PHVIV,
+    model: torch.nn.Module,
     z0: torch.Tensor,
     ur0: torch.Tensor,
     td_context0: torch.Tensor,
@@ -462,57 +414,36 @@ def _td_correction_state_rollout(
     structural_mass: torch.Tensor,
     damping_c: torch.Tensor,
     stiffness: torch.Tensor,
-    td_params: dict[str, float],
+    rho: float,
+    diameter: float,
     predict_sigma: bool = False,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
     rollout_seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del predict_sigma, force_zero_output, rollout_stochastic, rollout_noise_scale, rollout_seed
     z = z0
     td_context = td_context0
     z_hist = [z0]
     total_force_hist: list[torch.Tensor] = []
-    corr_mu_hist: list[torch.Tensor] = []
-    generator: torch.Generator | None = None
-    if rollout_seed is not None:
-        generator = torch.Generator(device=z0.device)
-        generator.manual_seed(int(rollout_seed))
+    zero_hist: list[torch.Tensor] = []
     for _ in range(int(steps)):
         velocity = z[:, 1:2] / structural_mass
+        td_params = model(ur0, like=velocity)
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=velocity,
             acceleration=td_context[:, 0:1],
             td_context=td_context,
             dt=dt,
-            rho=float(model.rho),
-            diameter=float(model.D),
+            rho=float(rho),
+            diameter=float(diameter),
             params=td_params,
         )
-        corr_mu, sigma_corr = _td_predict_correction(
-            model,
-            z=z,
-            reduced_velocity=ur0,
-            td_force_input=td_force_next,
-            structural_mass=structural_mass,
-            stiffness=stiffness,
-            predict_sigma=predict_sigma,
-            force_zero_output=force_zero_output,
-        )
-        corr_force = corr_mu
-        if rollout_stochastic and predict_sigma:
-            noise = torch.randn(
-                corr_mu.shape,
-                device=corr_mu.device,
-                dtype=corr_mu.dtype,
-                generator=generator,
-            )
-            corr_force = corr_mu + float(rollout_noise_scale) * sigma_corr * noise
-        total_force = td_force_next + corr_force
         y_next, v_next, a_next = structural_step_constant_force_torch(
             y=z[:, 0:1],
             velocity=velocity,
-            force=total_force,
+            force=td_force_next,
             dt=dt,
             mass=structural_mass,
             damping_c=damping_c,
@@ -522,12 +453,12 @@ def _td_correction_state_rollout(
         td_context = td_context_next.clone()
         td_context[:, 0:1] = a_next
         z_hist.append(z)
-        total_force_hist.append(total_force)
-        corr_mu_hist.append(corr_force)
+        total_force_hist.append(td_force_next)
+        zero_hist.append(torch.zeros_like(td_force_next))
     z_seq = torch.stack(z_hist, dim=1)
     total_force_seq = torch.stack(total_force_hist, dim=1) if total_force_hist else z0.new_zeros((z0.shape[0], 0, 1))
-    corr_mu_seq = torch.stack(corr_mu_hist, dim=1) if corr_mu_hist else z0.new_zeros((z0.shape[0], 0, 1))
-    return z_seq, total_force_seq, corr_mu_seq
+    zero_seq = torch.stack(zero_hist, dim=1) if zero_hist else z0.new_zeros((z0.shape[0], 0, 1))
+    return z_seq, total_force_seq, zero_seq
 
 
 def _td_pure_baseline_state_rollout(
@@ -602,8 +533,8 @@ def _build_td_correction_hnn_loaders(
             dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
             ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
-            corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr_per_m"])).float().unsqueeze(1)
-            td_force = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1)
+            td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
+            force_true = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1)
             mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
             damping = torch.full((y.shape[0], 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=torch.float32)
             stiffness = torch.full((y.shape[0], 1), float(np.asarray(traj["stiffness_n_m"]).reshape(())), dtype=torch.float32)
@@ -614,8 +545,8 @@ def _build_td_correction_hnn_loaders(
                 z[1:],
                 t[1:].unsqueeze(1),
                 ur[:-1],
-                corr[1:],
-                td_force[1:],
+                td_context[:-1],
+                force_true[1:],
                 mass[:-1],
                 damping[:-1],
                 stiffness[:-1],
@@ -712,7 +643,7 @@ def _log_td_correction_rollout_validation(
     *,
     writer: SummaryWriter,
     epoch: int,
-    model: PHVIV,
+    model: torch.nn.Module,
     traj: dict[str, np.ndarray],
     dt: float,
     td_mass_source: str,
@@ -731,6 +662,8 @@ def _log_td_correction_rollout_validation(
     log_correction_on_data: bool = False,
     title_suffix: str = "",
 ) -> dict[str, float]:
+    del dt, td_params, predict_sigma, force_zero_output, rollout_stochastic, rollout_noise_scale, rollout_seed
+    del log_phase_map, log_correction_on_data
     mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
     mass_value = float(np.asarray(traj[mass_key]).reshape(()))
     damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
@@ -750,7 +683,7 @@ def _log_td_correction_rollout_validation(
     mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
     damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
     stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-    z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
+    z_pred, total_force_seq, _unused = _td_correction_state_rollout(
         model=model,
         z0=z_true_t[0:1],
         ur0=ur_t[0:1],
@@ -760,38 +693,17 @@ def _log_td_correction_rollout_validation(
         structural_mass=mass_t,
         damping_c=damping_t,
         stiffness=stiffness_t,
-        td_params=td_params,
-        predict_sigma=predict_sigma,
-        force_zero_output=force_zero_output,
-        rollout_stochastic=rollout_stochastic,
-        rollout_noise_scale=rollout_noise_scale,
-        rollout_seed=rollout_seed,
+        rho=float(getattr(model, "rho", 1.0)),
+        diameter=float(getattr(model, "diameter", 1.0)),
     )
     y_pred = z_pred[0, :, 0].detach().cpu().numpy()
     v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
     force_roll = total_force_seq[0, :, 0].detach().cpu().numpy()
-    corr_roll = corr_mu_seq[0, :, 0].detach().cpu().numpy()
-    td_roll = force_roll - corr_roll
-
-    with torch.no_grad():
-        corr_on_data, sigma_on_data = _td_predict_correction(
-            model,
-            z=z_true_t,
-            reduced_velocity=ur_t,
-            td_force_input=td_force_t,
-            structural_mass=torch.full_like(y_true_t, mass_value),
-            stiffness=torch.full_like(y_true_t, stiffness_value),
-            predict_sigma=False,
-            force_zero_output=force_zero_output,
-        )
-    force_total_full = np.concatenate(
-        [np.asarray([float((td_force_t[0:1] + corr_on_data[0:1])[0, 0].detach().cpu())]), force_roll],
-        axis=0,
-    )
-    force_td_full = np.concatenate([td_force_t[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
+    force_total_full = np.concatenate([force_roll[:1], force_roll], axis=0) if force_roll.size > 0 else force_roll
+    force_td_full = np.asarray(traj["force_td_per_m"], dtype=float).reshape(-1)
 
     metrics = compute_validation_metrics(
-        model=model,
+        model=None,
         y_data_t=y_true_t[:, 0],
         val_vel=v_true_t[:, 0],
         reduced_velocity=ur_t[:, 0],
@@ -800,17 +712,17 @@ def _log_td_correction_rollout_validation(
         t=t_np,
         y_data_raw=y_true_t[:, 0].detach().cpu().numpy(),
         force_data=f_true_t[:, 0].detach().cpu().numpy(),
-        D=float(model.D),
+        D=float(getattr(model, "diameter", 1.0)),
         k=stiffness_value,
         device=device,
         rollout={
-            "y_norm": y_pred / float(model.D),
-            "p_norm": v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D)),
+            "y_norm": y_pred / float(getattr(model, "diameter", 1.0)),
+            "p_norm": v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(getattr(model, "diameter", 1.0))),
             "force_total": force_total_full,
         },
     )
     force_true = f_true_t[:, 0].detach().cpu().numpy()
-    force_model_on_data = (td_force_t[:, 0] + corr_on_data[:, 0]).detach().cpu().numpy()
+    force_model_on_data = force_total_full[: force_true.shape[0]]
     force_std = float(np.std(force_true))
     if force_std <= 0.0:
         force_std = 1.0
@@ -824,18 +736,14 @@ def _log_td_correction_rollout_validation(
     if log_plots:
         zoom_mask = create_zoom_mask(t_np)
         ur_val = float(ur_t[0, 0].detach().cpu().item())
-        omega = float(np.sqrt(stiffness_value / mass_value))
-        q_true_norm = y_true_t[:, 0].detach().cpu().numpy() / float(model.D)
-        p_true_norm = v_true_t[:, 0].detach().cpu().numpy() / (omega * float(model.D))
-        q_pred_norm = y_pred / float(model.D)
-        p_pred_norm = v_pred / (omega * float(model.D))
+        diameter = float(getattr(model, "diameter", 1.0))
         log_displacement_plots(
             writer,
             epoch,
             t_np,
-            q_true_norm,
-            q_pred_norm,
-            p_pred_norm,
+            y_true_t[:, 0].detach().cpu().numpy() / diameter,
+            y_pred / diameter,
+            v_pred / (float(np.sqrt(stiffness_value / mass_value)) * diameter),
             zoom_mask,
             reduced_velocity=ur_val,
             tag_prefix=tag_prefix,
@@ -853,97 +761,11 @@ def _log_td_correction_rollout_validation(
             create_zoom_mask(force_t),
             reduced_velocity=ur_val,
             force_coeff_baseline=force_td_full[:n_force],
-            baseline_label="C_F (Vivana-TD)",
+            baseline_label="C_F (config TD baseline)",
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
         )
-        if log_correction_on_data:
-            output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
-            log_correction_on_data_plot(
-                writer,
-                epoch,
-                t=t_np,
-                corr_true=(f_true_t[:, 0] - td_force_t[:, 0]).detach().cpu().numpy(),
-                corr_pred=corr_on_data[:, 0].detach().cpu().numpy(),
-                sigma=(
-                    sigma_on_data[:, 0].detach().cpu().numpy()
-                    if predict_sigma
-                    else None
-                ),
-                reduced_velocity=ur_val,
-                value_label=output_label,
-                sigma_label=("Sigma coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Sigma force"),
-                tag="final_val/correction_on_data",
-                step=step,
-                title_suffix=title_suffix,
-            )
-        if log_phase_map:
-            q_extent = np.concatenate([np.asarray(q_true_norm, dtype=float), np.asarray(q_pred_norm, dtype=float)])
-            p_extent = np.concatenate([np.asarray(p_true_norm, dtype=float), np.asarray(p_pred_norm, dtype=float)])
-            q_grid, p_grid = build_phase_plot_grid(q_extent, p_extent, bins=96, extent_scale=1.2)
-            y_grid = torch.as_tensor(
-                (q_grid.reshape(-1) * float(model.D)).reshape(-1, 1),
-                dtype=z_true_t.dtype,
-                device=device,
-            )
-            v_grid = torch.as_tensor(
-                (p_grid.reshape(-1) * (omega * float(model.D))).reshape(-1, 1),
-                dtype=z_true_t.dtype,
-                device=device,
-            )
-            z_grid = torch.cat([y_grid, v_grid * mass_value], dim=1)
-            ur_grid = torch.full((z_grid.shape[0], 1), ur_val, dtype=z_true_t.dtype, device=device)
-            td_force_grid = None
-            if bool(getattr(model, "use_td_force_input", False)):
-                td_force_grid_np = nearest_phase_series_values(
-                    q_grid,
-                    p_grid,
-                    q_true_norm,
-                    p_true_norm,
-                    td_force_t[:, 0].detach().cpu().numpy(),
-                )
-                td_force_grid = torch.as_tensor(
-                    td_force_grid_np.reshape(-1, 1),
-                    dtype=z_true_t.dtype,
-                    device=device,
-                )
-            with torch.no_grad():
-                corr_grid, sigma_grid = _td_predict_correction(
-                    model,
-                    z=z_grid,
-                    reduced_velocity=ur_grid,
-                    td_force_input=td_force_grid,
-                    structural_mass=torch.full((z_grid.shape[0], 1), mass_value, dtype=z_true_t.dtype, device=device),
-                    stiffness=torch.full((z_grid.shape[0], 1), stiffness_value, dtype=z_true_t.dtype, device=device),
-                    predict_sigma=False,
-                    force_zero_output=force_zero_output,
-                )
-            output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
-            log_signed_phase_output_plot(
-                writer,
-                epoch,
-                q_grid=q_grid,
-                p_grid=p_grid,
-                values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
-                q_true=q_true_norm,
-                p_true=p_true_norm,
-                q_pred=q_pred_norm,
-                p_pred=p_pred_norm,
-                reduced_velocity=ur_val,
-                output_label=output_label,
-                sigma_values=(
-                    sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
-                    if predict_sigma
-                    else None
-                ),
-                sigma_label=(
-                    "Sigma coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Sigma force"
-                ),
-                tag="final_val/phase_output",
-                step=step,
-                title_suffix=title_suffix,
-            )
     return metrics
 
 
@@ -2188,6 +2010,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     monitoring_cfg = config.monitoring
     hnn_cfg = dict(config.hnn or {})
 
+    warn_ignored_td_delta_keys(hnn_cfg)
+
     device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
     print(f"Using device: {device}")
     if device.type == "cuda":
@@ -2242,53 +2066,36 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         else []
     )
 
-    td_params = resolve_td_correction_params(hnn_cfg)
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
-    predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
-    use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
-    state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
-    if state_loss_mode not in {"mse", "propagated_nll"}:
-        raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
-    force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
-    corr_init_mode, corr_init_tiny_std = _resolve_td_correction_init_settings(hnn_cfg, model_cfg)
+    td_params = resolve_td_correction_params(hnn_cfg)
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
-    rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
-    rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
-    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
     mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
-    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
-    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
+    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
     rollout_det_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
     rollout_det_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
     rollout_det_steps_final = rollout_det_steps if rollout_det_steps_final_raw <= 0 else rollout_det_steps_final_raw
-    rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
-    rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
-    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
-        raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
-    rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
-    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
+    rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
+    rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
+    symmetry_weight = float(getattr(loss_cfg, "symmetry_weight", 0.0))
 
-    if rollout_loss_mode == "stochastic":
-        rollout_loss_mode = "stochastic_nll"
-    if rollout_loss_mode not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
-        raise ValueError(
-            "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
+    if sigma_reg != 0.0:
+        warnings.warn("loss.sigma_reg is ignored for td_parameter_model=global_delta.", stacklevel=2)
+    if symmetry_weight != 0.0:
+        warnings.warn("loss.symmetry_weight is ignored for td_parameter_model=global_delta.", stacklevel=2)
+    if rollout_loss_mode != "deterministic":
+        warnings.warn(
+            f"Ignoring loss.rollout_loss_mode='{rollout_loss_mode}' and using deterministic rollout loss.",
+            stacklevel=2,
         )
-    if rollout_stochastic_samples < 1:
-        raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
-    if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_det_weight > 0.0:
-        if not predict_sigma:
-            raise ValueError("PHNN stochastic rollout loss modes require hnn.predict_sigma=true.")
-        if rollout_stochastic_samples < 2:
-            raise ValueError(
-                "loss.rollout_stochastic_samples must be >= 2 when "
-                "loss.rollout_loss_mode is stochastic_nll or stochastic_mse."
-            )
+        rollout_loss_mode = "deterministic"
+    if rollout_stochastic_samples != 1:
+        warnings.warn("loss.rollout_stochastic_samples is ignored for td_parameter_model=global_delta.", stacklevel=2)
     if rollout_det_steps_final < 0:
         raise ValueError("loss.rollout_det_steps_final must be non-negative.")
     if rollout_det_steps_warmup_epochs < 0:
@@ -2299,22 +2106,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss.rollout_det_weight > 0."
         )
 
-    model_dict = asdict(model_cfg)
-    first_train_traj = train_trajs[0]
-    model_dict["structural_mass"] = float(np.asarray(first_train_traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
-    model_dict["k"] = float(np.asarray(first_train_traj["stiffness_n_m"]).reshape(()))
-    model_dict["damping_c"] = float(np.asarray(first_train_traj["damping_c"]).reshape(()))
-    model_dict["Ca"] = 0.0
-    model_dict["use_stochastic_process_noise"] = predict_sigma
-    model_dict["use_td_force_input"] = use_td_force_input
-    arch_dict = asdict(config.architecture)
-    model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
-    _apply_td_correction_head_init(
-        model,
-        mode=corr_init_mode,
-        tiny_std=corr_init_tiny_std,
-        predict_sigma=predict_sigma,
-    )
+    model = build_td_parameter_model(hnn_cfg, device=device)
+    setattr(model, "rho", float(getattr(model_cfg, "rho", 1.0)))
+    setattr(model, "diameter", float(getattr(model_cfg, "D", 1.0)))
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
     current_rollout_det_steps = _scheduled_rollout_det_steps(
@@ -2323,7 +2117,6 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         final_steps=rollout_det_steps_final,
         warmup_epochs=rollout_det_steps_warmup_epochs,
     )
-
     train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
         train_trajs=train_trajs,
         val_trajs=val_trajs,
@@ -2366,14 +2159,26 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         run_name_override=getattr(config.logging, "run_name", None),
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
-    writer.add_text("hnn/td_correction_config", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
+    writer.add_text("hnn/td_delta_config", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
+    writer.add_text("hnn/base_td_params", json.dumps(td_params, indent=2, sort_keys=True), 0)
     writer.flush()
 
-    def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _unwrap_model(module: torch.nn.Module) -> torch.nn.Module:
+        return getattr(module, "_orig_mod", module)
+
+    def _inspect_td_params(module: torch.nn.Module) -> dict[str, float]:
+        base = _unwrap_model(module)
+        if not hasattr(base, "inspect_effective_params"):
+            raise AttributeError("TD parameter model must implement inspect_effective_params().")
+        return dict(base.inspect_effective_params())
+
+    def _parse_td_train_batch(
+        batch: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(batch) != 10:
             raise ValueError("Unexpected TD correction HNN batch format.")
-        z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
-        return z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i
+        z_i, t_i, z_next, t_next, ur_i, td_context_i, force_next, mass_i, damping_i, stiffness_i = batch
+        return z_i, t_i, z_next, t_next, ur_i, td_context_i, force_next, mass_i, damping_i, stiffness_i
 
     def _state_loss(
         *,
@@ -2381,52 +2186,32 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         dt_i: torch.Tensor,
         z_next: torch.Tensor,
         ur_i: torch.Tensor,
-        td_force_next: torch.Tensor,
+        td_context_i: torch.Tensor,
         mass_i: torch.Tensor,
         damping_i: torch.Tensor,
         stiffness_i: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        corr_mu, sigma_corr = _td_predict_correction(
-            model,
-            z=z_i,
-            reduced_velocity=ur_i,
-            td_force_input=td_force_next,
-            structural_mass=mass_i,
-            stiffness=stiffness_i,
-            predict_sigma=predict_sigma,
-            force_zero_output=force_zero_output,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        velocity_i = z_i[:, 1:2] / mass_i
+        effective_params = model(ur_i, like=velocity_i)
+        td_force_next, _td_context_next = td_baseline_step_torch(
+            velocity=velocity_i,
+            acceleration=td_context_i[:, 0:1],
+            td_context=td_context_i,
+            dt=dt_i,
+            rho=float(getattr(model, "rho", 1.0)),
+            diameter=float(getattr(model, "diameter", 1.0)),
+            params=effective_params,
         )
-        total_force_next = td_force_next + corr_mu
-        if predict_sigma and state_loss_mode == "propagated_nll":
-            state_loss, _z_next_mean = _td_state_propagated_nll_loss(
-                z_i=z_i,
-                dt_i=dt_i,
-                z_next=z_next,
-                total_force_next=total_force_next,
-                sigma_corr=sigma_corr,
-                mass_i=mass_i,
-                damping_i=damping_i,
-                stiffness_i=stiffness_i,
-            )
-        else:
-            state_loss, _z_next_mean = _td_state_mse_loss(
-                z_i=z_i,
-                dt_i=dt_i,
-                z_next=z_next,
-                total_force_next=total_force_next,
-                mass_i=mass_i,
-                damping_i=damping_i,
-                stiffness_i=stiffness_i,
-            )
-        return state_loss, corr_mu, sigma_corr
-
-    def _regularizer(value: torch.Tensor, norm: str) -> torch.Tensor:
-        key = str(norm).strip().lower()
-        if key == "l1":
-            return torch.mean(torch.abs(value))
-        if key == "l2":
-            return torch.mean(value * value)
-        raise ValueError("Regularizer norm must be one of: l1, l2.")
+        state_loss, _z_next_mean = _td_state_mse_loss(
+            z_i=z_i,
+            dt_i=dt_i,
+            z_next=z_next,
+            total_force_next=td_force_next,
+            mass_i=mass_i,
+            damping_i=damping_i,
+            stiffness_i=stiffness_i,
+        )
+        return state_loss, td_force_next
 
     epochs = int(training_cfg.epochs)
     validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
@@ -2444,7 +2229,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     startup_lines = [
         f"Run name: {run_name}",
         (
-            f"HNN TD-correction setup: epochs={epochs}, batch_size={int(training_cfg.batch_size)}, "
+            f"HNN TD-delta setup: epochs={epochs}, batch_size={int(training_cfg.batch_size)}, "
             f"steps_per_epoch={train_steps_per_epoch}, train_instances={train_instances}, "
             f"train_trajectories={len(train_trajs)}"
         ),
@@ -2462,21 +2247,6 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
         ),
     ]
-    sigma_identified_by_rollout = (
-        rollout_det_weight > 0.0 and rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}
-    )
-    if predict_sigma and not use_force_data_loss and not sigma_identified_by_rollout:
-        startup_lines.append(
-            "Warning: hnn.predict_sigma=true with loss.use_force_data_loss=false. "
-            "Sigma is treated as correction-force uncertainty, and no stochastic rollout loss is enabled."
-        )
-    if rollout_det_weight > 0.0:
-        rollout_mode_msg = rollout_loss_mode
-        if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}:
-            rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
-        startup_lines.append(
-            f"Rollout loss mode: {rollout_mode_msg}, state_loss_mode={state_loss_mode}"
-        )
     print("\n".join(startup_lines))
 
     def _rebuild_td_rollout_loader(steps: int) -> Any | None:
@@ -2528,40 +2298,36 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         batch_count = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_det_weight > 0.0 else None
         for batch in train_loader:
-            z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
+            z_i, t_i, z_next, t_next, ur_i, td_context_i, force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
-            corr_next = corr_next.to(device, non_blocking=non_blocking)
-            td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+            td_context_i = td_context_i.to(device, non_blocking=non_blocking)
+            force_next = force_next.to(device, non_blocking=non_blocking)
             mass_i = mass_i.to(device, non_blocking=non_blocking)
             damping_i = damping_i.to(device, non_blocking=non_blocking)
             stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                state_loss, corr_mu, sigma_corr = _state_loss(
+                state_loss, td_force_pred = _state_loss(
                     z_i=z_i,
                     dt_i=dt_i,
                     z_next=z_next,
                     ur_i=ur_i,
-                    td_force_next=td_force_next,
+                    td_context_i=td_context_i,
                     mass_i=mass_i,
                     damping_i=damping_i,
                     stiffness_i=stiffness_i,
                 )
                 if use_force_data_loss:
-                    if predict_sigma:
-                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
-                    else:
-                        data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                    data_loss = torch.mean((force_next - td_force_pred) ** 2)
                 else:
                     data_loss = state_loss.new_tensor(0.0)
-                mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
-                sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                mean_reg_loss = _unwrap_model(model).regularization(mean_reg_norm)
+                sigma_reg_loss = state_loss.new_tensor(0.0)
                 rollout_det_loss = state_loss.new_tensor(0.0)
                 if rollout_iter is not None:
                     try:
@@ -2575,11 +2341,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         device=device,
                         non_blocking=non_blocking,
                         td_params=td_params,
-                        predict_sigma=predict_sigma,
-                        force_zero_output=force_zero_output,
-                        rollout_loss_mode=rollout_loss_mode,
-                        rollout_stochastic_samples=rollout_stochastic_samples,
-                        rollout_noise_scale=rollout_noise_scale,
+                        predict_sigma=False,
+                        force_zero_output=False,
+                        rollout_loss_mode="deterministic",
+                        rollout_stochastic_samples=1,
+                        rollout_noise_scale=0.0,
                     )
                 if gradnorm_balancer is not None:
                     loss_inputs: dict[str, torch.Tensor] = {"state": state_loss.float()}
@@ -2608,7 +2374,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 else:
                     base_loss = state_loss + float(force_data_weight) * data_loss
                     weighted_rollout_det = float(rollout_det_weight) * rollout_det_loss
-                total_loss = base_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + weighted_rollout_det
+                total_loss = base_loss + float(mean_reg) * mean_reg_loss + weighted_rollout_det
             if total_loss.requires_grad:
                 if scaler.is_enabled():
                     scaler.scale(total_loss).backward()
@@ -2635,6 +2401,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         denom = float(max(1, batch_count))
         train_metrics = {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
         train_metrics["lr"] = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(optim_cfg.lr)
+        train_metrics.update({f"td_{name}": value for name, value in _inspect_td_params(model).items()})
         if gradnorm_count > 0:
             if gradnorm_state_w_sum is not None:
                 train_metrics["gradnorm_weight_physics"] = float(
@@ -2655,7 +2422,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             print(
                 f"Epoch {epoch}: loss={train_metrics['loss_total']:.4e}, "
                 f"Lstate={train_metrics['loss_state']:.4e}, Ldata={train_metrics['loss_data']:.4e}, "
-                f"Lroll={train_metrics['loss_rollout_det']:.4e}, lr={train_metrics['lr']:.3e}"
+                f"Lroll={train_metrics['loss_rollout_det']:.4e}, "
+                f"Cv={train_metrics['td_Cv']:.4f}, Cd={train_metrics['td_Cd']:.4f}, Ca={train_metrics['td_Ca']:.4f}"
             )
 
         if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
@@ -2670,40 +2438,33 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             val_count = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
+                    z_i, t_i, z_next, t_next, ur_i, td_context_i, force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
                     z_i = z_i.to(device, non_blocking=non_blocking)
                     t_i = t_i.to(device, non_blocking=non_blocking)
                     z_next = z_next.to(device, non_blocking=non_blocking)
                     t_next = t_next.to(device, non_blocking=non_blocking)
                     ur_i = ur_i.to(device, non_blocking=non_blocking)
-                    corr_next = corr_next.to(device, non_blocking=non_blocking)
-                    td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+                    td_context_i = td_context_i.to(device, non_blocking=non_blocking)
+                    force_next = force_next.to(device, non_blocking=non_blocking)
                     mass_i = mass_i.to(device, non_blocking=non_blocking)
                     damping_i = damping_i.to(device, non_blocking=non_blocking)
                     stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                         dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                        state_loss, corr_mu, sigma_corr = _state_loss(
+                        state_loss, td_force_pred = _state_loss(
                             z_i=z_i,
                             dt_i=dt_i,
                             z_next=z_next,
                             ur_i=ur_i,
-                            td_force_next=td_force_next,
+                            td_context_i=td_context_i,
                             mass_i=mass_i,
                             damping_i=damping_i,
                             stiffness_i=stiffness_i,
                         )
-                        if use_force_data_loss:
-                            if predict_sigma:
-                                var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                                data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
-                            else:
-                                data_loss = torch.mean((corr_next - corr_mu) ** 2)
-                        else:
-                            data_loss = state_loss.new_tensor(0.0)
-                        mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
-                        sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
-                        total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                        data_loss = torch.mean((force_next - td_force_pred) ** 2) if use_force_data_loss else state_loss.new_tensor(0.0)
+                        mean_reg_loss = _unwrap_model(model).regularization(mean_reg_norm)
+                        sigma_reg_loss = state_loss.new_tensor(0.0)
+                        total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss
                     val_sums["loss_total"] += total_loss.detach()
                     val_sums["loss_state"] += state_loss.detach()
                     val_sums["loss_data"] += data_loss.detach()
@@ -2713,6 +2474,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             val_denom = float(max(1, val_count))
             for name, value in val_sums.items():
                 writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch + 1)
+            for name, value in _inspect_td_params(model).items():
+                writer.add_scalar(f"val/td_{name}", value, epoch + 1)
             if rollout_loader is not None and rollout_det_weight > 0.0:
                 with torch.no_grad():
                     rollout_loss_sum = torch.zeros((), device=device)
@@ -2724,16 +2487,16 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             device=device,
                             non_blocking=non_blocking,
                             td_params=td_params,
-                            predict_sigma=predict_sigma,
-                            force_zero_output=force_zero_output,
-                            rollout_loss_mode=rollout_loss_mode,
-                            rollout_stochastic_samples=rollout_stochastic_samples,
-                            rollout_noise_scale=rollout_noise_scale,
+                            predict_sigma=False,
+                            force_zero_output=False,
+                            rollout_loss_mode="deterministic",
+                            rollout_stochastic_samples=1,
+                            rollout_noise_scale=0.0,
                         ).detach()
                         rollout_count += 1
                     writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch + 1)
 
-            if val_trajs and ((epoch % validate_every) == 0 or epoch == epochs - 1):
+            if val_trajs:
                 ur_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs]
                 sampled_metric_indices = sample_indices_per_ur(
                     ur_all,
@@ -2742,8 +2505,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 )
                 sampled_names = [str(val_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
                 print(
-                    f"[td-val][phnn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
-                    f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+                    f"[td-val][hnn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
+                    f"(mass_source={td_mass_source})"
                 )
                 metrics_sum: dict[str, float] = {}
                 metrics_count: dict[str, int] = {}
@@ -2758,11 +2521,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         td_mass_source=td_mass_source,
                         td_params=td_params,
                         device=device,
-                        predict_sigma=predict_sigma,
-                        force_zero_output=force_zero_output,
-                        rollout_stochastic=rollout_stochastic,
-                        rollout_noise_scale=rollout_noise_scale,
-                        rollout_seed=rollout_seed,
+                        predict_sigma=False,
+                        force_zero_output=False,
+                        rollout_stochastic=False,
+                        rollout_noise_scale=0.0,
+                        rollout_seed=None,
                         log_metrics=False,
                         log_plots=False,
                     )
@@ -2783,15 +2546,6 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     selected_indices = list(range(len(val_trajs)))
                 rollout_idx = selected_indices[0]
                 rollout_traj = val_trajs[rollout_idx]
-                rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
-                print(
-                    f"[td-val][phnn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
-                    f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-                    f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
-                    f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
-                    f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
-                    f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
-                )
                 _log_td_correction_rollout_validation(
                     writer=writer,
                     epoch=epoch + 1,
@@ -2801,11 +2555,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     td_mass_source=td_mass_source,
                     td_params=td_params,
                     device=device,
-                    predict_sigma=predict_sigma,
-                    force_zero_output=force_zero_output,
-                    rollout_stochastic=rollout_stochastic,
-                    rollout_noise_scale=rollout_noise_scale,
-                    rollout_seed=rollout_seed,
+                    predict_sigma=False,
+                    force_zero_output=False,
+                    rollout_stochastic=False,
+                    rollout_noise_scale=0.0,
+                    rollout_seed=None,
                     log_metrics=False,
                     log_plots=True,
                 )
@@ -2814,13 +2568,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         print("Final validation rollout (all trajectories) started.")
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
-        ur_values: list[float] = []
-        metrics_list: list[dict[str, float]] = []
         plot_ur_values: list[float] = []
         plot_metrics_list: list[dict[str, float]] = []
-        output_ur_values: list[float] = []
-        corr_series_list: list[np.ndarray] = []
-        sigma_series_list: list[np.ndarray] = []
         metric_trajs: list[dict[str, Any]] = []
         seen_metric_ur: set[float] = set()
         for traj in val_trajs:
@@ -2850,11 +2599,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 td_mass_source=td_mass_source,
                 td_params=td_params,
                 device=device,
-                predict_sigma=predict_sigma,
-                force_zero_output=force_zero_output,
-                rollout_stochastic=rollout_stochastic,
-                rollout_noise_scale=rollout_noise_scale,
-                rollout_seed=rollout_seed,
+                predict_sigma=False,
+                force_zero_output=False,
+                rollout_stochastic=False,
+                rollout_noise_scale=0.0,
+                rollout_seed=None,
                 tag_prefix="final_val/rollout",
                 log_metrics=False,
                 log_plots=False,
@@ -2866,38 +2615,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 for name, value in metrics.items()
                 if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
             }
-            if filtered:
-                ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
-                metrics_list.append(filtered)
             for name, value in filtered.items():
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
                 metrics_count[name] = metrics_count.get(name, 0) + 1
         for idx, traj in enumerate(plot_trajs, start=1):
-            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
-            mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
-            mass_value = float(np.asarray(traj[mass_key]).reshape(()))
-            stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
-            y_true_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1).to(device)
-            v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
-            z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
-            td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
-            ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
-            with torch.no_grad():
-                corr_on_data, sigma_on_data = _td_predict_correction(
-                    model,
-                    z=z_true_t,
-                    reduced_velocity=ur_t,
-                    td_force_input=td_force_t,
-                    structural_mass=torch.full_like(y_true_t, mass_value),
-                    stiffness=torch.full_like(y_true_t, stiffness_value),
-                    predict_sigma=predict_sigma,
-                    force_zero_output=force_zero_output,
-                )
-            output_ur_values.append(ur_val)
-            corr_series_list.append(corr_on_data[:, 0].detach().cpu().numpy())
-            if predict_sigma:
-                sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
-
             plot_metrics = _log_td_correction_rollout_validation(
                 writer=writer,
                 epoch=max(0, epochs - 1),
@@ -2907,22 +2628,26 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 td_mass_source=td_mass_source,
                 td_params=td_params,
                 device=device,
-                predict_sigma=predict_sigma,
-                force_zero_output=force_zero_output,
-                rollout_stochastic=rollout_stochastic,
-                rollout_noise_scale=rollout_noise_scale,
-                rollout_seed=rollout_seed,
+                predict_sigma=False,
+                force_zero_output=False,
+                rollout_stochastic=False,
+                rollout_noise_scale=0.0,
+                rollout_seed=None,
                 tag_prefix="final_val/rollout",
                 step=idx,
                 log_metrics=False,
                 log_plots=True,
-                log_correction_on_data=True,
-                log_phase_map=True,
+                log_correction_on_data=False,
+                log_phase_map=False,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
-            filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
+            filtered_plot_metrics = {
+                name: float(value)
+                for name, value in plot_metrics.items()
+                if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+            }
             if filtered_plot_metrics:
-                plot_ur_values.append(ur_val)
+                plot_ur_values.append(float(np.asarray(traj["ur"]).reshape(-1)[0]))
                 plot_metrics_list.append(filtered_plot_metrics)
         avg_metrics = {
             name: metrics_sum[name] / float(metrics_count[name])
@@ -2934,6 +2659,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
+            summary_lines.append("")
+            summary_lines.append("Learned TD parameters:")
+            for name, value in sorted(_inspect_td_params(model).items()):
+                summary_lines.append(f"{name}: {value:.6f}")
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
         if plot_ur_values and plot_metrics_list:
             reference_ur_values = [
@@ -2948,33 +2677,23 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 epochs,
                 reference_ur_values=reference_ur_values,
             )
-        if output_ur_values and corr_series_list:
-            force_mode = str(getattr(model, "force_output", "force"))
-            log_output_distribution_vs_ur(
-                writer,
-                epochs,
-                ur_values=output_ur_values,
-                mean_series=corr_series_list,
-                sigma_series=(sigma_series_list if predict_sigma else None),
-                mean_label=("Correction coefficient" if force_mode == "coefficient" else "Correction force"),
-                sigma_label=("Sigma coefficient" if force_mode == "coefficient" else "Sigma force"),
-                tag="final_val/output_distribution_vs_ur",
-            )
 
     models_dir = Path("models")
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / f"{run_name}.pt"
-    state_source: torch.nn.Module = model
-    if hasattr(model, "_orig_mod"):
-        state_source = getattr(model, "_orig_mod")
+    state_source = _unwrap_model(model)
+    resolved_td_params = _inspect_td_params(model)
     torch.save(
         {
             "model_state": state_source.state_dict(),
             "config": asdict(config),
             "run_name": run_name,
             "dt": dt,
-            "method": "phnn",
+            "method": "hnn",
             "td_correction": True,
+            "td_parameter_model": str(hnn_cfg.get("td_parameter_model", "global_delta")).strip().lower(),
+            "base_td_params": td_params,
+            "resolved_td_params": resolved_td_params,
         },
         model_path,
     )

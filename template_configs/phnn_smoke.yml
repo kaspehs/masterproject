@@ -14,32 +14,6 @@ model:
   Ca: 1.0
   k: 1218.0
   damping_c: 1e-4
-  force_output: coefficient
-  sigma_min: 1.0e-6
-  ur_scale: 10.0
-
-architecture:
-  # If true, enforce odd force symmetry by construction: f(-state, U_r) = -f(state, U_r).
-  # Requires hnn.use_td_force_input: false.
-  hard_force_symmetry: false
-  use_fourier_features: false
-  fourier_features: 64
-  fourier_sigma: 1.0
-  force_net_type: mlp
-  residual_kwargs:
-    hidden: 128
-    layers: 2
-    activation: gelu
-  mlp_kwargs:
-    hidden: 128
-    layers: 2
-    activation: gelu
-  pirate_force_kwargs:
-    depth: 1
-    fourier_features: 64
-    sigma: 1.0
-    use_rwf: false
-    activation: gelu
 
 training:
   batch_size: 1024
@@ -59,35 +33,15 @@ optim:
     scheduler_type: cosine
 
 loss:
-  # Regularization
   mean_reg: 0.0
   mean_reg_norm: l1
-  sigma_reg: 0.0
-  sigma_reg_norm: l2
-
-  # U_r-bin normalization
-  ur_bin_size: 1.0e-6
-  normalize_by_ur_bin_std: false
-  ur_bin_scale_eps: 1.0e-6
-
-  # Rollout loss
   rollout_det_weight: 0.0
   rollout_det_steps: 0
-  # Rollout loss mode: deterministic | stochastic_nll | stochastic_mse
-  rollout_loss_mode: deterministic
-  # Number of stochastic rollout samples K. Must be >= 2 for stochastic_nll/stochastic_mse.
-  rollout_stochastic_samples: 1
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
   rollout_det_batch_size: 0
-
-  # Data / symmetry losses
   use_force_data_loss: false
   force_data_weight: 0.0
-  symmetry_weight: 0.0
-  symmetry_norm: l2
-
-  # GradNorm balancing
   use_gradnorm: false
   gradnorm_alpha: 0.9
   gradnorm_min_weight: 0.001
@@ -125,7 +79,7 @@ logging:
   append_timestamp: true
 
 hnn:
-  # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
+  td_parameter_model: global_delta
   td_cv: 1.2
   td_cd: 1.1
   td_ca: 1.0
@@ -133,30 +87,6 @@ hnn:
   td_fhat_min: 0.11
   td_fhat_max: 0.26
   td_n_memory: 500
-  # If true, learn sigma on the correction force/coefficient output head.
-  predict_sigma: false
-  # If true, include the current Vivana-TD predicted force as an extra force-network input.
-  use_td_force_input: false
-  # One-step state loss: mse | propagated_nll
-  state_loss_mode: mse
-
-  # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
-  # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
-  corr_init_mode: zero
-  corr_init_tiny_std: 1.0e-4
-
-  # Debug / structural convention
-  # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.
-  force_zero_output: false
-  # Structural mass used in TD-correction mode: dry | effective
   td_mass_source: dry
-
-  # Rollout behavior
-  # Validation/final rollout sampling:
-  # false -> deterministic drift-only rollout
-  # true  -> stochastic correction rollout using learned sigma_corr
-  rollout_stochastic: false
-  rollout_noise_scale: 1.0
-  rollout_seed: null
 
 pinn: {}

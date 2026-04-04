@@ -20,6 +20,7 @@ from HNN_helper import (
     FORCE_MAPPING_NRMSE_KEY,
     FORCE_SPECTRAL_REL_ERROR_KEY,
     ROLLOUT_DIVERGED_KEY,
+    build_td_parameter_model,
     compute_validation_metrics,
     load_config,
     load_td_correction_trajectories,
@@ -28,10 +29,12 @@ from HNN_helper import (
     resolve_td_correction_params,
     structural_step_constant_force_torch,
     td_baseline_step_torch,
+    warn_ignored_td_delta_keys,
 )
 
 # Script config: edit these and run the file directly.
-CONFIG_PATH = Path("template_configs/vpinn_smoke.yml")
+CONFIG_PATH = Path("template_configs/phnn_smoke.yml")
+CHECKPOINT_PATH: Path | None = None
 SPLIT = "val"
 OUTPUT_CSV: Path | None = Path("CFD_Data/analysis/vivana_td_baseline_val.csv")
 PLOT_OUTPUT_DIR: Path | None = Path("CFD_Data/analysis/vivana_td_baseline_plots")
@@ -73,6 +76,14 @@ def _maybe_print_progress(*, label: str, completed: int, total: int, last_percen
     return percent
 
 
+def _load_state(model: torch.nn.Module, state: dict[str, Any]) -> None:
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+    model.load_state_dict(state, strict=False)
+
+
 def _load_split_trajectories(config: Any, split: str) -> list[dict[str, np.ndarray]]:
     data_cfg = config.data
     method_name = str(getattr(config, "method", "")).strip().lower()
@@ -102,6 +113,7 @@ def _load_split_trajectories(config: Any, split: str) -> list[dict[str, np.ndarr
 def _baseline_hnn_rollout(
     *,
     z0: torch.Tensor,
+    reduced_velocity: torch.Tensor | None,
     td_context0: torch.Tensor,
     steps: int,
     dt: float,
@@ -110,9 +122,12 @@ def _baseline_hnn_rollout(
     stiffness: torch.Tensor,
     rho: float,
     diameter: float,
-    td_params: dict[str, float],
+    td_params: dict[str, float] | None = None,
+    td_parameter_model: torch.nn.Module | None = None,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (td_params is None) == (td_parameter_model is None):
+        raise ValueError("Provide exactly one of td_params or td_parameter_model.")
     z = z0
     td_context = td_context0
     z_hist = [z0]
@@ -120,6 +135,9 @@ def _baseline_hnn_rollout(
     progress = -1
     for step_idx in range(int(steps)):
         velocity = z[:, 1:2] / structural_mass
+        effective_td_params = td_params
+        if td_parameter_model is not None:
+            effective_td_params = td_parameter_model(reduced_velocity, like=velocity)
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=velocity,
             acceleration=td_context[:, 0:1],
@@ -127,7 +145,7 @@ def _baseline_hnn_rollout(
             dt=dt,
             rho=rho,
             diameter=diameter,
-            params=td_params,
+            params=effective_td_params,
         )
         y_next, v_next, a_next = structural_step_constant_force_torch(
             y=z[:, 0:1],
@@ -258,6 +276,7 @@ def _save_rollout_plots(
     y_pred: np.ndarray,
     force_pred: np.ndarray,
     plot_dir: Path,
+    model_label: str,
 ) -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
     case_name = Path(str(traj["name"])).stem
@@ -280,7 +299,7 @@ def _save_rollout_plots(
 
     ax = axes[0, 0]
     ax.plot(t[:y_len], y_true[:y_len], label="Ground truth", linewidth=1.4)
-    ax.plot(t[:y_len], y_pred[:y_len], label="Vivana-TD", linewidth=1.2)
+    ax.plot(t[:y_len], y_pred[:y_len], label=model_label, linewidth=1.2)
     ax.set_title("Displacement Rollout")
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("y")
@@ -289,7 +308,7 @@ def _save_rollout_plots(
 
     ax = axes[0, 1]
     ax.plot(t[:f_len], force_true[:f_len], label="Ground truth", linewidth=1.4)
-    ax.plot(t[:f_len], force_pred[:f_len], label="Vivana-TD", linewidth=1.2)
+    ax.plot(t[:f_len], force_pred[:f_len], label=model_label, linewidth=1.2)
     ax.set_title("Force Rollout")
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Force per meter")
@@ -300,7 +319,7 @@ def _save_rollout_plots(
     if disp_freqs_true.size > 0:
         ax.semilogy(disp_freqs_true, np.maximum(disp_psd_true, 1e-16), label="Ground truth", linewidth=1.4)
     if disp_freqs_pred.size > 0:
-        ax.semilogy(disp_freqs_pred, np.maximum(disp_psd_pred, 1e-16), label="Vivana-TD", linewidth=1.2)
+        ax.semilogy(disp_freqs_pred, np.maximum(disp_psd_pred, 1e-16), label=model_label, linewidth=1.2)
     ax.set_title("Displacement Spectrum")
     ax.set_xlabel("Frequency [Hz]")
     ax.set_ylabel("PSD")
@@ -311,7 +330,7 @@ def _save_rollout_plots(
     if force_freqs_true.size > 0:
         ax.semilogy(force_freqs_true, np.maximum(force_psd_true, 1e-16), label="Ground truth", linewidth=1.4)
     if force_freqs_pred.size > 0:
-        ax.semilogy(force_freqs_pred, np.maximum(force_psd_pred, 1e-16), label="Vivana-TD", linewidth=1.2)
+        ax.semilogy(force_freqs_pred, np.maximum(force_psd_pred, 1e-16), label=model_label, linewidth=1.2)
     ax.set_title("Force Spectrum")
     ax.set_xlabel("Frequency [Hz]")
     ax.set_ylabel("PSD")
@@ -323,10 +342,11 @@ def _save_rollout_plots(
     plt.close(fig)
 
 
-def _base_row(traj: dict[str, np.ndarray], dt: float) -> dict[str, float | str]:
+def _base_row(traj: dict[str, np.ndarray], dt: float, *, eval_mode: str) -> dict[str, float | str]:
     t_np = np.asarray(traj["t"], dtype=float).reshape(-1)
     return {
         "timeseries": str(traj["name"]),
+        "eval_mode": str(eval_mode),
         "ur_value": float(np.asarray(traj["ur"]).reshape(-1)[0]),
         "n_samples": float(int(t_np.shape[0])),
         "dt": float(dt),
@@ -345,8 +365,14 @@ def _metric_row(metrics: dict[str, float]) -> dict[str, float]:
     }
 
 
-def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> list[dict[str, float | str]]:
+def _evaluate_hnn_baseline(
+    config: Any,
+    trajs: list[dict[str, np.ndarray]],
+    *,
+    checkpoint: dict[str, Any] | None = None,
+) -> list[dict[str, float | str]]:
     hnn_cfg = dict(config.hnn or {})
+    warn_ignored_td_delta_keys(hnn_cfg)
     model_cfg = config.model
     td_params = resolve_td_correction_params(hnn_cfg)
     mass_key = _mass_key(hnn_cfg, key_name="td_mass_source")
@@ -354,6 +380,17 @@ def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> l
     diameter = float(getattr(model_cfg, "D", 0.1))
     device = torch.device("cpu")
     total_trajs = len(trajs)
+    td_parameter_model = None
+    eval_mode = "baseline"
+    model_label = "Vivana-TD"
+    if checkpoint is not None:
+        td_parameter_model = build_td_parameter_model(hnn_cfg, device=device)
+        setattr(td_parameter_model, "rho", rho)
+        setattr(td_parameter_model, "diameter", diameter)
+        _load_state(td_parameter_model, checkpoint["model_state"])
+        td_parameter_model.eval()
+        eval_mode = "learned_td_delta"
+        model_label = "Learned TD-delta"
 
     rows: list[dict[str, float | str]] = []
     with torch.no_grad():
@@ -380,6 +417,7 @@ def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> l
             )
             z_seq, force_seq = _baseline_hnn_rollout(
                 z0=z[0:1],
+                reduced_velocity=ur[0:1],
                 td_context0=td_context[0:1],
                 steps=max(0, int(z.shape[0] - 1)),
                 dt=dt,
@@ -388,16 +426,18 @@ def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> l
                 stiffness=torch.full((1, 1), stiffness_value, dtype=torch.float32),
                 rho=rho,
                 diameter=diameter,
-                td_params=td_params,
+                td_params=td_params if td_parameter_model is None else None,
+                td_parameter_model=td_parameter_model,
                 progress_label="  rollout ",
             )
 
             y_pred = z_seq[0, :, 0].detach().cpu().numpy()
             vel_pred = (z_seq[0, :, 1] / mass_value).detach().cpu().numpy()
+            force_total = _force_series_with_initial(force_seq)
             rollout = {
                 "y_norm": y_pred / float(diameter),
                 "p_norm": vel_pred / (np.sqrt(stiffness_value / mass_value) * float(diameter)),
-                "force_total": _force_series_with_initial(force_seq),
+                "force_total": force_total,
             }
             metrics = compute_validation_metrics(
                 model=None,
@@ -415,18 +455,19 @@ def _evaluate_hnn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) -> l
                 rollout=rollout,
             )
             metrics[FORCE_MAPPING_NRMSE_KEY] = _force_mapping_nrmse(
-                np.asarray(traj["force_td_per_m"], dtype=float),
+                np.asarray(force_total, dtype=float),
                 np.asarray(traj["force_per_m"], dtype=float),
             )
             if PLOT_OUTPUT_DIR is not None:
                 _save_rollout_plots(
                     traj=traj,
                     y_pred=y_pred,
-                    force_pred=np.asarray(rollout["force_total"], dtype=float),
-                    plot_dir=PLOT_OUTPUT_DIR / str(SPLIT).strip().lower(),
+                    force_pred=np.asarray(force_total, dtype=float),
+                    plot_dir=PLOT_OUTPUT_DIR / str(SPLIT).strip().lower() / eval_mode,
+                    model_label=model_label,
                 )
 
-            row = _base_row(traj, dt)
+            row = _base_row(traj, dt, eval_mode=eval_mode)
             row.update(_metric_row(metrics))
             rows.append(row)
             overall_progress = _maybe_print_progress(
@@ -511,9 +552,10 @@ def _evaluate_vpinn_baseline(config: Any, trajs: list[dict[str, np.ndarray]]) ->
                     y_pred=x_pred,
                     force_pred=np.asarray(rollout["force_total"], dtype=float),
                     plot_dir=PLOT_OUTPUT_DIR / str(SPLIT).strip().lower(),
+                    model_label="Vivana-TD",
                 )
 
-            row = _base_row(traj, dt)
+            row = _base_row(traj, dt, eval_mode="baseline")
             row.update(_metric_row(metrics))
             rows.append(row)
             overall_progress = _maybe_print_progress(
@@ -537,7 +579,8 @@ def _write_csv(path: Path, rows: list[dict[str, float | str]]) -> None:
 
 
 def _print_table(method: str, split: str, rows: list[dict[str, float | str]]) -> None:
-    print(f"Vivana-TD baseline validation errors ({method}, split={split})")
+    modes = sorted({str(row.get("eval_mode", "baseline")) for row in rows}) if rows else ["baseline"]
+    print(f"TD rollout validation errors ({method}, split={split}, mode={','.join(modes)})")
     if not rows:
         print("No rows to display.")
         return
@@ -583,18 +626,26 @@ def _print_table(method: str, split: str, rows: list[dict[str, float | str]]) ->
 def main() -> None:
     raw_cfg = load_config(CONFIG_PATH)
     config = parse_config(raw_cfg)
+    ckpt: dict[str, Any] | None = None
+    if CHECKPOINT_PATH is not None:
+        ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu")
+        ckpt_cfg_raw = ckpt.get("config")
+        if ckpt_cfg_raw:
+            config = parse_config(ckpt_cfg_raw)
     split = str(SPLIT).strip().lower()
     if split not in {"train", "val"}:
         raise ValueError("SPLIT must be 'train' or 'val'.")
     trajs = _load_split_trajectories(config, split)
 
-    method = str(getattr(config, "method", "hnn")).strip().lower()
+    method = str(ckpt.get("method", getattr(config, "method", "hnn")) if ckpt is not None else getattr(config, "method", "hnn")).strip().lower()
     if method == "hnn":
         hnn_cfg = dict(config.hnn or {})
         if "use_td_correction" in hnn_cfg and not bool(hnn_cfg.get("use_td_correction", True)):
             raise ValueError("PHNN now only supports TD-correction baseline evaluation. Remove hnn.use_td_correction or set it to true.")
-        rows = _evaluate_hnn_baseline(config, trajs)
+        rows = _evaluate_hnn_baseline(config, trajs, checkpoint=ckpt)
     elif method == "vpinn":
+        if ckpt is not None:
+            raise ValueError("CHECKPOINT_PATH is currently only supported for method=hnn TD-delta evaluation.")
         vpinn_cfg = dict(config.vpinn or {})
         if "use_td_correction" in vpinn_cfg and not bool(vpinn_cfg.get("use_td_correction", True)):
             raise ValueError("VPINN now only supports TD-correction baseline evaluation. Remove vpinn.use_td_correction or set it to true.")

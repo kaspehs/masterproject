@@ -29,6 +29,7 @@ from HNN_helper import (
     PHVIV,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
+    build_td_parameter_model,
     create_window_mask,
     create_zoom_mask,
     load_td_correction_trajectories,
@@ -48,15 +49,16 @@ from HNN_helper import (
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
     resolve_td_correction_params,
+    td_baseline_step_torch,
+    warn_ignored_td_delta_keys,
 )
 from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
     _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
+    _scheduled_rollout_det_steps,
     _td_correction_rollout_loss_from_batch,
     _td_correction_state_rollout,
-    _td_predict_correction,
     _td_state_mse_loss,
-    _td_state_propagated_nll_loss,
 )
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
@@ -711,6 +713,7 @@ def _run_hnn_td_correction_validation(
     monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
     loss_cfg = cfg.loss
+    warn_ignored_td_delta_keys(hnn_cfg)
     td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
     if td_mass_source not in {"dry", "effective"}:
         raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
@@ -728,39 +731,34 @@ def _run_hnn_td_correction_validation(
         cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        stagger_reduced_time=bool(getattr(data_cfg, "stagger_reduced_time_val", False)),
         ur_source=td_mass_source,
     )
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
-    td_params = resolve_td_correction_params(hnn_cfg)
-    predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
-    use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
-    state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
-    if state_loss_mode not in {"mse", "propagated_nll"}:
-        raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
-    force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
+    td_params = dict(ckpt.get("base_td_params", resolve_td_correction_params(hnn_cfg)))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
+    rollout_det_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
+    rollout_det_steps_final = rollout_det_steps if rollout_det_steps_final_raw <= 0 else rollout_det_steps_final_raw
+    rollout_det_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_batch_size = int(cfg.training.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
-    sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
     mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
-    sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+    epoch_index = max(0, int(epoch) - 1)
+    scheduled_rollout_det_steps = _scheduled_rollout_det_steps(
+        epoch=epoch_index,
+        base_steps=rollout_det_steps,
+        final_steps=rollout_det_steps_final,
+        warmup_epochs=rollout_det_steps_warmup_epochs,
+    )
 
-    model_dict = asdict(cfg.model)
-    first_val_traj = val_trajs_np[0]
-    mass_key = "dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"
-    model_dict["structural_mass"] = float(np.asarray(first_val_traj[mass_key]).reshape(()))
-    model_dict["k"] = float(np.asarray(first_val_traj["stiffness_n_m"]).reshape(()))
-    model_dict["damping_c"] = float(np.asarray(first_val_traj["damping_c"]).reshape(()))
-    model_dict["Ca"] = 0.0
-    model_dict["use_stochastic_process_noise"] = predict_sigma
-    model_dict["use_td_force_input"] = use_td_force_input
-    arch_dict = asdict(cfg.architecture)
-    model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    model = build_td_parameter_model(hnn_cfg, device=device)
+    setattr(model, "rho", float(getattr(cfg.model, "rho", 1.0)))
+    setattr(model, "diameter", float(getattr(cfg.model, "D", 1.0)))
     _load_state(model, ckpt["model_state"])
     model.eval()
 
@@ -770,13 +768,10 @@ def _run_hnn_td_correction_validation(
         mass_source=td_mass_source,
         batch_size=int(cfg.training.batch_size),
         rollout_batch_size=rollout_batch_size,
-        rollout_steps=rollout_det_steps,
+        rollout_steps=scheduled_rollout_det_steps,
         num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
     )
-
-    def _reg(value: torch.Tensor, norm: str) -> torch.Tensor:
-        return torch.mean(torch.abs(value)) if str(norm).strip().lower() == "l1" else torch.mean(value * value)
 
     num_loss_scalars_written = 0
     num_rollout_scalars_written = 0
@@ -791,62 +786,46 @@ def _run_hnn_td_correction_validation(
             for batch in val_loader:
                 if len(batch) != 10:
                     raise ValueError("Unexpected TD correction HNN batch format.")
-                z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
+                z_i, t_i, z_next, t_next, ur_i, td_context_i, force_next, mass_i, damping_i, stiffness_i = batch
                 z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
                 t_i = t_i.to(device, non_blocking=(device.type == "cuda"))
                 z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
                 t_next = t_next.to(device, non_blocking=(device.type == "cuda"))
                 ur_i = ur_i.to(device, non_blocking=(device.type == "cuda"))
-                corr_next = corr_next.to(device, non_blocking=(device.type == "cuda"))
-                td_force_next = td_force_next.to(device, non_blocking=(device.type == "cuda"))
+                td_context_i = td_context_i.to(device, non_blocking=(device.type == "cuda"))
+                force_next = force_next.to(device, non_blocking=(device.type == "cuda"))
                 mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
                 damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
                 stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
 
-                corr_mu, sigma_corr = _td_predict_correction(
-                    model,
-                    z=z_i,
-                    reduced_velocity=ur_i,
-                    td_force_input=td_force_next,
-                    structural_mass=mass_i,
-                    stiffness=stiffness_i,
-                    predict_sigma=predict_sigma,
-                    force_zero_output=force_zero_output,
-                )
                 dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                total_force_next = td_force_next + corr_mu
-                if predict_sigma and state_loss_mode == "propagated_nll":
-                    state_loss, _z_next_mean = _td_state_propagated_nll_loss(
-                        z_i=z_i,
-                        dt_i=dt_i,
-                        z_next=z_next,
-                        total_force_next=total_force_next,
-                        sigma_corr=sigma_corr,
-                        mass_i=mass_i,
-                        damping_i=damping_i,
-                        stiffness_i=stiffness_i,
-                    )
-                else:
-                    state_loss, _z_next_mean = _td_state_mse_loss(
-                        z_i=z_i,
-                        dt_i=dt_i,
-                        z_next=z_next,
-                        total_force_next=total_force_next,
-                        mass_i=mass_i,
-                        damping_i=damping_i,
-                        stiffness_i=stiffness_i,
-                    )
+                velocity_i = z_i[:, 1:2] / mass_i
+                effective_params = model(ur_i, like=velocity_i)
+                td_force_pred, _td_context_next = td_baseline_step_torch(
+                    velocity=velocity_i,
+                    acceleration=td_context_i[:, 0:1],
+                    td_context=td_context_i,
+                    dt=dt_i,
+                    rho=float(getattr(model, "rho", 1.0)),
+                    diameter=float(getattr(model, "diameter", 1.0)),
+                    params=effective_params,
+                )
+                state_loss, _z_next_mean = _td_state_mse_loss(
+                    z_i=z_i,
+                    dt_i=dt_i,
+                    z_next=z_next,
+                    total_force_next=td_force_pred,
+                    mass_i=mass_i,
+                    damping_i=damping_i,
+                    stiffness_i=stiffness_i,
+                )
                 if use_force_data_loss:
-                    if predict_sigma:
-                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
-                    else:
-                        data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                    data_loss = torch.mean((force_next - td_force_pred) ** 2)
                 else:
                     data_loss = state_loss.new_tensor(0.0)
-                mean_reg_loss = _reg(corr_mu, mean_reg_norm)
-                sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
-                total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                mean_reg_loss = model.regularization(mean_reg_norm)
+                sigma_reg_loss = state_loss.new_tensor(0.0)
+                total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss
                 val_sums["loss_total"] += total_loss.detach()
                 val_sums["loss_state"] += state_loss.detach()
                 val_sums["loss_data"] += data_loss.detach()
@@ -857,6 +836,9 @@ def _run_hnn_td_correction_validation(
         for name, value in val_sums.items():
             writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch)
             num_loss_scalars_written += 1
+        for name, value in dict(model.inspect_effective_params()).items():
+            writer.add_scalar(f"val/td_{name}", float(value), epoch)
+            num_loss_scalars_written += 1
 
         if rollout_loader is not None and rollout_det_weight > 0.0:
             rollout_loss_sum = torch.zeros((), device=device)
@@ -865,27 +847,17 @@ def _run_hnn_td_correction_validation(
                 for rollout_batch in rollout_loader:
                     if len(rollout_batch) != 8:
                         raise ValueError("Unexpected TD correction rollout batch format.")
-                    z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
-                    z0 = z0.to(device, non_blocking=(device.type == "cuda"))
-                    t_seq = t_seq.to(device, non_blocking=(device.type == "cuda"))
-                    z_traj = z_traj.to(device, non_blocking=(device.type == "cuda"))
-                    ur0 = ur0.to(device, non_blocking=(device.type == "cuda"))
-                    td_context0 = td_context0.to(device, non_blocking=(device.type == "cuda"))
-                    mass0 = mass0.to(device, non_blocking=(device.type == "cuda"))
-                    damping0 = damping0.to(device, non_blocking=(device.type == "cuda"))
-                    stiffness0 = stiffness0.to(device, non_blocking=(device.type == "cuda"))
-                    dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
                     rollout_loss_sum += _td_correction_rollout_loss_from_batch(
                         model=model,
                         batch=rollout_batch,
                         device=device,
                         non_blocking=(device.type == "cuda"),
                         td_params=td_params,
-                        predict_sigma=predict_sigma,
-                        force_zero_output=force_zero_output,
-                        rollout_loss_mode=rollout_loss_mode,
-                        rollout_stochastic_samples=rollout_stochastic_samples,
-                        rollout_noise_scale=rollout_noise_scale,
+                        predict_sigma=False,
+                        force_zero_output=False,
+                        rollout_loss_mode="deterministic",
+                        rollout_stochastic_samples=1,
+                        rollout_noise_scale=0.0,
                     ).detach()
                     rollout_count += 1
             writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch)
@@ -901,8 +873,8 @@ def _run_hnn_td_correction_validation(
         )
         sampled_names = [str(val_trajs_np[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
         print(
-            f"[async-val][phnn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
-            f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+            f"[async-val][hnn] epoch {epoch}: sampled metric trajectories={sampled_names} "
+            f"(mass_source={td_mass_source})"
         )
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
@@ -917,11 +889,11 @@ def _run_hnn_td_correction_validation(
                 td_mass_source=td_mass_source,
                 td_params=td_params,
                 device=device,
-                predict_sigma=predict_sigma,
-                force_zero_output=force_zero_output,
-                rollout_stochastic=rollout_stochastic,
-                rollout_noise_scale=rollout_noise_scale,
-                rollout_seed=rollout_seed,
+                predict_sigma=False,
+                force_zero_output=False,
+                rollout_stochastic=False,
+                rollout_noise_scale=0.0,
+                rollout_seed=None,
                 log_metrics=False,
                 log_plots=False,
             )
@@ -946,9 +918,9 @@ def _run_hnn_td_correction_validation(
         rollout_traj = val_trajs_np[rollout_idx]
         rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
         print(
-            f"[async-val][phnn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+            f"[async-val][hnn] epoch {epoch}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
             f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-            f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
+            f"dt={rollout_dt:.6g} rho={float(getattr(model, 'rho', 1.0)):.6g} D={float(getattr(model, 'diameter', 1.0)):.6g} "
             f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
             f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
             f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
@@ -962,11 +934,11 @@ def _run_hnn_td_correction_validation(
             td_mass_source=td_mass_source,
             td_params=td_params,
             device=device,
-            predict_sigma=predict_sigma,
-            force_zero_output=force_zero_output,
-            rollout_stochastic=rollout_stochastic,
-            rollout_noise_scale=rollout_noise_scale,
-            rollout_seed=rollout_seed,
+            predict_sigma=False,
+            force_zero_output=False,
+            rollout_stochastic=False,
+            rollout_noise_scale=0.0,
+            rollout_seed=None,
             log_metrics=False,
             log_plots=True,
         )

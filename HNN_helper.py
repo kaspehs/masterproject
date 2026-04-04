@@ -3582,6 +3582,215 @@ def resolve_td_correction_params(raw_cfg: dict[str, Any] | None) -> dict[str, fl
     return out
 
 
+def resolve_td_parameter_model_type(raw_cfg: dict[str, Any] | None) -> str:
+    cfg = dict(raw_cfg or {})
+    model_type = str(cfg.get("td_parameter_model", "global_delta")).strip().lower()
+    if model_type != "global_delta":
+        raise ValueError("hnn.td_parameter_model must currently be 'global_delta'.")
+    return model_type
+
+
+def _prepare_td_like_tensor(
+    like: torch.Tensor | np.ndarray | float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    if torch.is_tensor(like):
+        out = like.to(device=device, dtype=dtype)
+    else:
+        out = torch.as_tensor(like, device=device, dtype=dtype)
+    if out.ndim == 0:
+        out = out.view(1, 1)
+    elif out.ndim == 1:
+        out = out.unsqueeze(-1)
+    if out.ndim < 2 or out.shape[-1] != 1:
+        raise ValueError(f"{name} must be scalar-like or have shape (..., 1).")
+    return out
+
+
+def _broadcast_td_param_value(
+    value: torch.Tensor | np.ndarray | float,
+    *,
+    like: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if torch.is_tensor(value):
+        out = value.to(device=like.device, dtype=like.dtype)
+    else:
+        out = torch.as_tensor(value, device=like.device, dtype=like.dtype)
+    if out.ndim == 0:
+        out = out.view(1, 1)
+    elif out.ndim == like.ndim - 1:
+        out = out.unsqueeze(-1)
+    if out.ndim != like.ndim or out.shape[-1] != 1:
+        raise ValueError(f"{name} must be scalar-like or have shape {tuple(like.shape[:-1]) + (1,)}.")
+    if out.shape[:-1] != like.shape[:-1]:
+        out = out.expand(like.shape[:-1] + (1,))
+    return out
+
+
+def tensorize_td_correction_params(
+    params: dict[str, torch.Tensor | np.ndarray | float],
+    *,
+    like: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    required = ("Cv", "Cd", "Ca", "fhat0", "fhat_min", "fhat_max", "n_memory")
+    missing = [name for name in required if name not in params]
+    if missing:
+        raise KeyError(f"TD parameters are missing required keys: {missing}")
+    out = {
+        name: _broadcast_td_param_value(params[name], like=like, name=name)
+        for name in required
+    }
+    return out
+
+
+def warn_ignored_td_delta_keys(raw_cfg: dict[str, Any] | None) -> None:
+    cfg = dict(raw_cfg or {})
+    ignored_keys = (
+        "predict_sigma",
+        "use_td_force_input",
+        "force_zero_output",
+        "rollout_stochastic",
+        "rollout_noise_scale",
+        "rollout_seed",
+        "corr_init_mode",
+        "corr_init_tiny_std",
+        "state_loss_mode",
+    )
+    active = [key for key in ignored_keys if key in cfg]
+    if active:
+        joined = ", ".join(sorted(active))
+        warnings.warn(
+            f"Ignoring obsolete HNN TD-correction keys for td_parameter_model=global_delta: {joined}",
+            stacklevel=2,
+        )
+
+
+class GlobalTDDeltaModel(nn.Module):
+    model_type = "global_delta"
+
+    def __init__(self, *, base_params: dict[str, float]) -> None:
+        super().__init__()
+        self.base_params = dict(base_params)
+        self.register_buffer("base_Cv", torch.tensor(float(base_params["Cv"]), dtype=torch.float32))
+        self.register_buffer("base_Cd", torch.tensor(float(base_params["Cd"]), dtype=torch.float32))
+        self.register_buffer("base_Ca", torch.tensor(float(base_params["Ca"]), dtype=torch.float32))
+        self.register_buffer("base_fhat0", torch.tensor(float(base_params["fhat0"]), dtype=torch.float32))
+        lower_gap = max(float(base_params["fhat0"]) - float(base_params["fhat_min"]), 1.0e-6)
+        upper_gap = max(float(base_params["fhat_max"]) - float(base_params["fhat0"]), 1.0e-6)
+        self.register_buffer("base_gap_min", torch.tensor(lower_gap, dtype=torch.float32))
+        self.register_buffer("base_gap_max", torch.tensor(upper_gap, dtype=torch.float32))
+        self.register_buffer("fixed_n_memory", torch.tensor(float(base_params["n_memory"]), dtype=torch.float32))
+        self.raw_log_cv = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.raw_log_cd = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.raw_log_ca = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.raw_dfhat0 = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.raw_dgap_min = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.raw_dgap_max = nn.Parameter(torch.zeros((), dtype=torch.float32))
+
+    def _effective_scalar_tensors(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        base_cv = self.base_Cv.to(device=device, dtype=dtype)
+        base_cd = self.base_Cd.to(device=device, dtype=dtype)
+        base_ca = self.base_Ca.to(device=device, dtype=dtype)
+        base_fhat0 = self.base_fhat0.to(device=device, dtype=dtype)
+        base_gap_min = self.base_gap_min.to(device=device, dtype=dtype)
+        base_gap_max = self.base_gap_max.to(device=device, dtype=dtype)
+        fixed_n_memory = self.fixed_n_memory.to(device=device, dtype=dtype)
+
+        cv = base_cv * torch.exp(self.raw_log_cv.to(device=device, dtype=dtype))
+        cd = base_cd * torch.exp(self.raw_log_cd.to(device=device, dtype=dtype))
+        ca = base_ca * torch.exp(self.raw_log_ca.to(device=device, dtype=dtype))
+        fhat0 = base_fhat0 + self.raw_dfhat0.to(device=device, dtype=dtype)
+        gap_min = F.softplus(
+            torch.log(torch.expm1(torch.clamp(base_gap_min, min=1.0e-6)))
+            + self.raw_dgap_min.to(device=device, dtype=dtype)
+        )
+        gap_max = F.softplus(
+            torch.log(torch.expm1(torch.clamp(base_gap_max, min=1.0e-6)))
+            + self.raw_dgap_max.to(device=device, dtype=dtype)
+        )
+        return {
+            "Cv": cv,
+            "Cd": cd,
+            "Ca": ca,
+            "fhat0": fhat0,
+            "fhat_min": fhat0 - gap_min,
+            "fhat_max": fhat0 + gap_max,
+            "n_memory": fixed_n_memory,
+        }
+
+    def forward(
+        self,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None,
+        *,
+        like: torch.Tensor | np.ndarray | float | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if like is None:
+            if reduced_velocity is None:
+                raise ValueError("GlobalTDDeltaModel requires reduced_velocity or like for shape inference.")
+            like_value = reduced_velocity
+        else:
+            like_value = like
+        like_tensor = _prepare_td_like_tensor(
+            like_value,
+            device=self.base_Cv.device,
+            dtype=self.base_Cv.dtype,
+            name="like",
+        )
+        scalars = self._effective_scalar_tensors(device=like_tensor.device, dtype=like_tensor.dtype)
+        return {
+            name: _broadcast_td_param_value(value, like=like_tensor, name=name)
+            for name, value in scalars.items()
+        }
+
+    def regularization(self, norm: str = "l2") -> torch.Tensor:
+        raw = torch.stack(
+            [
+                self.raw_log_cv.reshape(()),
+                self.raw_log_cd.reshape(()),
+                self.raw_log_ca.reshape(()),
+                self.raw_dfhat0.reshape(()),
+                self.raw_dgap_min.reshape(()),
+                self.raw_dgap_max.reshape(()),
+            ]
+        )
+        key = str(norm).strip().lower()
+        if key == "l1":
+            return torch.mean(torch.abs(raw))
+        if key == "l2":
+            return torch.mean(raw * raw)
+        raise ValueError("Regularizer norm must be one of: l1, l2.")
+
+    def inspect_effective_params(self) -> dict[str, float]:
+        with torch.no_grad():
+            values = self._effective_scalar_tensors(device=self.base_Cv.device, dtype=self.base_Cv.dtype)
+            return {name: float(value.detach().cpu().reshape(())) for name, value in values.items()}
+
+
+def build_td_parameter_model(
+    raw_cfg: dict[str, Any] | None,
+    *,
+    device: torch.device | None = None,
+) -> nn.Module:
+    cfg = dict(raw_cfg or {})
+    model_type = resolve_td_parameter_model_type(cfg)
+    if model_type != "global_delta":
+        raise ValueError(f"Unsupported td_parameter_model '{model_type}'.")
+    base_params = resolve_td_correction_params(cfg)
+    model = GlobalTDDeltaModel(base_params=base_params)
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
 def _extract_first_present(data: Any, keys: Sequence[str], *, path: Path, required: bool = True) -> np.ndarray | None:
     for key in keys:
         if key in data:
@@ -3896,7 +4105,14 @@ def td_baseline_step_torch(
     sig_dy = td_context[:, 2:3]
     sig_ddy = td_context[:, 3:4]
     flow_speed = td_context[:, 4:5]
-    n_memory = max(1.0, float(params["n_memory"]))
+    td_params = tensorize_td_correction_params(params, like=velocity)
+    n_memory = torch.clamp(td_params["n_memory"], min=1.0)
+    cv = td_params["Cv"]
+    cd = td_params["Cd"]
+    ca = td_params["Ca"]
+    fhat0 = td_params["fhat0"]
+    fhat_min = td_params["fhat_min"]
+    fhat_max = td_params["fhat_max"]
     dt_t = torch.as_tensor(dt, device=velocity.device, dtype=velocity.dtype)
     if dt_t.ndim == 0:
         dt_t = dt_t.view(1, 1)
@@ -3909,8 +4125,12 @@ def td_baseline_step_torch(
     dy_r = velocity * projection
     ddy_r = ddy * projection
 
-    sig_dy_next = torch.sqrt(torch.clamp(((n_memory - 1.0) / n_memory) * (sig_dy * sig_dy) + (dy_r * dy_r) / n_memory, min=1e-12))
-    sig_ddy_next = torch.sqrt(torch.clamp(((n_memory - 1.0) / n_memory) * (sig_ddy * sig_ddy) + (ddy_r * ddy_r) / n_memory, min=1e-12))
+    sig_dy_next = torch.sqrt(
+        torch.clamp(((n_memory - 1.0) / n_memory) * (sig_dy * sig_dy) + (dy_r * dy_r) / n_memory, min=1e-12)
+    )
+    sig_ddy_next = torch.sqrt(
+        torch.clamp(((n_memory - 1.0) / n_memory) * (sig_ddy * sig_ddy) + (ddy_r * ddy_r) / n_memory, min=1e-12)
+    )
 
     cos_phi_dy = dy_r / torch.clamp(sig_dy_next, min=1e-12)
     sin_phi_dy = -ddy_r / torch.clamp(sig_ddy_next, min=1e-12)
@@ -3920,15 +4140,15 @@ def td_baseline_step_torch(
     theta = torch.atan2(torch.sin(theta), torch.cos(theta))
     fhat = torch.where(
         theta <= 0.0,
-        float(params["fhat0"]) + (float(params["fhat0"]) - float(params["fhat_min"])) * torch.sin(theta),
-        float(params["fhat0"]) + (float(params["fhat_max"]) - float(params["fhat0"])) * torch.sin(theta),
+        fhat0 + (fhat0 - fhat_min) * torch.sin(theta),
+        fhat0 + (fhat_max - fhat0) * torch.sin(theta),
     )
     omega_vy = 2.0 * math.pi * fhat * speed_mag / float(diameter)
     phi_vy_next = phi_vy + dt_t * omega_vy
 
-    fdy = -0.5 * float(rho) * float(diameter) * float(params["Cd"]) * speed_mag * velocity
-    fcv = 0.5 * float(rho) * float(diameter) * float(params["Cv"]) * speed_mag * flow_speed * torch.cos(phi_vy_next)
-    fca = -0.25 * float(rho) * float(params["Ca"]) * math.pi * (float(diameter) ** 2) * acceleration
+    fdy = -0.5 * float(rho) * float(diameter) * cd * speed_mag * velocity
+    fcv = 0.5 * float(rho) * float(diameter) * cv * speed_mag * flow_speed * torch.cos(phi_vy_next)
+    fca = -0.25 * float(rho) * ca * math.pi * (float(diameter) ** 2) * acceleration
     force_total = fca + fcv + fdy
 
     next_context = torch.cat([acceleration, phi_vy_next, sig_dy_next, sig_ddy_next, flow_speed], dim=1)
