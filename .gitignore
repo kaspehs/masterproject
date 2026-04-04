@@ -18,6 +18,7 @@
 /Data_Gen/generated_series_Ur_60
 /Data_Gen/groundtruth_runs_100hz
 /Data_Gen/npz_exports_td_burnin_trimmed
+/Data_Gen/npz_exports_td_burnin_trimmed_old
 /Experimental_Data/eval_models
 /CFD_Data
 __pycache__/
