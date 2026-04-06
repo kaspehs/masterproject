@@ -3,7 +3,7 @@ method: hnn
 data:
   cut_start_seconds_train: 0.0
   cut_start_seconds_val: 0.0
-  reduce_time: true
+  reduce_time: false
   reduction_factor: 5
   train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
 
@@ -13,12 +13,12 @@ model:
   structural_mass: 16.79
   Ca: 1.0
   k: 1218.0
-  damping_c: 1e-4
+  damping_c: 0e-4
 
 training:
-  batch_size: 1024
-  max_grad_norm: 20.0
-  epochs: 2000
+  batch_size: 8192
+  max_grad_norm: 200.0
+  epochs: 200
 
 optim:
   lr: 0.001
@@ -61,7 +61,7 @@ compile:
   compile_mode: reduce-overhead
 
 monitoring:
-  validate_every_epochs: 50
+  validate_every_epochs: 20
   validation_samples_per_ur: 2
   final_rollout_all_validation: true
   log_every_epochs: 10
