@@ -62,6 +62,8 @@ from HNN_helper import (
     load_td_correction_trajectories,
     resolve_middle_time_plot,
     resolve_td_correction_params,
+    resolve_td_memory_config,
+    resolve_td_n_memory_torch,
     rollout_model,
     structural_step_constant_force_torch,
     scaled_residual_loss_per_sample,
@@ -366,6 +368,7 @@ def _td_correction_rollout_loss_from_batch(
     device: torch.device,
     non_blocking: bool,
     td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
     predict_sigma: bool,
     force_zero_output: bool,
     rollout_loss_mode: str,
@@ -404,6 +407,7 @@ def _td_correction_rollout_loss_from_batch(
             damping_c=damping0,
             stiffness=stiffness0,
             td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
             predict_sigma=False,
             force_zero_output=force_zero_output,
         )
@@ -432,6 +436,7 @@ def _td_correction_rollout_loss_from_batch(
         damping_c=damping0_in,
         stiffness=stiffness0_in,
         td_params=td_params,
+        td_memory_cfg=td_memory_cfg,
         predict_sigma=True,
         force_zero_output=force_zero_output,
         rollout_stochastic=True,
@@ -463,6 +468,7 @@ def _td_correction_state_rollout(
     damping_c: torch.Tensor,
     stiffness: torch.Tensor,
     td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
     predict_sigma: bool = False,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
@@ -480,6 +486,14 @@ def _td_correction_state_rollout(
         generator.manual_seed(int(rollout_seed))
     for _ in range(int(steps)):
         velocity = z[:, 1:2] / structural_mass
+        step_params = dict(td_params)
+        step_params["n_memory"] = resolve_td_n_memory_torch(
+            td_params,
+            dt=dt,
+            flow_speed=td_context[:, 4:5],
+            diameter=float(model.D),
+            memory_cfg=td_memory_cfg,
+        )
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=velocity,
             acceleration=td_context[:, 0:1],
@@ -487,7 +501,7 @@ def _td_correction_state_rollout(
             dt=dt,
             rho=float(model.rho),
             diameter=float(model.D),
-            params=td_params,
+            params=step_params,
         )
         corr_mu, sigma_corr = _td_predict_correction(
             model,
@@ -542,6 +556,7 @@ def _td_pure_baseline_state_rollout(
     rho: float,
     diameter: float,
     td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     z = z0
     td_context = td_context0
@@ -549,6 +564,14 @@ def _td_pure_baseline_state_rollout(
     total_force_hist: list[torch.Tensor] = []
     for _ in range(int(steps)):
         velocity = z[:, 1:2] / structural_mass
+        step_params = dict(td_params)
+        step_params["n_memory"] = resolve_td_n_memory_torch(
+            td_params,
+            dt=dt,
+            flow_speed=td_context[:, 4:5],
+            diameter=float(diameter),
+            memory_cfg=td_memory_cfg,
+        )
         td_force_next, td_context_next = td_baseline_step_torch(
             velocity=velocity,
             acceleration=td_context[:, 0:1],
@@ -556,7 +579,7 @@ def _td_pure_baseline_state_rollout(
             dt=dt,
             rho=float(rho),
             diameter=float(diameter),
-            params=td_params,
+            params=step_params,
         )
         y_next, v_next, a_next = structural_step_constant_force_torch(
             y=z[:, 0:1],
@@ -717,6 +740,7 @@ def _log_td_correction_rollout_validation(
     dt: float,
     td_mass_source: str,
     td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
     device: torch.device,
     predict_sigma: bool = False,
     force_zero_output: bool = False,
@@ -761,6 +785,7 @@ def _log_td_correction_rollout_validation(
         damping_c=damping_t,
         stiffness=stiffness_t,
         td_params=td_params,
+        td_memory_cfg=td_memory_cfg,
         predict_sigma=predict_sigma,
         force_zero_output=force_zero_output,
         rollout_stochastic=rollout_stochastic,
@@ -2209,6 +2234,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
     if td_mass_source not in {"dry", "effective"}:
         raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
+    td_params = resolve_td_correction_params(hnn_cfg)
+    td_memory_cfg = resolve_td_memory_config(hnn_cfg)
     train_cut = resolve_cut_start_seconds(data_cfg, "train")
     val_cut = resolve_cut_start_seconds(data_cfg, "val")
     reduce_time_enabled = bool(getattr(data_cfg, "reduce_time", False))
@@ -2228,6 +2255,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         reduction_factor=reduction_factor,
         stagger_reduced_time=stagger_train_reduce,
         ur_source=td_mass_source,
+        td_params=td_params,
+        td_memory_cfg=td_memory_cfg,
     )
     val_trajs = (
         load_td_correction_trajectories(
@@ -2237,12 +2266,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             reduction_factor=reduction_factor,
             stagger_reduced_time=stagger_val_reduce,
             ur_source=td_mass_source,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
         )
         if val_paths
         else []
     )
-
-    td_params = resolve_td_correction_params(hnn_cfg)
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
@@ -2575,6 +2604,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         device=device,
                         non_blocking=non_blocking,
                         td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
                         predict_sigma=predict_sigma,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
@@ -2724,6 +2754,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             device=device,
                             non_blocking=non_blocking,
                             td_params=td_params,
+                            td_memory_cfg=td_memory_cfg,
                             predict_sigma=predict_sigma,
                             force_zero_output=force_zero_output,
                             rollout_loss_mode=rollout_loss_mode,
@@ -2757,6 +2788,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         dt=dt,
                         td_mass_source=td_mass_source,
                         td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
                         device=device,
                         predict_sigma=predict_sigma,
                         force_zero_output=force_zero_output,
@@ -2800,6 +2832,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     dt=dt,
                     td_mass_source=td_mass_source,
                     td_params=td_params,
+                    td_memory_cfg=td_memory_cfg,
                     device=device,
                     predict_sigma=predict_sigma,
                     force_zero_output=force_zero_output,
@@ -2849,6 +2882,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 dt=dt,
                 td_mass_source=td_mass_source,
                 td_params=td_params,
+                td_memory_cfg=td_memory_cfg,
                 device=device,
                 predict_sigma=predict_sigma,
                 force_zero_output=force_zero_output,
@@ -2906,6 +2940,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 dt=dt,
                 td_mass_source=td_mass_source,
                 td_params=td_params,
+                td_memory_cfg=td_memory_cfg,
                 device=device,
                 predict_sigma=predict_sigma,
                 force_zero_output=force_zero_output,

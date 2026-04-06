@@ -3582,6 +3582,99 @@ def resolve_td_correction_params(raw_cfg: dict[str, Any] | None) -> dict[str, fl
     return out
 
 
+def resolve_td_memory_config(raw_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(raw_cfg or {})
+    mode_value = cfg.get("td_memory_mode", cfg.get("mode", "fixed_n_memory"))
+    mode = str(mode_value).strip().lower()
+    aliases = {
+        "fixed": "fixed_n_memory",
+        "fixed_n": "fixed_n_memory",
+        "n_memory": "fixed_n_memory",
+        "fixed_tau_s": "fixed_tau",
+        "tau": "fixed_tau",
+        "tau_over_tref": "tau_over_tref",
+        "tau_over_t_ref": "tau_over_tref",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"fixed_n_memory", "fixed_tau", "tau_over_tref"}:
+        raise ValueError("hnn.td_memory_mode must be one of: fixed_n_memory, fixed_tau, tau_over_tref.")
+    tau_s_raw = cfg.get("td_memory_tau_s", cfg.get("tau_s", None))
+    tau_s = None if tau_s_raw is None else float(tau_s_raw)
+    tau_over_tref = float(cfg.get("td_tau_over_tref", cfg.get("tau_over_tref", 4.0)))
+    if tau_s is not None and (not np.isfinite(tau_s) or tau_s <= 0.0):
+        raise ValueError("hnn.td_memory_tau_s must be positive and finite when provided.")
+    if not np.isfinite(tau_over_tref) or tau_over_tref <= 0.0:
+        raise ValueError("hnn.td_tau_over_tref must be positive and finite.")
+    if mode == "fixed_tau" and tau_s is None:
+        raise ValueError("hnn.td_memory_mode='fixed_tau' requires hnn.td_memory_tau_s.")
+    return {
+        "mode": mode,
+        "tau_s": tau_s,
+        "tau_over_tref": tau_over_tref,
+    }
+
+
+def resolve_td_n_memory(
+    params: dict[str, float],
+    *,
+    dt: float,
+    flow_speed: float,
+    diameter: float,
+    memory_cfg: dict[str, Any] | None,
+) -> float:
+    cfg = resolve_td_memory_config(memory_cfg)
+    mode = str(cfg["mode"])
+    if mode == "fixed_n_memory":
+        return max(1.0, float(params["n_memory"]))
+    dt_value = float(dt)
+    flow_speed_value = float(flow_speed)
+    diameter_value = float(diameter)
+    if not np.isfinite(dt_value) or dt_value <= 0.0:
+        raise ValueError("dt must be positive and finite when resolving TD memory.")
+    if not np.isfinite(diameter_value) or diameter_value <= 0.0:
+        raise ValueError("diameter must be positive and finite when resolving TD memory.")
+    if not np.isfinite(flow_speed_value) or abs(flow_speed_value) <= 0.0:
+        raise ValueError("flow_speed must be finite and non-zero when resolving TD memory.")
+    if mode == "fixed_tau":
+        tau_value = float(cfg["tau_s"])
+    else:
+        fhat0 = float(params["fhat0"])
+        if not np.isfinite(fhat0) or fhat0 <= 0.0:
+            raise ValueError("params['fhat0'] must be positive and finite when resolving TD memory.")
+        tau_value = float(cfg["tau_over_tref"]) * float(diameter_value) / (fhat0 * abs(flow_speed_value))
+    return max(1.0, tau_value / dt_value)
+
+
+def resolve_td_n_memory_torch(
+    params: dict[str, float],
+    *,
+    dt: float | torch.Tensor,
+    flow_speed: torch.Tensor,
+    diameter: float,
+    memory_cfg: dict[str, Any] | None,
+) -> torch.Tensor:
+    cfg = resolve_td_memory_config(memory_cfg)
+    flow_tensor = torch.as_tensor(flow_speed)
+    dtype = flow_tensor.dtype
+    device = flow_tensor.device
+    if str(cfg["mode"]) == "fixed_n_memory":
+        return torch.full_like(flow_tensor, fill_value=max(1.0, float(params["n_memory"])), dtype=dtype, device=device)
+    dt_tensor = torch.as_tensor(dt, dtype=dtype, device=device)
+    dt_tensor = torch.clamp(dt_tensor, min=torch.finfo(dtype).eps)
+    diameter_tensor = torch.as_tensor(float(diameter), dtype=dtype, device=device)
+    if str(cfg["mode"]) == "fixed_tau":
+        tau_tensor = torch.full_like(flow_tensor, fill_value=float(cfg["tau_s"]), dtype=dtype, device=device)
+    else:
+        fhat0 = float(params["fhat0"])
+        if not np.isfinite(fhat0) or fhat0 <= 0.0:
+            raise ValueError("params['fhat0'] must be positive and finite when resolving TD memory.")
+        tau_tensor = (
+            float(cfg["tau_over_tref"]) * diameter_tensor
+            / torch.clamp(abs(flow_tensor) * float(fhat0), min=torch.finfo(dtype).eps)
+        )
+    return torch.clamp(tau_tensor / dt_tensor, min=1.0)
+
+
 def _extract_first_present(data: Any, keys: Sequence[str], *, path: Path, required: bool = True) -> np.ndarray | None:
     for key in keys:
         if key in data:
@@ -3627,6 +3720,79 @@ def _maybe_reduce_time_td(
     return t_out, arrays_out
 
 
+def _recompute_td_baseline_on_grid(
+    *,
+    t: np.ndarray,
+    dy: np.ndarray,
+    ddy: np.ndarray,
+    flow_speed: np.ndarray,
+    force_td0: float,
+    phi_td0: float,
+    sig_dy_td0: float,
+    sig_ddy_td0: float,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    dy_arr = np.asarray(dy, dtype=float).reshape(-1)
+    ddy_arr = np.asarray(ddy, dtype=float).reshape(-1)
+    flow_arr = np.asarray(flow_speed, dtype=float).reshape(-1)
+    n = min(t_arr.size, dy_arr.size, ddy_arr.size, flow_arr.size)
+    if n < 2:
+        raise ValueError("Need at least two samples to recompute the TD baseline on the reduced grid.")
+    t_arr = t_arr[:n]
+    dy_arr = dy_arr[:n]
+    ddy_arr = ddy_arr[:n]
+    flow_arr = flow_arr[:n]
+    force_td = np.empty((n,), dtype=float)
+    phi_td = np.empty((n,), dtype=float)
+    sig_dy_td = np.empty((n,), dtype=float)
+    sig_ddy_td = np.empty((n,), dtype=float)
+    force_td[0] = float(force_td0)
+    phi_td[0] = float(phi_td0)
+    sig_dy_td[0] = float(sig_dy_td0)
+    sig_ddy_td[0] = float(sig_ddy_td0)
+    for idx in range(n - 1):
+        dt_step = float(t_arr[idx + 1] - t_arr[idx])
+        flow_value = float(flow_arr[idx])
+        n_memory = resolve_td_n_memory(
+            td_params,
+            dt=dt_step,
+            flow_speed=flow_value,
+            diameter=float(diameter),
+            memory_cfg=td_memory_cfg,
+        )
+        speed_mag = math.sqrt(max(flow_value * flow_value + float(dy_arr[idx]) * float(dy_arr[idx]), 1.0e-12))
+        projection = flow_value / max(speed_mag, 1.0e-12)
+        dy_r = float(dy_arr[idx]) * projection
+        ddy_r = float(ddy_arr[idx]) * projection
+        sig_dy_next = math.sqrt(
+            max(((n_memory - 1.0) / n_memory) * (sig_dy_td[idx] * sig_dy_td[idx]) + (dy_r * dy_r) / n_memory, 1.0e-12)
+        )
+        sig_ddy_next = math.sqrt(
+            max(((n_memory - 1.0) / n_memory) * (sig_ddy_td[idx] * sig_ddy_td[idx]) + (ddy_r * ddy_r) / n_memory, 1.0e-12)
+        )
+        cos_phi_dy = dy_r / max(sig_dy_next, 1.0e-12)
+        sin_phi_dy = -ddy_r / max(sig_ddy_next, 1.0e-12)
+        phi_dy = math.atan2(sin_phi_dy, cos_phi_dy)
+        theta = math.atan2(math.sin(phi_dy - phi_td[idx]), math.cos(phi_dy - phi_td[idx]))
+        if theta <= 0.0:
+            fhat = float(td_params["fhat0"]) + (float(td_params["fhat0"]) - float(td_params["fhat_min"])) * math.sin(theta)
+        else:
+            fhat = float(td_params["fhat0"]) + (float(td_params["fhat_max"]) - float(td_params["fhat0"])) * math.sin(theta)
+        omega_vy = 2.0 * math.pi * fhat * speed_mag / float(diameter)
+        phi_td[idx + 1] = float(phi_td[idx] + dt_step * omega_vy)
+        fdy = -0.5 * float(rho) * float(diameter) * float(td_params["Cd"]) * speed_mag * float(dy_arr[idx])
+        fcv = 0.5 * float(rho) * float(diameter) * float(td_params["Cv"]) * speed_mag * flow_value * math.cos(phi_td[idx + 1])
+        fca = -0.25 * float(rho) * float(td_params["Ca"]) * math.pi * (float(diameter) ** 2) * float(ddy_arr[idx])
+        force_td[idx + 1] = float(fca + fcv + fdy)
+        sig_dy_td[idx + 1] = float(sig_dy_next)
+        sig_ddy_td[idx + 1] = float(sig_ddy_next)
+    return force_td, phi_td, sig_dy_td, sig_ddy_td
+
+
 def load_td_correction_trajectories(
     *,
     paths: Sequence[Path],
@@ -3635,6 +3801,8 @@ def load_td_correction_trajectories(
     reduction_factor: int = 1,
     stagger_reduced_time: bool = False,
     ur_source: str = "stored",
+    td_params: dict[str, float] | None = None,
+    td_memory_cfg: dict[str, Any] | None = None,
 ) -> list[dict[str, np.ndarray]]:
     trajectories: list[dict[str, np.ndarray]] = []
     for path in paths:
@@ -3833,6 +4001,21 @@ def load_td_correction_trajectories(
                 if ur_label_reduced is not None:
                     ur_label_reduced = ur_label_reduced[mask]
                 flow_speed_reduced = flow_speed_reduced[mask]
+            if bool(reduce_time) and td_params is not None and resolve_td_memory_config(td_memory_cfg)["mode"] != "fixed_n_memory":
+                force_td_per_m_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced = _recompute_td_baseline_on_grid(
+                    t=t_reduced,
+                    dy=dy_reduced,
+                    ddy=ddy_reduced,
+                    flow_speed=flow_speed_reduced,
+                    force_td0=float(force_td_per_m_reduced[0]),
+                    phi_td0=float(phi_td_reduced[0]),
+                    sig_dy_td0=float(sig_dy_td_reduced[0]),
+                    sig_ddy_td0=float(sig_ddy_td_reduced[0]),
+                    rho=float(_preferred_scalar(("python_rho_kg_m3", "rho_kg_m3"))),
+                    diameter=float(diameter_m),
+                    td_params=td_params,
+                    td_memory_cfg=td_memory_cfg,
+                )
             td_context = np.stack(
                 [ddy_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced, flow_speed_reduced],
                 axis=1,
@@ -3896,7 +4079,14 @@ def td_baseline_step_torch(
     sig_dy = td_context[:, 2:3]
     sig_ddy = td_context[:, 3:4]
     flow_speed = td_context[:, 4:5]
-    n_memory = max(1.0, float(params["n_memory"]))
+    n_memory_raw = params["n_memory"]
+    if torch.is_tensor(n_memory_raw):
+        n_memory = torch.clamp(
+            torch.as_tensor(n_memory_raw, dtype=td_context.dtype, device=td_context.device),
+            min=1.0,
+        )
+    else:
+        n_memory = torch.full_like(flow_speed, fill_value=max(1.0, float(n_memory_raw)))
     dt_t = torch.as_tensor(dt, device=velocity.device, dtype=velocity.dtype)
     if dt_t.ndim == 0:
         dt_t = dt_t.view(1, 1)

@@ -133,6 +133,13 @@ hnn:
   td_fhat_min: 0.11
   td_fhat_max: 0.26
   td_n_memory: 500
+  # TD memory handling:
+  # fixed_n_memory -> use td_n_memory directly
+  # fixed_tau -> use n_memory = td_memory_tau_s / dt
+  # tau_over_tref -> use tau = td_tau_over_tref * D / (td_fhat0 * U), then n_memory = tau / dt
+  td_memory_mode: tau_over_tref
+  td_tau_over_tref: 4.0
+  td_memory_tau_s: null
   # If true, learn sigma on the correction force/coefficient output head.
   predict_sigma: false
   # If true, include the current Vivana-TD predicted force as an extra force-network input.

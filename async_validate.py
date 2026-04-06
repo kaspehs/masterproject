@@ -48,6 +48,7 @@ from HNN_helper import (
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
     resolve_td_correction_params,
+    resolve_td_memory_config,
 )
 from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
@@ -289,6 +290,7 @@ def _log_td_correction_hnn_rollout_validation(
     dt: float,
     td_mass_source: str,
     td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
     device: torch.device,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
@@ -326,6 +328,7 @@ def _log_td_correction_hnn_rollout_validation(
         damping_c=damping_t,
         stiffness=stiffness_t,
         td_params=td_params,
+        td_memory_cfg=td_memory_cfg,
     )
     y_pred = z_pred[0, :, 0].detach().cpu().numpy()
     v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
@@ -729,9 +732,12 @@ def _run_hnn_td_correction_validation(
         reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
         reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
         ur_source=td_mass_source,
+        td_params=resolve_td_correction_params(hnn_cfg),
+        td_memory_cfg=resolve_td_memory_config(hnn_cfg),
     )
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     td_params = resolve_td_correction_params(hnn_cfg)
+    td_memory_cfg = resolve_td_memory_config(hnn_cfg)
     predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
@@ -881,6 +887,7 @@ def _run_hnn_td_correction_validation(
                         device=device,
                         non_blocking=(device.type == "cuda"),
                         td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
                         predict_sigma=predict_sigma,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
@@ -916,6 +923,7 @@ def _run_hnn_td_correction_validation(
                 dt=dt,
                 td_mass_source=td_mass_source,
                 td_params=td_params,
+                td_memory_cfg=td_memory_cfg,
                 device=device,
                 predict_sigma=predict_sigma,
                 force_zero_output=force_zero_output,
@@ -961,6 +969,7 @@ def _run_hnn_td_correction_validation(
             dt=dt,
             td_mass_source=td_mass_source,
             td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
             device=device,
             predict_sigma=predict_sigma,
             force_zero_output=force_zero_output,

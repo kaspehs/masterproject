@@ -172,8 +172,8 @@ def initial_hidden_sigmas(
 ) -> tuple[float, float]:
     if mode == "zero":
         return 0.0, 0.0
-    if mode != "local_rms":
-        raise ValueError("mode must be 'zero' or 'local_rms'.")
+    if mode not in {"local_rms", "lookahead_rms"}:
+        raise ValueError("mode must be 'zero', 'local_rms', or 'lookahead_rms'.")
 
     y_vel = _extract_case_channel(case_like, "dy_dim", "y_vel_dim")
     y_acc = _extract_case_channel(case_like, "ddy_dim", "y_acc_dim")
@@ -186,9 +186,14 @@ def initial_hidden_sigmas(
     else:
         window_samples = max(1, int(round(float(window_seconds) / dt_dim)))
 
-    start_hist_idx = max(0, int(start_idx) - window_samples + 1)
-    dy_hist = np.asarray(y_vel[start_hist_idx : start_idx + 1], dtype=float)
-    ddy_hist = np.asarray(y_acc[start_hist_idx : start_idx + 1], dtype=float)
+    if mode == "lookahead_rms":
+        end_hist_idx = min(int(y_vel.shape[0]), int(start_idx) + window_samples)
+        dy_hist = np.asarray(y_vel[int(start_idx) : end_hist_idx], dtype=float)
+        ddy_hist = np.asarray(y_acc[int(start_idx) : end_hist_idx], dtype=float)
+    else:
+        start_hist_idx = max(0, int(start_idx) - window_samples + 1)
+        dy_hist = np.asarray(y_vel[start_hist_idx : start_idx + 1], dtype=float)
+        ddy_hist = np.asarray(y_acc[start_hist_idx : start_idx + 1], dtype=float)
     if dy_hist.size == 0 or ddy_hist.size == 0:
         return 0.0, 0.0
 
@@ -242,6 +247,7 @@ def compute_force_spread_history(
     n_memory: int,
     progress=None,
     progress_desc: str = "",
+    return_force_stack: bool = False,
 ) -> dict[str, np.ndarray | float]:
     time_dim = _extract_case_channel(case_payload, "time_dim")
     y_dim = _extract_case_channel(case_payload, "y_dim", "y_disp_dim")
@@ -283,6 +289,7 @@ def compute_force_spread_history(
         )
 
     force_total_stack = []
+    theta_stack = []
     for theta0 in theta0_iterable:
         phi_vy0 = float(wrap_phase(np.asarray([phi_dy0 - float(theta0)]))[0])
         sim = replay_hidden_state_with_cfd_motion(
@@ -300,6 +307,21 @@ def compute_force_spread_history(
             n_memory=int(n_memory),
         )
         force_total_stack.append(np.asarray(sim["F_total"], dtype=float))
+        if return_force_stack:
+            theta_stack.append(
+                np.asarray(
+                    compute_theta_series(
+                        dy=np.asarray(sim["dy"], dtype=float),
+                        ddy=np.asarray(sim["ddy"], dtype=float),
+                        phi_vy=np.asarray(sim["phi_vy"], dtype=float),
+                        sig_dy_loc=np.asarray(sim["sig_dy_loc"], dtype=float),
+                        sig_ddy_loc=np.asarray(sim["sig_ddy_loc"], dtype=float),
+                        flow_speed_m_s=flow_speed_m_s,
+                        mode="principal",
+                    ),
+                    dtype=float,
+                )
+            )
 
     force_total_stack = np.asarray(force_total_stack, dtype=float)
     force_std_ref = max(float(np.std(force_dim)), np.finfo(float).eps)
@@ -311,6 +333,9 @@ def compute_force_spread_history(
         "phi_dy0": float(phi_dy0),
         "sig_dy_loc0": float(sig_dy_loc0),
         "sig_ddy_loc0": float(sig_ddy_loc0),
+        "theta0_values": np.asarray(theta0_values, dtype=float) if return_force_stack else np.asarray([], dtype=float),
+        "force_total_stack": np.asarray(force_total_stack, dtype=float) if return_force_stack else np.asarray([], dtype=float),
+        "theta_stack": np.asarray(theta_stack, dtype=float) if return_force_stack else np.asarray([], dtype=float),
     }
 
 

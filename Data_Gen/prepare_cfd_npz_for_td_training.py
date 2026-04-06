@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import csv
+import fnmatch
 import glob
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from HNN_helper import resolve_td_memory_config, resolve_td_n_memory
 
 try:
     from tqdm.auto import tqdm
@@ -64,18 +72,155 @@ OUTPUT_DIR = DATA_DIR / "npz_exports_td_burnin_trimmed"
 METADATA_PATH = DATA_DIR / "analysis" / "CFD_metadata.csv"
 OVERWRITE = True
 SKIP_NO_CONVERGENCE = True
-FORCE_REL_STD_THRESHOLD = 1.0e-4
+FORCE_REL_STD_THRESHOLD = 1.0e-2
 PERSISTENCE_SECONDS = 1.0
 EXPORT_THETA0 = 0.0
 SHOW_PROGRESS = True
 MIN_OUTPUT_SAMPLES = 2
 _METADATA_CACHE: dict[str, dict[str, str]] | None = None
 
+# TD memory rule used when replaying the Vivana-TD hidden state onto CFD motion.
+# "fixed_n_memory" uses the stored scalar python_n_memory / burnin N_MEMORY.
+# "fixed_tau" uses td_memory_tau_s and resolves n_memory=tau/dt.
+# "tau_over_tref" uses tau = td_tau_over_tref * D / (fhat0 * U), then n_memory=tau/dt.
+TD_MEMORY_MODE = "tau_over_tref"
+TD_TAU_OVER_TREF = 4.0
+TD_MEMORY_TAU_S: float | None = None
+
+# Sigma initialization for the exported TD replay.
+# "lookahead_rms" seeds sigma from the first tau seconds of CFD kinematics while still
+# starting the replay at the first sample. This reduces wasted startup transient.
+SIGMA_INIT_MODE = "lookahead_rms"
+
+# Optional diagnostics to explain why a case gets trimmed where it does.
+WRITE_BURNIN_DIAGNOSTIC_PLOTS = True
+#DIAGNOSTIC_PLOT_CASE_PATTERNS: tuple[str, ...] | None = ("*Ur2*",)
+DIAGNOSTIC_PLOT_CASE_PATTERNS: tuple[str, ...] | None = None
+DIAGNOSTIC_PLOT_DIR = DATA_DIR / "td_preprocess_diagnostics"
+DIAGNOSTIC_PLOT_MAX_SECONDS = 120.0
+
 
 def _progress(iterable, *, total: int | None = None, desc: str = ""):
     if SHOW_PROGRESS and tqdm is not None:
         return tqdm(iterable, total=total, desc=desc, leave=False)
     return iterable
+
+
+def _td_memory_config() -> dict[str, object]:
+    return resolve_td_memory_config(
+        {
+            "td_memory_mode": TD_MEMORY_MODE,
+            "td_tau_over_tref": TD_TAU_OVER_TREF,
+            "td_memory_tau_s": TD_MEMORY_TAU_S,
+        }
+    )
+
+
+def _should_write_diagnostic_plot(case_name: str) -> bool:
+    if not bool(WRITE_BURNIN_DIAGNOSTIC_PLOTS):
+        return False
+    patterns = DIAGNOSTIC_PLOT_CASE_PATTERNS
+    if patterns is None:
+        return True
+    return any(fnmatch.fnmatch(str(case_name), str(pattern)) for pattern in patterns)
+
+
+def _save_burnin_diagnostic_plot(
+    *,
+    case_name: str,
+    payload: dict[str, np.ndarray],
+    spread: dict[str, np.ndarray | float],
+    burnin_start_time_dim: float | None,
+    replay_tau_seconds: float,
+    replay_n_memory: int,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return
+
+    time_dim = np.asarray(spread["time_dim"], dtype=float).reshape(-1)
+    force_total_rel_std = np.asarray(spread["force_total_rel_std"], dtype=float).reshape(-1)
+    theta0_values = np.asarray(spread.get("theta0_values", np.asarray([], dtype=float)), dtype=float).reshape(-1)
+    force_total_stack = np.asarray(spread.get("force_total_stack", np.asarray([], dtype=float)), dtype=float)
+    theta_stack = np.asarray(spread.get("theta_stack", np.asarray([], dtype=float)), dtype=float)
+    if time_dim.size == 0 or force_total_rel_std.size == 0:
+        return
+
+    time_zeroed = time_dim - float(time_dim[0])
+    x_max = float(time_zeroed[-1])
+    if DIAGNOSTIC_PLOT_MAX_SECONDS is not None:
+        x_max = min(x_max, float(DIAGNOSTIC_PLOT_MAX_SECONDS))
+    mask = time_zeroed <= x_max + 1.0e-12
+    force_std_abs = force_total_rel_std * float(spread["force_std_ref"])
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+
+    axes[0].plot(time_zeroed[mask], force_total_rel_std[mask], color="tab:red", linewidth=1.8, label="Across-theta rel std")
+    axes[0].axhline(float(FORCE_REL_STD_THRESHOLD), color="black", linestyle="--", linewidth=1.0, label="Threshold")
+    if burnin_start_time_dim is not None:
+        axes[0].axvline(float(burnin_start_time_dim - float(time_dim[0])), color="tab:green", linestyle="--", linewidth=1.2, label="Chosen cut")
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("rel std [-]")
+    axes[0].set_title("Across-theta force spread driving the trim decision")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(time_zeroed[mask], force_std_abs[mask], color="tab:purple", linewidth=1.8, label="Across-theta std [N/m]")
+    axes[1].axhline(float(spread["force_std_ref"]) * float(FORCE_REL_STD_THRESHOLD), color="black", linestyle="--", linewidth=1.0, label="Threshold in force units")
+    if burnin_start_time_dim is not None:
+        axes[1].axvline(float(burnin_start_time_dim - float(time_dim[0])), color="tab:green", linestyle="--", linewidth=1.2, label="Chosen cut")
+    axes[1].set_ylabel("std [N/m]")
+    axes[1].set_title("Same spread in physical force units")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    if force_total_stack.ndim == 2 and force_total_stack.shape[1] == time_dim.size:
+        for idx, force_series in enumerate(force_total_stack):
+            label = None
+            if theta0_values.size == force_total_stack.shape[0]:
+                label = f"TD theta0={theta0_values[idx]:.2f}"
+            axes[2].plot(time_zeroed[mask], np.asarray(force_series, dtype=float)[mask], linewidth=1.0, alpha=0.8, label=label)
+    if burnin_start_time_dim is not None:
+        axes[2].axvline(float(burnin_start_time_dim - float(time_dim[0])), color="tab:green", linestyle="--", linewidth=1.2)
+    axes[2].set_xlabel("Time from series start [s]")
+    axes[2].set_ylabel("Force [N/m]")
+    axes[2].set_title("TD force traces for each theta0")
+    axes[2].grid(True, alpha=0.3)
+    if force_total_stack.ndim == 2 and force_total_stack.shape[0] <= 10:
+        axes[2].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+
+    if theta_stack.ndim == 2 and theta_stack.shape[1] == time_dim.size:
+        for idx, theta_series in enumerate(theta_stack):
+            label = None
+            if theta0_values.size == theta_stack.shape[0]:
+                label = f"theta0={theta0_values[idx]:.3f}"
+            axes[3].plot(
+                time_zeroed[mask],
+                np.asarray(theta_series, dtype=float)[mask],
+                marker="o",
+                markersize=2.5,
+                linewidth=1.0,
+                alpha=0.85,
+                label=label,
+            )
+    if burnin_start_time_dim is not None:
+        axes[3].axvline(float(burnin_start_time_dim - float(time_dim[0])), color="tab:green", linestyle="--", linewidth=1.2)
+    axes[3].set_xlabel("Time from series start [s]")
+    axes[3].set_ylabel("Wrapped theta [rad]")
+    axes[3].set_title("Wrapped theta vs time for each theta0")
+    axes[3].grid(True, alpha=0.3)
+    if theta_stack.ndim == 2 and theta_stack.shape[0] <= 10:
+        axes[3].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+
+    fig.suptitle(
+        f"{case_name} | sigma_mode={SIGMA_INIT_MODE} | tau={float(replay_tau_seconds):.3f} s | "
+        f"n_memory={int(replay_n_memory)} | threshold={float(FORCE_REL_STD_THRESHOLD):.3g}"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    DIAGNOSTIC_PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(DIAGNOSTIC_PLOT_DIR / f"{case_name}_burnin_diagnostic.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _resolve_input_npzs() -> list[Path]:
@@ -264,7 +409,7 @@ def _build_case_td_replay_inputs(
     payload: dict[str, np.ndarray],
     *,
     fallback_params: dict[str, float],
-) -> tuple[dict[str, np.ndarray], dict[str, float], int]:
+) -> tuple[dict[str, np.ndarray], dict[str, float], int, float]:
     replay_payload = {key: np.asarray(value).copy() for key, value in payload.items()}
 
     def _override_scalar(target_key: str, source_keys: tuple[str, ...]) -> None:
@@ -296,9 +441,31 @@ def _build_case_td_replay_inputs(
             f"{params['fhat_min']} <= {params['fhat0']} <= {params['fhat_max']} is required."
         )
 
-    n_memory_value = _preferred_scalar(replay_payload, ("python_n_memory",), default=float(burnin_config.N_MEMORY))
+    memory_cfg = _td_memory_config()
+    dt_value = float(np.asarray(replay_payload["dt_dim"]).reshape(()))
+    flow_speed_value = float(np.asarray(replay_payload["flow_speed_m_s"]).reshape(()))
+    diameter_value = float(np.asarray(replay_payload["diameter_m"]).reshape(()))
+    if str(memory_cfg["mode"]) == "fixed_n_memory":
+        n_memory_value = _preferred_scalar(replay_payload, ("python_n_memory",), default=float(burnin_config.N_MEMORY))
+        tau_seconds = float(n_memory_value) * dt_value
+    else:
+        n_memory_value = resolve_td_n_memory(
+            params,
+            dt=dt_value,
+            flow_speed=flow_speed_value,
+            diameter=diameter_value,
+            memory_cfg=memory_cfg,
+        )
+        tau_seconds = float(n_memory_value) * dt_value
+    params["n_memory"] = float(n_memory_value)
     n_memory = max(1, int(round(float(n_memory_value))))
-    return replay_payload, params, n_memory
+    replay_payload["python_n_memory"] = np.asarray(float(n_memory_value), dtype=float)
+    replay_payload["python_tau_s"] = np.asarray(float(tau_seconds), dtype=float)
+    replay_payload["python_td_memory_mode"] = np.asarray(str(memory_cfg["mode"]))
+    replay_payload["python_td_tau_over_tref"] = np.asarray(float(memory_cfg["tau_over_tref"]), dtype=float)
+    if memory_cfg["tau_s"] is not None:
+        replay_payload["python_td_memory_tau_s"] = np.asarray(float(memory_cfg["tau_s"]), dtype=float)
+    return replay_payload, params, n_memory, float(tau_seconds)
 
 
 def _representative_replay(
@@ -307,6 +474,7 @@ def _representative_replay(
     params: dict[str, float],
     theta0_export: float,
     n_memory: int,
+    tau_seconds: float,
 ) -> dict[str, np.ndarray]:
     flow_speed_m_s = float(np.asarray(payload["flow_speed_m_s"]).reshape(()))
     rho_kg_m3 = float(np.asarray(payload["rho_kg_m3"]).reshape(()))
@@ -316,8 +484,8 @@ def _representative_replay(
         start_idx=0,
         flow_speed_m_s=flow_speed_m_s,
         n_memory=int(n_memory),
-        mode=str(burnin_config.SIGMA_INIT_MODE),
-        window_seconds=burnin_config.SIGMA_INIT_WINDOW_SECONDS,
+        mode=str(SIGMA_INIT_MODE),
+        window_seconds=float(tau_seconds),
     )
     phi_dy0 = initial_phi_dy(
         dy0=float(np.asarray(payload["y_vel_dim"], dtype=float)[0]),
@@ -391,6 +559,11 @@ def _manifest_row_base(npz_path: Path, payload: dict[str, np.ndarray], td_params
             ("python_flow_speed_m_s", "flow_speed_m_s"),
         ),
         "dt_dim": float(np.asarray(payload["dt_dim"]).reshape(())),
+        "td_memory_mode": str(_td_memory_config()["mode"]),
+        "td_tau_over_tref": float(_td_memory_config()["tau_over_tref"]),
+        "td_memory_tau_s": None if _td_memory_config()["tau_s"] is None else float(_td_memory_config()["tau_s"]),
+        "td_n_memory_resolved": _preferred_scalar(payload, ("python_n_memory",)),
+        "td_tau_s_resolved": _preferred_scalar(payload, ("python_tau_s",)),
         "stiffness_n_m": _preferred_scalar(
             payload,
             ("python_stiffness_n_m", "stiffness_n_m"),
@@ -437,6 +610,11 @@ def _write_manifest(rows: list[dict[str, object]], out_dir: Path) -> None:
         "num_theta0",
         "flow_speed_m_s",
         "dt_dim",
+        "td_memory_mode",
+        "td_tau_over_tref",
+        "td_memory_tau_s",
+        "td_n_memory_resolved",
+        "td_tau_s_resolved",
         "stiffness_n_m",
         "effective_mass_kg",
         "dry_mass_kg",
@@ -447,6 +625,68 @@ def _write_manifest(rows: list[dict[str, object]], out_dir: Path) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _print_trim_summary_table(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        print("No TD preprocessing rows to summarize.")
+        return
+
+    table_rows: list[dict[str, str]] = []
+    for row in sorted(rows, key=lambda item: str(item.get("case_name", ""))):
+        num_input_samples = int(row.get("num_input_samples") or 0)
+        num_output_samples = int(row.get("num_output_samples") or 0)
+        burnin_start_idx = row.get("burnin_start_idx")
+        removed_samples = None if burnin_start_idx is None else int(burnin_start_idx)
+        if removed_samples is None and num_input_samples > 0 and num_output_samples > 0:
+            removed_samples = max(0, num_input_samples - num_output_samples)
+        removed_pct = (
+            100.0 * float(removed_samples) / float(num_input_samples)
+            if removed_samples is not None and num_input_samples > 0
+            else None
+        )
+        burnin_seconds_removed = row.get("burnin_seconds_removed")
+        burnin_seconds_text = (
+            f"{float(burnin_seconds_removed):.3f}"
+            if burnin_seconds_removed is not None and np.isfinite(float(burnin_seconds_removed))
+            else "-"
+        )
+        removed_samples_text = "-" if removed_samples is None else str(int(removed_samples))
+        removed_pct_text = "-" if removed_pct is None else f"{removed_pct:.1f}"
+        table_rows.append(
+            {
+                "case_name": str(row.get("case_name", "")),
+                "status": str(row.get("status", "")),
+                "removed_s": burnin_seconds_text,
+                "removed_samples": removed_samples_text,
+                "removed_pct": removed_pct_text,
+                "kept_samples": str(num_output_samples) if num_output_samples > 0 else "-",
+            }
+        )
+
+    headers = {
+        "case_name": "case_name",
+        "status": "status",
+        "removed_s": "removed_s",
+        "removed_samples": "removed_samples",
+        "removed_pct": "removed_pct",
+        "kept_samples": "kept_samples",
+    }
+    columns = list(headers.keys())
+    widths = {
+        column: max([len(headers[column]), *[len(row[column]) for row in table_rows]])
+        for column in columns
+    }
+
+    def _fmt_line(values: dict[str, str]) -> str:
+        return " | ".join(values[column].ljust(widths[column]) for column in columns)
+
+    separator = "-+-".join("-" * widths[column] for column in columns)
+    print("\nTD preprocessing trim summary:")
+    print(_fmt_line(headers))
+    print(separator)
+    for row in table_rows:
+        print(_fmt_line(row))
 
 
 def _prepare_output_payload(
@@ -501,6 +741,15 @@ def _prepare_output_payload(
         ),
         dtype=float,
     )
+    for key in (
+        "python_n_memory",
+        "python_tau_s",
+        "python_td_memory_mode",
+        "python_td_tau_over_tref",
+        "python_td_memory_tau_s",
+    ):
+        if key in payload:
+            trimmed[key] = np.asarray(payload[key]).copy()
     trimmed["force_reference_convention_dim"] = np.asarray("per_unit_length", dtype="<U32")
     trimmed["force_td_convention_dim"] = np.asarray("per_unit_length", dtype="<U32")
     for key in (
@@ -523,22 +772,25 @@ def _prepare_output_payload(
 def _process_single_file(npz_path: Path, *, params: dict[str, float]) -> dict[str, object]:
     raw_payload = _inject_python_metadata(_load_npz_payload(npz_path), case_name=npz_path.stem)
     payload = _sanitize_payload(raw_payload, case_name=npz_path.stem)
-    replay_payload, replay_params, replay_n_memory = _build_case_td_replay_inputs(
+    replay_payload, replay_params, replay_n_memory, replay_tau_seconds = _build_case_td_replay_inputs(
         payload,
         fallback_params=params,
     )
     replay_paramset_id = paramset_id(replay_params)
     row = _manifest_row_base(npz_path, payload, replay_paramset_id)
+    row["td_n_memory_resolved"] = float(replay_n_memory)
+    row["td_tau_s_resolved"] = float(replay_tau_seconds)
 
     spread = compute_force_spread_history(
         case_payload=replay_payload,
         params=replay_params,
         theta0_values=np.asarray(burnin_config.THETA0_VALUES, dtype=float),
-        sigma_init_mode=str(burnin_config.SIGMA_INIT_MODE),
-        sigma_init_window_seconds=burnin_config.SIGMA_INIT_WINDOW_SECONDS,
+        sigma_init_mode=str(SIGMA_INIT_MODE),
+        sigma_init_window_seconds=float(replay_tau_seconds),
         n_memory=int(replay_n_memory),
         progress=_progress if SHOW_PROGRESS else None,
         progress_desc=f"{npz_path.stem} theta0",
+        return_force_stack=_should_write_diagnostic_plot(npz_path.stem),
     )
     force_total_rel_std = np.asarray(spread["force_total_rel_std"], dtype=float)
     burnin_start_idx = detect_burnin_start_index(
@@ -563,6 +815,16 @@ def _process_single_file(npz_path: Path, *, params: dict[str, float]) -> dict[st
     row["burnin_seconds_removed"] = burnin_seconds_removed
     row["force_rel_std_at_cut"] = float(force_total_rel_std[burnin_start_idx])
 
+    if _should_write_diagnostic_plot(npz_path.stem):
+        _save_burnin_diagnostic_plot(
+            case_name=npz_path.stem,
+            payload=replay_payload,
+            spread=spread,
+            burnin_start_time_dim=burnin_start_time_dim,
+            replay_tau_seconds=float(replay_tau_seconds),
+            replay_n_memory=int(replay_n_memory),
+        )
+
     if int(time_dim.size - burnin_start_idx) < int(MIN_OUTPUT_SAMPLES):
         row["status"] = "too_short_after_trim"
         return row
@@ -572,6 +834,7 @@ def _process_single_file(npz_path: Path, *, params: dict[str, float]) -> dict[st
         params=replay_params,
         theta0_export=float(EXPORT_THETA0),
         n_memory=int(replay_n_memory),
+        tau_seconds=float(replay_tau_seconds),
     )
     output_payload = _prepare_output_payload(
         payload,
@@ -631,6 +894,7 @@ def main() -> None:
         rows.append(row)
 
     _write_manifest(rows, OUTPUT_DIR.resolve())
+    _print_trim_summary_table(rows)
     print(f"Wrote TD training-ready outputs to {OUTPUT_DIR.resolve()}")
 
 

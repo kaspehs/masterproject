@@ -4,6 +4,7 @@ import glob
 import json
 from itertools import product
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +13,12 @@ try:
     from tqdm.auto import tqdm
 except ModuleNotFoundError:
     tqdm = None
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from HNN_helper import resolve_td_memory_config, resolve_td_n_memory
 
 try:
     from td_hidden_state import (
@@ -70,6 +77,9 @@ FHAT_MAX_VALUES = [0.26]
 DAMPING_C_VALUES = [0.0]
 N_MEMORY = 500
 INTEGRATOR = "rk4_coupled"
+TD_MEMORY_MODE = "tau_over_tref"
+TD_TAU_OVER_TREF = 4.0
+TD_MEMORY_TAU_S: float | None = None
 
 # Burn-in analysis configs
 EVAL_FRACTION = 1.0
@@ -86,7 +96,7 @@ SPREAD_PLOT_YMIN = 1.0e-12
 
 # Hidden-state initialization
 SIGMA_INIT_MODE = "local_rms"  # "zero" or "local_rms"
-SIGMA_INIT_WINDOW_SECONDS = None  # None -> use up to N_MEMORY samples
+SIGMA_INIT_WINDOW_SECONDS = None  # None -> use up to the resolved n_memory samples
 
 
 def _as_list(value):
@@ -143,6 +153,34 @@ def _initial_phi_dy(
         sig_ddy_loc0=sig_ddy_loc0,
         flow_speed_m_s=flow_speed_m_s,
     )
+
+
+def _td_memory_config() -> dict[str, object]:
+    return resolve_td_memory_config(
+        {
+            "td_memory_mode": TD_MEMORY_MODE,
+            "td_tau_over_tref": TD_TAU_OVER_TREF,
+            "td_memory_tau_s": TD_MEMORY_TAU_S,
+        }
+    )
+
+
+def _resolve_case_td_memory(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    params: dict[str, float],
+) -> tuple[int, float]:
+    params_with_memory = dict(params)
+    params_with_memory.setdefault("n_memory", float(N_MEMORY))
+    dt_value = float(case["dt_dim"])
+    n_memory_value = resolve_td_n_memory(
+        params_with_memory,
+        dt=dt_value,
+        flow_speed=float(case["flow_speed_m_s"]),
+        diameter=float(case["diameter_m"]),
+        memory_cfg=_td_memory_config(),
+    )
+    return max(1, int(round(float(n_memory_value)))), float(n_memory_value) * dt_value
 
 
 def _circular_std(values: np.ndarray) -> float:
@@ -286,6 +324,8 @@ def _run_single_sim(
     start_idx: int,
     eval_idx: int,
     theta0: float,
+    n_memory: int,
+    tau_s: float,
 ) -> tuple[dict[str, object], dict[str, np.ndarray]]:
     time_dim = case["time_dim"]
     y_dim = case["y_dim"]
@@ -299,6 +339,7 @@ def _run_single_sim(
         case=case,
         start_idx=start_idx,
         flow_speed_m_s=float(case["flow_speed_m_s"]),
+        n_memory=int(n_memory),
     )
     phi_dy0 = _initial_phi_dy(
         dy0=float(dy_dim[start_idx]),
@@ -320,6 +361,7 @@ def _run_single_sim(
         phi_vy0=float(phi_vy0),
         sig_dy_loc0=sig_dy_loc0,
         sig_ddy_loc0=sig_ddy_loc0,
+        n_memory=int(n_memory),
     )
 
     phi_vy_eval = float(sim["phi_vy"][-1])
@@ -353,6 +395,8 @@ def _run_single_sim(
         "phi_vy_eval_wrapped": float(_wrap_phase(np.asarray([phi_vy_eval]), PHASE_WRAP)[0]),
         "theta_eval": theta_eval,
         "theta_eval_wrapped": float(_wrap_phase(np.asarray([theta_eval]), PHASE_WRAP)[0]),
+        "n_memory": int(n_memory),
+        "tau_s": float(tau_s),
         "F_total_eval": float(sim["F_total"][-1]),
         "F_total_eval_per_m": float(sim["F_total"][-1]),
         "Fy_eval": float(sim["Fy"][-1]),
@@ -384,6 +428,7 @@ def _replay_hidden_state_with_cfd_motion(
     phi_vy0: float,
     sig_dy_loc0: float,
     sig_ddy_loc0: float,
+    n_memory: int,
 ) -> dict[str, np.ndarray]:
     return shared_replay_hidden_state_with_cfd_motion(
         time=time,
@@ -397,7 +442,7 @@ def _replay_hidden_state_with_cfd_motion(
         phi_vy0=float(phi_vy0),
         sig_dy_loc0=float(sig_dy_loc0),
         sig_ddy_loc0=float(sig_ddy_loc0),
-        n_memory=int(N_MEMORY),
+        n_memory=int(n_memory),
     )
 
 
@@ -406,12 +451,13 @@ def _initial_hidden_sigmas(
     case: dict[str, np.ndarray | float | str],
     start_idx: int,
     flow_speed_m_s: float,
+    n_memory: int,
 ) -> tuple[float, float]:
     return shared_initial_hidden_sigmas(
         case_like=case,
         start_idx=start_idx,
         flow_speed_m_s=flow_speed_m_s,
-        n_memory=int(N_MEMORY),
+        n_memory=int(n_memory),
         mode=SIGMA_INIT_MODE,
         window_seconds=SIGMA_INIT_WINDOW_SECONDS,
     )
@@ -637,6 +683,7 @@ def _rerun_for_selected_burnins(
     df: pd.DataFrame,
 ) -> dict[float, list[tuple[float, dict[str, np.ndarray]]]]:
     selected = _selected_burnins(df)
+    resolved_n_memory, resolved_tau_s = _resolve_case_td_memory(case=case, params=params)
     reruns: dict[float, list[tuple[float, dict[str, np.ndarray]]]] = {}
     for burnin in selected:
         subset = df[np.isclose(df["burnin_seconds"], burnin)].sort_values("theta0")
@@ -648,6 +695,8 @@ def _rerun_for_selected_burnins(
                 start_idx=int(row.start_idx),
                 eval_idx=int(row.eval_idx),
                 theta0=float(row.theta0),
+                n_memory=int(resolved_n_memory),
+                tau_s=float(resolved_tau_s),
             )
             runs.append((float(row.theta0), sim))
         reruns[float(burnin)] = runs
@@ -822,6 +871,8 @@ def _write_run_metadata(
     eval_idx: int,
     candidate_starts: list[int],
 ) -> None:
+    resolved_n_memory, resolved_tau_s = _resolve_case_td_memory(case=case, params=params)
+    td_memory_cfg = _td_memory_config()
     payload = {
         "case_name": case["case_name"],
         "input_npz": str(case["source_path"]),
@@ -830,7 +881,12 @@ def _write_run_metadata(
         "sigma_init_window_seconds": SIGMA_INIT_WINDOW_SECONDS,
         "comparison_window_seconds": float(COMPARISON_WINDOW_SECONDS),
         "phase_wrap": PHASE_WRAP,
-        "n_memory": int(N_MEMORY),
+        "td_memory_mode": str(td_memory_cfg["mode"]),
+        "td_tau_over_tref": float(td_memory_cfg["tau_over_tref"]),
+        "td_memory_tau_s": None if td_memory_cfg["tau_s"] is None else float(td_memory_cfg["tau_s"]),
+        "n_memory_fallback": int(N_MEMORY),
+        "n_memory": int(resolved_n_memory),
+        "tau_s": float(resolved_tau_s),
         "eval_fraction": float(EVAL_FRACTION),
         "eval_idx": int(eval_idx),
         "eval_time": float(np.asarray(case["time_dim"])[eval_idx]),
@@ -905,6 +961,7 @@ def main() -> None:
                 raise FileExistsError(f"Output directory already exists: {param_dir}")
             param_dir.mkdir(parents=True, exist_ok=True)
 
+            resolved_n_memory, resolved_tau_s = _resolve_case_td_memory(case=case, params=params)
             rows: list[dict[str, object]] = []
             total_runs = len(candidate_starts) * len(np.asarray(THETA0_VALUES, dtype=float))
             run_iterator = (
@@ -923,6 +980,8 @@ def main() -> None:
                     start_idx=start_idx,
                     eval_idx=eval_idx,
                     theta0=float(theta0),
+                    n_memory=int(resolved_n_memory),
+                    tau_s=float(resolved_tau_s),
                 )
                 rows.append(row)
 
