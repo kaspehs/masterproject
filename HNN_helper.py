@@ -3881,6 +3881,7 @@ def load_td_correction_trajectories(
             effective_mass_kg = float(_preferred_scalar(("python_effective_mass_kg", "model_effective_mass_kg", "training_effective_mass_kg", "effective_mass_kg")))
             dry_mass_kg = float(_preferred_scalar(("python_dry_mass_kg", "python_mass_kg", "model_dry_mass_kg", "training_dry_mass_kg", "dry_mass_kg")))
             damping_c = float(_preferred_scalar(("python_damping_c", "model_damping_c", "training_damping_c", "damping_c")))
+            rho_kg_m3 = float(_preferred_scalar(("python_rho_kg_m3", "rho_kg_m3")))
             diameter_m = float(_preferred_scalar(("python_diameter_m", "diameter_m")))
             flow_speed_raw = _preferred_numeric_value(("python_flow_speed_m_s", "model_flow_speed_m_s", "training_flow_speed_m_s", "flow_speed_m_s"))
             ur_raw = _extract_first_present(data, ("U_r_computed_series", "U_r"), path=path)
@@ -4001,21 +4002,21 @@ def load_td_correction_trajectories(
                 if ur_label_reduced is not None:
                     ur_label_reduced = ur_label_reduced[mask]
                 flow_speed_reduced = flow_speed_reduced[mask]
-            if bool(reduce_time) and td_params is not None and resolve_td_memory_config(td_memory_cfg)["mode"] != "fixed_n_memory":
-                force_td_per_m_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced = _recompute_td_baseline_on_grid(
-                    t=t_reduced,
-                    dy=dy_reduced,
-                    ddy=ddy_reduced,
-                    flow_speed=flow_speed_reduced,
-                    force_td0=float(force_td_per_m_reduced[0]),
-                    phi_td0=float(phi_td_reduced[0]),
-                    sig_dy_td0=float(sig_dy_td_reduced[0]),
-                    sig_ddy_td0=float(sig_ddy_td_reduced[0]),
-                    rho=float(_preferred_scalar(("python_rho_kg_m3", "rho_kg_m3"))),
-                    diameter=float(diameter_m),
-                    td_params=td_params,
-                    td_memory_cfg=td_memory_cfg,
-                )
+                if bool(reduce_time) and td_params is not None and resolve_td_memory_config(td_memory_cfg)["mode"] != "fixed_n_memory":
+                    force_td_per_m_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced = _recompute_td_baseline_on_grid(
+                        t=t_reduced,
+                        dy=dy_reduced,
+                        ddy=ddy_reduced,
+                        flow_speed=flow_speed_reduced,
+                        force_td0=float(force_td_per_m_reduced[0]),
+                        phi_td0=float(phi_td_reduced[0]),
+                        sig_dy_td0=float(sig_dy_td_reduced[0]),
+                        sig_ddy_td0=float(sig_ddy_td_reduced[0]),
+                        rho=float(rho_kg_m3),
+                        diameter=float(diameter_m),
+                        td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
+                    )
             td_context = np.stack(
                 [ddy_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced, flow_speed_reduced],
                 axis=1,
