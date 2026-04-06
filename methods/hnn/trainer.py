@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import time
 import subprocess
 import sys
@@ -1761,6 +1762,7 @@ def _reap_async_processes(
     processes: list[dict[str, Any]],
     *,
     writer: SummaryWriter | None = None,
+    best_state: dict[str, Any] | None = None,
     wait: bool = False,
 ) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
@@ -1778,6 +1780,8 @@ def _reap_async_processes(
         elapsed = time.perf_counter() - start_time
         epoch = int(job.get("epoch", -1))
         ckpt_path = Path(job.get("checkpoint_path", ""))
+        summary_path = Path(job.get("summary_path", ""))
+        run_name = str(job.get("run_name", "")).strip()
 
         if return_code == 0:
             print(
@@ -1792,6 +1796,40 @@ def _reap_async_processes(
             )
 
         if ckpt_path.exists() and return_code == 0:
+            if best_state is not None and summary_path.exists() and run_name:
+                try:
+                    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+                    loss_total = payload.get("loss_total", None)
+                    if loss_total is not None and np.isfinite(float(loss_total)):
+                        loss_total_f = float(loss_total)
+                        prev_best = float(best_state.get("loss_total", float("inf")))
+                        if loss_total_f < prev_best:
+                            models_dir = Path("models")
+                            models_dir.mkdir(parents=True, exist_ok=True)
+                            best_model_path = models_dir / f"{run_name}_best_val.pt"
+                            best_meta_path = models_dir / f"{run_name}_best_val.json"
+                            shutil.copy2(ckpt_path, best_model_path)
+                            best_meta = {
+                                "epoch": epoch,
+                                "loss_total": loss_total_f,
+                                "run_name": run_name,
+                                "source_checkpoint": str(ckpt_path),
+                                "summary_path": str(summary_path),
+                            }
+                            best_meta_path.write_text(json.dumps(best_meta, indent=2, sort_keys=True), encoding="utf-8")
+                            best_state.update(
+                                {
+                                    "epoch": epoch,
+                                    "loss_total": loss_total_f,
+                                    "best_model_path": str(best_model_path),
+                                }
+                            )
+                            print(
+                                f"[async-val] epoch {epoch}: new best val/loss_total={loss_total_f:.6e}; "
+                                f"kept {best_model_path}"
+                            )
+                except Exception as exc:
+                    print(f"[async-val] epoch {epoch}: failed to promote best checkpoint ({exc})")
             try:
                 ckpt_path.unlink()
             except OSError:
@@ -1806,14 +1844,16 @@ def _launch_async_validation(
     max_concurrent: int,
     checkpoint_path: Path,
     epoch: int,
+    run_name: str,
     writer: SummaryWriter,
     async_device: str,
     async_num_workers: int,
     async_num_threads: int,
     do_losses: bool,
     do_rollout: bool,
+    best_state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    processes = _reap_async_processes(processes, writer=writer, wait=False)
+    processes = _reap_async_processes(processes, writer=writer, best_state=best_state, wait=False)
     if max_concurrent > 0 and len(processes) >= max_concurrent:
         return processes
     script_path = Path(__file__).resolve().parents[2] / "async_validate.py"
@@ -1843,6 +1883,7 @@ def _launch_async_validation(
         "1" if do_rollout else "0",
     ]
     epoch_num = int(epoch + 1)
+    summary_path = Path(writer.log_dir) / "async_validation" / "results" / f"epoch_{epoch_num:06d}.json"
     proc = subprocess.Popen(args, env=env)
     processes.append(
         {
@@ -1850,6 +1891,8 @@ def _launch_async_validation(
             "epoch": epoch_num,
             "start_time": time.perf_counter(),
             "checkpoint_path": str(checkpoint_path),
+            "summary_path": str(summary_path),
+            "run_name": run_name,
         }
     )
     print(
@@ -2741,8 +2784,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
                     val_count += 1
             val_denom = float(max(1, val_count))
-            for name, value in val_sums.items():
-                writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch + 1)
+            val_metrics = {
+                name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
+            }
+            rollout_loss_avg = 0.0
             if rollout_loader is not None and rollout_det_weight > 0.0:
                 with torch.no_grad():
                     rollout_loss_sum = torch.zeros((), device=device)
@@ -2762,7 +2807,17 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             rollout_noise_scale=rollout_noise_scale,
                         ).detach()
                         rollout_count += 1
-                    writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch + 1)
+                    rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                    writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch + 1)
+            val_metrics["loss_total"] = (
+                val_metrics["loss_state"]
+                + float(force_data_weight) * val_metrics["loss_data"]
+                + float(mean_reg) * val_metrics["loss_reg_mean"]
+                + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+                + float(rollout_det_weight) * rollout_loss_avg
+            )
+            for name, value in val_metrics.items():
+                writer.add_scalar(f"val/{name}", value, epoch + 1)
 
             if val_trajs and ((epoch % validate_every) == 0 or epoch == epochs - 1):
                 ur_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs]
@@ -3326,6 +3381,7 @@ def train(config: Config, config_name: str) -> None:
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
     async_processes: list[dict[str, Any]] = []
+    async_best_state: dict[str, Any] = {"loss_total": float("inf")}
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
         async_dir.mkdir(parents=True, exist_ok=True)
@@ -3523,7 +3579,7 @@ def train(config: Config, config_name: str) -> None:
         )
         should_validate_rollout = should_validate_losses
         if async_validation and (should_validate_losses or should_validate_rollout):
-            async_processes = _reap_async_processes(async_processes, writer=writer, wait=False)
+            async_processes = _reap_async_processes(async_processes, writer=writer, best_state=async_best_state, wait=False)
             state_source = model
             if hasattr(model, "_orig_mod"):
                 state_source = getattr(model, "_orig_mod")
@@ -3548,12 +3604,14 @@ def train(config: Config, config_name: str) -> None:
                 max_concurrent=async_max_concurrent,
                 checkpoint_path=ckpt_path,
                 epoch=epoch,
+                run_name=run_name,
                 writer=writer,
                 async_device=async_device,
                 async_num_workers=async_num_workers,
                 async_num_threads=async_num_threads,
                 do_losses=should_validate_losses,
                 do_rollout=should_validate_rollout,
+                best_state=async_best_state,
             )
         elif not async_validation:
             _validate_if_needed(
@@ -3606,7 +3664,7 @@ def train(config: Config, config_name: str) -> None:
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
-        async_processes = _reap_async_processes(async_processes, writer=writer, wait=True)
+        async_processes = _reap_async_processes(async_processes, writer=writer, best_state=async_best_state, wait=True)
 
     writer.add_text("phnn/config_hnn", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
 

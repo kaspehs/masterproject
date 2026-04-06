@@ -4,6 +4,7 @@ import glob
 import json
 from itertools import product
 from pathlib import Path
+import re
 import sys
 
 import matplotlib.pyplot as plt
@@ -23,6 +24,7 @@ from HNN_helper import resolve_td_memory_config, resolve_td_n_memory
 try:
     from td_hidden_state import (
         build_paramsets_from_values,
+        compute_force_spread_history,
         compute_theta_series as shared_compute_theta_series,
         initial_hidden_sigmas as shared_initial_hidden_sigmas,
         initial_phi_dy as shared_initial_phi_dy,
@@ -34,6 +36,7 @@ except ModuleNotFoundError:
     try:
         from Data_Gen.td_hidden_state import (
             build_paramsets_from_values,
+            compute_force_spread_history,
             compute_theta_series as shared_compute_theta_series,
             initial_hidden_sigmas as shared_initial_hidden_sigmas,
             initial_phi_dy as shared_initial_phi_dy,
@@ -44,6 +47,7 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         from CFD_Data.td_hidden_state import (
             build_paramsets_from_values,
+            compute_force_spread_history,
             compute_theta_series as shared_compute_theta_series,
             initial_hidden_sigmas as shared_initial_hidden_sigmas,
             initial_phi_dy as shared_initial_phi_dy,
@@ -82,21 +86,24 @@ TD_TAU_OVER_TREF = 4.0
 TD_MEMORY_TAU_S: float | None = None
 
 # Burn-in analysis configs
-EVAL_FRACTION = 1.0
 THETA0_VALUES = np.linspace(-np.pi / 2, np.pi / 2, 7, endpoint=True)
-
-MIN_BURNIN_SECONDS = 0.0
-MAX_BURNIN_SECONDS = None
-BURNIN_STEP_SECONDS = 5.0
 
 COMPARISON_WINDOW_SECONDS = 10.0
 PHASE_WRAP = "principal"
 RERUN_BURNIN_WINDOWS_SECONDS = [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)]
 SPREAD_PLOT_YMIN = 1.0e-12
+COMBINED_THETA_REL_STD_THRESHOLD = 1.0e-2
+COMBINED_THETA_PERSISTENCE_SECONDS = 1.0
+COMBINED_THETA_MAX_SECONDS = 100.0
+COMBINED_THETA_FIG_DPI = 300
+COMBINED_THETA_TITLE_FONTSIZE = 12
+COMBINED_THETA_LABEL_FONTSIZE = 11
+COMBINED_THETA_TICK_FONTSIZE = 10
+COMBINED_THETA_LEGEND_FONTSIZE = 10
 
 # Hidden-state initialization
-SIGMA_INIT_MODE = "local_rms"  # "zero" or "local_rms"
-SIGMA_INIT_WINDOW_SECONDS = None  # None -> use up to the resolved n_memory samples
+SIGMA_INIT_MODE = "lookahead_rms"  # "zero", "local_rms", or "lookahead_rms"
+SIGMA_INIT_WINDOW_SECONDS: float | str | None = "tau"  # "tau" -> use the resolved tau seconds
 
 
 def _as_list(value):
@@ -181,6 +188,18 @@ def _resolve_case_td_memory(
         memory_cfg=_td_memory_config(),
     )
     return max(1, int(round(float(n_memory_value)))), float(n_memory_value) * dt_value
+
+
+def _resolve_sigma_init_window_seconds(tau_s: float) -> float | None:
+    window = SIGMA_INIT_WINDOW_SECONDS
+    if window is None:
+        return None
+    if isinstance(window, str):
+        key = window.strip().lower()
+        if key == "tau":
+            return float(tau_s)
+        raise ValueError("SIGMA_INIT_WINDOW_SECONDS must be None, a number, or 'tau'.")
+    return float(window)
 
 
 def _circular_std(values: np.ndarray) -> float:
@@ -340,6 +359,7 @@ def _run_single_sim(
         start_idx=start_idx,
         flow_speed_m_s=float(case["flow_speed_m_s"]),
         n_memory=int(n_memory),
+        tau_s=float(tau_s),
     )
     phi_dy0 = _initial_phi_dy(
         dy0=float(dy_dim[start_idx]),
@@ -452,14 +472,16 @@ def _initial_hidden_sigmas(
     start_idx: int,
     flow_speed_m_s: float,
     n_memory: int,
+    tau_s: float | None = None,
 ) -> tuple[float, float]:
+    window_seconds = _resolve_sigma_init_window_seconds(float(tau_s)) if tau_s is not None else SIGMA_INIT_WINDOW_SECONDS
     return shared_initial_hidden_sigmas(
         case_like=case,
         start_idx=start_idx,
         flow_speed_m_s=flow_speed_m_s,
         n_memory=int(n_memory),
         mode=SIGMA_INIT_MODE,
-        window_seconds=SIGMA_INIT_WINDOW_SECONDS,
+        window_seconds=window_seconds,
     )
 
 
@@ -550,6 +572,343 @@ def _plot_phase_spread_summary(grouped: pd.DataFrame, *, out_path: Path) -> None
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
+
+
+def _time_spread_analysis(
+    *,
+    case: dict[str, np.ndarray | float | str],
+    params: dict[str, float],
+) -> dict[str, object]:
+    resolved_n_memory, resolved_tau_s = _resolve_case_td_memory(case=case, params=params)
+    spread = compute_force_spread_history(
+        case_payload=case,
+        params=params,
+        theta0_values=np.asarray(THETA0_VALUES, dtype=float),
+        sigma_init_mode=SIGMA_INIT_MODE,
+        sigma_init_window_seconds=_resolve_sigma_init_window_seconds(float(resolved_tau_s)),
+        n_memory=int(resolved_n_memory),
+        progress=_progress if SHOW_PROGRESS else None,
+        progress_desc=f"{case['case_name']} theta0",
+        return_force_stack=True,
+    )
+    time_dim = np.asarray(spread["time_dim"], dtype=float).reshape(-1)
+    time_from_start_s = time_dim - float(time_dim[0])
+    theta_stack = np.asarray(spread["theta_stack"], dtype=float)
+    theta0_values = np.asarray(spread["theta0_values"], dtype=float).reshape(-1)
+    force_total_rel_std = np.asarray(spread["force_total_rel_std"], dtype=float).reshape(-1)
+    force_total_stack = np.asarray(spread["force_total_stack"], dtype=float)
+
+    rows: list[dict[str, float | str]] = []
+    for idx, time_value in enumerate(time_from_start_s):
+        theta_vals = theta_stack[:, idx] if theta_stack.ndim == 2 and theta_stack.shape[1] == time_from_start_s.size else np.asarray([], dtype=float)
+        rows.append(
+            {
+                "time_from_start_s": float(time_value),
+                "theta_circular_std": _circular_std(theta_vals) if theta_vals.size > 0 else float("nan"),
+                "cos_theta_std": float(np.std(np.cos(theta_vals))) if theta_vals.size > 0 else float("nan"),
+                "force_total_rel_std": float(force_total_rel_std[idx]),
+                "case_name": str(case["case_name"]),
+                "flow_speed_m_s": float(case["flow_speed_m_s"]),
+                "stiffness_n_m": float(case["stiffness_n_m"]),
+                "dry_mass_kg": float(case["dry_mass_kg"]),
+                "rho_kg_m3": float(case["rho_kg_m3"]),
+                "diameter_m": float(case["diameter_m"]),
+                "Ca": float(params["Ca"]),
+            }
+        )
+    summary = pd.DataFrame(rows)
+
+    theta_traj_rows: list[dict[str, float | str]] = []
+    if theta_stack.ndim == 2 and theta_stack.shape[1] == time_from_start_s.size:
+        for theta_idx, theta0 in enumerate(theta0_values):
+            for time_idx, time_value in enumerate(time_from_start_s):
+                theta_traj_rows.append(
+                    {
+                        "time_from_start_s": float(time_value),
+                        "theta0": float(theta0),
+                        "theta": float(theta_stack[theta_idx, time_idx]),
+                        "case_name": str(case["case_name"]),
+                    }
+                )
+    theta_traj_df = pd.DataFrame(theta_traj_rows)
+    return {
+        "summary": summary,
+        "theta_trajectories": theta_traj_df,
+        "time_from_start_s": np.asarray(time_from_start_s, dtype=float),
+        "theta_stack": np.asarray(theta_stack, dtype=float),
+        "theta0_values": np.asarray(theta0_values, dtype=float),
+        "force_total_stack": np.asarray(force_total_stack, dtype=float),
+        "resolved_n_memory": int(resolved_n_memory),
+        "resolved_tau_s": float(resolved_tau_s),
+    }
+
+
+def _plot_time_spread_summary(summary: pd.DataFrame, *, out_path: Path) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
+    panel_specs = [
+        ("theta_circular_std", "Circular std of wrapped theta [rad]", "Theta spread vs time from start"),
+        ("cos_theta_std", "Std of cos(theta) [-]", "cos(theta) spread vs time from start"),
+        (
+            "force_total_rel_std",
+            "Std of predicted force per unit length / std(CFD force per unit length) [-]",
+            "Relative force-per-unit-length spread vs time from start",
+        ),
+    ]
+    x = summary["time_from_start_s"].to_numpy(dtype=float)
+    for ax, (column, ylabel, title) in zip(axes, panel_specs):
+        values = summary[column].to_numpy(dtype=float)
+        ax.plot(x, values, linewidth=1.5)
+        positive = values[np.isfinite(values) & (values > 0.0)]
+        if positive.size > 0:
+            ax.set_yscale("log")
+            ax.set_ylim(bottom=max(float(np.min(positive)) * 0.8, float(SPREAD_PLOT_YMIN)))
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Time from series start [s]")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_theta_trajectories(
+    *,
+    time_from_start_s: np.ndarray,
+    theta_stack: np.ndarray,
+    theta0_values: np.ndarray,
+    out_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for idx, theta0 in enumerate(np.asarray(theta0_values, dtype=float).reshape(-1)):
+        ax.plot(
+            np.asarray(time_from_start_s, dtype=float),
+            np.asarray(theta_stack[idx], dtype=float),
+            linewidth=1.0,
+            label=rf"$\theta_0={theta0:.3f}$",
+        )
+    ax.set_xlabel("Time from series start [s]")
+    ax.set_ylabel(r"Wrapped $\theta$ [rad]")
+    ax.set_title(r"Wrapped $\theta$ vs time from series start")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, ncol=1)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _nominal_ur_key(case_name: str) -> str:
+    match = re.search(r"Ur([^_]+)", str(case_name))
+    return str(match.group(1)) if match else str(case_name)
+
+
+def _nominal_ur_sort_value(case_name: str) -> float:
+    raw = _nominal_ur_key(case_name)
+    if raw == "575":
+        return 5.75
+    try:
+        return float(raw)
+    except ValueError:
+        return float("inf")
+
+
+def _nominal_ur_display(case_name: str) -> str:
+    value = _nominal_ur_sort_value(case_name)
+    if np.isfinite(value):
+        return rf"$U_{{r,\mathrm{{nom}}}}={value:.2f}$"
+    return str(case_name)
+
+
+def _effective_ur_with_added_mass(summary: pd.DataFrame) -> float:
+    if summary.empty:
+        return float("nan")
+    required = {"flow_speed_m_s", "stiffness_n_m", "dry_mass_kg", "rho_kg_m3", "diameter_m", "Ca"}
+    if not required.issubset(summary.columns):
+        return float("nan")
+    flow_speed = float(summary["flow_speed_m_s"].iloc[0])
+    stiffness = float(summary["stiffness_n_m"].iloc[0])
+    dry_mass = float(summary["dry_mass_kg"].iloc[0])
+    rho = float(summary["rho_kg_m3"].iloc[0])
+    diameter = float(summary["diameter_m"].iloc[0])
+    ca = float(summary["Ca"].iloc[0])
+    if not all(np.isfinite(value) for value in (flow_speed, stiffness, dry_mass, rho, diameter, ca)):
+        return float("nan")
+    if stiffness <= 0.0 or dry_mass <= 0.0 or diameter <= 0.0:
+        return float("nan")
+    effective_mass = dry_mass + 0.25 * np.pi * rho * ca * diameter**2
+    if effective_mass <= 0.0:
+        return float("nan")
+    omega_n = np.sqrt(stiffness / effective_mass)
+    f_n = omega_n / (2.0 * np.pi)
+    if f_n <= 0.0:
+        return float("nan")
+    return float(flow_speed / (f_n * diameter))
+
+
+def _estimate_burnin_time_from_summary(summary: pd.DataFrame) -> float:
+    if summary.empty:
+        return float("nan")
+    time_arr = summary["time_from_start_s"].to_numpy(dtype=float)
+    rel_std_arr = summary["force_total_rel_std"].to_numpy(dtype=float)
+    finite_mask = np.isfinite(time_arr) & np.isfinite(rel_std_arr)
+    time_arr = time_arr[finite_mask]
+    rel_std_arr = rel_std_arr[finite_mask]
+    if time_arr.size < 2:
+        return float("nan")
+    below = rel_std_arr < float(COMBINED_THETA_REL_STD_THRESHOLD)
+    fail_prefix = np.concatenate(([0], np.cumsum(~below, dtype=int)))
+    persistence_seconds = float(COMBINED_THETA_PERSISTENCE_SECONDS)
+    for idx in range(time_arr.size):
+        if not below[idx]:
+            continue
+        target_time = float(time_arr[idx]) + persistence_seconds
+        end_idx = int(np.searchsorted(time_arr, target_time, side="left"))
+        end_idx = min(end_idx, time_arr.size - 1)
+        if fail_prefix[end_idx + 1] == fail_prefix[idx]:
+            return float(time_arr[idx])
+    return float(time_arr[-1])
+
+
+def _select_theta_trajectory_bundles(
+    bundles: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]],
+) -> list[tuple[str, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]]:
+    if not bundles:
+        return []
+    chosen: dict[str, tuple[float, tuple[str, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]]] = {}
+    for bundle in bundles:
+        case_name, _time, _theta_stack, _theta0_values, summary = bundle
+        ur_key = _nominal_ur_key(str(case_name))
+        burnin_time = _estimate_burnin_time_from_summary(summary)
+        current = chosen.get(ur_key)
+        if current is None or burnin_time > current[0]:
+            chosen[ur_key] = (burnin_time, bundle)
+    selected = [item[1] for item in chosen.values()]
+    selected.sort(key=lambda item: (_nominal_ur_sort_value(str(item[0])), str(item[0])))
+    return selected
+
+
+def _plot_theta_trajectories_all_cases(
+    *,
+    case_theta_trajectories: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]],
+    out_path: Path,
+) -> None:
+    selected_bundles = _select_theta_trajectory_bundles(case_theta_trajectories)
+    if not selected_bundles:
+        raise ValueError("Need at least one case theta trajectory bundle.")
+    n_cases = len(selected_bundles)
+    fig_height = max(1.8 * n_cases, 6.0)
+    fig, axes = plt.subplots(n_cases, 1, figsize=(12.5, fig_height), sharex=False)
+    if n_cases == 1:
+        axes = [axes]
+
+    for ax, (case_name, time_from_start_s, theta_stack, theta0_values, summary) in zip(axes, selected_bundles):
+        burnin_time = _estimate_burnin_time_from_summary(summary)
+        effective_ur = _effective_ur_with_added_mass(summary)
+        time_arr = np.asarray(time_from_start_s, dtype=float)
+        if COMBINED_THETA_MAX_SECONDS is None:
+            mask = np.ones_like(time_arr, dtype=bool)
+        else:
+            mask = time_arr <= float(COMBINED_THETA_MAX_SECONDS)
+        for idx, theta0 in enumerate(np.asarray(theta0_values, dtype=float).reshape(-1)):
+            ax.plot(
+                time_arr[mask],
+                np.asarray(theta_stack[idx], dtype=float)[mask],
+                linewidth=0.9,
+                alpha=0.9,
+                label=rf"$\theta_0={theta0:.3f}$",
+            )
+        if np.isfinite(burnin_time):
+            ax.axvline(float(burnin_time), color="black", linestyle="--", linewidth=1.0, alpha=0.9)
+        title = str(case_name)
+        if np.isfinite(effective_ur):
+            title = f"{case_name} | " + rf"$U_{{r}}={effective_ur:.2f}$"
+        ax.set_title(title, loc="left", fontsize=COMBINED_THETA_TITLE_FONTSIZE)
+        ax.set_ylabel(r"$\theta$ [rad]", fontsize=COMBINED_THETA_LABEL_FONTSIZE)
+        ax.grid(True, alpha=0.3)
+        if COMBINED_THETA_MAX_SECONDS is not None:
+            ax.set_xlim(0.0, float(COMBINED_THETA_MAX_SECONDS))
+        ax.tick_params(axis="both", labelsize=COMBINED_THETA_TICK_FONTSIZE)
+    axes[-1].set_xlabel("Time from series start [s]", fontsize=COMBINED_THETA_LABEL_FONTSIZE)
+    handles, labels = axes[0].get_legend_handles_labels()
+    legend_ncol = max(1, len(labels))
+    fig.legend(
+        handles,
+        labels,
+        loc="lower left",
+        bbox_to_anchor=(0.06, 0.965, 0.88, 0.06),
+        mode="expand",
+        ncol=legend_ncol,
+        fontsize=COMBINED_THETA_LEGEND_FONTSIZE,
+        frameon=False,
+        borderaxespad=0.0,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(out_path, dpi=int(COMBINED_THETA_FIG_DPI), bbox_inches="tight")
+    plt.close(fig)
+
+
+def _combine_time_spread_summaries(summaries: list[pd.DataFrame]) -> pd.DataFrame:
+    if not summaries:
+        raise ValueError("Need at least one time-spread summary to combine.")
+    return pd.concat(summaries, ignore_index=True).sort_values(["case_name", "time_from_start_s"]).reset_index(drop=True)
+
+
+def _plot_time_spread_all_cases(combined: pd.DataFrame, *, out_path: Path) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(9, 11), sharex=True)
+    panel_specs = [
+        ("theta_circular_std", "Circular std of wrapped theta [rad]", "Theta spread vs time from start"),
+        ("cos_theta_std", "Std of cos(theta) [-]", "cos(theta) spread vs time from start"),
+        (
+            "force_total_rel_std",
+            "Std of predicted force per unit length / std(CFD force per unit length) [-]",
+            "Relative force-per-unit-length spread vs time from start",
+        ),
+    ]
+    case_groups = list(combined.groupby("case_name", sort=True))
+    for ax, (column, ylabel, title) in zip(axes, panel_specs):
+        positive_values = []
+        for case_name, group in case_groups:
+            values = group[column].to_numpy(dtype=float)
+            ax.plot(
+                group["time_from_start_s"].to_numpy(dtype=float),
+                values,
+                linewidth=1.3,
+                label=str(case_name),
+            )
+            positive_values.append(values[np.isfinite(values) & (values > 0.0)])
+        nonempty_positive_values = [vals for vals in positive_values if vals.size > 0]
+        if nonempty_positive_values:
+            positive = np.concatenate(nonempty_positive_values)
+            if positive.size > 0:
+                ax.set_yscale("log")
+                ax.set_ylim(bottom=max(float(np.min(positive)) * 0.8, float(SPREAD_PLOT_YMIN)))
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Time from series start [s]")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), fontsize=8)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _write_combined_time_spread_outputs(
+    *,
+    summaries: list[pd.DataFrame],
+    theta_trajectory_bundles: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]],
+    out_dir: Path,
+) -> None:
+    combined = _combine_time_spread_summaries(summaries)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(out_dir / "phase_spread_vs_time_all_cases.csv", index=False)
+    _plot_time_spread_all_cases(
+        combined,
+        out_path=out_dir / "phase_spread_vs_time_all_cases.png",
+    )
+    _plot_theta_trajectories_all_cases(
+        case_theta_trajectories=theta_trajectory_bundles,
+        out_path=out_dir / "theta_vs_time_all_cases.png",
+    )
 
 
 def _combine_phase_spread_summaries(summaries: list[pd.DataFrame]) -> pd.DataFrame:
@@ -868,8 +1227,7 @@ def _write_run_metadata(
     *,
     case: dict[str, np.ndarray | float | str],
     params: dict[str, float],
-    eval_idx: int,
-    candidate_starts: list[int],
+    num_samples: int,
 ) -> None:
     resolved_n_memory, resolved_tau_s = _resolve_case_td_memory(case=case, params=params)
     td_memory_cfg = _td_memory_config()
@@ -887,11 +1245,8 @@ def _write_run_metadata(
         "n_memory_fallback": int(N_MEMORY),
         "n_memory": int(resolved_n_memory),
         "tau_s": float(resolved_tau_s),
-        "eval_fraction": float(EVAL_FRACTION),
-        "eval_idx": int(eval_idx),
-        "eval_time": float(np.asarray(case["time_dim"])[eval_idx]),
-        "num_candidate_starts": len(candidate_starts),
-        "candidate_start_indices": [int(x) for x in candidate_starts],
+        "analysis_mode": "time_spread_from_start",
+        "num_samples": int(num_samples),
         "theta0_values": [float(x) for x in np.asarray(THETA0_VALUES, dtype=float)],
         "dt_dim": float(case["dt_dim"]),
         "flow_speed_m_s": float(case["flow_speed_m_s"]),
@@ -925,21 +1280,18 @@ def _progress(iterable, *, total: int | None = None, desc: str = ""):
 def main() -> None:
     if str(INTEGRATOR).lower() not in {"rk4", "rk4_coupled"}:
         raise ValueError("INTEGRATOR must be 'rk4' or 'rk4_coupled'.")
-    if SIGMA_INIT_MODE not in {"zero", "local_rms"}:
-        raise ValueError("SIGMA_INIT_MODE must be 'zero' or 'local_rms'.")
+    if SIGMA_INIT_MODE not in {"zero", "local_rms", "lookahead_rms"}:
+        raise ValueError("SIGMA_INIT_MODE must be 'zero', 'local_rms', or 'lookahead_rms'.")
 
     paramsets = _build_paramsets()
     input_npzs = _resolve_input_npzs()
     multi_case_mode = len(input_npzs) > 1
     combined_phase_spread_by_param = {_paramset_id(params): [] for params in paramsets}
+    combined_theta_trajectories_by_param = {_paramset_id(params): [] for params in paramsets}
 
     for npz_path in _progress(input_npzs, total=len(input_npzs), desc="Cases"):
         try:
             case = _load_case(npz_path)
-            time_dim = np.asarray(case["time_dim"], dtype=float)
-            eval_idx = int(len(time_dim) * float(EVAL_FRACTION))
-            eval_idx = max(1, min(eval_idx, len(time_dim) - 2))
-            candidate_starts = _candidate_start_indices(time_dim, float(case["dt_dim"]), eval_idx)
         except Exception as exc:
             if SKIP_INVALID_CASES:
                 print(f"Skipping case {npz_path.name}: {exc}")
@@ -950,7 +1302,7 @@ def main() -> None:
         base_out_dir.mkdir(parents=True, exist_ok=True)
         if SHOW_PROGRESS:
             print(
-                f"Case {case['case_name']}: {len(candidate_starts)} burn-in starts, "
+                f"Case {case['case_name']}: {len(np.asarray(case['time_dim'], dtype=float))} time samples, "
                 f"{len(np.asarray(THETA0_VALUES, dtype=float))} theta0 values, "
                 f"{len(paramsets)} parameter set(s)"
             )
@@ -961,47 +1313,37 @@ def main() -> None:
                 raise FileExistsError(f"Output directory already exists: {param_dir}")
             param_dir.mkdir(parents=True, exist_ok=True)
 
-            resolved_n_memory, resolved_tau_s = _resolve_case_td_memory(case=case, params=params)
-            rows: list[dict[str, object]] = []
-            total_runs = len(candidate_starts) * len(np.asarray(THETA0_VALUES, dtype=float))
-            run_iterator = (
-                (start_idx, theta0)
-                for start_idx in candidate_starts
-                for theta0 in np.asarray(THETA0_VALUES, dtype=float)
-            )
-            for start_idx, theta0 in _progress(
-                run_iterator,
-                total=total_runs,
-                desc=f"{case['case_name']} {_paramset_id(params)}",
-            ):
-                row, _ = _run_single_sim(
-                    case=case,
-                    params=params,
-                    start_idx=start_idx,
-                    eval_idx=eval_idx,
-                    theta0=float(theta0),
-                    n_memory=int(resolved_n_memory),
-                    tau_s=float(resolved_tau_s),
-                )
-                rows.append(row)
-
-            df = pd.DataFrame(rows).sort_values(["burnin_seconds", "theta0"]).reset_index(drop=True)
-            df.to_csv(param_dir / "burnin_scan.csv", index=False)
-
-            phase_spread_summary = _phase_spread_summary(case, df)
+            analysis = _time_spread_analysis(case=case, params=params)
+            phase_spread_summary = pd.DataFrame(analysis["summary"]).sort_values("time_from_start_s").reset_index(drop=True)
+            theta_traj_df = pd.DataFrame(analysis["theta_trajectories"]).sort_values(["theta0", "time_from_start_s"]).reset_index(drop=True)
+            phase_spread_summary.to_csv(param_dir / "phase_spread_vs_time.csv", index=False)
+            theta_traj_df.to_csv(param_dir / "theta_vs_time.csv", index=False)
             combined_phase_spread_by_param[_paramset_id(params)].append(phase_spread_summary)
-            if not (multi_case_mode and MULTI_CASE_ONLY_SPREAD_PLOT):
-                _plot_phase_vs_burnin(df, param_dir / "phase_vs_burnin.png")
-            _plot_phase_spread_summary(
+            _plot_time_spread_summary(
                 phase_spread_summary,
-                out_path=param_dir / "phase_spread_vs_burnin.png",
+                out_path=param_dir / "phase_spread_vs_time.png",
+            )
+            if not (multi_case_mode and MULTI_CASE_ONLY_SPREAD_PLOT):
+                _plot_theta_trajectories(
+                    time_from_start_s=np.asarray(analysis["time_from_start_s"], dtype=float),
+                    theta_stack=np.asarray(analysis["theta_stack"], dtype=float),
+                    theta0_values=np.asarray(analysis["theta0_values"], dtype=float),
+                    out_path=param_dir / "theta_vs_time.png",
+                )
+            combined_theta_trajectories_by_param[_paramset_id(params)].append(
+                (
+                    str(case["case_name"]),
+                    np.asarray(analysis["time_from_start_s"], dtype=float),
+                    np.asarray(analysis["theta_stack"], dtype=float),
+                    np.asarray(analysis["theta0_values"], dtype=float),
+                    phase_spread_summary.copy(),
+                )
             )
             _write_run_metadata(
                 param_dir / "run_metadata.json",
                 case=case,
                 params=params,
-                eval_idx=eval_idx,
-                candidate_starts=candidate_starts,
+                num_samples=int(np.asarray(case["time_dim"], dtype=float).size),
             )
             print(f"Wrote burn-in analysis to {param_dir}")
 
@@ -1011,8 +1353,9 @@ def main() -> None:
             param_id = _paramset_id(params)
             summaries = combined_phase_spread_by_param[param_id]
             if summaries:
-                _write_combined_phase_spread_outputs(
+                _write_combined_time_spread_outputs(
                     summaries=summaries,
+                    theta_trajectory_bundles=combined_theta_trajectories_by_param[param_id],
                     out_dir=combined_root / param_id,
                 )
                 print(f"Wrote combined burn-in spread analysis to {combined_root / param_id}")

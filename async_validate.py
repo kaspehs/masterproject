@@ -8,6 +8,7 @@ Intended to be spawned as a child process so training can continue.
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -102,6 +103,10 @@ def _rollout_index(
         if sampled:
             selected = sampled
     return int(selected[0])
+
+
+def _async_summary_path(log_dir: Path, epoch: int) -> Path:
+    return Path(log_dir) / "async_validation" / "results" / f"epoch_{int(epoch):06d}.json"
 
 
 def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
@@ -709,7 +714,7 @@ def _run_hnn_td_correction_validation(
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
-) -> None:
+) -> dict[str, Any]:
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
@@ -786,6 +791,7 @@ def _run_hnn_td_correction_validation(
 
     num_loss_scalars_written = 0
     num_rollout_scalars_written = 0
+    val_metrics: dict[str, float] = {}
 
     if do_losses and val_loader is not None:
         val_sums = {
@@ -860,9 +866,10 @@ def _run_hnn_td_correction_validation(
                 val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
                 val_count += 1
         val_denom = float(max(1, val_count))
-        for name, value in val_sums.items():
-            writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch)
-            num_loss_scalars_written += 1
+        val_metrics = {
+            name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
+        }
+        rollout_loss_avg = 0.0
 
         if rollout_loader is not None and rollout_det_weight > 0.0:
             rollout_loss_sum = torch.zeros((), device=device)
@@ -895,7 +902,18 @@ def _run_hnn_td_correction_validation(
                         rollout_noise_scale=rollout_noise_scale,
                     ).detach()
                     rollout_count += 1
-            writer.add_scalar("val/loss_rollout_det", float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu()), epoch)
+            rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
+            writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch)
+            num_loss_scalars_written += 1
+        val_metrics["loss_total"] = (
+            val_metrics["loss_state"]
+            + float(force_data_weight) * val_metrics["loss_data"]
+            + float(mean_reg) * val_metrics["loss_reg_mean"]
+            + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+            + float(rollout_det_weight) * rollout_loss_avg
+        )
+        for name, value in val_metrics.items():
+            writer.add_scalar(f"val/{name}", value, epoch)
             num_loss_scalars_written += 1
 
     if do_rollout:
@@ -984,6 +1002,10 @@ def _run_hnn_td_correction_validation(
         f"[async-val] epoch {epoch}: HNN TD scalar writes "
         f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
     )
+    return {
+        "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
+        "val_metrics": val_metrics,
+    }
 
 
 def _run_vpinn_validation(
@@ -1196,7 +1218,7 @@ def _run_vpinn_td_correction_validation(
     do_losses: bool,
     do_rollout: bool,
     num_workers: int,
-) -> None:
+) -> dict[str, Any]:
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
@@ -1290,6 +1312,8 @@ def _run_vpinn_td_correction_validation(
     wdot = wdot.to(device)
     alpha = alpha.to(device)
 
+    val_metrics: dict[str, float] = {}
+
     if do_losses:
         val_sums = {
             name: torch.zeros((), device=device)
@@ -1368,8 +1392,10 @@ def _run_vpinn_td_correction_validation(
                 val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
                 val_batches += 1
         val_denom = float(max(1, val_batches))
-        for name, value in val_sums.items():
-            writer.add_scalar(f"val/{name}", float((value / val_denom).detach().cpu()), epoch)
+        val_metrics = {
+            name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
+        }
+        rollout_loss_avg = 0.0
 
         if val_rollout_loader is not None and float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0)))) > 0.0 and rollout_steps > 0:
             roll_sum = torch.zeros((), device=device)
@@ -1407,7 +1433,18 @@ def _run_vpinn_td_correction_validation(
                         ur_bin_size=ur_bin_size,
                     ).detach()
                     roll_batches += 1
-            writer.add_scalar("val/loss_rollout_det", float((roll_sum / float(max(1, roll_batches))).detach().cpu()), epoch)
+            rollout_loss_avg = float((roll_sum / float(max(1, roll_batches))).detach().cpu())
+            writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch)
+        rollout_weight = float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0))))
+        val_metrics["loss_total"] = (
+            val_metrics["loss_data"]
+            + val_metrics["loss_physics"]
+            + float(mean_reg) * val_metrics["loss_reg_mean"]
+            + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+            + rollout_weight * rollout_loss_avg
+        )
+        for name, value in val_metrics.items():
+            writer.add_scalar(f"val/{name}", value, epoch)
 
     if do_rollout:
         validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
@@ -1493,6 +1530,10 @@ def _run_vpinn_td_correction_validation(
             log_metrics=False,
             log_plots=True,
         )
+    return {
+        "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
+        "val_metrics": val_metrics,
+    }
 
 
 def _evaluate_val_losses(
@@ -1981,12 +2022,20 @@ def main() -> None:
     ckpt, cfg, method = _load_checkpoint(args.checkpoint)
 
     writer = SummaryWriter(log_dir=str(args.log_dir))
+    summary: dict[str, Any] = {
+        "checkpoint": str(args.checkpoint),
+        "epoch": int(args.epoch),
+        "loss_total": None,
+        "method": method,
+        "run_name": ckpt.get("run_name"),
+        "status": "started",
+    }
     try:
         validation_start = time.perf_counter()
         if method in {"hnn", "phnn"}:
             if not bool(ckpt.get("td_correction", False)):
                 raise ValueError("PHNN async validation now only supports TD-correction checkpoints.")
-            _run_hnn_td_correction_validation(
+            summary.update(_run_hnn_td_correction_validation(
                 ckpt=ckpt,
                 cfg=cfg,
                 device=device,
@@ -1995,11 +2044,11 @@ def main() -> None:
                 do_losses=bool(int(args.do_losses)),
                 do_rollout=bool(int(args.do_rollout)),
                 num_workers=int(args.num_workers),
-            )
+            ))
         elif method == "vpinn":
             if not bool(ckpt.get("td_correction", False)):
                 raise ValueError("VPINN async validation now only supports TD-correction checkpoints.")
-            _run_vpinn_td_correction_validation(
+            summary.update(_run_vpinn_td_correction_validation(
                 ckpt=ckpt,
                 cfg=cfg,
                 device=device,
@@ -2008,11 +2057,16 @@ def main() -> None:
                 do_losses=bool(int(args.do_losses)),
                 do_rollout=bool(int(args.do_rollout)),
                 num_workers=int(args.num_workers),
-            )
+            ))
         else:
             raise ValueError(f"Unsupported method '{method}'.")
         elapsed = time.perf_counter() - validation_start
+        summary["status"] = "completed"
+        summary["validation_wall_time_s"] = float(elapsed)
         writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(args.epoch))
+        summary_path = _async_summary_path(args.log_dir, int(args.epoch))
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     finally:
         writer.flush()
         writer.close()
