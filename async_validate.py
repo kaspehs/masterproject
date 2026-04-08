@@ -49,14 +49,15 @@ from HNN_helper import (
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
     resolve_td_correction_params,
+    resolve_td_correction_mode,
     resolve_td_memory_config,
+    td_correction_mode_flags,
 )
 from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
     _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
     _td_correction_rollout_loss_from_batch,
-    _td_correction_state_rollout,
-    _td_predict_correction,
+    _td_step_with_corrections,
     _td_state_mse_loss,
     _td_state_propagated_nll_loss,
 )
@@ -75,7 +76,10 @@ from methods.vpinn.trainer import (
     _log_td_correction_rollout_validation,
     _td_rollout_traj_to_tensors,
     _build_td_correction_vpinn_datasets,
-    _vpinn_predict_correction,
+    _vpinn_input_dim,
+    _vpinn_output_dim,
+    _vpinn_optional_hidden_inputs_from_context,
+    _vpinn_step_with_corrections,
     _vpinn_rollout_state_loss,
     _vpinn_scale_weak_residual,
     _vpinn_td_rollout,
@@ -303,122 +307,36 @@ def _log_td_correction_hnn_rollout_validation(
     log_plots: bool = True,
     title_suffix: str = "",
 ) -> dict[str, float]:
-    traj_t = _td_hnn_traj_to_tensors(traj, mass_source=td_mass_source)
-    y_true_t = traj_t["y"].to(device)
-    v_true_t = traj_t["v"].to(device)
-    z_true_t = traj_t["z"].to(device)
-    f_true_t = traj_t["f"].to(device)
-    td_force_t = traj_t["td_force"].to(device)
-    ur_t = traj_t["ur"].to(device)
-    td_context_t = traj_t["td_context"].to(device)
-    t_np = traj_t["t"].detach().cpu().numpy()
-    mass_value = float(traj_t["mass_value"])
-    damping_value = float(traj_t["damping_value"])
-    stiffness_value = float(traj_t["stiffness_value"])
-    if z_true_t.shape[0] < 2:
-        return {}
-
-    mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
-    damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
-    stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-
-    z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
+    correction_mode = str(
+        getattr(
+            model,
+            "correction_mode",
+            ("mean_sigma_only" if bool(getattr(model, "use_stochastic_process_noise", False)) else "mean_only"),
+        )
+    )
+    mode_flags = td_correction_mode_flags(correction_mode)
+    return _hnn_td_rollout_validation(
+        writer=writer,
+        epoch=epoch,
         model=model,
-        z0=z_true_t[0:1],
-        ur0=ur_t[0:1],
-        td_context0=td_context_t[0:1],
-        steps=int(z_true_t.shape[0] - 1),
+        traj=traj,
         dt=dt,
-        structural_mass=mass_t,
-        damping_c=damping_t,
-        stiffness=stiffness_t,
+        td_mass_source=td_mass_source,
         td_params=td_params,
         td_memory_cfg=td_memory_cfg,
-    )
-    y_pred = z_pred[0, :, 0].detach().cpu().numpy()
-    v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
-    force_roll = total_force_seq[0, :, 0].detach().cpu().numpy()
-    corr_roll = corr_mu_seq[0, :, 0].detach().cpu().numpy()
-    td_roll = force_roll - corr_roll
-
-    with torch.no_grad():
-        corr0 = model.learned_force(z_true_t[0:1], reduced_velocity=ur_t[0:1])[0, 0]
-        corr_on_data_t = model.learned_force(z_true_t, reduced_velocity=ur_t)
-
-    force_total_full = np.concatenate(
-        [np.asarray([float(td_force_t[0, 0].detach().cpu() + corr0.detach().cpu())]), force_roll],
-        axis=0,
-    )
-    force_td_full = np.concatenate(
-        [td_force_t[:1, 0].detach().cpu().numpy(), td_roll],
-        axis=0,
-    )
-
-    metrics = compute_validation_metrics(
-        model=model,
-        y_data_t=y_true_t[:, 0],
-        val_vel=v_true_t[:, 0],
-        reduced_velocity=ur_t[:, 0],
-        m_eff=mass_value,
-        dt=dt,
-        t=t_np,
-        y_data_raw=y_true_t[:, 0].detach().cpu().numpy(),
-        force_data=f_true_t[:, 0].detach().cpu().numpy(),
-        D=float(model.D),
-        k=stiffness_value,
         device=device,
-        rollout={
-            "y_norm": y_pred / float(model.D),
-            "p_norm": (v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D))),
-            "force_total": force_total_full,
-        },
+        mean_active=bool(mode_flags["mean_active"]),
+        predict_sigma=bool(mode_flags["sigma_active"]),
+        fhat_active=bool(mode_flags["fhat_active"]),
+        use_td_force_input=bool(getattr(model, "use_td_force_input", False)),
+        fhat_bound_multiplier=float(getattr(model, "fhat_bound_multiplier", 1.5)),
+        force_zero_output=bool(getattr(model, "force_zero_output", False)),
+        tag_prefix=tag_prefix,
+        step=step,
+        log_metrics=log_metrics,
+        log_plots=log_plots,
+        title_suffix=title_suffix,
     )
-
-    force_true = f_true_t[:, 0].detach().cpu().numpy()
-    force_model_on_data = (td_force_t + corr_on_data_t.to(device))[:, 0].detach().cpu().numpy()
-    force_std = float(np.std(force_true))
-    if force_std <= 0.0:
-        force_std = 1.0
-    metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((force_model_on_data - force_true) ** 2))) / force_std
-
-    if log_metrics:
-        for name, value in metrics.items():
-            if np.isfinite(float(value)):
-                writer.add_scalar(f"val/{name}", float(value), epoch)
-
-    if log_plots:
-        zoom_mask = create_zoom_mask(t_np)
-        ur_val = float(ur_t[0, 0].detach().cpu().item())
-        log_displacement_plots(
-            writer,
-            epoch,
-            t_np,
-            y_true_t[:, 0].detach().cpu().numpy() / float(model.D),
-            y_pred / float(model.D),
-            v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D)),
-            zoom_mask,
-            reduced_velocity=ur_val,
-            tag_prefix=tag_prefix,
-            step=step,
-            title_suffix=title_suffix,
-        )
-        n_force = min(len(t_np), len(force_total_full), len(force_true), len(force_td_full))
-        force_t = t_np[:n_force]
-        log_force_plots(
-            writer,
-            epoch,
-            force_t,
-            force_total_full[:n_force],
-            force_true[:n_force],
-            create_zoom_mask(force_t),
-            reduced_velocity=ur_val,
-            force_coeff_baseline=force_td_full[:n_force],
-            baseline_label="C_F (Vivana-TD)",
-            tag_prefix=tag_prefix,
-            step=step,
-            title_suffix=title_suffix,
-        )
-    return metrics
 
 
 def _run_hnn_validation(
@@ -743,8 +661,17 @@ def _run_hnn_td_correction_validation(
     dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     td_params = resolve_td_correction_params(hnn_cfg)
     td_memory_cfg = resolve_td_memory_config(hnn_cfg)
-    predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    correction_mode = resolve_td_correction_mode(hnn_cfg)
+    mode_flags = td_correction_mode_flags(correction_mode)
+    mean_active = bool(mode_flags["mean_active"])
+    predict_sigma = bool(mode_flags["sigma_active"])
+    fhat_active = bool(mode_flags["fhat_active"])
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
+    use_phi_input = bool(hnn_cfg.get("use_phi_input", False))
+    use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
+    fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
+    fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
+    fhat_reg_norm = str(getattr(loss_cfg, "fhat_reg_norm", "l2")).strip().lower()
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
     if state_loss_mode not in {"mse", "propagated_nll"}:
         raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
@@ -770,8 +697,14 @@ def _run_hnn_td_correction_validation(
     model_dict["Ca"] = 0.0
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
+    model_dict["use_phi_input"] = use_phi_input
+    model_dict["use_sigma_inputs"] = use_sigma_inputs
+    model_dict["correction_mode"] = correction_mode
     arch_dict = asdict(cfg.architecture)
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    setattr(model, "correction_mode", correction_mode)
+    setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
+    setattr(model, "force_zero_output", force_zero_output)
     _load_state(model, ckpt["model_state"])
     model.eval()
 
@@ -796,37 +729,46 @@ def _run_hnn_td_correction_validation(
     if do_losses and val_loader is not None:
         val_sums = {
             name: torch.zeros((), device=device)
-            for name in ["loss_total", "loss_state", "loss_data", "loss_reg_mean", "loss_reg_sigma"]
+            for name in ["loss_total", "loss_state", "loss_data", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]
         }
         val_count = 0
         with torch.no_grad():
             for batch in val_loader:
                 if len(batch) != 10:
                     raise ValueError("Unexpected TD correction HNN batch format.")
-                z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
+                z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = batch
                 z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
                 t_i = t_i.to(device, non_blocking=(device.type == "cuda"))
                 z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
                 t_next = t_next.to(device, non_blocking=(device.type == "cuda"))
                 ur_i = ur_i.to(device, non_blocking=(device.type == "cuda"))
-                corr_next = corr_next.to(device, non_blocking=(device.type == "cuda"))
-                td_force_next = td_force_next.to(device, non_blocking=(device.type == "cuda"))
+                force_true_next = force_true_next.to(device, non_blocking=(device.type == "cuda"))
+                td_context_i = td_context_i.to(device, non_blocking=(device.type == "cuda"))
                 mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
                 damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
                 stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
-
-                corr_mu, sigma_corr = _td_predict_correction(
-                    model,
+                dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
+                step = _td_step_with_corrections(
+                    model=model,
                     z=z_i,
                     reduced_velocity=ur_i,
-                    td_force_input=td_force_next,
+                    td_context=td_context_i,
+                    dt=dt_i,
                     structural_mass=mass_i,
+                    damping_c=damping_i,
                     stiffness=stiffness_i,
-                    predict_sigma=predict_sigma,
+                    td_params=td_params,
+                    td_memory_cfg=td_memory_cfg,
+                    mean_active=mean_active,
+                    sigma_active=predict_sigma,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                 )
-                dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                total_force_next = td_force_next + corr_mu
+                corr_mu = step["corr_mu"]
+                sigma_corr = step["sigma_corr"]
+                total_force_next = step["total_force_next"]
                 if predict_sigma and state_loss_mode == "propagated_nll":
                     state_loss, _z_next_mean = _td_state_propagated_nll_loss(
                         z_i=z_i,
@@ -851,19 +793,27 @@ def _run_hnn_td_correction_validation(
                 if use_force_data_loss:
                     if predict_sigma:
                         var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
+                        data_loss = torch.mean(0.5 * (((force_true_next - total_force_next) ** 2) / var + torch.log(var)))
                     else:
-                        data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                        data_loss = torch.mean((force_true_next - total_force_next) ** 2)
                 else:
                     data_loss = state_loss.new_tensor(0.0)
                 mean_reg_loss = _reg(corr_mu, mean_reg_norm)
                 sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
-                total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                fhat_reg_loss = _reg(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
+                total_loss = (
+                    state_loss
+                    + float(force_data_weight) * data_loss
+                    + float(mean_reg) * mean_reg_loss
+                    + float(sigma_reg) * sigma_reg_loss
+                    + float(fhat_reg) * fhat_reg_loss
+                )
                 val_sums["loss_total"] += total_loss.detach()
                 val_sums["loss_state"] += state_loss.detach()
                 val_sums["loss_data"] += data_loss.detach()
                 val_sums["loss_reg_mean"] += mean_reg_loss.detach()
                 val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
                 val_count += 1
         val_denom = float(max(1, val_count))
         val_metrics = {
@@ -895,7 +845,11 @@ def _run_hnn_td_correction_validation(
                         non_blocking=(device.type == "cuda"),
                         td_params=td_params,
                         td_memory_cfg=td_memory_cfg,
-                        predict_sigma=predict_sigma,
+                        mean_active=mean_active,
+                        sigma_active=predict_sigma,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
@@ -910,6 +864,7 @@ def _run_hnn_td_correction_validation(
             + float(force_data_weight) * val_metrics["loss_data"]
             + float(mean_reg) * val_metrics["loss_reg_mean"]
             + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+            + float(fhat_reg) * val_metrics["loss_reg_fhat"]
             + float(rollout_det_weight) * rollout_loss_avg
         )
         for name, value in val_metrics.items():
@@ -943,7 +898,11 @@ def _run_hnn_td_correction_validation(
                 td_params=td_params,
                 td_memory_cfg=td_memory_cfg,
                 device=device,
+                mean_active=mean_active,
                 predict_sigma=predict_sigma,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
@@ -989,7 +948,11 @@ def _run_hnn_td_correction_validation(
             td_params=td_params,
             td_memory_cfg=td_memory_cfg,
             device=device,
+            mean_active=mean_active,
             predict_sigma=predict_sigma,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
@@ -1222,7 +1185,11 @@ def _run_vpinn_td_correction_validation(
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
-    probabilistic = bool(vp.get("predict_sigma", False))
+    correction_mode = resolve_td_correction_mode(vp)
+    mode_flags = td_correction_mode_flags(correction_mode)
+    mean_active = bool(mode_flags["mean_active"])
+    probabilistic = bool(mode_flags["sigma_active"])
+    fhat_active = bool(mode_flags["fhat_active"])
     force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
     rollout_stochastic = bool(vp.get("rollout_stochastic", False))
@@ -1255,9 +1222,26 @@ def _run_vpinn_td_correction_validation(
     diameter = float(getattr(cfg.model, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
+    use_phi_input = bool(vp.get("use_phi_input", False))
+    use_sigma_inputs = bool(vp.get("use_sigma_inputs", False))
+    fhat_bound_multiplier = float(vp.get("fhat_bound_multiplier", 1.5))
 
-    model = _build_force_model(cfg, input_dim=(4 if use_td_force_input else 3), output_dim=(2 if probabilistic else 1)).to(device)
+    model = _build_force_model(
+        cfg,
+        input_dim=_vpinn_input_dim(
+            d=1,
+            use_td_force_input=use_td_force_input,
+            use_phi_input=use_phi_input,
+            use_sigma_inputs=use_sigma_inputs,
+        ),
+        output_dim=_vpinn_output_dim(mean_active=mean_active, sigma_active=probabilistic, fhat_active=fhat_active, d=1),
+    ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
+    setattr(model, "use_phi_input", use_phi_input)
+    setattr(model, "use_sigma_inputs", use_sigma_inputs)
+    setattr(model, "correction_mode", correction_mode)
+    setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
+    setattr(model, "force_zero_output", force_zero_output)
     _load_state(model, ckpt["model_state"])
     model.eval()
 
@@ -1295,8 +1279,10 @@ def _run_vpinn_td_correction_validation(
 
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
     sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
+    fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
     mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
+    fhat_reg_norm = str(getattr(loss_cfg, "fhat_reg_norm", "l2")).strip().lower()
     ur_bin_size = float(getattr(cfg.loss, "ur_bin_size", 1.0e-6))
     normalize_by_ur_bin_std = bool(getattr(loss_cfg, "normalize_by_ur_bin_std", False))
     ur_bin_state_scale_info = ckpt.get("ur_bin_state_scale_info", None)
@@ -1317,31 +1303,44 @@ def _run_vpinn_td_correction_validation(
     if do_losses:
         val_sums = {
             name: torch.zeros((), device=device)
-            for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma"]
+            for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]
         }
         val_batches = 0
         with torch.no_grad():
             for batch in val_loader:
-                x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = [
+                x_win, v_win, force_true, ur_win, td_win, m_win, c_win, k_win = [
                     item.to(device, non_blocking=(device.type == "cuda")) for item in batch
                 ]
-                mu_corr, sigma_corr = _vpinn_predict_correction(
-                    model,
-                    x_win,
-                    v_win,
-                    ur_win,
-                    td_force,
-                    probabilistic=probabilistic,
+                step = _vpinn_step_with_corrections(
+                    model=model,
+                    x=x_win,
+                    v=v_win,
+                    ur=ur_win,
+                    td_context=td_win,
+                    dt=dt,
+                    m=m_win,
+                    c=c_win,
+                    k=k_win,
+                    rho=rho,
+                    diameter=diameter,
+                    td_params=td_params,
+                    mean_active=mean_active,
+                    sigma_active=probabilistic,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     sigma_min=sigma_min,
                     force_zero_output=force_zero_output,
                 )
-                total_force_mu = td_force + mu_corr
+                mu_corr = step["corr_mu"]
+                sigma_corr = step["corr_sigma"]
+                total_force_mu = step["total_force_next"]
                 if use_force_loss:
                     if probabilistic:
                         var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        loss_data = torch.mean(0.5 * (((corr_true - mu_corr) ** 2) / var + torch.log(var)))
+                        loss_data = torch.mean(0.5 * (((force_true - total_force_mu) ** 2) / var + torch.log(var)))
                     else:
-                        loss_data = torch.mean((corr_true - mu_corr) ** 2)
+                        loss_data = torch.mean((force_true - total_force_mu) ** 2)
                 else:
                     loss_data = mu_corr.new_tensor(0.0)
                 if use_weak_loss:
@@ -1384,12 +1383,24 @@ def _run_vpinn_td_correction_validation(
                     if probabilistic
                     else mu_corr.new_tensor(0.0)
                 )
-                total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                fhat_reg_loss = (
+                    (torch.mean(torch.abs(step["delta_fhat"])) if fhat_reg_norm == "l1" else torch.mean(step["delta_fhat"] * step["delta_fhat"]))
+                    if fhat_active
+                    else mu_corr.new_tensor(0.0)
+                )
+                total_loss = (
+                    loss_data
+                    + loss_physics
+                    + float(mean_reg) * mean_reg_loss
+                    + float(sigma_reg) * sigma_reg_loss
+                    + float(fhat_reg) * fhat_reg_loss
+                )
                 val_sums["loss_total"] += total_loss.detach()
                 val_sums["loss_data"] += loss_data.detach()
                 val_sums["loss_physics"] += loss_physics.detach()
                 val_sums["loss_reg_mean"] += mean_reg_loss.detach()
                 val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
                 val_batches += 1
         val_denom = float(max(1, val_batches))
         val_metrics = {
@@ -1405,7 +1416,7 @@ def _run_vpinn_td_correction_validation(
                     x0, v0, ur0, td0, x_true_seq, v_true_seq, m0, c0, k0 = [
                         item.to(device, non_blocking=(device.type == "cuda")) for item in rb
                     ]
-                    x_seq, v_seq, _, _, _ = _vpinn_td_rollout(
+                    x_seq, v_seq, _, _, _, _ = _vpinn_td_rollout(
                         model=model,
                         x0=x0,
                         v0=v0,
@@ -1419,7 +1430,11 @@ def _run_vpinn_td_correction_validation(
                         rho=rho,
                         diameter=diameter,
                         td_params=td_params,
-                        probabilistic=probabilistic,
+                        mean_active=mean_active,
+                        sigma_active=probabilistic,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
                         sigma_min=sigma_min,
                         force_zero_output=force_zero_output,
                     )
@@ -1441,6 +1456,7 @@ def _run_vpinn_td_correction_validation(
             + val_metrics["loss_physics"]
             + float(mean_reg) * val_metrics["loss_reg_mean"]
             + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+            + float(fhat_reg) * val_metrics["loss_reg_fhat"]
             + rollout_weight * rollout_loss_avg
         )
         for name, value in val_metrics.items():
@@ -1477,7 +1493,11 @@ def _run_vpinn_td_correction_validation(
                 td_params=td_params,
                 device=device,
                 sigma_min=sigma_min,
+                mean_active=mean_active,
                 probabilistic=probabilistic,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
@@ -1522,7 +1542,11 @@ def _run_vpinn_td_correction_validation(
             td_params=td_params,
             device=device,
             sigma_min=sigma_min,
+            mean_active=mean_active,
             probabilistic=probabilistic,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,

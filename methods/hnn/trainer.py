@@ -63,15 +63,22 @@ from HNN_helper import (
     load_td_correction_trajectories,
     resolve_middle_time_plot,
     resolve_td_correction_params,
+    resolve_td_correction_mode,
     resolve_td_memory_config,
     resolve_td_n_memory_torch,
     rollout_model,
     structural_step_constant_force_torch,
     scaled_residual_loss_per_sample,
+    td_bounded_delta_fhat_torch,
     td_baseline_step_torch,
+    td_correction_mode_flags,
+    td_fhat_active_from_mode,
+    td_mean_active_from_mode,
+    td_predict_sigma_from_mode,
     resolve_cut_start_seconds,
     sample_indices_per_ur,
     sample_one_index_per_ur,
+    td_hidden_inputs_from_context_torch,
 )
 
 
@@ -125,6 +132,20 @@ def _init_sigma_head(module: nn.Module | None, *, mode: str, tiny_std: float, si
         nn.init.constant_(last.bias, bias_value)
 
 
+def _init_fhat_head(module: nn.Module | None, *, mode: str, tiny_std: float) -> None:
+    last = _last_linear(module)
+    if last is None or mode == "standard":
+        return
+    with torch.no_grad():
+        if mode == "zero":
+            nn.init.zeros_(last.weight)
+        elif mode == "tiny":
+            nn.init.normal_(last.weight, mean=0.0, std=float(tiny_std))
+        else:
+            raise ValueError("corr_init_mode must be one of: zero, tiny, standard.")
+        nn.init.zeros_(last.bias)
+
+
 def _resolve_td_correction_init_settings(method_cfg: dict[str, Any], model_cfg: Any) -> tuple[str, float]:
     mode = str(method_cfg.get("corr_init_mode", "standard")).strip().lower()
     if mode not in {"zero", "tiny", "standard"}:
@@ -141,11 +162,14 @@ def _apply_td_correction_head_init(
     mode: str,
     tiny_std: float,
     predict_sigma: bool,
+    predict_fhat: bool,
 ) -> None:
     _init_mean_head(model.u_base_net, mode=mode, tiny_std=tiny_std)
     if predict_sigma:
         sigma_min = float(model.sigma_min.detach().cpu())
         _init_sigma_head(model.sigma_net, mode=mode, tiny_std=tiny_std, sigma_min=sigma_min)
+    if predict_fhat:
+        _init_fhat_head(model.fhat_net, mode=mode, tiny_std=tiny_std)
 
 
 def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
@@ -258,17 +282,42 @@ def _td_state_for_model_scaling(
     return torch.cat([z[..., 0:1], p_model], dim=-1)
 
 
-def _td_predict_correction(
+def _td_optional_hidden_inputs_for_model(
+    model: PHVIV,
+    *,
+    td_context: torch.Tensor,
+    structural_mass: torch.Tensor | float,
+    stiffness: torch.Tensor | float,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not (bool(getattr(model, "use_phi_input", False)) or bool(getattr(model, "use_sigma_inputs", False))):
+        return None, None
+    phi_input, sigma_inputs = td_hidden_inputs_from_context_torch(
+        td_context=td_context,
+        structural_mass=structural_mass,
+        stiffness=stiffness,
+        diameter=float(model.D),
+    )
+    return (
+        phi_input if bool(getattr(model, "use_phi_input", False)) else None,
+        sigma_inputs if bool(getattr(model, "use_sigma_inputs", False)) else None,
+    )
+
+
+def _td_predict_outputs(
     model: PHVIV,
     *,
     z: torch.Tensor,
     reduced_velocity: torch.Tensor,
     td_force_input: torch.Tensor | None,
+    phi_input: torch.Tensor | None,
+    sigma_inputs: torch.Tensor | None,
     structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
-    predict_sigma: bool,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
     force_zero_output: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     z_model = _td_state_for_model_scaling(
         model,
         z=z,
@@ -282,17 +331,19 @@ def _td_predict_correction(
         stiffness=stiffness,
         like=z_model[..., :1],
     )
-    if force_zero_output:
+    if force_zero_output or not mean_active:
         raw_force = z_model[..., :1].new_zeros(z_model.shape[:-1] + (1,))
     else:
         raw_force = model._force_net_raw(
             z_model,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
             td_force_scale=output_scale,
         )
     corr_mu = raw_force * output_scale
-    if predict_sigma:
+    if sigma_active:
         if force_zero_output:
             sigma = model.sigma_min.to(device=raw_force.device, dtype=raw_force.dtype) * output_scale
         else:
@@ -300,13 +351,150 @@ def _td_predict_correction(
                 z_model,
                 reduced_velocity=reduced_velocity,
                 td_force_input=td_force_input,
+                phi_input=phi_input,
+                sigma_inputs=sigma_inputs,
                 td_force_scale=output_scale,
             )
             sigma = model.sigma_min.to(device=raw_sigma.device, dtype=raw_sigma.dtype) + F.softplus(raw_sigma)
             sigma = sigma * output_scale
     else:
         sigma = corr_mu.new_zeros(corr_mu.shape)
-    return corr_mu, sigma
+    if force_zero_output or not fhat_active:
+        raw_delta_fhat = corr_mu.new_zeros(corr_mu.shape)
+    else:
+        raw_delta_fhat = model._fhat_net_raw(
+            z_model,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
+            td_force_scale=output_scale,
+        )
+    return corr_mu, sigma, raw_delta_fhat
+
+
+def _td_step_with_corrections(
+    *,
+    model: PHVIV,
+    z: torch.Tensor,
+    reduced_velocity: torch.Tensor,
+    td_context: torch.Tensor,
+    dt: float | torch.Tensor,
+    structural_mass: torch.Tensor | float,
+    damping_c: torch.Tensor | float,
+    stiffness: torch.Tensor | float,
+    td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
+    force_zero_output: bool = False,
+    rollout_stochastic: bool = False,
+    rollout_noise_scale: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor]:
+    velocity = z[:, 1:2] / structural_mass
+    step_params = dict(td_params)
+    step_params["n_memory"] = resolve_td_n_memory_torch(
+        td_params,
+        dt=dt,
+        flow_speed=td_context[:, 4:5],
+        diameter=float(model.D),
+        memory_cfg=td_memory_cfg,
+    )
+    baseline_force_next, baseline_context_next, baseline_diag = td_baseline_step_torch(
+        velocity=velocity,
+        acceleration=td_context[:, 0:1],
+        td_context=td_context,
+        dt=dt,
+        rho=float(model.rho),
+        diameter=float(model.D),
+        params=step_params,
+        return_diagnostics=True,
+    )
+    phi_input, sigma_inputs = _td_optional_hidden_inputs_for_model(
+        model,
+        td_context=td_context,
+        structural_mass=structural_mass,
+        stiffness=stiffness,
+    )
+    corr_mu, sigma_corr, raw_delta_fhat = _td_predict_outputs(
+        model,
+        z=z,
+        reduced_velocity=reduced_velocity,
+        td_force_input=(baseline_force_next if use_td_force_input else None),
+        phi_input=phi_input,
+        sigma_inputs=sigma_inputs,
+        structural_mass=structural_mass,
+        stiffness=stiffness,
+        mean_active=mean_active,
+        sigma_active=sigma_active,
+        fhat_active=fhat_active,
+        force_zero_output=force_zero_output,
+    )
+    if fhat_active:
+        td_force_next, td_context_next, td_diag = td_baseline_step_torch(
+            velocity=velocity,
+            acceleration=td_context[:, 0:1],
+            td_context=td_context,
+            dt=dt,
+            rho=float(model.rho),
+            diameter=float(model.D),
+            params=step_params,
+            raw_delta_fhat=raw_delta_fhat,
+            fhat_bound_multiplier=float(fhat_bound_multiplier),
+            return_diagnostics=True,
+        )
+    else:
+        td_force_next = baseline_force_next
+        td_context_next = baseline_context_next
+        td_diag = baseline_diag
+        td_diag = dict(td_diag)
+        td_diag["delta_fhat"] = raw_delta_fhat.new_zeros(raw_delta_fhat.shape)
+        td_diag["fhat_corr"] = td_diag["fhat_td"]
+        td_diag["omega_vy_corr"] = td_diag["omega_vy_td"]
+    corr_force = corr_mu
+    if rollout_stochastic and sigma_active:
+        noise = torch.randn(
+            corr_mu.shape,
+            device=corr_mu.device,
+            dtype=corr_mu.dtype,
+            generator=generator,
+        )
+        corr_force = corr_mu + float(rollout_noise_scale) * sigma_corr * noise
+    total_force_next = td_force_next + corr_force
+    y_next, v_next, a_next = structural_step_constant_force_torch(
+        y=z[:, 0:1],
+        velocity=velocity,
+        force=total_force_next,
+        dt=dt,
+        mass=structural_mass,
+        damping_c=damping_c,
+        stiffness=stiffness,
+    )
+    z_next_mean = torch.cat([y_next, v_next * structural_mass], dim=1)
+    td_context_next = td_context_next.clone()
+    td_context_next[:, 0:1] = a_next
+    return {
+        "baseline_force_next": baseline_force_next,
+        "td_force_next": td_force_next,
+        "total_force_next": total_force_next,
+        "corr_mu": corr_mu,
+        "corr_force": corr_force,
+        "sigma_corr": sigma_corr,
+        "raw_delta_fhat": raw_delta_fhat,
+        "delta_fhat": td_diag["delta_fhat"],
+        "fhat_td": td_diag["fhat_td"],
+        "fhat_corr": td_diag["fhat_corr"],
+        "omega_vy_td": td_diag["omega_vy_td"],
+        "omega_vy_corr": td_diag["omega_vy_corr"],
+        "theta_td": td_diag["theta_td"],
+        "z_next_mean": z_next_mean,
+        "td_context_next": td_context_next,
+        "a_next": a_next,
+    }
 
 
 def _td_state_mse_loss(
@@ -370,7 +558,11 @@ def _td_correction_rollout_loss_from_batch(
     non_blocking: bool,
     td_params: dict[str, float],
     td_memory_cfg: dict[str, Any],
-    predict_sigma: bool,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
     force_zero_output: bool,
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
@@ -396,8 +588,8 @@ def _td_correction_rollout_loss_from_batch(
             "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
         )
     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
-    if mode_key == "deterministic" or not predict_sigma:
-        z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+    if mode_key == "deterministic" or not sigma_active:
+        z_pred, _force_seq, _corr_seq, _delta_fhat_seq = _td_correction_state_rollout(
             model=model,
             z0=z0,
             ur0=ur0,
@@ -409,7 +601,11 @@ def _td_correction_rollout_loss_from_batch(
             stiffness=stiffness0,
             td_params=td_params,
             td_memory_cfg=td_memory_cfg,
-            predict_sigma=False,
+            mean_active=mean_active,
+            sigma_active=False,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
         return torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
@@ -426,7 +622,7 @@ def _td_correction_rollout_loss_from_batch(
     stiffness0_in = stiffness0.unsqueeze(0).expand(samples, *stiffness0.shape).reshape(samples * batch_size, *stiffness0.shape[1:])
     dt_roll_in = dt_roll.unsqueeze(0).expand(samples, *dt_roll.shape).reshape(samples * batch_size, *dt_roll.shape[1:])
 
-    z_pred, _force_seq, _corr_seq = _td_correction_state_rollout(
+    z_pred, _force_seq, _corr_seq, _delta_fhat_seq = _td_correction_state_rollout(
         model=model,
         z0=z0_in,
         ur0=ur0_in,
@@ -438,7 +634,11 @@ def _td_correction_rollout_loss_from_batch(
         stiffness=stiffness0_in,
         td_params=td_params,
         td_memory_cfg=td_memory_cfg,
-        predict_sigma=True,
+        mean_active=mean_active,
+        sigma_active=sigma_active,
+        fhat_active=fhat_active,
+        use_td_force_input=use_td_force_input,
+        fhat_bound_multiplier=fhat_bound_multiplier,
         force_zero_output=force_zero_output,
         rollout_stochastic=True,
         rollout_noise_scale=rollout_noise_scale,
@@ -470,79 +670,59 @@ def _td_correction_state_rollout(
     stiffness: torch.Tensor,
     td_params: dict[str, float],
     td_memory_cfg: dict[str, Any],
-    predict_sigma: bool = False,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
     rollout_seed: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     z = z0
     td_context = td_context0
     z_hist = [z0]
     total_force_hist: list[torch.Tensor] = []
     corr_mu_hist: list[torch.Tensor] = []
+    delta_fhat_hist: list[torch.Tensor] = []
     generator: torch.Generator | None = None
     if rollout_seed is not None:
         generator = torch.Generator(device=z0.device)
         generator.manual_seed(int(rollout_seed))
     for _ in range(int(steps)):
-        velocity = z[:, 1:2] / structural_mass
-        step_params = dict(td_params)
-        step_params["n_memory"] = resolve_td_n_memory_torch(
-            td_params,
-            dt=dt,
-            flow_speed=td_context[:, 4:5],
-            diameter=float(model.D),
-            memory_cfg=td_memory_cfg,
-        )
-        td_force_next, td_context_next = td_baseline_step_torch(
-            velocity=velocity,
-            acceleration=td_context[:, 0:1],
-            td_context=td_context,
-            dt=dt,
-            rho=float(model.rho),
-            diameter=float(model.D),
-            params=step_params,
-        )
-        corr_mu, sigma_corr = _td_predict_correction(
-            model,
+        step = _td_step_with_corrections(
+            model=model,
             z=z,
             reduced_velocity=ur0,
-            td_force_input=td_force_next,
-            structural_mass=structural_mass,
-            stiffness=stiffness,
-            predict_sigma=predict_sigma,
-            force_zero_output=force_zero_output,
-        )
-        corr_force = corr_mu
-        if rollout_stochastic and predict_sigma:
-            noise = torch.randn(
-                corr_mu.shape,
-                device=corr_mu.device,
-                dtype=corr_mu.dtype,
-                generator=generator,
-            )
-            corr_force = corr_mu + float(rollout_noise_scale) * sigma_corr * noise
-        total_force = td_force_next + corr_force
-        y_next, v_next, a_next = structural_step_constant_force_torch(
-            y=z[:, 0:1],
-            velocity=velocity,
-            force=total_force,
+            td_context=td_context,
             dt=dt,
-            mass=structural_mass,
+            structural_mass=structural_mass,
             damping_c=damping_c,
             stiffness=stiffness,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+            mean_active=mean_active,
+            sigma_active=sigma_active,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
+            force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            generator=generator,
         )
-        z = torch.cat([y_next, v_next * structural_mass], dim=1)
-        td_context = td_context_next.clone()
-        td_context[:, 0:1] = a_next
+        z = step["z_next_mean"]
+        td_context = step["td_context_next"]
         z_hist.append(z)
-        total_force_hist.append(total_force)
-        corr_mu_hist.append(corr_force)
+        total_force_hist.append(step["total_force_next"])
+        corr_mu_hist.append(step["corr_force"])
+        delta_fhat_hist.append(step["delta_fhat"])
     z_seq = torch.stack(z_hist, dim=1)
     total_force_seq = torch.stack(total_force_hist, dim=1) if total_force_hist else z0.new_zeros((z0.shape[0], 0, 1))
     corr_mu_seq = torch.stack(corr_mu_hist, dim=1) if corr_mu_hist else z0.new_zeros((z0.shape[0], 0, 1))
-    return z_seq, total_force_seq, corr_mu_seq
+    delta_fhat_seq = torch.stack(delta_fhat_hist, dim=1) if delta_fhat_hist else z0.new_zeros((z0.shape[0], 0, 1))
+    return z_seq, total_force_seq, corr_mu_seq, delta_fhat_seq
 
 
 def _td_pure_baseline_state_rollout(
@@ -618,6 +798,7 @@ def _build_td_correction_hnn_loaders(
     }.get(str(mass_source).strip().lower())
     if mass_key is None:
         raise ValueError("td_mass_source must be one of: dry, effective.")
+    sigma_key_prefix = "dry" if mass_key == "dry_mass_kg" else "effective"
 
     def _one_step_dataset(trajs: list[dict[str, np.ndarray]]) -> TensorDataset | None:
         tensors: list[TensorDataset] = []
@@ -626,8 +807,8 @@ def _build_td_correction_hnn_loaders(
             dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
             ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
-            corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr_per_m"])).float().unsqueeze(1)
-            td_force = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1)
+            force_true = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1)
+            td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
             mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
             damping = torch.full((y.shape[0], 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=torch.float32)
             stiffness = torch.full((y.shape[0], 1), float(np.asarray(traj["stiffness_n_m"]).reshape(())), dtype=torch.float32)
@@ -638,8 +819,8 @@ def _build_td_correction_hnn_loaders(
                 z[1:],
                 t[1:].unsqueeze(1),
                 ur[:-1],
-                corr[1:],
-                td_force[1:],
+                force_true[1:],
+                td_context[:-1],
                 mass[:-1],
                 damping[:-1],
                 stiffness[:-1],
@@ -743,7 +924,11 @@ def _log_td_correction_rollout_validation(
     td_params: dict[str, float],
     td_memory_cfg: dict[str, Any],
     device: torch.device,
-    predict_sigma: bool = False,
+    mean_active: bool,
+    predict_sigma: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
@@ -775,7 +960,7 @@ def _log_td_correction_rollout_validation(
     mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
     damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
     stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-    z_pred, total_force_seq, corr_mu_seq = _td_correction_state_rollout(
+    z_pred, total_force_seq, corr_mu_seq, delta_fhat_seq = _td_correction_state_rollout(
         model=model,
         z0=z_true_t[0:1],
         ur0=ur_t[0:1],
@@ -787,7 +972,11 @@ def _log_td_correction_rollout_validation(
         stiffness=stiffness_t,
         td_params=td_params,
         td_memory_cfg=td_memory_cfg,
-        predict_sigma=predict_sigma,
+        mean_active=mean_active,
+        sigma_active=predict_sigma,
+        fhat_active=fhat_active,
+        use_td_force_input=use_td_force_input,
+        fhat_bound_multiplier=fhat_bound_multiplier,
         force_zero_output=force_zero_output,
         rollout_stochastic=rollout_stochastic,
         rollout_noise_scale=rollout_noise_scale,
@@ -797,24 +986,38 @@ def _log_td_correction_rollout_validation(
     v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
     force_roll = total_force_seq[0, :, 0].detach().cpu().numpy()
     corr_roll = corr_mu_seq[0, :, 0].detach().cpu().numpy()
+    delta_fhat_roll = delta_fhat_seq[0, :, 0].detach().cpu().numpy()
     td_roll = force_roll - corr_roll
 
     with torch.no_grad():
-        corr_on_data, sigma_on_data = _td_predict_correction(
-            model,
-            z=z_true_t,
-            reduced_velocity=ur_t,
-            td_force_input=td_force_t,
-            structural_mass=torch.full_like(y_true_t, mass_value),
-            stiffness=torch.full_like(y_true_t, stiffness_value),
-            predict_sigma=False,
+        step_on_data = _td_step_with_corrections(
+            model=model,
+            z=z_true_t[:-1],
+            reduced_velocity=ur_t[:-1],
+            td_context=td_context_t[:-1],
+            dt=traj_dt,
+            structural_mass=torch.full((z_true_t.shape[0] - 1, 1), mass_value, dtype=z_true_t.dtype, device=device),
+            damping_c=torch.full((z_true_t.shape[0] - 1, 1), damping_value, dtype=z_true_t.dtype, device=device),
+            stiffness=torch.full((z_true_t.shape[0] - 1, 1), stiffness_value, dtype=z_true_t.dtype, device=device),
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+            mean_active=mean_active,
+            sigma_active=predict_sigma,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
+        corr_on_data = step_on_data["corr_mu"]
+        sigma_on_data = step_on_data["sigma_corr"]
+        td_force_on_data = step_on_data["td_force_next"]
+        total_force_on_data = step_on_data["total_force_next"]
+        delta_fhat_on_data = step_on_data["delta_fhat"]
     force_total_full = np.concatenate(
-        [np.asarray([float((td_force_t[0:1] + corr_on_data[0:1])[0, 0].detach().cpu())]), force_roll],
+        [np.asarray([float(total_force_on_data[0, 0].detach().cpu())]), force_roll],
         axis=0,
     )
-    force_td_full = np.concatenate([td_force_t[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
+    force_td_full = np.concatenate([td_force_on_data[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
 
     metrics = compute_validation_metrics(
         model=model,
@@ -835,12 +1038,15 @@ def _log_td_correction_rollout_validation(
             "force_total": force_total_full,
         },
     )
-    force_true = f_true_t[:, 0].detach().cpu().numpy()
-    force_model_on_data = (td_force_t[:, 0] + corr_on_data[:, 0]).detach().cpu().numpy()
+    force_true = f_true_t[1:, 0].detach().cpu().numpy()
+    force_model_on_data = total_force_on_data[:, 0].detach().cpu().numpy()
     force_std = float(np.std(force_true))
     if force_std <= 0.0:
         force_std = 1.0
     metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((force_model_on_data - force_true) ** 2))) / force_std
+    if fhat_active:
+        metrics["Delta fhat mean abs"] = float(torch.mean(torch.abs(delta_fhat_on_data)).detach().cpu())
+        metrics["Delta fhat mean"] = float(torch.mean(delta_fhat_on_data).detach().cpu())
 
     if log_metrics:
         for name, value in metrics.items():
@@ -875,7 +1081,7 @@ def _log_td_correction_rollout_validation(
             epoch,
             force_t,
             force_total_full[:n_force],
-            force_true[:n_force],
+            f_true_t[:, 0].detach().cpu().numpy()[:n_force],
             create_zoom_mask(force_t),
             reduced_velocity=ur_val,
             force_coeff_baseline=force_td_full[:n_force],
@@ -889,8 +1095,8 @@ def _log_td_correction_rollout_validation(
             log_correction_on_data_plot(
                 writer,
                 epoch,
-                t=t_np,
-                corr_true=(f_true_t[:, 0] - td_force_t[:, 0]).detach().cpu().numpy(),
+                t=t_np[1:],
+                corr_true=(f_true_t[1:, 0] - td_force_on_data[:, 0]).detach().cpu().numpy(),
                 corr_pred=corr_on_data[:, 0].detach().cpu().numpy(),
                 sigma=(
                     sigma_on_data[:, 0].detach().cpu().numpy()
@@ -904,6 +1110,21 @@ def _log_td_correction_rollout_validation(
                 step=step,
                 title_suffix=title_suffix,
             )
+            if fhat_active:
+                log_correction_on_data_plot(
+                    writer,
+                    epoch,
+                    t=t_np[1:],
+                    corr_true=np.zeros_like(delta_fhat_on_data[:, 0].detach().cpu().numpy()),
+                    corr_pred=delta_fhat_on_data[:, 0].detach().cpu().numpy(),
+                    sigma=None,
+                    reduced_velocity=ur_val,
+                    value_label="Delta fhat",
+                    sigma_label="",
+                    tag="final_val/delta_fhat_on_data",
+                    step=step,
+                    title_suffix=title_suffix,
+                )
         if log_phase_map:
             q_extent = np.concatenate([np.asarray(q_true_norm, dtype=float), np.asarray(q_pred_norm, dtype=float)])
             p_extent = np.concatenate([np.asarray(p_true_norm, dtype=float), np.asarray(p_pred_norm, dtype=float)])
@@ -934,42 +1155,116 @@ def _log_td_correction_rollout_validation(
                     dtype=z_true_t.dtype,
                     device=device,
                 )
+            phi_grid = None
+            sigma_grid_inputs = None
+            if bool(getattr(model, "use_phi_input", False)) or bool(getattr(model, "use_sigma_inputs", False)):
+                if bool(getattr(model, "use_phi_input", False)):
+                    phi_grid = torch.as_tensor(
+                        np.stack(
+                            [
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["phi_sin_td"], dtype=float)),
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["phi_cos_td"], dtype=float)),
+                            ],
+                            axis=-1,
+                        ).reshape(-1, 2),
+                        dtype=z_true_t.dtype,
+                        device=device,
+                    )
+                if bool(getattr(model, "use_sigma_inputs", False)):
+                    sigma_grid_inputs = torch.as_tensor(
+                        np.stack(
+                            [
+                                nearest_phase_series_values(
+                                    q_grid,
+                                    p_grid,
+                                    q_true_norm,
+                                    p_true_norm,
+                                    np.asarray(traj["sig_dy_norm_dry_td" if mass_key == "dry_mass_kg" else "sig_dy_norm_effective_td"], dtype=float),
+                                ),
+                                nearest_phase_series_values(
+                                    q_grid,
+                                    p_grid,
+                                    q_true_norm,
+                                    p_true_norm,
+                                    np.asarray(traj["sig_ddy_norm_dry_td" if mass_key == "dry_mass_kg" else "sig_ddy_norm_effective_td"], dtype=float),
+                                ),
+                            ],
+                            axis=-1,
+                        ).reshape(-1, 2),
+                        dtype=z_true_t.dtype,
+                        device=device,
+                    )
             with torch.no_grad():
-                corr_grid, sigma_grid = _td_predict_correction(
+                corr_grid, sigma_grid, raw_delta_fhat_grid = _td_predict_outputs(
                     model,
                     z=z_grid,
                     reduced_velocity=ur_grid,
-                    td_force_input=td_force_grid,
+                    td_force_input=(td_force_grid if use_td_force_input else None),
+                    phi_input=phi_grid,
+                    sigma_inputs=sigma_grid_inputs,
                     structural_mass=torch.full((z_grid.shape[0], 1), mass_value, dtype=z_true_t.dtype, device=device),
                     stiffness=torch.full((z_grid.shape[0], 1), stiffness_value, dtype=z_true_t.dtype, device=device),
-                    predict_sigma=False,
+                    mean_active=mean_active,
+                    sigma_active=predict_sigma,
+                    fhat_active=fhat_active,
                     force_zero_output=force_zero_output,
                 )
-            output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
-            log_signed_phase_output_plot(
-                writer,
-                epoch,
-                q_grid=q_grid,
-                p_grid=p_grid,
-                values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
-                q_true=q_true_norm,
-                p_true=p_true_norm,
-                q_pred=q_pred_norm,
-                p_pred=p_pred_norm,
-                reduced_velocity=ur_val,
-                output_label=output_label,
-                sigma_values=(
-                    sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
-                    if predict_sigma
-                    else None
-                ),
-                sigma_label=(
-                    "Sigma coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Sigma force"
-                ),
-                tag="final_val/phase_output",
-                step=step,
-                title_suffix=title_suffix,
-            )
+            if mean_active:
+                output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
+                log_signed_phase_output_plot(
+                    writer,
+                    epoch,
+                    q_grid=q_grid,
+                    p_grid=p_grid,
+                    values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
+                    q_true=q_true_norm,
+                    p_true=p_true_norm,
+                    q_pred=q_pred_norm,
+                    p_pred=p_pred_norm,
+                    reduced_velocity=ur_val,
+                    output_label=output_label,
+                    sigma_values=(
+                        sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
+                        if predict_sigma
+                        else None
+                    ),
+                    sigma_label=(
+                        "Sigma coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Sigma force"
+                    ),
+                    tag="final_val/phase_output",
+                    step=step,
+                    title_suffix=title_suffix,
+                )
+            if fhat_active:
+                delta_fhat_grid, _fhat_corr_grid = td_bounded_delta_fhat_torch(
+                    raw_delta_fhat_grid,
+                    fhat_td=torch.as_tensor(
+                        nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["fhat_td"], dtype=float)).reshape(-1, 1),
+                        dtype=z_true_t.dtype,
+                        device=device,
+                    ),
+                    fhat_min=float(td_params["fhat_min"]),
+                    fhat_max=float(td_params["fhat_max"]),
+                    fhat_bound_multiplier=float(fhat_bound_multiplier),
+                )
+                log_signed_phase_output_plot(
+                    writer,
+                    epoch,
+                    q_grid=q_grid,
+                    p_grid=p_grid,
+                    values=delta_fhat_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
+                    q_true=q_true_norm,
+                    p_true=p_true_norm,
+                    q_pred=q_pred_norm,
+                    p_pred=p_pred_norm,
+                    reduced_velocity=ur_val,
+                    output_label="Delta fhat",
+                    sigma_values=None,
+                    sigma_label="",
+                    tag="final_val/phase_output_delta_fhat",
+                    step=step,
+                    title_suffix=title_suffix,
+                )
     return metrics
 
 
@@ -2316,8 +2611,19 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         else []
     )
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
-    predict_sigma = bool(hnn_cfg.get("predict_sigma", False))
+    correction_mode = resolve_td_correction_mode(hnn_cfg)
+    mode_flags = td_correction_mode_flags(correction_mode)
+    mean_active = bool(mode_flags["mean_active"])
+    predict_sigma = bool(mode_flags["sigma_active"])
+    fhat_active = bool(mode_flags["fhat_active"])
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
+    use_phi_input = bool(hnn_cfg.get("use_phi_input", False))
+    use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
+    fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
+    if not np.isfinite(fhat_bound_multiplier) or fhat_bound_multiplier <= 0.0:
+        raise ValueError("hnn.fhat_bound_multiplier must be finite and positive.")
+    if fhat_active and use_td_force_input:
+        raise ValueError("hnn.use_td_force_input=true is invalid for correction_mode values that include fhat correction.")
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
     if state_loss_mode not in {"mse", "propagated_nll"}:
         raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
@@ -2331,8 +2637,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
     sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
+    fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
     mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
     sigma_reg_norm = str(getattr(loss_cfg, "sigma_reg_norm", "l2")).strip().lower()
+    fhat_reg_norm = str(getattr(loss_cfg, "fhat_reg_norm", "l2")).strip().lower()
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     rollout_det_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
@@ -2355,7 +2663,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
     if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_det_weight > 0.0:
         if not predict_sigma:
-            raise ValueError("PHNN stochastic rollout loss modes require hnn.predict_sigma=true.")
+            raise ValueError("PHNN stochastic rollout loss modes require a correction_mode that includes the sigma head.")
         if rollout_stochastic_samples < 2:
             raise ValueError(
                 "loss.rollout_stochastic_samples must be >= 2 when "
@@ -2379,13 +2687,20 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     model_dict["Ca"] = 0.0
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
+    model_dict["use_phi_input"] = use_phi_input
+    model_dict["use_sigma_inputs"] = use_sigma_inputs
+    model_dict["correction_mode"] = correction_mode
     arch_dict = asdict(config.architecture)
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    setattr(model, "correction_mode", correction_mode)
+    setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
+    setattr(model, "force_zero_output", force_zero_output)
     _apply_td_correction_head_init(
         model,
         mode=corr_init_mode,
         tiny_std=corr_init_tiny_std,
         predict_sigma=predict_sigma,
+        predict_fhat=fhat_active,
     )
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
@@ -2444,8 +2759,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(batch) != 10:
             raise ValueError("Unexpected TD correction HNN batch format.")
-        z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = batch
-        return z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i
+        z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = batch
+        return z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i
 
     def _state_loss(
         *,
@@ -2453,29 +2768,36 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         dt_i: torch.Tensor,
         z_next: torch.Tensor,
         ur_i: torch.Tensor,
-        td_force_next: torch.Tensor,
+        td_context_i: torch.Tensor,
         mass_i: torch.Tensor,
         damping_i: torch.Tensor,
         stiffness_i: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        corr_mu, sigma_corr = _td_predict_correction(
-            model,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        step = _td_step_with_corrections(
+            model=model,
             z=z_i,
             reduced_velocity=ur_i,
-            td_force_input=td_force_next,
+            td_context=td_context_i,
+            dt=dt_i,
             structural_mass=mass_i,
+            damping_c=damping_i,
             stiffness=stiffness_i,
-            predict_sigma=predict_sigma,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+            mean_active=mean_active,
+            sigma_active=predict_sigma,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
-        total_force_next = td_force_next + corr_mu
         if predict_sigma and state_loss_mode == "propagated_nll":
             state_loss, _z_next_mean = _td_state_propagated_nll_loss(
                 z_i=z_i,
                 dt_i=dt_i,
                 z_next=z_next,
-                total_force_next=total_force_next,
-                sigma_corr=sigma_corr,
+                total_force_next=step["total_force_next"],
+                sigma_corr=step["sigma_corr"],
                 mass_i=mass_i,
                 damping_i=damping_i,
                 stiffness_i=stiffness_i,
@@ -2485,12 +2807,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 z_i=z_i,
                 dt_i=dt_i,
                 z_next=z_next,
-                total_force_next=total_force_next,
+                total_force_next=step["total_force_next"],
                 mass_i=mass_i,
                 damping_i=damping_i,
                 stiffness_i=stiffness_i,
             )
-        return state_loss, corr_mu, sigma_corr
+        step["z_next_mean"] = _z_next_mean
+        return state_loss, step
 
     def _regularizer(value: torch.Tensor, norm: str) -> torch.Tensor:
         key = str(norm).strip().lower()
@@ -2518,7 +2841,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         (
             f"HNN TD-correction setup: epochs={epochs}, batch_size={int(training_cfg.batch_size)}, "
             f"steps_per_epoch={train_steps_per_epoch}, train_instances={train_instances}, "
-            f"train_trajectories={len(train_trajs)}"
+            f"train_trajectories={len(train_trajs)}, correction_mode={correction_mode}"
         ),
         (
             f"Validation setup: steps={val_steps_per_epoch}, val_instances={val_instances}, "
@@ -2539,7 +2862,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     )
     if predict_sigma and not use_force_data_loss and not sigma_identified_by_rollout:
         startup_lines.append(
-            "Warning: hnn.predict_sigma=true with loss.use_force_data_loss=false. "
+            "Warning: the active correction_mode includes sigma while loss.use_force_data_loss=false. "
             "Sigma is treated as correction-force uncertainty, and no stochastic rollout loss is enabled."
         )
     if rollout_det_weight > 0.0:
@@ -2588,6 +2911,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss_data": torch.zeros((), device=device),
             "loss_reg_mean": torch.zeros((), device=device),
             "loss_reg_sigma": torch.zeros((), device=device),
+            "loss_reg_fhat": torch.zeros((), device=device),
             "loss_rollout_det": torch.zeros((), device=device),
             "grad_norm": torch.zeros((), device=device),
         }
@@ -2600,40 +2924,43 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         batch_count = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_det_weight > 0.0 else None
         for batch in train_loader:
-            z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
+            z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
             t_i = t_i.to(device, non_blocking=non_blocking)
             z_next = z_next.to(device, non_blocking=non_blocking)
             t_next = t_next.to(device, non_blocking=non_blocking)
             ur_i = ur_i.to(device, non_blocking=non_blocking)
-            corr_next = corr_next.to(device, non_blocking=non_blocking)
-            td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+            force_true_next = force_true_next.to(device, non_blocking=non_blocking)
+            td_context_i = td_context_i.to(device, non_blocking=non_blocking)
             mass_i = mass_i.to(device, non_blocking=non_blocking)
             damping_i = damping_i.to(device, non_blocking=non_blocking)
             stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                state_loss, corr_mu, sigma_corr = _state_loss(
+                state_loss, step = _state_loss(
                     z_i=z_i,
                     dt_i=dt_i,
                     z_next=z_next,
                     ur_i=ur_i,
-                    td_force_next=td_force_next,
+                    td_context_i=td_context_i,
                     mass_i=mass_i,
                     damping_i=damping_i,
                     stiffness_i=stiffness_i,
                 )
+                corr_mu = step["corr_mu"]
+                sigma_corr = step["sigma_corr"]
                 if use_force_data_loss:
                     if predict_sigma:
                         var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
+                        data_loss = torch.mean(0.5 * (((force_true_next - step["total_force_next"]) ** 2) / var + torch.log(var)))
                     else:
-                        data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                        data_loss = torch.mean((force_true_next - step["total_force_next"]) ** 2)
                 else:
                     data_loss = state_loss.new_tensor(0.0)
                 mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
                 sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                 rollout_det_loss = state_loss.new_tensor(0.0)
                 if rollout_iter is not None:
                     try:
@@ -2648,7 +2975,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         non_blocking=non_blocking,
                         td_params=td_params,
                         td_memory_cfg=td_memory_cfg,
-                        predict_sigma=predict_sigma,
+                        mean_active=mean_active,
+                        sigma_active=predict_sigma,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
@@ -2681,7 +3012,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 else:
                     base_loss = state_loss + float(force_data_weight) * data_loss
                     weighted_rollout_det = float(rollout_det_weight) * rollout_det_loss
-                total_loss = base_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + weighted_rollout_det
+                total_loss = (
+                    base_loss
+                    + float(mean_reg) * mean_reg_loss
+                    + float(sigma_reg) * sigma_reg_loss
+                    + float(fhat_reg) * fhat_reg_loss
+                    + weighted_rollout_det
+                )
             if total_loss.requires_grad:
                 if scaler.is_enabled():
                     scaler.scale(total_loss).backward()
@@ -2702,6 +3039,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             sums["loss_data"] += data_loss.detach()
             sums["loss_reg_mean"] += mean_reg_loss.detach()
             sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+            sums["loss_reg_fhat"] += fhat_reg_loss.detach()
             sums["loss_rollout_det"] += rollout_det_loss.detach()
             sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
 
@@ -2739,49 +3077,60 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 "loss_data": torch.zeros((), device=device),
                 "loss_reg_mean": torch.zeros((), device=device),
                 "loss_reg_sigma": torch.zeros((), device=device),
+                "loss_reg_fhat": torch.zeros((), device=device),
             }
             val_count = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    z_i, t_i, z_next, t_next, ur_i, corr_next, td_force_next, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
+                    z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
                     z_i = z_i.to(device, non_blocking=non_blocking)
                     t_i = t_i.to(device, non_blocking=non_blocking)
                     z_next = z_next.to(device, non_blocking=non_blocking)
                     t_next = t_next.to(device, non_blocking=non_blocking)
                     ur_i = ur_i.to(device, non_blocking=non_blocking)
-                    corr_next = corr_next.to(device, non_blocking=non_blocking)
-                    td_force_next = td_force_next.to(device, non_blocking=non_blocking)
+                    force_true_next = force_true_next.to(device, non_blocking=non_blocking)
+                    td_context_i = td_context_i.to(device, non_blocking=non_blocking)
                     mass_i = mass_i.to(device, non_blocking=non_blocking)
                     damping_i = damping_i.to(device, non_blocking=non_blocking)
                     stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                         dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                        state_loss, corr_mu, sigma_corr = _state_loss(
+                        state_loss, step = _state_loss(
                             z_i=z_i,
                             dt_i=dt_i,
                             z_next=z_next,
                             ur_i=ur_i,
-                            td_force_next=td_force_next,
+                            td_context_i=td_context_i,
                             mass_i=mass_i,
                             damping_i=damping_i,
                             stiffness_i=stiffness_i,
                         )
+                        corr_mu = step["corr_mu"]
+                        sigma_corr = step["sigma_corr"]
                         if use_force_data_loss:
                             if predict_sigma:
                                 var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                                data_loss = torch.mean(0.5 * (((corr_next - corr_mu) ** 2) / var + torch.log(var)))
+                                data_loss = torch.mean(0.5 * (((force_true_next - step["total_force_next"]) ** 2) / var + torch.log(var)))
                             else:
-                                data_loss = torch.mean((corr_next - corr_mu) ** 2)
+                                data_loss = torch.mean((force_true_next - step["total_force_next"]) ** 2)
                         else:
                             data_loss = state_loss.new_tensor(0.0)
                         mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
                         sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
-                        total_loss = state_loss + float(force_data_weight) * data_loss + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                        fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
+                        total_loss = (
+                            state_loss
+                            + float(force_data_weight) * data_loss
+                            + float(mean_reg) * mean_reg_loss
+                            + float(sigma_reg) * sigma_reg_loss
+                            + float(fhat_reg) * fhat_reg_loss
+                        )
                     val_sums["loss_total"] += total_loss.detach()
                     val_sums["loss_state"] += state_loss.detach()
                     val_sums["loss_data"] += data_loss.detach()
                     val_sums["loss_reg_mean"] += mean_reg_loss.detach()
                     val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                    val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
                     val_count += 1
             val_denom = float(max(1, val_count))
             val_metrics = {
@@ -2800,7 +3149,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             non_blocking=non_blocking,
                             td_params=td_params,
                             td_memory_cfg=td_memory_cfg,
-                            predict_sigma=predict_sigma,
+                            mean_active=mean_active,
+                            sigma_active=predict_sigma,
+                            fhat_active=fhat_active,
+                            use_td_force_input=use_td_force_input,
+                            fhat_bound_multiplier=fhat_bound_multiplier,
                             force_zero_output=force_zero_output,
                             rollout_loss_mode=rollout_loss_mode,
                             rollout_stochastic_samples=rollout_stochastic_samples,
@@ -2814,6 +3167,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 + float(force_data_weight) * val_metrics["loss_data"]
                 + float(mean_reg) * val_metrics["loss_reg_mean"]
                 + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+                + float(fhat_reg) * val_metrics["loss_reg_fhat"]
                 + float(rollout_det_weight) * rollout_loss_avg
             )
             for name, value in val_metrics.items():
@@ -2845,7 +3199,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         td_params=td_params,
                         td_memory_cfg=td_memory_cfg,
                         device=device,
+                        mean_active=mean_active,
                         predict_sigma=predict_sigma,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_stochastic=rollout_stochastic,
                         rollout_noise_scale=rollout_noise_scale,
@@ -2889,7 +3247,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     td_params=td_params,
                     td_memory_cfg=td_memory_cfg,
                     device=device,
+                    mean_active=mean_active,
                     predict_sigma=predict_sigma,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                     rollout_stochastic=rollout_stochastic,
                     rollout_noise_scale=rollout_noise_scale,
@@ -2909,6 +3271,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         output_ur_values: list[float] = []
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
+        delta_fhat_series_list: list[np.ndarray] = []
         metric_trajs: list[dict[str, Any]] = []
         seen_metric_ur: set[float] = set()
         for traj in val_trajs:
@@ -2939,7 +3302,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 td_params=td_params,
                 td_memory_cfg=td_memory_cfg,
                 device=device,
+                mean_active=mean_active,
                 predict_sigma=predict_sigma,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
@@ -2972,20 +3339,33 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
             ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
             with torch.no_grad():
-                corr_on_data, sigma_on_data = _td_predict_correction(
-                    model,
-                    z=z_true_t,
-                    reduced_velocity=ur_t,
-                    td_force_input=td_force_t,
-                    structural_mass=torch.full_like(y_true_t, mass_value),
-                    stiffness=torch.full_like(y_true_t, stiffness_value),
-                    predict_sigma=predict_sigma,
+                step_on_data = _td_step_with_corrections(
+                    model=model,
+                    z=z_true_t[:-1],
+                    reduced_velocity=ur_t[:-1],
+                    td_context=torch.from_numpy(np.ascontiguousarray(traj["td_context"][:-1])).float().to(device),
+                    dt=dt,
+                    structural_mass=torch.full((z_true_t.shape[0] - 1, 1), mass_value, dtype=z_true_t.dtype, device=device),
+                    damping_c=torch.full((z_true_t.shape[0] - 1, 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=z_true_t.dtype, device=device),
+                    stiffness=torch.full((z_true_t.shape[0] - 1, 1), stiffness_value, dtype=z_true_t.dtype, device=device),
+                    td_params=td_params,
+                    td_memory_cfg=td_memory_cfg,
+                    mean_active=mean_active,
+                    sigma_active=predict_sigma,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                 )
+                corr_on_data = step_on_data["corr_mu"]
+                sigma_on_data = step_on_data["sigma_corr"]
+                delta_fhat_on_data = step_on_data["delta_fhat"]
             output_ur_values.append(ur_val)
             corr_series_list.append(corr_on_data[:, 0].detach().cpu().numpy())
             if predict_sigma:
                 sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
+            if fhat_active:
+                delta_fhat_series_list.append(delta_fhat_on_data[:, 0].detach().cpu().numpy())
 
             plot_metrics = _log_td_correction_rollout_validation(
                 writer=writer,
@@ -2997,7 +3377,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 td_params=td_params,
                 td_memory_cfg=td_memory_cfg,
                 device=device,
+                mean_active=mean_active,
                 predict_sigma=predict_sigma,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
@@ -3038,7 +3422,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 epochs,
                 reference_ur_values=reference_ur_values,
             )
-        if output_ur_values and corr_series_list:
+        if output_ur_values and mean_active and corr_series_list:
             force_mode = str(getattr(model, "force_output", "force"))
             log_output_distribution_vs_ur(
                 writer,
@@ -3049,6 +3433,17 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 mean_label=("Correction coefficient" if force_mode == "coefficient" else "Correction force"),
                 sigma_label=("Sigma coefficient" if force_mode == "coefficient" else "Sigma force"),
                 tag="final_val/output_distribution_vs_ur",
+            )
+        if output_ur_values and fhat_active and delta_fhat_series_list:
+            log_output_distribution_vs_ur(
+                writer,
+                epochs,
+                ur_values=output_ur_values,
+                mean_series=delta_fhat_series_list,
+                sigma_series=None,
+                mean_label="Delta fhat",
+                sigma_label=None,
+                tag="final_val/delta_fhat_distribution_vs_ur",
             )
 
     models_dir = Path("models")
@@ -3065,6 +3460,16 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "dt": dt,
             "method": "phnn",
             "td_correction": True,
+            "correction_mode": correction_mode,
+            "predict_sigma": predict_sigma,
+            "mean_active": mean_active,
+            "fhat_active": fhat_active,
+            "use_td_force_input": use_td_force_input,
+            "use_phi_input": use_phi_input,
+            "use_sigma_inputs": use_sigma_inputs,
+            "fhat_bound_multiplier": float(fhat_bound_multiplier),
+            "fhat_reg": float(fhat_reg),
+            "fhat_reg_norm": str(fhat_reg_norm),
         },
         model_path,
     )
@@ -3596,6 +4001,16 @@ def train(config: Config, config_name: str) -> None:
                     "dt": dt,
                     "method": str(config.method),
                     "td_correction": True,
+                    "correction_mode": correction_mode,
+                    "predict_sigma": predict_sigma,
+                    "mean_active": mean_active,
+                    "fhat_active": fhat_active,
+                    "use_td_force_input": use_td_force_input,
+                    "use_phi_input": use_phi_input,
+                    "use_sigma_inputs": use_sigma_inputs,
+                    "fhat_bound_multiplier": float(fhat_bound_multiplier),
+                    "fhat_reg": float(fhat_reg),
+                    "fhat_reg_norm": str(fhat_reg_norm),
                 },
                 ckpt_path,
             )

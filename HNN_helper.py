@@ -53,6 +53,66 @@ SIGNED_PHASE_CMAP = LinearSegmentedColormap.from_list(
     ],
 )
 
+TD_CORRECTION_MODES = (
+    "mean_only",
+    "mean_sigma_only",
+    "fhat_only",
+    "mean_fhat_only",
+    "mean_sigma_fhat",
+)
+
+
+def resolve_td_correction_mode(method_cfg: dict[str, Any]) -> str:
+    raw_mode = method_cfg.get("correction_mode")
+    if raw_mode is None or str(raw_mode).strip() == "":
+        return "mean_sigma_only" if bool(method_cfg.get("predict_sigma", False)) else "mean_only"
+    mode = str(raw_mode).strip().lower()
+    if mode not in TD_CORRECTION_MODES:
+        raise ValueError(f"correction_mode must be one of {TD_CORRECTION_MODES}, got {raw_mode!r}.")
+    return mode
+
+
+def td_correction_mode_flags(mode: str) -> dict[str, bool]:
+    key = str(mode).strip().lower()
+    if key not in TD_CORRECTION_MODES:
+        raise ValueError(f"Unknown TD correction mode {mode!r}.")
+    return {
+        "mean_active": key in {"mean_only", "mean_sigma_only", "mean_fhat_only", "mean_sigma_fhat"},
+        "sigma_active": key in {"mean_sigma_only", "mean_sigma_fhat"},
+        "fhat_active": key in {"fhat_only", "mean_fhat_only", "mean_sigma_fhat"},
+    }
+
+
+def td_predict_sigma_from_mode(method_cfg: dict[str, Any]) -> bool:
+    return bool(td_correction_mode_flags(resolve_td_correction_mode(method_cfg))["sigma_active"])
+
+
+def td_fhat_active_from_mode(method_cfg: dict[str, Any]) -> bool:
+    return bool(td_correction_mode_flags(resolve_td_correction_mode(method_cfg))["fhat_active"])
+
+
+def td_mean_active_from_mode(method_cfg: dict[str, Any]) -> bool:
+    return bool(td_correction_mode_flags(resolve_td_correction_mode(method_cfg))["mean_active"])
+
+
+def td_bounded_delta_fhat_torch(
+    raw_delta_fhat: torch.Tensor,
+    *,
+    fhat_td: torch.Tensor,
+    fhat_min: float,
+    fhat_max: float,
+    fhat_bound_multiplier: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mult = float(fhat_bound_multiplier)
+    if not np.isfinite(mult) or mult <= 0.0:
+        raise ValueError(f"fhat_bound_multiplier must be finite and positive, got {fhat_bound_multiplier!r}.")
+    f_lo = float(fhat_min) / mult
+    f_hi = float(fhat_max) * mult
+    room_up = torch.clamp(torch.as_tensor(f_hi, device=fhat_td.device, dtype=fhat_td.dtype) - fhat_td, min=0.0)
+    room_down = torch.clamp(fhat_td - torch.as_tensor(f_lo, device=fhat_td.device, dtype=fhat_td.dtype), min=0.0)
+    bounded = torch.where(raw_delta_fhat >= 0.0, torch.tanh(raw_delta_fhat) * room_up, torch.tanh(raw_delta_fhat) * room_down)
+    return bounded, fhat_td + bounded
+
 @dataclass
 class DataConfig:
     # Cut away the first N seconds from each time series (relative to the series start).
@@ -139,6 +199,8 @@ class LossConfig:
     mean_reg_norm: str = "l1"  # "l1" or "l2"
     sigma_reg: float = 1e-2
     sigma_reg_norm: str = "l2"  # "l1" or "l2"
+    fhat_reg: float = 0.0
+    fhat_reg_norm: str = "l2"  # "l1" or "l2"
     ur_bin_size: float = 1e-6
     normalize_by_ur_bin_std: bool = False
     ur_bin_scale_eps: float = 1e-6
@@ -1356,6 +1418,8 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_reduced_velocity: bool = True,
         use_td_force_input: bool = False,
+        use_phi_input: bool = False,
+        use_sigma_inputs: bool = False,
         use_stochastic_process_noise: bool = True,
         sigma_min: float = 1e-6,
         ur_scale: float | None = None,
@@ -1379,11 +1443,14 @@ class PHVIV(nn.Module):
         self.force_output = force_output
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
+        self.use_phi_input = bool(use_phi_input)
+        self.use_sigma_inputs = bool(use_sigma_inputs)
         self.hard_force_symmetry = bool(hard_force_symmetry)
-        if self.hard_force_symmetry and self.use_td_force_input:
+        if self.hard_force_symmetry and (self.use_td_force_input or self.use_phi_input or self.use_sigma_inputs):
             raise ValueError(
-                "architecture.hard_force_symmetry requires use_td_force_input=false "
-                "because the TD-force input does not have a defined sign-flip symmetry."
+                "architecture.hard_force_symmetry requires use_td_force_input=false, "
+                "use_phi_input=false, and use_sigma_inputs=false because those auxiliary "
+                "inputs do not have a defined sign-flip symmetry."
             )
         self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
         sigma_min_val = float(sigma_min)
@@ -1395,7 +1462,12 @@ class PHVIV(nn.Module):
             raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
         self.register_buffer("ur_scale", torch.tensor(ur_scale_val, dtype=torch.float32))
         self.base_feature_dim = 2
-        self.force_input_dim = self.base_feature_dim + (1 if self.use_reduced_velocity else 0) + (1 if self.use_td_force_input else 0)
+        self.force_input_dim = (
+            self.base_feature_dim
+            + (1 if self.use_reduced_velocity else 0)
+            + (1 if self.use_td_force_input else 0)
+            + _td_hidden_input_dim(use_phi_input=self.use_phi_input, use_sigma_inputs=self.use_sigma_inputs)
+        )
 
         residual_cfg = _default_residual_kwargs()
         if residual_kwargs:
@@ -1485,6 +1557,7 @@ class PHVIV(nn.Module):
         self.u_base_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
         # Backward-compatible alias used throughout the codebase.
         self.u_net = self.u_base_net
+        self.fhat_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
 
         self.sigma_net = (
             _build_scalar_net(force_in_features, use_selected_backbone=True)
@@ -1520,6 +1593,8 @@ class PHVIV(nn.Module):
         force_output = str(cfg.get("force_output", "force")).strip().lower()
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
         use_td_force_input = bool(cfg.get("use_td_force_input", False))
+        use_phi_input = bool(cfg.get("use_phi_input", False))
+        use_sigma_inputs = bool(cfg.get("use_sigma_inputs", False))
         use_stochastic_process_noise = bool(cfg.get("use_stochastic_process_noise", True))
         sigma_min = float(cfg.get("sigma_min", 1e-6))
         ur_scale_val = cfg.get("ur_scale")
@@ -1563,6 +1638,8 @@ class PHVIV(nn.Module):
             fourier_sigma=fourier_sigma,
             use_reduced_velocity=use_reduced_velocity,
             use_td_force_input=use_td_force_input,
+            use_phi_input=use_phi_input,
+            use_sigma_inputs=use_sigma_inputs,
             use_stochastic_process_noise=use_stochastic_process_noise,
             sigma_min=sigma_min,
             ur_scale=ur_scale,
@@ -1673,6 +1750,8 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
     ):
         base_features = self._base_features(x)
@@ -1702,6 +1781,30 @@ class PHVIV(nn.Module):
                 min=1e-12,
             )
             base_features = torch.cat([base_features, td_force_feat], dim=-1)
+        if self.use_phi_input:
+            if phi_input is None:
+                raise ValueError("phi_input is required when model.use_phi_input is enabled.")
+            phi_feat = phi_input if torch.is_tensor(phi_input) else torch.as_tensor(phi_input, device=base_features.device, dtype=base_features.dtype)
+            phi_feat = phi_feat.to(device=base_features.device, dtype=base_features.dtype)
+            if phi_feat.ndim == 1 and base_features.ndim == 2 and phi_feat.shape[0] == 2:
+                phi_feat = phi_feat.view(1, 2)
+            if phi_feat.ndim != base_features.ndim or phi_feat.shape[-1] != 2:
+                raise ValueError("phi_input must have shape (..., 2) containing [sin(phi), cos(phi)].")
+            if phi_feat.shape[:-1] != base_features.shape[:-1]:
+                phi_feat = phi_feat.expand(base_features.shape[:-1] + (2,))
+            base_features = torch.cat([base_features, phi_feat], dim=-1)
+        if self.use_sigma_inputs:
+            if sigma_inputs is None:
+                raise ValueError("sigma_inputs is required when model.use_sigma_inputs is enabled.")
+            sigma_feat = sigma_inputs if torch.is_tensor(sigma_inputs) else torch.as_tensor(sigma_inputs, device=base_features.device, dtype=base_features.dtype)
+            sigma_feat = sigma_feat.to(device=base_features.device, dtype=base_features.dtype)
+            if sigma_feat.ndim == 1 and base_features.ndim == 2 and sigma_feat.shape[0] == 2:
+                sigma_feat = sigma_feat.view(1, 2)
+            if sigma_feat.ndim != base_features.ndim or sigma_feat.shape[-1] != 2:
+                raise ValueError("sigma_inputs must have shape (..., 2) containing normalized [sigma_dy, sigma_ddy].")
+            if sigma_feat.shape[:-1] != base_features.shape[:-1]:
+                sigma_feat = sigma_feat.expand(base_features.shape[:-1] + (2,))
+            base_features = torch.cat([base_features, sigma_feat], dim=-1)
         return base_features
 
     def _force_net_raw(
@@ -1709,12 +1812,16 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
     ):
         base_features = self._force_features(
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
@@ -1724,6 +1831,8 @@ class PHVIV(nn.Module):
             -x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
         neg_features = self.force_embed(neg_base_features) if self.force_embed is not None else neg_base_features
@@ -1734,6 +1843,8 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
     ):
         if not self.use_stochastic_process_noise:
@@ -1743,6 +1854,8 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
         features = self.force_embed(base_features) if self.force_embed is not None else base_features
@@ -1751,14 +1864,43 @@ class PHVIV(nn.Module):
             return torch.zeros_like(like)
         return self.sigma_net(features)
 
+    def _fhat_net_raw(
+        self,
+        x,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
+        td_force_scale: torch.Tensor | None = None,
+    ):
+        base_features = self._force_features(
+            x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
+            td_force_scale=td_force_scale,
+        )
+        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        return self.fhat_net(features)
+
     def sigma_theta(
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
     ):
         if not self.use_stochastic_process_noise:
             return torch.zeros_like(x[..., :1])
-        raw = self._sigma_net_raw(x, reduced_velocity=reduced_velocity)
+        raw = self._sigma_net_raw(
+            x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
+        )
         sigma_min = self.sigma_min.to(device=raw.device, dtype=raw.dtype)
         sigma = sigma_min + F.softplus(raw)
         if self.force_output == "coefficient":
@@ -1772,8 +1914,17 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
     ):
-        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
+        raw = self._force_net_raw(
+            x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
+        )
         if self.force_output == "coefficient":
             return raw
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
@@ -1783,8 +1934,17 @@ class PHVIV(nn.Module):
         self,
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
+        td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        phi_input: torch.Tensor | np.ndarray | None = None,
+        sigma_inputs: torch.Tensor | np.ndarray | None = None,
     ):
-        raw = self._force_net_raw(x, reduced_velocity=reduced_velocity)
+        raw = self._force_net_raw(
+            x,
+            reduced_velocity=reduced_velocity,
+            td_force_input=td_force_input,
+            phi_input=phi_input,
+            sigma_inputs=sigma_inputs,
+        )
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
             return raw * f0
@@ -3734,7 +3894,7 @@ def _recompute_td_baseline_on_grid(
     diameter: float,
     td_params: dict[str, float],
     td_memory_cfg: dict[str, Any] | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> dict[str, np.ndarray]:
     t_arr = np.asarray(t, dtype=float).reshape(-1)
     dy_arr = np.asarray(dy, dtype=float).reshape(-1)
     ddy_arr = np.asarray(ddy, dtype=float).reshape(-1)
@@ -3750,10 +3910,16 @@ def _recompute_td_baseline_on_grid(
     phi_td = np.empty((n,), dtype=float)
     sig_dy_td = np.empty((n,), dtype=float)
     sig_ddy_td = np.empty((n,), dtype=float)
+    theta_td = np.empty((n,), dtype=float)
+    fhat_td = np.empty((n,), dtype=float)
+    omega_vy_td = np.empty((n,), dtype=float)
     force_td[0] = float(force_td0)
     phi_td[0] = float(phi_td0)
     sig_dy_td[0] = float(sig_dy_td0)
     sig_ddy_td[0] = float(sig_ddy_td0)
+    theta_td[0] = 0.0
+    fhat_td[0] = float(td_params["fhat0"])
+    omega_vy_td[0] = 0.0
     for idx in range(n - 1):
         dt_step = float(t_arr[idx + 1] - t_arr[idx])
         flow_value = float(flow_arr[idx])
@@ -3783,6 +3949,9 @@ def _recompute_td_baseline_on_grid(
         else:
             fhat = float(td_params["fhat0"]) + (float(td_params["fhat_max"]) - float(td_params["fhat0"])) * math.sin(theta)
         omega_vy = 2.0 * math.pi * fhat * speed_mag / float(diameter)
+        theta_td[idx] = float(theta)
+        fhat_td[idx] = float(fhat)
+        omega_vy_td[idx] = float(omega_vy)
         phi_td[idx + 1] = float(phi_td[idx] + dt_step * omega_vy)
         fdy = -0.5 * float(rho) * float(diameter) * float(td_params["Cd"]) * speed_mag * float(dy_arr[idx])
         fcv = 0.5 * float(rho) * float(diameter) * float(td_params["Cv"]) * speed_mag * flow_value * math.cos(phi_td[idx + 1])
@@ -3790,7 +3959,97 @@ def _recompute_td_baseline_on_grid(
         force_td[idx + 1] = float(fca + fcv + fdy)
         sig_dy_td[idx + 1] = float(sig_dy_next)
         sig_ddy_td[idx + 1] = float(sig_ddy_next)
-    return force_td, phi_td, sig_dy_td, sig_ddy_td
+    theta_td[-1] = float(theta_td[-2]) if n > 1 else 0.0
+    fhat_td[-1] = float(fhat_td[-2]) if n > 1 else float(td_params["fhat0"])
+    omega_vy_td[-1] = float(omega_vy_td[-2]) if n > 1 else 0.0
+    return {
+        "force_td": force_td,
+        "phi_td": phi_td,
+        "sig_dy_td": sig_dy_td,
+        "sig_ddy_td": sig_ddy_td,
+        "theta_td": theta_td,
+        "fhat_td": fhat_td,
+        "omega_vy_td": omega_vy_td,
+    }
+
+
+def _td_hidden_input_dim(*, use_phi_input: bool, use_sigma_inputs: bool) -> int:
+    return (2 if bool(use_phi_input) else 0) + (2 if bool(use_sigma_inputs) else 0)
+
+
+def _td_hidden_inputs_from_arrays_numpy(
+    *,
+    phi_td: np.ndarray,
+    sig_dy_td: np.ndarray,
+    sig_ddy_td: np.ndarray,
+    structural_mass: float | np.ndarray,
+    stiffness: float | np.ndarray,
+    diameter: float,
+) -> dict[str, np.ndarray]:
+    phi_arr = np.asarray(phi_td, dtype=float)
+    sig_dy_arr = np.asarray(sig_dy_td, dtype=float)
+    sig_ddy_arr = np.asarray(sig_ddy_td, dtype=float)
+    if phi_arr.shape != sig_dy_arr.shape or phi_arr.shape != sig_ddy_arr.shape:
+        raise ValueError("TD hidden-state arrays must have matching shapes.")
+    diameter_val = float(diameter)
+    if not np.isfinite(diameter_val) or diameter_val <= 0.0:
+        raise ValueError(f"diameter must be finite and positive, got {diameter!r}")
+    mass_arr = np.broadcast_to(np.asarray(structural_mass, dtype=float), phi_arr.shape)
+    stiffness_arr = np.broadcast_to(np.asarray(stiffness, dtype=float), phi_arr.shape)
+    omega = np.sqrt(np.clip(stiffness_arr / np.clip(mass_arr, 1.0e-12, None), 1.0e-12, None))
+    vel_scale = np.clip(omega * diameter_val, 1.0e-12, None)
+    acc_scale = np.clip((omega**2) * diameter_val, 1.0e-12, None)
+    return {
+        "phi_sin": np.sin(phi_arr),
+        "phi_cos": np.cos(phi_arr),
+        "sig_dy_norm": sig_dy_arr / vel_scale,
+        "sig_ddy_norm": sig_ddy_arr / acc_scale,
+    }
+
+
+def _broadcast_td_hidden_param_torch(
+    value: torch.Tensor | np.ndarray | float,
+    *,
+    like: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    tensor = value if torch.is_tensor(value) else torch.as_tensor(value, device=like.device, dtype=like.dtype)
+    tensor = tensor.to(device=like.device, dtype=like.dtype)
+    if tensor.ndim == 0:
+        tensor = tensor.view(1, 1)
+    elif tensor.ndim == like.ndim - 1:
+        tensor = tensor.unsqueeze(-1)
+    if tensor.ndim != like.ndim or tensor.shape[-1] != 1:
+        raise ValueError(f"{name} must be broadcastable to shape {tuple(like.shape)}, got {tuple(tensor.shape)}.")
+    if tensor.shape[:-1] != like.shape[:-1]:
+        tensor = tensor.expand(like.shape[:-1] + (1,))
+    return tensor
+
+
+def td_hidden_inputs_from_context_torch(
+    *,
+    td_context: torch.Tensor,
+    structural_mass: torch.Tensor | np.ndarray | float,
+    stiffness: torch.Tensor | np.ndarray | float,
+    diameter: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if int(td_context.shape[-1]) < 4:
+        raise ValueError("td_context must contain at least [ddy, phi, sig_dy, sig_ddy].")
+    like = td_context[..., :1]
+    mass_t = _broadcast_td_hidden_param_torch(structural_mass, like=like, name="structural_mass")
+    stiffness_t = _broadcast_td_hidden_param_torch(stiffness, like=like, name="stiffness")
+    diameter_t = torch.as_tensor(float(diameter), device=td_context.device, dtype=td_context.dtype)
+    if (not bool(torch.isfinite(diameter_t).item())) or float(diameter_t.detach().cpu()) <= 0.0:
+        raise ValueError(f"diameter must be finite and positive, got {diameter!r}.")
+    phi_td = td_context[..., 1:2]
+    sig_dy_td = td_context[..., 2:3]
+    sig_ddy_td = td_context[..., 3:4]
+    omega = torch.sqrt(torch.clamp(stiffness_t / torch.clamp(mass_t, min=1.0e-12), min=1.0e-12))
+    vel_scale = torch.clamp(omega * diameter_t, min=1.0e-12)
+    acc_scale = torch.clamp((omega**2) * diameter_t, min=1.0e-12)
+    phi_input = torch.cat([torch.sin(phi_td), torch.cos(phi_td)], dim=-1)
+    sigma_inputs = torch.cat([sig_dy_td / vel_scale, sig_ddy_td / acc_scale], dim=-1)
+    return phi_input, sigma_inputs
 
 
 def load_td_correction_trajectories(
@@ -3874,6 +4133,9 @@ def load_td_correction_trajectories(
                 if not np.isfinite(span_scale) or span_scale <= 0.0:
                     raise ValueError(f"{path} has invalid TD force span scale {span_scale!r}.")
                 force_td_per_m = np.asarray(force_td_total_raw, dtype=float).reshape(-1) / span_scale
+            theta_td_raw = _preferred_numeric_value(("theta_td",))
+            fhat_td_raw = _preferred_numeric_value(("fhat_td",))
+            omega_vy_td_raw = _preferred_numeric_value(("omega_vy_td",))
             phi_td = np.asarray(_extract_first_present(data, ("phi_vy_td",), path=path), dtype=float).reshape(-1)
             sig_dy_td = np.asarray(_extract_first_present(data, ("sig_dy_loc_td",), path=path), dtype=float).reshape(-1)
             sig_ddy_td = np.asarray(_extract_first_present(data, ("sig_ddy_loc_td",), path=path), dtype=float).reshape(-1)
@@ -3915,6 +4177,40 @@ def load_td_correction_trajectories(
                     raise ValueError(f"{path} flow speed must be scalar or length-matched to time.")
         if not np.all(np.isfinite(flow_speed)):
             flow_speed = np.full((n,), float(np.nanmean(flow_speed)), dtype=float)
+        if theta_td_raw is not None:
+            theta_td = np.asarray(theta_td_raw, dtype=float).reshape(-1)
+            if theta_td.shape[0] != n:
+                raise ValueError(f"{path} theta_td length does not match time vector.")
+        else:
+            speed_mag = np.sqrt(np.clip(flow_speed * flow_speed + dy * dy, 1.0e-12, None))
+            projection = flow_speed / np.clip(speed_mag, 1.0e-12, None)
+            dy_r = dy * projection
+            ddy_r = ddy * projection
+            cos_phi_dy = dy_r / np.clip(sig_dy_td, 1.0e-12, None)
+            sin_phi_dy = -ddy_r / np.clip(sig_ddy_td, 1.0e-12, None)
+            phi_dy = np.arctan2(sin_phi_dy, cos_phi_dy)
+            theta_td = np.arctan2(np.sin(phi_dy - phi_td), np.cos(phi_dy - phi_td))
+        if fhat_td_raw is not None:
+            fhat_td = np.asarray(fhat_td_raw, dtype=float).reshape(-1)
+            if fhat_td.shape[0] != n:
+                raise ValueError(f"{path} fhat_td length does not match time vector.")
+        elif td_params is not None:
+            fhat_td = np.where(
+                theta_td <= 0.0,
+                float(td_params["fhat0"]) + (float(td_params["fhat0"]) - float(td_params["fhat_min"])) * np.sin(theta_td),
+                float(td_params["fhat0"]) + (float(td_params["fhat_max"]) - float(td_params["fhat0"])) * np.sin(theta_td),
+            )
+        else:
+            fhat_td = np.full((n,), np.nan, dtype=float)
+        if omega_vy_td_raw is not None:
+            omega_vy_td = np.asarray(omega_vy_td_raw, dtype=float).reshape(-1)
+            if omega_vy_td.shape[0] != n:
+                raise ValueError(f"{path} omega_vy_td length does not match time vector.")
+        elif td_params is not None:
+            speed_mag = np.sqrt(np.clip(flow_speed * flow_speed + dy * dy, 1.0e-12, None))
+            omega_vy_td = 2.0 * np.pi * fhat_td * speed_mag / float(diameter_m)
+        else:
+            omega_vy_td = np.full((n,), np.nan, dtype=float)
         ur_label = None
         if ur_label_raw is not None:
             ur_label = _prepare_reduced_velocity_series(ur_label_raw, n, name=f"{path} U_r_label")
@@ -3941,6 +4237,22 @@ def load_td_correction_trajectories(
             rf = min(max(1, int(reduction_factor)), max(1, int(t.shape[0]) - 1))
             if bool(stagger_reduced_time) and rf > 1:
                 reduction_offsets = list(range(rf))
+        hidden_inputs_dry = _td_hidden_inputs_from_arrays_numpy(
+            phi_td=phi_td,
+            sig_dy_td=sig_dy_td,
+            sig_ddy_td=sig_ddy_td,
+            structural_mass=dry_mass_kg,
+            stiffness=stiffness_n_m,
+            diameter=diameter_m,
+        )
+        hidden_inputs_effective = _td_hidden_inputs_from_arrays_numpy(
+            phi_td=phi_td,
+            sig_dy_td=sig_dy_td,
+            sig_ddy_td=sig_ddy_td,
+            structural_mass=effective_mass_kg,
+            stiffness=stiffness_n_m,
+            diameter=diameter_m,
+        )
 
         num_valid_reductions = 0
         for reduction_offset in reduction_offsets:
@@ -3954,8 +4266,17 @@ def load_td_correction_trajectories(
                         "force_per_m": force_per_m,
                         "force_td_per_m": force_td_per_m,
                         "phi_td": phi_td,
+                        "phi_sin_td": hidden_inputs_dry["phi_sin"],
+                        "phi_cos_td": hidden_inputs_dry["phi_cos"],
                         "sig_dy_td": sig_dy_td,
                         "sig_ddy_td": sig_ddy_td,
+                        "theta_td": theta_td,
+                        "fhat_td": fhat_td,
+                        "omega_vy_td": omega_vy_td,
+                        "sig_dy_norm_dry_td": hidden_inputs_dry["sig_dy_norm"],
+                        "sig_ddy_norm_dry_td": hidden_inputs_dry["sig_ddy_norm"],
+                        "sig_dy_norm_effective_td": hidden_inputs_effective["sig_dy_norm"],
+                        "sig_ddy_norm_effective_td": hidden_inputs_effective["sig_ddy_norm"],
                         "ur": ur,
                         "ur_stored": ur_stored,
                         **({"ur_label": ur_label} if ur_label is not None else {}),
@@ -3975,8 +4296,17 @@ def load_td_correction_trajectories(
             force_per_m_reduced = reduced["force_per_m"]
             force_td_per_m_reduced = reduced["force_td_per_m"]
             phi_td_reduced = reduced["phi_td"]
+            phi_sin_td_reduced = reduced["phi_sin_td"]
+            phi_cos_td_reduced = reduced["phi_cos_td"]
             sig_dy_td_reduced = reduced["sig_dy_td"]
             sig_ddy_td_reduced = reduced["sig_ddy_td"]
+            theta_td_reduced = reduced["theta_td"]
+            fhat_td_reduced = reduced["fhat_td"]
+            omega_vy_td_reduced = reduced["omega_vy_td"]
+            sig_dy_norm_dry_td_reduced = reduced["sig_dy_norm_dry_td"]
+            sig_ddy_norm_dry_td_reduced = reduced["sig_ddy_norm_dry_td"]
+            sig_dy_norm_effective_td_reduced = reduced["sig_dy_norm_effective_td"]
+            sig_ddy_norm_effective_td_reduced = reduced["sig_ddy_norm_effective_td"]
             ur_reduced = reduced["ur"]
             ur_stored_reduced = reduced["ur_stored"]
             ur_label_reduced = None if ur_label is None else reduced["ur_label"]
@@ -3995,15 +4325,24 @@ def load_td_correction_trajectories(
                 force_per_m_reduced = force_per_m_reduced[mask]
                 force_td_per_m_reduced = force_td_per_m_reduced[mask]
                 phi_td_reduced = phi_td_reduced[mask]
+                phi_sin_td_reduced = phi_sin_td_reduced[mask]
+                phi_cos_td_reduced = phi_cos_td_reduced[mask]
                 sig_dy_td_reduced = sig_dy_td_reduced[mask]
                 sig_ddy_td_reduced = sig_ddy_td_reduced[mask]
+                theta_td_reduced = theta_td_reduced[mask]
+                fhat_td_reduced = fhat_td_reduced[mask]
+                omega_vy_td_reduced = omega_vy_td_reduced[mask]
+                sig_dy_norm_dry_td_reduced = sig_dy_norm_dry_td_reduced[mask]
+                sig_ddy_norm_dry_td_reduced = sig_ddy_norm_dry_td_reduced[mask]
+                sig_dy_norm_effective_td_reduced = sig_dy_norm_effective_td_reduced[mask]
+                sig_ddy_norm_effective_td_reduced = sig_ddy_norm_effective_td_reduced[mask]
                 ur_reduced = ur_reduced[mask]
                 ur_stored_reduced = ur_stored_reduced[mask]
                 if ur_label_reduced is not None:
                     ur_label_reduced = ur_label_reduced[mask]
                 flow_speed_reduced = flow_speed_reduced[mask]
                 if bool(reduce_time) and td_params is not None and resolve_td_memory_config(td_memory_cfg)["mode"] != "fixed_n_memory":
-                    force_td_per_m_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced = _recompute_td_baseline_on_grid(
+                    recomputed_td = _recompute_td_baseline_on_grid(
                         t=t_reduced,
                         dy=dy_reduced,
                         ddy=ddy_reduced,
@@ -4017,6 +4356,35 @@ def load_td_correction_trajectories(
                         td_params=td_params,
                         td_memory_cfg=td_memory_cfg,
                     )
+                    force_td_per_m_reduced = recomputed_td["force_td"]
+                    phi_td_reduced = recomputed_td["phi_td"]
+                    sig_dy_td_reduced = recomputed_td["sig_dy_td"]
+                    sig_ddy_td_reduced = recomputed_td["sig_ddy_td"]
+                    theta_td_reduced = recomputed_td["theta_td"]
+                    fhat_td_reduced = recomputed_td["fhat_td"]
+                    omega_vy_td_reduced = recomputed_td["omega_vy_td"]
+                    hidden_inputs_dry_reduced = _td_hidden_inputs_from_arrays_numpy(
+                        phi_td=phi_td_reduced,
+                        sig_dy_td=sig_dy_td_reduced,
+                        sig_ddy_td=sig_ddy_td_reduced,
+                        structural_mass=dry_mass_kg,
+                        stiffness=stiffness_n_m,
+                        diameter=diameter_m,
+                    )
+                    hidden_inputs_effective_reduced = _td_hidden_inputs_from_arrays_numpy(
+                        phi_td=phi_td_reduced,
+                        sig_dy_td=sig_dy_td_reduced,
+                        sig_ddy_td=sig_ddy_td_reduced,
+                        structural_mass=effective_mass_kg,
+                        stiffness=stiffness_n_m,
+                        diameter=diameter_m,
+                    )
+                    phi_sin_td_reduced = hidden_inputs_dry_reduced["phi_sin"]
+                    phi_cos_td_reduced = hidden_inputs_dry_reduced["phi_cos"]
+                    sig_dy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_dy_norm"]
+                    sig_ddy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_ddy_norm"]
+                    sig_dy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_dy_norm"]
+                    sig_ddy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_ddy_norm"]
             td_context = np.stack(
                 [ddy_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced, flow_speed_reduced],
                 axis=1,
@@ -4040,6 +4408,20 @@ def load_td_correction_trajectories(
                     "force_td_per_m": np.asarray(force_td_per_m_reduced, dtype=np.float32),
                     "force_corr": np.asarray(force_per_m_reduced - force_td_per_m_reduced, dtype=np.float32),
                     "force_corr_per_m": np.asarray(force_per_m_reduced - force_td_per_m_reduced, dtype=np.float32),
+                    "phi_td": np.asarray(phi_td_reduced, dtype=np.float32),
+                    "phi_sin_td": np.asarray(phi_sin_td_reduced, dtype=np.float32),
+                    "phi_cos_td": np.asarray(phi_cos_td_reduced, dtype=np.float32),
+                    "sig_dy_td": np.asarray(sig_dy_td_reduced, dtype=np.float32),
+                    "sig_ddy_td": np.asarray(sig_ddy_td_reduced, dtype=np.float32),
+                    "theta_td": np.asarray(theta_td_reduced, dtype=np.float32),
+                    "fhat_td": np.asarray(fhat_td_reduced, dtype=np.float32),
+                    "omega_vy_td": np.asarray(omega_vy_td_reduced, dtype=np.float32),
+                    "sig_dy_norm_td": np.asarray(sig_dy_norm_dry_td_reduced, dtype=np.float32),
+                    "sig_ddy_norm_td": np.asarray(sig_ddy_norm_dry_td_reduced, dtype=np.float32),
+                    "sig_dy_norm_dry_td": np.asarray(sig_dy_norm_dry_td_reduced, dtype=np.float32),
+                    "sig_ddy_norm_dry_td": np.asarray(sig_ddy_norm_dry_td_reduced, dtype=np.float32),
+                    "sig_dy_norm_effective_td": np.asarray(sig_dy_norm_effective_td_reduced, dtype=np.float32),
+                    "sig_ddy_norm_effective_td": np.asarray(sig_ddy_norm_effective_td_reduced, dtype=np.float32),
                     "ur": np.asarray(ur_reduced, dtype=np.float32),
                     "ur_stored": np.asarray(ur_stored_reduced, dtype=np.float32),
                     "ur_label": (
@@ -4072,14 +4454,17 @@ def td_baseline_step_torch(
     rho: float,
     diameter: float,
     params: dict[str, float],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if td_context.ndim != 2 or td_context.shape[1] < 5:
-        raise ValueError("td_context must have shape (B, 5) with [ddy, phi, sig_dy, sig_ddy, flow_speed].")
-    ddy = td_context[:, 0:1]
-    phi_vy = td_context[:, 1:2]
-    sig_dy = td_context[:, 2:3]
-    sig_ddy = td_context[:, 3:4]
-    flow_speed = td_context[:, 4:5]
+    raw_delta_fhat: torch.Tensor | None = None,
+    fhat_bound_multiplier: float = 1.5,
+    return_diagnostics: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    if td_context.ndim < 2 or td_context.shape[-1] < 5:
+        raise ValueError("td_context must have shape (..., 5) with [ddy, phi, sig_dy, sig_ddy, flow_speed].")
+    ddy = td_context[..., 0:1]
+    phi_vy = td_context[..., 1:2]
+    sig_dy = td_context[..., 2:3]
+    sig_ddy = td_context[..., 3:4]
+    flow_speed = td_context[..., 4:5]
     n_memory_raw = params["n_memory"]
     if torch.is_tensor(n_memory_raw):
         n_memory = torch.clamp(
@@ -4109,12 +4494,24 @@ def td_baseline_step_torch(
 
     theta = phi_dy - phi_vy
     theta = torch.atan2(torch.sin(theta), torch.cos(theta))
-    fhat = torch.where(
+    fhat_td = torch.where(
         theta <= 0.0,
         float(params["fhat0"]) + (float(params["fhat0"]) - float(params["fhat_min"])) * torch.sin(theta),
         float(params["fhat0"]) + (float(params["fhat_max"]) - float(params["fhat0"])) * torch.sin(theta),
     )
-    omega_vy = 2.0 * math.pi * fhat * speed_mag / float(diameter)
+    omega_vy_td = 2.0 * math.pi * fhat_td * speed_mag / float(diameter)
+    if raw_delta_fhat is None:
+        delta_fhat = torch.zeros_like(fhat_td)
+        fhat_corr = fhat_td
+    else:
+        delta_fhat, fhat_corr = td_bounded_delta_fhat_torch(
+            raw_delta_fhat.to(device=fhat_td.device, dtype=fhat_td.dtype),
+            fhat_td=fhat_td,
+            fhat_min=float(params["fhat_min"]),
+            fhat_max=float(params["fhat_max"]),
+            fhat_bound_multiplier=float(fhat_bound_multiplier),
+        )
+    omega_vy = 2.0 * math.pi * fhat_corr * speed_mag / float(diameter)
     phi_vy_next = phi_vy + dt_t * omega_vy
 
     fdy = -0.5 * float(rho) * float(diameter) * float(params["Cd"]) * speed_mag * velocity
@@ -4123,7 +4520,24 @@ def td_baseline_step_torch(
     force_total = fca + fcv + fdy
 
     next_context = torch.cat([acceleration, phi_vy_next, sig_dy_next, sig_ddy_next, flow_speed], dim=1)
-    return force_total, next_context
+    if not return_diagnostics:
+        return force_total, next_context
+    diagnostics = {
+        "theta_td": theta,
+        "fhat_td": fhat_td,
+        "omega_vy_td": omega_vy_td,
+        "delta_fhat": delta_fhat,
+        "fhat_corr": fhat_corr,
+        "omega_vy_corr": omega_vy,
+        "phi_vy_next": phi_vy_next,
+        "sig_dy_next": sig_dy_next,
+        "sig_ddy_next": sig_ddy_next,
+        "speed_mag": speed_mag,
+        "force_drag": fdy,
+        "force_cv": fcv,
+        "force_ca": fca,
+    }
+    return force_total, next_context, diagnostics
 
 
 def structural_step_constant_force_torch(

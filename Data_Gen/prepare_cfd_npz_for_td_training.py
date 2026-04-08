@@ -705,6 +705,16 @@ def _prepare_output_payload(
     trimmed["theta_td"] = np.asarray(representative["theta_td"][burnin_start_idx:], dtype=float)
     trimmed["sig_dy_loc_td"] = np.asarray(representative["sig_dy_loc"][burnin_start_idx:], dtype=float)
     trimmed["sig_ddy_loc_td"] = np.asarray(representative["sig_ddy_loc"][burnin_start_idx:], dtype=float)
+    trimmed["fhat_td"] = np.asarray(representative["fhat"][burnin_start_idx:], dtype=float)
+    trimmed["omega_vy_td"] = np.asarray(representative["omega_vy"][burnin_start_idx:], dtype=float)
+    expected_samples = int(np.asarray(trimmed["time_dim"]).reshape(-1).shape[0])
+    for key in ("phi_vy_td", "theta_td", "sig_dy_loc_td", "sig_ddy_loc_td", "fhat_td", "omega_vy_td"):
+        actual_samples = int(np.asarray(trimmed[key]).reshape(-1).shape[0])
+        if actual_samples != expected_samples:
+            raise ValueError(
+                f"Trimmed TD hidden-state array '{key}' has length {actual_samples}, "
+                f"expected {expected_samples} after burn-in trimming."
+            )
     fy_td_per_m = np.asarray(representative["Fy"][burnin_start_idx:], dtype=float)
     f_total_td_per_m = np.asarray(representative["F_total"][burnin_start_idx:], dtype=float)
     fcv_td_per_m = np.asarray(representative["Fcv"][burnin_start_idx:], dtype=float)

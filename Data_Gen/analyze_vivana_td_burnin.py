@@ -290,6 +290,24 @@ def _load_case(npz_path: Path) -> dict[str, np.ndarray | float | str]:
         "dry_mass_kg": float(np.asarray(data["dry_mass_kg"]).reshape(())),
         "diameter_m": float(np.asarray(data["diameter_m"]).reshape(())),
         "rho_kg_m3": float(np.asarray(data["rho_kg_m3"]).reshape(())),
+        "ur_label": (
+            float(np.asarray(data["U_r_label_scalar"]).reshape(()))
+            if "U_r_label_scalar" in data.files
+            else (
+                float(np.asarray(data["label_ur"]).reshape(()))
+                if "label_ur" in data.files
+                else float("nan")
+            )
+        ),
+        "ur_computed": (
+            float(np.asarray(data["U_r_computed_scalar"]).reshape(()))
+            if "U_r_computed_scalar" in data.files
+            else (
+                float(np.asarray(data["computed_ur"]).reshape(()))
+                if "computed_ur" in data.files
+                else float("nan")
+            )
+        ),
         "structural_frequency_hz": (
             float(np.asarray(data["structural_frequency_hz"]).reshape(()))
             if "structural_frequency_hz" in data.files
@@ -608,6 +626,8 @@ def _time_spread_analysis(
                 "cos_theta_std": float(np.std(np.cos(theta_vals))) if theta_vals.size > 0 else float("nan"),
                 "force_total_rel_std": float(force_total_rel_std[idx]),
                 "case_name": str(case["case_name"]),
+                "ur_label": float(case["ur_label"]) if np.isfinite(float(case["ur_label"])) else float("nan"),
+                "ur_computed": float(case["ur_computed"]) if np.isfinite(float(case["ur_computed"])) else float("nan"),
                 "flow_speed_m_s": float(case["flow_speed_m_s"]),
                 "stiffness_n_m": float(case["stiffness_n_m"]),
                 "dry_mass_kg": float(case["dry_mass_kg"]),
@@ -711,37 +731,13 @@ def _nominal_ur_sort_value(case_name: str) -> float:
         return float("inf")
 
 
-def _nominal_ur_display(case_name: str) -> str:
-    value = _nominal_ur_sort_value(case_name)
-    if np.isfinite(value):
-        return rf"$U_{{r,\mathrm{{nom}}}}={value:.2f}$"
-    return str(case_name)
-
-
-def _effective_ur_with_added_mass(summary: pd.DataFrame) -> float:
+def _stored_ur_display_value(summary: pd.DataFrame) -> float:
     if summary.empty:
         return float("nan")
-    required = {"flow_speed_m_s", "stiffness_n_m", "dry_mass_kg", "rho_kg_m3", "diameter_m", "Ca"}
-    if not required.issubset(summary.columns):
+    if "ur_computed" not in summary.columns:
         return float("nan")
-    flow_speed = float(summary["flow_speed_m_s"].iloc[0])
-    stiffness = float(summary["stiffness_n_m"].iloc[0])
-    dry_mass = float(summary["dry_mass_kg"].iloc[0])
-    rho = float(summary["rho_kg_m3"].iloc[0])
-    diameter = float(summary["diameter_m"].iloc[0])
-    ca = float(summary["Ca"].iloc[0])
-    if not all(np.isfinite(value) for value in (flow_speed, stiffness, dry_mass, rho, diameter, ca)):
-        return float("nan")
-    if stiffness <= 0.0 or dry_mass <= 0.0 or diameter <= 0.0:
-        return float("nan")
-    effective_mass = dry_mass + 0.25 * np.pi * rho * ca * diameter**2
-    if effective_mass <= 0.0:
-        return float("nan")
-    omega_n = np.sqrt(stiffness / effective_mass)
-    f_n = omega_n / (2.0 * np.pi)
-    if f_n <= 0.0:
-        return float("nan")
-    return float(flow_speed / (f_n * diameter))
+    value = float(summary["ur_computed"].iloc[0])
+    return value if np.isfinite(value) else float("nan")
 
 
 def _estimate_burnin_time_from_summary(summary: pd.DataFrame) -> float:
@@ -802,7 +798,7 @@ def _plot_theta_trajectories_all_cases(
 
     for ax, (case_name, time_from_start_s, theta_stack, theta0_values, summary) in zip(axes, selected_bundles):
         burnin_time = _estimate_burnin_time_from_summary(summary)
-        effective_ur = _effective_ur_with_added_mass(summary)
+        stored_ur = _stored_ur_display_value(summary)
         time_arr = np.asarray(time_from_start_s, dtype=float)
         if COMBINED_THETA_MAX_SECONDS is None:
             mask = np.ones_like(time_arr, dtype=bool)
@@ -819,8 +815,8 @@ def _plot_theta_trajectories_all_cases(
         if np.isfinite(burnin_time):
             ax.axvline(float(burnin_time), color="black", linestyle="--", linewidth=1.0, alpha=0.9)
         title = str(case_name)
-        if np.isfinite(effective_ur):
-            title = f"{case_name} | " + rf"$U_{{r}}={effective_ur:.2f}$"
+        if np.isfinite(stored_ur):
+            title = f"{case_name} | " + rf"$U_{{r}}={stored_ur:.2f}$"
         ax.set_title(title, loc="left", fontsize=COMBINED_THETA_TITLE_FONTSIZE)
         ax.set_ylabel(r"$\theta$ [rad]", fontsize=COMBINED_THETA_LABEL_FONTSIZE)
         ax.grid(True, alpha=0.3)

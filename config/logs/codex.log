@@ -1,0 +1,24 @@
+2026-04-06 16:55:25 | WARNING  | Cannot detect or read from CBR archives
+2026-04-06 16:55:25 | INFO     | Starting Codex v1.9.24
+2026-04-06 16:55:25 | INFO     | Ensuring database is correct and up to date...
+2026-04-06 16:55:31 | SUCCESS  | Database ready.
+2026-04-06 16:55:32 | SUCCESS  | Created admin user.
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Auto Update = False
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Banner Text = True
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Folder View = True
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Import Metadata = True
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Lazy Import Metadata = True
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Non Users = True
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Registration = True
+2026-04-06 16:55:32 | INFO     | Created AdminFlag: Send Telemetry = True
+2026-04-06 16:55:32 | INFO     | Created Custom Covers Dir settings in the db.
+2026-04-06 16:55:32 | INFO     | Created 1 missing auth tokens for users.
+2026-04-06 16:55:32 | INFO     | root_path: 
+2026-04-06 16:55:32 | SUCCESS  | Running Codex v1.9.24
+2026-04-06 16:56:34 | WARNING  | Cannot detect or read from CBR archives
+2026-04-06 16:56:34 | INFO     | Starting Codex v1.9.24
+2026-04-06 16:56:34 | INFO     | Ensuring database is correct and up to date...
+2026-04-06 16:56:34 | SUCCESS  | Database ready.
+2026-04-06 16:56:34 | INFO     | Created 0 missing auth tokens for users.
+2026-04-06 16:56:34 | INFO     | root_path: 
+2026-04-06 16:56:34 | SUCCESS  | Running Codex v1.9.24

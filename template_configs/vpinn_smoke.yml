@@ -73,6 +73,8 @@ loss:
   mean_reg_norm: l1
   sigma_reg: 0.0
   sigma_reg_norm: l2
+  fhat_reg: 0.0
+  fhat_reg_norm: l2
 
   # U_r-bin normalization
   ur_bin_size: 1.0e-6
@@ -142,9 +144,19 @@ vpinn:
   td_fhat_min: 0.11
   td_fhat_max: 0.26
   td_n_memory: 500
+  # Legacy compatibility field; correction_mode is the primary switch.
   predict_sigma: false
+  # Unified TD correction output mode:
+  # mean_only | mean_sigma_only | fhat_only | mean_fhat_only | mean_sigma_fhat
+  correction_mode: mean_only
   # If true, include the current Vivana-TD predicted force as an extra force-network input.
+  # Invalid for correction_mode values that include fhat correction.
   use_td_force_input: false
+  # If true, append sin(phi_vy_td) and cos(phi_vy_td) as TD hidden-state inputs.
+  use_phi_input: false
+  # If true, append both normalized TD sigma states:
+  # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).
+  use_sigma_inputs: false
 
   # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
   # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
@@ -156,6 +168,8 @@ vpinn:
   force_zero_output: false
   # Structural mass used in TD-correction mode: dry | effective
   td_mass_source: dry
+  # Bounded delta_fhat range extension multiplier. 1.0 means the strict physical band.
+  fhat_bound_multiplier: 1.5
 
   # Rollout behavior
   # Validation/final rollout sampling:

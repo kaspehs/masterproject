@@ -509,12 +509,41 @@ def replay_prescribed_motion(
     phi_vy = np.zeros(n_samples, dtype=float)
     sig_dy_loc = np.zeros(n_samples, dtype=float)
     sig_ddy_loc = np.zeros(n_samples, dtype=float)
+    theta = np.zeros(n_samples, dtype=float)
+    fhat = np.zeros(n_samples, dtype=float)
+    omega_vy = np.zeros(n_samples, dtype=float)
 
     phi_vy[0] = float(phi_vy0)
     sig_dy_loc[0] = float(sig_dy_loc0)
     sig_ddy_loc[0] = float(sig_ddy_loc0)
 
-    for idx in range(n_samples - 1):
+    def _diagnostics_at(idx: int) -> tuple[float, float, float]:
+        abs_v, dy_r, ddy_r = _local_cf_kinematics(
+            resolved_U,
+            float(dy_arr[idx]),
+            float(ddy_arr[idx]),
+        )
+        cos_phi_dy = dy_r / (float(sig_dy_loc[idx]) + np.spacing(1.0))
+        sin_phi_dy = -ddy_r / (float(sig_ddy_loc[idx]) + np.spacing(1.0))
+        phi_dy = float(np.angle(complex(cos_phi_dy, sin_phi_dy)))
+        theta_val = float(np.angle(complex(np.cos(phi_dy - float(phi_vy[idx])), np.sin(phi_dy - float(phi_vy[idx])))))
+        fhat_val = _synchronized_fhat(
+            float(params["fhat0"]),
+            float(params["fhat_min"]),
+            float(params["fhat_max"]),
+            dy_r,
+            ddy_r,
+            float(phi_vy[idx]),
+            float(sig_dy_loc[idx]),
+            float(sig_ddy_loc[idx]),
+        )
+        omega_val = float(2.0 * np.pi * fhat_val * abs_v / resolved_D)
+        return theta_val, float(fhat_val), omega_val
+
+    for idx in range(n_samples):
+        theta[idx], fhat[idx], omega_vy[idx] = _diagnostics_at(idx)
+        if idx >= n_samples - 1:
+            continue
         dt = float(time_arr[idx + 1] - time_arr[idx])
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError(f"Non-positive dt detected at index {idx}: {dt}")
@@ -559,6 +588,9 @@ def replay_prescribed_motion(
         "phi_vy": phi_vy,
         "sig_dy_loc": sig_dy_loc,
         "sig_ddy_loc": sig_ddy_loc,
+        "theta": theta,
+        "fhat": fhat,
+        "omega_vy": omega_vy,
     }
 
 

@@ -54,12 +54,16 @@ from HNN_helper import (
     relative_error,
     resample_uniform_series,
     load_td_correction_trajectories,
+    resolve_td_correction_mode,
     resolve_td_correction_params,
     sample_indices_per_ur,
     sample_one_index_per_ur,
     spectral_relative_error,
     structural_step_constant_force_torch,
+    td_bounded_delta_fhat_torch,
+    td_hidden_inputs_from_context_torch,
     td_baseline_step_torch,
+    td_correction_mode_flags,
 )
 from architectures import FourierFeatures, ODEPirateNet
 
@@ -546,18 +550,80 @@ def _vpinn_model_uses_td_force_input(model: nn.Module) -> bool:
     return bool(getattr(base, "use_td_force_input", False))
 
 
+def _vpinn_model_uses_phi_input(model: nn.Module) -> bool:
+    base = getattr(model, "_orig_mod", model)
+    return bool(getattr(base, "use_phi_input", False))
+
+
+def _vpinn_model_uses_sigma_inputs(model: nn.Module) -> bool:
+    base = getattr(model, "_orig_mod", model)
+    return bool(getattr(base, "use_sigma_inputs", False))
+
+
+def _vpinn_input_dim(
+    *,
+    d: int,
+    use_td_force_input: bool,
+    use_phi_input: bool,
+    use_sigma_inputs: bool,
+) -> int:
+    return int(2 * d + 1 + (1 if use_td_force_input else 0) + (2 if use_phi_input else 0) + (2 if use_sigma_inputs else 0))
+
+
+def _vpinn_output_dim(
+    *,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    d: int,
+) -> int:
+    return int((d if mean_active else 0) + (d if sigma_active else 0) + (d if fhat_active else 0))
+
+
+def _vpinn_optional_hidden_inputs_from_context(
+    model: nn.Module,
+    *,
+    td_context: torch.Tensor,
+    structural_mass: torch.Tensor,
+    stiffness: torch.Tensor,
+    diameter: float,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not (_vpinn_model_uses_phi_input(model) or _vpinn_model_uses_sigma_inputs(model)):
+        return None, None
+    phi_input, sigma_inputs = td_hidden_inputs_from_context_torch(
+        td_context=td_context,
+        structural_mass=structural_mass,
+        stiffness=stiffness,
+        diameter=diameter,
+    )
+    return (
+        phi_input if _vpinn_model_uses_phi_input(model) else None,
+        sigma_inputs if _vpinn_model_uses_sigma_inputs(model) else None,
+    )
+
+
 def _vpinn_force(
     model: nn.Module,
     x: torch.Tensor,
     v: torch.Tensor,
     ur: torch.Tensor,
     td_force_input: torch.Tensor | None = None,
+    phi_input: torch.Tensor | None = None,
+    sigma_inputs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     parts = [x, v, ur]
     if _vpinn_model_uses_td_force_input(model):
         if td_force_input is None:
             raise ValueError("td_force_input is required when vpinn.use_td_force_input is enabled.")
         parts.append(td_force_input)
+    if _vpinn_model_uses_phi_input(model):
+        if phi_input is None:
+            raise ValueError("phi_input is required when vpinn.use_phi_input is enabled.")
+        parts.append(phi_input)
+    if _vpinn_model_uses_sigma_inputs(model):
+        if sigma_inputs is None:
+            raise ValueError("sigma_inputs is required when vpinn.use_sigma_inputs is enabled.")
+        parts.append(sigma_inputs)
     return model(torch.cat(parts, dim=-1))
 
 
@@ -1718,7 +1784,11 @@ def _log_td_correction_rollout_validation(
     td_params: dict[str, float],
     device: torch.device,
     sigma_min: float,
+    mean_active: bool,
     probabilistic: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
@@ -1759,7 +1829,7 @@ def _log_td_correction_rollout_validation(
     c = torch.full((1, d), damping_value, dtype=x_true_t.dtype, device=device)
     k = torch.full((1, d), stiffness_value, dtype=x_true_t.dtype, device=device)
 
-    x_seq, v_seq, f_seq, td_roll_seq, _corr_roll_seq = _vpinn_td_rollout(
+    x_seq, v_seq, f_seq, td_roll_seq, _corr_roll_seq, delta_fhat_roll_seq = _vpinn_td_rollout(
         model=model,
         x0=x_true_t[0:1, :],
         v0=v_true_t[0:1, :],
@@ -1773,7 +1843,11 @@ def _log_td_correction_rollout_validation(
         rho=rho,
         diameter=diameter,
         td_params=td_params,
-        probabilistic=probabilistic,
+        mean_active=mean_active,
+        sigma_active=probabilistic,
+        fhat_active=fhat_active,
+        use_td_force_input=use_td_force_input,
+        fhat_bound_multiplier=fhat_bound_multiplier,
         sigma_min=sigma_min,
         force_zero_output=force_zero_output,
         rollout_stochastic=rollout_stochastic,
@@ -1784,26 +1858,42 @@ def _log_td_correction_rollout_validation(
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
     f_roll = f_seq[0, :, 0].detach().cpu().numpy()
     td_roll = td_roll_seq[0, :, 0].detach().cpu().numpy()
+    delta_fhat_roll = delta_fhat_roll_seq[0, :, 0].detach().cpu().numpy()
 
     with torch.no_grad():
-        corr_on_data, sigma_on_data = _vpinn_predict_correction(
-            model,
-            x_true_t,
-            v_true_t,
-            ur_true_t,
-            td_true_t,
-            probabilistic=probabilistic,
+        step_on_data = _vpinn_step_with_corrections(
+            model=model,
+            x=x_true_t[:-1],
+            v=v_true_t[:-1],
+            ur=ur_true_t[:-1],
+            td_context=td_context_t[:-1],
+            dt=dt,
+            m=torch.full((x_true_t.shape[0] - 1, d), mass_value, dtype=x_true_t.dtype, device=device),
+            c=torch.full((x_true_t.shape[0] - 1, d), damping_value, dtype=x_true_t.dtype, device=device),
+            k=torch.full((x_true_t.shape[0] - 1, d), stiffness_value, dtype=x_true_t.dtype, device=device),
+            rho=rho,
+            diameter=diameter,
+            td_params=td_params,
+            mean_active=mean_active,
+            sigma_active=probabilistic,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             sigma_min=sigma_min,
             force_zero_output=force_zero_output,
         )
-        f_on_data = (td_true_t + corr_on_data)[:, 0].detach().cpu().numpy()
+        corr_on_data = step_on_data["corr_mu"]
+        sigma_on_data = step_on_data["corr_sigma"]
+        td_on_data = step_on_data["td_force_next"]
+        f_on_data = step_on_data["total_force_next"][:, 0].detach().cpu().numpy()
+        delta_fhat_on_data = step_on_data["delta_fhat"][:, 0].detach().cpu().numpy()
 
     if f_roll.size > 0:
         force_total_full = np.concatenate([f_on_data[:1], f_roll], axis=0)
-        force_td_full = np.concatenate([td_true_t[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
+        force_td_full = np.concatenate([td_on_data[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
     else:
         force_total_full = f_on_data
-        force_td_full = td_true_t[:, 0].detach().cpu().numpy()
+        force_td_full = td_on_data[:, 0].detach().cpu().numpy()
 
     metrics = compute_validation_metrics(
         model=model,  # ignored when rollout is provided
@@ -1825,11 +1915,14 @@ def _log_td_correction_rollout_validation(
         },
     )
 
-    force_true = f_true_t[:, 0].detach().cpu().numpy()
+    force_true = f_true_t[1:, 0].detach().cpu().numpy()
     force_std = float(np.std(force_true))
     if force_std <= 0.0:
         force_std = 1.0
     metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((f_on_data - force_true) ** 2))) / force_std
+    if fhat_active:
+        metrics["Delta fhat mean abs"] = float(np.mean(np.abs(delta_fhat_on_data)))
+        metrics["Delta fhat mean"] = float(np.mean(delta_fhat_on_data))
 
     if log_metrics:
         for name, value in metrics.items():
@@ -1863,7 +1956,7 @@ def _log_td_correction_rollout_validation(
             epoch,
             t_np[: min(len(t_np), len(force_total_full), len(force_true))],
             force_total_full[: min(len(t_np), len(force_total_full), len(force_true))],
-            force_true[: min(len(t_np), len(force_total_full), len(force_true))],
+            f_true_t[:, 0].detach().cpu().numpy()[: min(len(t_np), len(force_total_full), len(f_true_t))],
             create_zoom_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))]),
             reduced_velocity=ur_val,
             force_coeff_baseline=force_td_full[: min(len(t_np), len(force_total_full), len(force_true))],
@@ -1881,8 +1974,8 @@ def _log_td_correction_rollout_validation(
             log_correction_on_data_plot(
                 writer,
                 epoch,
-                t=t_np,
-                corr_true=(f_true_t[:, 0] - td_true_t[:, 0]).detach().cpu().numpy(),
+                t=t_np[1:],
+                corr_true=(f_true_t[1:, 0] - td_on_data[:, 0]).detach().cpu().numpy(),
                 corr_pred=corr_on_data[:, 0].detach().cpu().numpy(),
                 sigma=(
                     sigma_on_data[:, 0].detach().cpu().numpy()
@@ -1900,6 +1993,21 @@ def _log_td_correction_rollout_validation(
                 step=step,
                 title_suffix=title_suffix,
             )
+            if fhat_active:
+                log_correction_on_data_plot(
+                    writer,
+                    epoch,
+                    t=t_np[1:],
+                    corr_true=np.zeros_like(delta_fhat_on_data),
+                    corr_pred=delta_fhat_on_data,
+                    sigma=None,
+                    reduced_velocity=ur_val,
+                    value_label="Delta fhat",
+                    sigma_label="",
+                    tag="final_val/delta_fhat_on_data",
+                    step=step,
+                    title_suffix=title_suffix,
+                )
         if log_phase_map:
             q_extent = np.concatenate([np.asarray(q_true_norm, dtype=float), np.asarray(q_pred_norm, dtype=float)])
             p_extent = np.concatenate([np.asarray(p_true_norm, dtype=float), np.asarray(p_pred_norm, dtype=float)])
@@ -1929,79 +2037,289 @@ def _log_td_correction_rollout_validation(
                     dtype=x_true_t.dtype,
                     device=device,
                 )
+            phi_grid = None
+            sigma_grid_inputs = None
+            if _vpinn_model_uses_phi_input(model) or _vpinn_model_uses_sigma_inputs(model):
+                phi_series, sigma_series = td_hidden_inputs_from_context_torch(
+                    td_context=td_context_t,
+                    structural_mass=torch.full_like(x_true_t, mass_value),
+                    stiffness=torch.full_like(x_true_t, stiffness_value),
+                    diameter=diameter,
+                )
+                phi_series_np = phi_series.detach().cpu().numpy()
+                sigma_series_np = sigma_series.detach().cpu().numpy()
+                if _vpinn_model_uses_phi_input(model):
+                    phi_grid = torch.as_tensor(
+                        np.stack(
+                            [
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, phi_series_np[:, 0]),
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, phi_series_np[:, 1]),
+                            ],
+                            axis=-1,
+                        ).reshape(-1, 2),
+                        dtype=x_true_t.dtype,
+                        device=device,
+                    )
+                if _vpinn_model_uses_sigma_inputs(model):
+                    sigma_grid_inputs = torch.as_tensor(
+                        np.stack(
+                            [
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, sigma_series_np[:, 0]),
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, sigma_series_np[:, 1]),
+                            ],
+                            axis=-1,
+                        ).reshape(-1, 2),
+                        dtype=x_true_t.dtype,
+                        device=device,
+                    )
             with torch.no_grad():
-                corr_grid, sigma_grid = _vpinn_predict_correction(
+                corr_grid, sigma_grid, raw_delta_fhat_grid = _vpinn_predict_outputs(
                     model,
                     x_grid,
                     v_grid,
                     ur_grid,
-                    td_force_grid,
-                    probabilistic=probabilistic,
+                    (td_force_grid if use_td_force_input else None),
+                    phi_grid,
+                    sigma_grid_inputs,
+                    mean_active=mean_active,
+                    sigma_active=probabilistic,
+                    fhat_active=fhat_active,
                     sigma_min=sigma_min,
                     force_zero_output=force_zero_output,
                 )
-            output_label = (
-                "Correction coefficient"
-                if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
-                else "Correction force"
-            )
-            log_signed_phase_output_plot(
-                writer,
-                epoch,
-                q_grid=q_grid,
-                p_grid=p_grid,
-                values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
-                q_true=q_true_norm,
-                p_true=p_true_norm,
-                q_pred=q_pred_norm,
-                p_pred=p_pred_norm,
-                reduced_velocity=ur_val,
-                output_label=output_label,
-                sigma_values=(
-                    sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
-                    if probabilistic
-                    else None
-                ),
-                sigma_label=(
-                    "Sigma coefficient"
+            if mean_active:
+                output_label = (
+                    "Correction coefficient"
                     if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
-                    else "Sigma force"
-                ),
-                tag="final_val/phase_output",
-                step=step,
-                title_suffix=title_suffix,
-            )
+                    else "Correction force"
+                )
+                log_signed_phase_output_plot(
+                    writer,
+                    epoch,
+                    q_grid=q_grid,
+                    p_grid=p_grid,
+                    values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
+                    q_true=q_true_norm,
+                    p_true=p_true_norm,
+                    q_pred=q_pred_norm,
+                    p_pred=p_pred_norm,
+                    reduced_velocity=ur_val,
+                    output_label=output_label,
+                    sigma_values=(
+                        sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
+                        if probabilistic
+                        else None
+                    ),
+                    sigma_label=(
+                        "Sigma coefficient"
+                        if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
+                        else "Sigma force"
+                    ),
+                    tag="final_val/phase_output",
+                    step=step,
+                    title_suffix=title_suffix,
+                )
+            if fhat_active:
+                delta_fhat_grid, _ = td_bounded_delta_fhat_torch(
+                    raw_delta_fhat_grid,
+                    fhat_td=torch.as_tensor(
+                        nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["fhat_td"], dtype=float)).reshape(-1, 1),
+                        dtype=x_true_t.dtype,
+                        device=device,
+                    ),
+                    fhat_min=float(td_params["fhat_min"]),
+                    fhat_max=float(td_params["fhat_max"]),
+                    fhat_bound_multiplier=float(fhat_bound_multiplier),
+                )
+                log_signed_phase_output_plot(
+                    writer,
+                    epoch,
+                    q_grid=q_grid,
+                    p_grid=p_grid,
+                    values=delta_fhat_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
+                    q_true=q_true_norm,
+                    p_true=p_true_norm,
+                    q_pred=q_pred_norm,
+                    p_pred=p_pred_norm,
+                    reduced_velocity=ur_val,
+                    output_label="Delta fhat",
+                    sigma_values=None,
+                    sigma_label="",
+                    tag="final_val/phase_output_delta_fhat",
+                    step=step,
+                    title_suffix=title_suffix,
+                )
     return metrics
 
 
-def _vpinn_predict_correction(
+def _vpinn_predict_outputs(
     model: nn.Module,
     x: torch.Tensor,
     v: torch.Tensor,
     ur: torch.Tensor,
     td_force_input: torch.Tensor | None = None,
+    phi_input: torch.Tensor | None = None,
+    sigma_inputs: torch.Tensor | None = None,
     *,
-    probabilistic: bool,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
     sigma_min: float,
     force_zero_output: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    d = int(x.shape[-1])
     if force_zero_output:
-        d = int(x.shape[-1])
         mu = x.new_zeros(x.shape[:-1] + (d,))
-        if probabilistic:
+        if sigma_active:
             sigma = x.new_full(x.shape[:-1] + (d,), float(sigma_min))
         else:
             sigma = torch.zeros_like(mu)
-        return mu, sigma
-    out = _vpinn_force(model, x, v, ur, td_force_input)
-    d = int(x.shape[-1])
-    if not probabilistic:
-        return out, torch.zeros_like(out)
-    if int(out.shape[-1]) != int(2 * d):
-        raise ValueError("Probabilistic TD correction VPINN expects output dimension 2*d.")
-    mu = out[..., :d]
-    sigma = float(sigma_min) + F.softplus(out[..., d:])
-    return mu, sigma
+        raw_delta_fhat = torch.zeros_like(mu)
+        return mu, sigma, raw_delta_fhat
+    out = _vpinn_force(
+        model,
+        x,
+        v,
+        ur,
+        td_force_input,
+        phi_input,
+        sigma_inputs,
+    )
+    expected_dim = _vpinn_output_dim(mean_active=mean_active, sigma_active=sigma_active, fhat_active=fhat_active, d=d)
+    if int(out.shape[-1]) != expected_dim:
+        raise ValueError(f"Unexpected VPINN TD correction output dimension {int(out.shape[-1])}; expected {expected_dim}.")
+    cursor = 0
+    if mean_active:
+        mu = out[..., cursor:cursor + d]
+        cursor += d
+    else:
+        mu = x.new_zeros(x.shape[:-1] + (d,))
+    if sigma_active:
+        raw_sigma = out[..., cursor:cursor + d]
+        sigma = float(sigma_min) + F.softplus(raw_sigma)
+        cursor += d
+    else:
+        sigma = x.new_zeros(x.shape[:-1] + (d,))
+    if fhat_active:
+        raw_delta_fhat = out[..., cursor:cursor + d]
+    else:
+        raw_delta_fhat = x.new_zeros(x.shape[:-1] + (d,))
+    return mu, sigma, raw_delta_fhat
+
+
+def _vpinn_step_with_corrections(
+    *,
+    model: nn.Module,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    ur: torch.Tensor,
+    td_context: torch.Tensor,
+    dt: float | torch.Tensor,
+    m: torch.Tensor,
+    c: torch.Tensor,
+    k: torch.Tensor,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
+    sigma_min: float,
+    force_zero_output: bool = False,
+    rollout_stochastic: bool = False,
+    rollout_noise_scale: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor]:
+    baseline_force_next, baseline_context_next, baseline_diag = td_baseline_step_torch(
+        velocity=v,
+        acceleration=td_context[..., 0:1],
+        td_context=td_context,
+        dt=dt,
+        rho=rho,
+        diameter=diameter,
+        params=td_params,
+        return_diagnostics=True,
+    )
+    phi_input, sigma_inputs = _vpinn_optional_hidden_inputs_from_context(
+        model,
+        td_context=td_context,
+        structural_mass=m,
+        stiffness=k,
+        diameter=diameter,
+    )
+    corr_mu, corr_sigma, raw_delta_fhat = _vpinn_predict_outputs(
+        model,
+        x,
+        v,
+        ur,
+        (baseline_force_next if use_td_force_input else None),
+        phi_input,
+        sigma_inputs,
+        mean_active=mean_active,
+        sigma_active=sigma_active,
+        fhat_active=fhat_active,
+        sigma_min=sigma_min,
+        force_zero_output=force_zero_output,
+    )
+    if fhat_active:
+        td_force_next, td_context_next, td_diag = td_baseline_step_torch(
+            velocity=v,
+            acceleration=td_context[..., 0:1],
+            td_context=td_context,
+            dt=dt,
+            rho=rho,
+            diameter=diameter,
+            params=td_params,
+            raw_delta_fhat=raw_delta_fhat,
+            fhat_bound_multiplier=float(fhat_bound_multiplier),
+            return_diagnostics=True,
+        )
+    else:
+        td_force_next = baseline_force_next
+        td_context_next = baseline_context_next
+        td_diag = dict(baseline_diag)
+        td_diag["delta_fhat"] = raw_delta_fhat.new_zeros(raw_delta_fhat.shape)
+        td_diag["fhat_corr"] = td_diag["fhat_td"]
+        td_diag["omega_vy_corr"] = td_diag["omega_vy_td"]
+    corr_force = corr_mu
+    if rollout_stochastic and sigma_active:
+        noise = torch.randn(
+            corr_mu.shape,
+            device=corr_mu.device,
+            dtype=corr_mu.dtype,
+            generator=generator,
+        )
+        corr_force = corr_mu + float(rollout_noise_scale) * corr_sigma * noise
+    total_force = td_force_next + corr_force
+    x_next, v_next, a_next = structural_step_constant_force_torch(
+        y=x,
+        velocity=v,
+        force=total_force,
+        dt=dt,
+        mass=m,
+        damping_c=c,
+        stiffness=k,
+    )
+    td_context_next = td_context_next.clone()
+    td_context_next[..., 0:1] = a_next
+    return {
+        "baseline_force_next": baseline_force_next,
+        "td_force_next": td_force_next,
+        "total_force_next": total_force,
+        "corr_mu": corr_mu,
+        "corr_sigma": corr_sigma,
+        "corr_force": corr_force,
+        "raw_delta_fhat": raw_delta_fhat,
+        "delta_fhat": td_diag["delta_fhat"],
+        "fhat_td": td_diag["fhat_td"],
+        "fhat_corr": td_diag["fhat_corr"],
+        "x_next": x_next,
+        "v_next": v_next,
+        "a_next": a_next,
+        "td_context_next": td_context_next,
+    }
 
 
 def _vpinn_td_rollout(
@@ -2019,13 +2337,17 @@ def _vpinn_td_rollout(
     rho: float,
     diameter: float,
     td_params: dict[str, float],
-    probabilistic: bool,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
     sigma_min: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
     rollout_seed: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     x = x0
     v = v0
     td_context = td_context0
@@ -2034,56 +2356,45 @@ def _vpinn_td_rollout(
     total_fs: list[torch.Tensor] = []
     td_fs: list[torch.Tensor] = []
     corr_fs: list[torch.Tensor] = []
+    delta_fhats: list[torch.Tensor] = []
     generator: torch.Generator | None = None
     if rollout_seed is not None:
         generator = torch.Generator(device=x0.device)
         generator.manual_seed(int(rollout_seed))
     for _ in range(int(steps)):
-        td_force_next, td_context_next = td_baseline_step_torch(
-            velocity=v,
-            acceleration=td_context[:, 0:1],
+        step = _vpinn_step_with_corrections(
+            model=model,
+            x=x,
+            v=v,
+            ur=ur0,
             td_context=td_context,
             dt=dt,
+            m=m,
+            c=c,
+            k=k,
             rho=rho,
             diameter=diameter,
-            params=td_params,
-        )
-        corr_mu, corr_sigma = _vpinn_predict_correction(
-            model,
-            x,
-            v,
-            ur0,
-            td_force_next,
-            probabilistic=probabilistic,
+            td_params=td_params,
+            mean_active=mean_active,
+            sigma_active=sigma_active,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             sigma_min=sigma_min,
             force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            generator=generator,
         )
-        corr_force = corr_mu
-        if rollout_stochastic:
-            noise = torch.randn(
-                corr_mu.shape,
-                device=corr_mu.device,
-                dtype=corr_mu.dtype,
-                generator=generator,
-            )
-            corr_force = corr_mu + float(rollout_noise_scale) * corr_sigma * noise
-        total_force = td_force_next + corr_force
-        x, v, a_next = structural_step_constant_force_torch(
-            y=x,
-            velocity=v,
-            force=total_force,
-            dt=dt,
-            mass=m,
-            damping_c=c,
-            stiffness=k,
-        )
-        td_context = td_context_next.clone()
-        td_context[:, 0:1] = a_next
+        x = step["x_next"]
+        v = step["v_next"]
+        td_context = step["td_context_next"]
         xs.append(x)
         vs.append(v)
-        total_fs.append(total_force)
-        td_fs.append(td_force_next)
-        corr_fs.append(corr_force)
+        total_fs.append(step["total_force_next"])
+        td_fs.append(step["td_force_next"])
+        corr_fs.append(step["corr_force"])
+        delta_fhats.append(step["delta_fhat"])
     empty_force = x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
     return (
         torch.stack(xs, dim=1),
@@ -2091,6 +2402,7 @@ def _vpinn_td_rollout(
         torch.stack(total_fs, dim=1) if total_fs else empty_force,
         torch.stack(td_fs, dim=1) if td_fs else empty_force,
         torch.stack(corr_fs, dim=1) if corr_fs else empty_force,
+        torch.stack(delta_fhats, dim=1) if delta_fhats else empty_force,
     )
 
 
@@ -2104,7 +2416,11 @@ def _vpinn_td_rollout_loss_from_batch(
     rho: float,
     diameter: float,
     td_params: dict[str, float],
-    probabilistic: bool,
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
     sigma_min: float,
     force_zero_output: bool,
     rollout_loss_mode: str,
@@ -2130,7 +2446,7 @@ def _vpinn_td_rollout_loss_from_batch(
         m0_in = m0.unsqueeze(0).expand(samples, *m0.shape).reshape(samples * batch_size, *m0.shape[1:])
         c0_in = c0.unsqueeze(0).expand(samples, *c0.shape).reshape(samples * batch_size, *c0.shape[1:])
         k0_in = k0.unsqueeze(0).expand(samples, *k0.shape).reshape(samples * batch_size, *k0.shape[1:])
-        x_pred, v_pred, _, _, _ = _vpinn_td_rollout(
+        x_pred, v_pred, _, _, _, _ = _vpinn_td_rollout(
             model=model,
             x0=x0_in,
             v0=v0_in,
@@ -2144,7 +2460,11 @@ def _vpinn_td_rollout_loss_from_batch(
             rho=rho,
             diameter=diameter,
             td_params=td_params,
-            probabilistic=probabilistic,
+            mean_active=mean_active,
+            sigma_active=sigma_active,
+            fhat_active=fhat_active,
+            use_td_force_input=use_td_force_input,
+            fhat_bound_multiplier=fhat_bound_multiplier,
             sigma_min=sigma_min,
             force_zero_output=force_zero_output,
             rollout_stochastic=True,
@@ -2191,7 +2511,7 @@ def _vpinn_td_rollout_loss_from_batch(
         per_samples = torch.mean(err_x * err_x, dim=(2, 3)) + torch.mean(err_v * err_v, dim=(2, 3))
         return torch.mean(torch.mean(per_samples, dim=0))
 
-    x_pred, v_pred, _, _, _ = _vpinn_td_rollout(
+    x_pred, v_pred, _, _, _, _ = _vpinn_td_rollout(
         model=model,
         x0=x0,
         v0=v0,
@@ -2205,7 +2525,11 @@ def _vpinn_td_rollout_loss_from_batch(
         rho=rho,
         diameter=diameter,
         td_params=td_params,
-        probabilistic=probabilistic,
+        mean_active=mean_active,
+        sigma_active=sigma_active,
+        fhat_active=fhat_active,
+        use_td_force_input=use_td_force_input,
+        fhat_bound_multiplier=fhat_bound_multiplier,
         sigma_min=sigma_min,
         force_zero_output=force_zero_output,
         rollout_stochastic=False,
@@ -2290,8 +2614,7 @@ def _build_td_correction_vpinn_datasets(
     for traj in trajs:
         x = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
         v = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
-        f_corr = torch.from_numpy(np.ascontiguousarray(traj["force_corr_per_m"])).float().unsqueeze(1)
-        f_td = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1)
+        f_true = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1)
         ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
         td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
         mass_value = float(np.asarray(traj["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
@@ -2303,9 +2626,9 @@ def _build_td_correction_vpinn_datasets(
         if x.shape[0] >= window:
             xw = []
             vw = []
-            cw = []
-            tdw = []
+            fw = []
             urw = []
+            tdw = []
             mw = []
             dw = []
             kw = []
@@ -2313,9 +2636,9 @@ def _build_td_correction_vpinn_datasets(
                 end = start + window
                 xw.append(x[start:end])
                 vw.append(v[start:end])
-                cw.append(f_corr[start:end])
-                tdw.append(f_td[start:end])
+                fw.append(f_true[start:end])
                 urw.append(ur[start:end])
+                tdw.append(td_context[start:end])
                 mw.append(mass[start:end])
                 dw.append(damping[start:end])
                 kw.append(stiffness[start:end])
@@ -2323,9 +2646,9 @@ def _build_td_correction_vpinn_datasets(
                 TensorDataset(
                     torch.stack(xw, dim=0),
                     torch.stack(vw, dim=0),
-                    torch.stack(cw, dim=0),
-                    torch.stack(tdw, dim=0),
+                    torch.stack(fw, dim=0),
                     torch.stack(urw, dim=0),
+                    torch.stack(tdw, dim=0),
                     torch.stack(mw, dim=0),
                     torch.stack(dw, dim=0),
                     torch.stack(kw, dim=0),
@@ -2384,7 +2707,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     compile_cfg = config.compile
     monitoring_cfg = config.monitoring
 
-    probabilistic = bool(vp.get("predict_sigma", False))
+    correction_mode = resolve_td_correction_mode(vp)
+    mode_flags = td_correction_mode_flags(correction_mode)
+    mean_active = bool(mode_flags["mean_active"])
+    probabilistic = bool(mode_flags["sigma_active"])
+    fhat_active = bool(mode_flags["fhat_active"])
     force_zero_output = bool(vp.get("force_zero_output", False))
     sigma_min = float(vp.get("sigma_min", 1e-6))
     rollout_stochastic = bool(vp.get("rollout_stochastic", False))
@@ -2450,16 +2777,29 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
+    use_phi_input = bool(vp.get("use_phi_input", False))
+    use_sigma_inputs = bool(vp.get("use_sigma_inputs", False))
+    fhat_bound_multiplier = float(vp.get("fhat_bound_multiplier", 1.5))
+    if not np.isfinite(fhat_bound_multiplier) or fhat_bound_multiplier <= 0.0:
+        raise ValueError("vpinn.fhat_bound_multiplier must be finite and positive.")
+    if fhat_active and use_td_force_input:
+        raise ValueError("vpinn.use_td_force_input=true is invalid for correction_mode values that include fhat correction.")
     hard_force_symmetry = bool(getattr(config.architecture, "hard_force_symmetry", False))
-    if hard_force_symmetry and use_td_force_input:
+    if hard_force_symmetry and (use_td_force_input or use_phi_input or use_sigma_inputs):
         raise ValueError(
-            "architecture.hard_force_symmetry requires vpinn.use_td_force_input=false "
-            "because the TD-force input does not have a defined sign-flip symmetry."
+            "architecture.hard_force_symmetry requires vpinn.use_td_force_input=false, "
+            "vpinn.use_phi_input=false, and vpinn.use_sigma_inputs=false because those "
+            "auxiliary inputs do not have a defined sign-flip symmetry."
         )
 
     d = int(np.asarray(train_trajs[0]["y"]).ndim == 1)
-    input_dim = 4 if use_td_force_input else 3
-    output_dim = 2 if probabilistic else 1
+    input_dim = _vpinn_input_dim(
+        d=d,
+        use_td_force_input=use_td_force_input,
+        use_phi_input=use_phi_input,
+        use_sigma_inputs=use_sigma_inputs,
+    )
+    output_dim = _vpinn_output_dim(mean_active=mean_active, sigma_active=probabilistic, fhat_active=fhat_active, d=d)
     model = _build_force_model(
         config,
         input_dim=input_dim,
@@ -2467,6 +2807,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         mean_output_dim=1,
     ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
+    setattr(model, "use_phi_input", use_phi_input)
+    setattr(model, "use_sigma_inputs", use_sigma_inputs)
+    setattr(model, "correction_mode", correction_mode)
+    setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
+    setattr(model, "force_zero_output", force_zero_output)
     setattr(model, "force_representation", str(vp.get("force_representation", "force")).strip().lower())
     setattr(model, "hard_force_symmetry", hard_force_symmetry)
     _apply_corr_head_init(
@@ -2507,7 +2852,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         )
     if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"} and rollout_weight > 0.0 and not probabilistic:
         raise ValueError(
-            "VPINN rollout stochastic loss modes require vpinn.predict_sigma=true."
+            "VPINN rollout stochastic loss modes require a correction_mode that includes the sigma head."
         )
     if rollout_weight > 0.0 and rollout_steps < 1 and rollout_steps_final < 1:
         raise ValueError(
@@ -2650,7 +2995,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         (
             f"VPINN TD-correction setup: epochs={epochs}, batch_size={int(training_cfg.batch_size)}, "
             f"steps_per_epoch={train_steps_per_epoch}, train_instances={train_instances}, "
-            f"train_trajectories={len(train_trajs)}"
+            f"train_trajectories={len(train_trajs)}, correction_mode={correction_mode}"
         ),
         (
             f"Validation setup: steps={val_steps_per_epoch}, val_instances={val_instances}, "
@@ -2718,38 +3063,51 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             print(
                 f"Epoch {epoch}: updated rollout loss horizon to {current_rollout_steps} step(s)."
             )
-        sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_rollout_det", "grad_norm"]}
+        sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat", "loss_rollout_det", "grad_norm"]}
         batches = 0
         rollout_iter = iter(rollout_loader) if rollout_loader is not None else None
         for batch in train_loader:
-            x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = batch
+            x_win, v_win, force_true, ur_win, td_win, m_win, c_win, k_win = batch
             x_win = x_win.to(device, non_blocking=non_blocking)
             v_win = v_win.to(device, non_blocking=non_blocking)
-            corr_true = corr_true.to(device, non_blocking=non_blocking)
-            td_force = td_force.to(device, non_blocking=non_blocking)
+            force_true = force_true.to(device, non_blocking=non_blocking)
             ur_win = ur_win.to(device, non_blocking=non_blocking)
+            td_win = td_win.to(device, non_blocking=non_blocking)
             m_win = m_win.to(device, non_blocking=non_blocking)
             c_win = c_win.to(device, non_blocking=non_blocking)
             k_win = k_win.to(device, non_blocking=non_blocking)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                mu_corr, sigma_corr = _vpinn_predict_correction(
-                    model,
-                    x_win,
-                    v_win,
-                    ur_win,
-                    td_force,
-                    probabilistic=probabilistic,
+                step = _vpinn_step_with_corrections(
+                    model=model,
+                    x=x_win,
+                    v=v_win,
+                    ur=ur_win,
+                    td_context=td_win,
+                    dt=dt,
+                    m=m_win,
+                    c=c_win,
+                    k=k_win,
+                    rho=rho,
+                    diameter=diameter,
+                    td_params=td_params,
+                    mean_active=mean_active,
+                    sigma_active=probabilistic,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     sigma_min=sigma_min,
                     force_zero_output=force_zero_output,
                 )
-                total_force_mu = td_force + mu_corr
+                mu_corr = step["corr_mu"]
+                sigma_corr = step["corr_sigma"]
+                total_force_mu = step["total_force_next"]
                 if use_force_loss:
                     if probabilistic:
                         var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        loss_data = torch.mean(0.5 * (((corr_true - mu_corr) ** 2) / var + torch.log(var)))
+                        loss_data = torch.mean(0.5 * (((force_true - total_force_mu) ** 2) / var + torch.log(var)))
                     else:
-                        loss_data = torch.mean((corr_true - mu_corr) ** 2)
+                        loss_data = torch.mean((force_true - total_force_mu) ** 2)
                 else:
                     loss_data = mu_corr.new_tensor(0.0)
                 if use_weak_loss:
@@ -2788,6 +3146,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     loss_physics = mu_corr.new_tensor(0.0)
                 mean_reg_loss = _reg(mu_corr, mean_reg_norm)
                 sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
+                fhat_reg_loss = _reg(step["delta_fhat"], str(getattr(loss_cfg, "fhat_reg_norm", "l2"))) if fhat_active else mu_corr.new_tensor(0.0)
                 rollout_det_loss = mu_corr.new_tensor(0.0)
                 if rollout_iter is not None and rollout_weight > 0.0 and current_rollout_steps > 0:
                     try:
@@ -2804,7 +3163,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         rho=rho,
                         diameter=diameter,
                         td_params=td_params,
-                        probabilistic=probabilistic,
+                        mean_active=mean_active,
+                        sigma_active=probabilistic,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
                         sigma_min=sigma_min,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
@@ -2813,7 +3176,14 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
                         ur_bin_size=ur_bin_size,
                     )
-                total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss + float(rollout_weight) * rollout_det_loss
+                total_loss = (
+                    loss_data
+                    + loss_physics
+                    + float(mean_reg) * mean_reg_loss
+                    + float(sigma_reg) * sigma_reg_loss
+                    + float(getattr(loss_cfg, "fhat_reg", 0.0)) * fhat_reg_loss
+                    + float(rollout_weight) * rollout_det_loss
+                )
             if total_loss.requires_grad:
                 if scaler.is_enabled():
                     scaler.scale(total_loss).backward()
@@ -2834,6 +3204,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             sums["loss_physics"] += loss_physics.detach()
             sums["loss_reg_mean"] += mean_reg_loss.detach()
             sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+            sums["loss_reg_fhat"] += fhat_reg_loss.detach()
             sums["loss_rollout_det"] += rollout_det_loss.detach()
             sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
         denom = float(max(1, batches))
@@ -2872,6 +3243,16 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     "method": "vpinn",
                     "td_correction": True,
                     "ur_bin_state_scale_info": ur_bin_state_scale_info,
+                    "correction_mode": correction_mode,
+                    "predict_sigma": probabilistic,
+                    "mean_active": mean_active,
+                    "fhat_active": fhat_active,
+                    "use_td_force_input": use_td_force_input,
+                    "use_phi_input": use_phi_input,
+                    "use_sigma_inputs": use_sigma_inputs,
+                    "fhat_bound_multiplier": float(fhat_bound_multiplier),
+                    "fhat_reg": float(fhat_reg),
+                    "fhat_reg_norm": str(fhat_reg_norm),
                 },
                 ckpt_path,
             )
@@ -2891,29 +3272,42 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             )
         elif should_validate:
             model.eval()
-            val_sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma"]}
+            val_sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]}
             val_batches = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    x_win, v_win, corr_true, td_force, ur_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
+                    x_win, v_win, force_true, ur_win, td_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
                     with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                        mu_corr, sigma_corr = _vpinn_predict_correction(
-                            model,
-                            x_win,
-                            v_win,
-                            ur_win,
-                            td_force,
-                            probabilistic=probabilistic,
+                        step = _vpinn_step_with_corrections(
+                            model=model,
+                            x=x_win,
+                            v=v_win,
+                            ur=ur_win,
+                            td_context=td_win,
+                            dt=dt,
+                            m=m_win,
+                            c=c_win,
+                            k=k_win,
+                            rho=rho,
+                            diameter=diameter,
+                            td_params=td_params,
+                            mean_active=mean_active,
+                            sigma_active=probabilistic,
+                            fhat_active=fhat_active,
+                            use_td_force_input=use_td_force_input,
+                            fhat_bound_multiplier=fhat_bound_multiplier,
                             sigma_min=sigma_min,
                             force_zero_output=force_zero_output,
                         )
-                        total_force_mu = td_force + mu_corr
+                        mu_corr = step["corr_mu"]
+                        sigma_corr = step["corr_sigma"]
+                        total_force_mu = step["total_force_next"]
                         if use_force_loss:
                             if probabilistic:
                                 var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                                loss_data = torch.mean(0.5 * (((corr_true - mu_corr) ** 2) / var + torch.log(var)))
+                                loss_data = torch.mean(0.5 * (((force_true - total_force_mu) ** 2) / var + torch.log(var)))
                             else:
-                                loss_data = torch.mean((corr_true - mu_corr) ** 2)
+                                loss_data = torch.mean((force_true - total_force_mu) ** 2)
                         else:
                             loss_data = mu_corr.new_tensor(0.0)
                         if use_weak_loss:
@@ -2952,12 +3346,20 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                             loss_physics = mu_corr.new_tensor(0.0)
                         mean_reg_loss = _reg(mu_corr, mean_reg_norm)
                         sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
-                        total_loss = loss_data + loss_physics + float(mean_reg) * mean_reg_loss + float(sigma_reg) * sigma_reg_loss
+                        fhat_reg_loss = _reg(step["delta_fhat"], str(getattr(loss_cfg, "fhat_reg_norm", "l2"))) if fhat_active else mu_corr.new_tensor(0.0)
+                        total_loss = (
+                            loss_data
+                            + loss_physics
+                            + float(mean_reg) * mean_reg_loss
+                            + float(sigma_reg) * sigma_reg_loss
+                            + float(getattr(loss_cfg, "fhat_reg", 0.0)) * fhat_reg_loss
+                        )
                     val_sums["loss_total"] += total_loss.detach()
                     val_sums["loss_data"] += loss_data.detach()
                     val_sums["loss_physics"] += loss_physics.detach()
                     val_sums["loss_reg_mean"] += mean_reg_loss.detach()
                     val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                    val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
                     val_batches += 1
             val_denom = float(max(1, val_batches))
             val_metrics = {
@@ -2975,13 +3377,17 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                             device=device,
                             non_blocking=non_blocking,
                             dt=dt,
-                            rho=rho,
-                            diameter=diameter,
-                            td_params=td_params,
-                            probabilistic=probabilistic,
-                            sigma_min=sigma_min,
-                            force_zero_output=force_zero_output,
-                            rollout_loss_mode="deterministic",
+                        rho=rho,
+                        diameter=diameter,
+                        td_params=td_params,
+                        mean_active=mean_active,
+                        sigma_active=probabilistic,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
+                        sigma_min=sigma_min,
+                        force_zero_output=force_zero_output,
+                        rollout_loss_mode="deterministic",
                             rollout_stochastic_samples=1,
                             rollout_noise_scale=rollout_noise_scale,
                             ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
@@ -2995,6 +3401,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 + val_metrics["loss_physics"]
                 + float(mean_reg) * val_metrics["loss_reg_mean"]
                 + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+                + float(getattr(loss_cfg, "fhat_reg", 0.0)) * val_metrics["loss_reg_fhat"]
                 + float(rollout_weight) * rollout_loss_avg
             )
             for name, value in val_metrics.items():
@@ -3027,7 +3434,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         td_params=td_params,
                         device=device,
                         sigma_min=sigma_min,
+                        mean_active=mean_active,
                         probabilistic=probabilistic,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_stochastic=rollout_stochastic,
                         rollout_noise_scale=rollout_noise_scale,
@@ -3069,7 +3480,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     td_params=td_params,
                     device=device,
                     sigma_min=sigma_min,
+                    mean_active=mean_active,
                     probabilistic=probabilistic,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                     rollout_stochastic=rollout_stochastic,
                     rollout_noise_scale=rollout_noise_scale,
@@ -3095,6 +3510,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         output_ur_values: list[float] = []
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
+        delta_fhat_series_list: list[np.ndarray] = []
         metric_trajs: list[dict[str, Any]] = []
         seen_metric_ur: set[float] = set()
         for traj in val_trajs:
@@ -3127,7 +3543,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 td_params=td_params,
                 device=device,
                 sigma_min=sigma_min,
+                mean_active=mean_active,
                 probabilistic=probabilistic,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
@@ -3152,21 +3572,39 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             v_true_t = traj_t["v"].to(device)
             td_true_t = traj_t["td_force"].to(device)
             ur_true_t = traj_t["ur"].to(device)
+            mass_value = float(np.asarray(traj_t["dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"]).reshape(()))
+            stiffness_value = float(np.asarray(traj_t["stiffness_n_m"]).reshape(()))
             with torch.no_grad():
-                corr_on_data, sigma_on_data = _vpinn_predict_correction(
-                    model,
-                    x_true_t,
-                    v_true_t,
-                    ur_true_t,
-                    td_true_t,
-                    probabilistic=probabilistic,
+                step_on_data = _vpinn_step_with_corrections(
+                    model=model,
+                    x=x_true_t[:-1],
+                    v=v_true_t[:-1],
+                    ur=ur_true_t[:-1],
+                    td_context=traj_t["td_context"].to(device)[:-1],
+                    dt=dt,
+                    m=torch.full((x_true_t.shape[0] - 1, x_true_t.shape[1]), mass_value, dtype=x_true_t.dtype, device=device),
+                    c=torch.full((x_true_t.shape[0] - 1, x_true_t.shape[1]), float(np.asarray(traj_t["damping_c"]).reshape(())), dtype=x_true_t.dtype, device=device),
+                    k=torch.full((x_true_t.shape[0] - 1, x_true_t.shape[1]), stiffness_value, dtype=x_true_t.dtype, device=device),
+                    rho=rho,
+                    diameter=diameter,
+                    td_params=td_params,
+                    mean_active=mean_active,
+                    sigma_active=probabilistic,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
                     sigma_min=sigma_min,
                     force_zero_output=force_zero_output,
                 )
+                corr_on_data = step_on_data["corr_mu"]
+                sigma_on_data = step_on_data["corr_sigma"]
+                delta_fhat_on_data = step_on_data["delta_fhat"]
             output_ur_values.append(ur_val)
             corr_series_list.append(corr_on_data[:, 0].detach().cpu().numpy())
             if probabilistic:
                 sigma_series_list.append(sigma_on_data[:, 0].detach().cpu().numpy())
+            if fhat_active:
+                delta_fhat_series_list.append(delta_fhat_on_data[:, 0].detach().cpu().numpy())
 
             plot_metrics = _log_td_correction_rollout_validation(
                 writer=writer,
@@ -3180,7 +3618,11 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 td_params=td_params,
                 device=device,
                 sigma_min=sigma_min,
+                mean_active=mean_active,
                 probabilistic=probabilistic,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
@@ -3221,7 +3663,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 epochs,
                 reference_ur_values=reference_ur_values,
             )
-        if output_ur_values and corr_series_list:
+        if output_ur_values and mean_active and corr_series_list:
             force_mode = str(getattr(model, "force_representation", "force")).strip().lower()
             log_output_distribution_vs_ur(
                 writer,
@@ -3232,6 +3674,17 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 mean_label=("Correction coefficient" if force_mode == "coefficient" else "Correction force"),
                 sigma_label=("Sigma coefficient" if force_mode == "coefficient" else "Sigma force"),
                 tag="final_val/output_distribution_vs_ur",
+            )
+        if output_ur_values and fhat_active and delta_fhat_series_list:
+            log_output_distribution_vs_ur(
+                writer,
+                epochs,
+                ur_values=output_ur_values,
+                mean_series=delta_fhat_series_list,
+                sigma_series=None,
+                mean_label="Delta fhat",
+                sigma_label=None,
+                tag="final_val/delta_fhat_distribution_vs_ur",
             )
 
     models_dir = Path("models")
@@ -3249,6 +3702,16 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             "method": "vpinn",
             "td_correction": True,
             "ur_bin_state_scale_info": ur_bin_state_scale_info,
+            "correction_mode": correction_mode,
+            "predict_sigma": probabilistic,
+            "mean_active": mean_active,
+            "fhat_active": fhat_active,
+            "use_td_force_input": use_td_force_input,
+            "use_phi_input": use_phi_input,
+            "use_sigma_inputs": use_sigma_inputs,
+            "fhat_bound_multiplier": float(fhat_bound_multiplier),
+            "fhat_reg": float(fhat_reg),
+            "fhat_reg_norm": str(fhat_reg_norm),
         },
         model_path,
     )
