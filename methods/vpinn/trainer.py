@@ -56,6 +56,7 @@ from HNN_helper import (
     load_td_correction_trajectories,
     resolve_td_correction_mode,
     resolve_td_correction_params,
+    resolve_td_phase_input_source,
     sample_indices_per_ur,
     sample_one_index_per_ur,
     spectral_relative_error,
@@ -555,6 +556,16 @@ def _vpinn_model_uses_phi_input(model: nn.Module) -> bool:
     return bool(getattr(base, "use_phi_input", False))
 
 
+def _vpinn_model_phase_input_source(model: nn.Module) -> str:
+    base = getattr(model, "_orig_mod", model)
+    raw_value = getattr(
+        base,
+        "phi_input_source",
+        (True if bool(getattr(base, "use_phi_input", False)) else False),
+    )
+    return resolve_td_phase_input_source(raw_value)
+
+
 def _vpinn_model_uses_sigma_inputs(model: nn.Module) -> bool:
     base = getattr(model, "_orig_mod", model)
     return bool(getattr(base, "use_sigma_inputs", False))
@@ -584,6 +595,7 @@ def _vpinn_optional_hidden_inputs_from_context(
     model: nn.Module,
     *,
     td_context: torch.Tensor,
+    velocity: torch.Tensor,
     structural_mass: torch.Tensor,
     stiffness: torch.Tensor,
     diameter: float,
@@ -595,6 +607,8 @@ def _vpinn_optional_hidden_inputs_from_context(
         structural_mass=structural_mass,
         stiffness=stiffness,
         diameter=diameter,
+        velocity=velocity,
+        phase_input_source=_vpinn_model_phase_input_source(model),
     )
     return (
         phi_input if _vpinn_model_uses_phi_input(model) else None,
@@ -2045,6 +2059,8 @@ def _log_td_correction_rollout_validation(
                     structural_mass=torch.full_like(x_true_t, mass_value),
                     stiffness=torch.full_like(x_true_t, stiffness_value),
                     diameter=diameter,
+                    velocity=v_true_t,
+                    phase_input_source=_vpinn_model_phase_input_source(model),
                 )
                 phi_series_np = phi_series.detach().cpu().numpy()
                 sigma_series_np = sigma_series.detach().cpu().numpy()
@@ -2245,6 +2261,7 @@ def _vpinn_step_with_corrections(
     phi_input, sigma_inputs = _vpinn_optional_hidden_inputs_from_context(
         model,
         td_context=td_context,
+        velocity=v,
         structural_mass=m,
         stiffness=k,
         diameter=diameter,
@@ -2777,7 +2794,10 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
-    use_phi_input = bool(vp.get("use_phi_input", False))
+    phase_input_source = resolve_td_phase_input_source(
+        vp.get("phi_input_source", vp.get("use_phi_input", False))
+    )
+    use_phi_input = phase_input_source != "none"
     use_sigma_inputs = bool(vp.get("use_sigma_inputs", False))
     fhat_bound_multiplier = float(vp.get("fhat_bound_multiplier", 1.5))
     if not np.isfinite(fhat_bound_multiplier) or fhat_bound_multiplier <= 0.0:
@@ -2808,6 +2828,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
     setattr(model, "use_phi_input", use_phi_input)
+    setattr(model, "phi_input_source", None if not use_phi_input else phase_input_source)
     setattr(model, "use_sigma_inputs", use_sigma_inputs)
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
@@ -3249,6 +3270,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     "fhat_active": fhat_active,
                     "use_td_force_input": use_td_force_input,
                     "use_phi_input": use_phi_input,
+                    "phi_input_source": (None if not use_phi_input else phase_input_source),
                     "use_sigma_inputs": use_sigma_inputs,
                     "fhat_bound_multiplier": float(fhat_bound_multiplier),
                     "fhat_reg": float(fhat_reg),
@@ -3708,6 +3730,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             "fhat_active": fhat_active,
             "use_td_force_input": use_td_force_input,
             "use_phi_input": use_phi_input,
+            "phi_input_source": (None if not use_phi_input else phase_input_source),
             "use_sigma_inputs": use_sigma_inputs,
             "fhat_bound_multiplier": float(fhat_bound_multiplier),
             "fhat_reg": float(fhat_reg),

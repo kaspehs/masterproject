@@ -67,6 +67,7 @@ from HNN_helper import (
     resolve_td_memory_config,
     resolve_td_n_memory_torch,
     rollout_model,
+    resolve_td_phase_input_source,
     structural_step_constant_force_torch,
     scaled_residual_loss_per_sample,
     td_bounded_delta_fhat_torch,
@@ -154,6 +155,16 @@ def _resolve_td_correction_init_settings(method_cfg: dict[str, Any], model_cfg: 
     if not np.isfinite(tiny_std) or tiny_std <= 0.0:
         raise ValueError("corr_init_tiny_std must be finite and > 0.")
     return mode, tiny_std
+
+
+def _model_phase_input_source(model: PHVIV) -> str:
+    base = getattr(model, "_orig_mod", model)
+    raw_value = getattr(
+        base,
+        "phi_input_source",
+        (True if bool(getattr(base, "use_phi_input", False)) else False),
+    )
+    return resolve_td_phase_input_source(raw_value)
 
 
 def _apply_td_correction_head_init(
@@ -286,16 +297,20 @@ def _td_optional_hidden_inputs_for_model(
     model: PHVIV,
     *,
     td_context: torch.Tensor,
+    velocity: torch.Tensor,
     structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not (bool(getattr(model, "use_phi_input", False)) or bool(getattr(model, "use_sigma_inputs", False))):
         return None, None
+    phase_input_source = _model_phase_input_source(model)
     phi_input, sigma_inputs = td_hidden_inputs_from_context_torch(
         td_context=td_context,
         structural_mass=structural_mass,
         stiffness=stiffness,
         diameter=float(model.D),
+        velocity=velocity,
+        phase_input_source=phase_input_source,
     )
     return (
         phi_input if bool(getattr(model, "use_phi_input", False)) else None,
@@ -417,6 +432,7 @@ def _td_step_with_corrections(
     phi_input, sigma_inputs = _td_optional_hidden_inputs_for_model(
         model,
         td_context=td_context,
+        velocity=velocity,
         structural_mass=structural_mass,
         stiffness=stiffness,
     )
@@ -1159,11 +1175,14 @@ def _log_td_correction_rollout_validation(
             sigma_grid_inputs = None
             if bool(getattr(model, "use_phi_input", False)) or bool(getattr(model, "use_sigma_inputs", False)):
                 if bool(getattr(model, "use_phi_input", False)):
+                    phase_input_source = _model_phase_input_source(model)
+                    phase_sin_key = "theta_sin_td" if phase_input_source == "theta" else "phi_sin_td"
+                    phase_cos_key = "theta_cos_td" if phase_input_source == "theta" else "phi_cos_td"
                     phi_grid = torch.as_tensor(
                         np.stack(
                             [
-                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["phi_sin_td"], dtype=float)),
-                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["phi_cos_td"], dtype=float)),
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj[phase_sin_key], dtype=float)),
+                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj[phase_cos_key], dtype=float)),
                             ],
                             axis=-1,
                         ).reshape(-1, 2),
@@ -2617,7 +2636,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
-    use_phi_input = bool(hnn_cfg.get("use_phi_input", False))
+    phase_input_source = resolve_td_phase_input_source(
+        hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
+    )
+    use_phi_input = phase_input_source != "none"
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
     if not np.isfinite(fhat_bound_multiplier) or fhat_bound_multiplier <= 0.0:
@@ -2688,6 +2710,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
     model_dict["use_phi_input"] = use_phi_input
+    model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
     model_dict["use_sigma_inputs"] = use_sigma_inputs
     model_dict["correction_mode"] = correction_mode
     arch_dict = asdict(config.architecture)
@@ -3466,6 +3489,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "fhat_active": fhat_active,
             "use_td_force_input": use_td_force_input,
             "use_phi_input": use_phi_input,
+            "phi_input_source": (None if not use_phi_input else phase_input_source),
             "use_sigma_inputs": use_sigma_inputs,
             "fhat_bound_multiplier": float(fhat_bound_multiplier),
             "fhat_reg": float(fhat_reg),
@@ -4007,6 +4031,7 @@ def train(config: Config, config_name: str) -> None:
                     "fhat_active": fhat_active,
                     "use_td_force_input": use_td_force_input,
                     "use_phi_input": use_phi_input,
+                    "phi_input_source": (None if not use_phi_input else phase_input_source),
                     "use_sigma_inputs": use_sigma_inputs,
                     "fhat_bound_multiplier": float(fhat_bound_multiplier),
                     "fhat_reg": float(fhat_reg),

@@ -152,7 +152,8 @@ vpinn:
   # If true, include the current Vivana-TD predicted force as an extra force-network input.
   # Invalid for correction_mode values that include fhat correction.
   use_td_force_input: false
-  # If true, append sin(phi_vy_td) and cos(phi_vy_td) as TD hidden-state inputs.
+  # Phase-input selector for TD hidden-state inputs:
+  # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td), theta -> sin/cos(theta_td)
   use_phi_input: false
   # If true, append both normalized TD sigma states:
   # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).

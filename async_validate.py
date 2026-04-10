@@ -50,6 +50,7 @@ from HNN_helper import (
     sample_one_index_per_ur,
     resolve_td_correction_params,
     resolve_td_correction_mode,
+    resolve_td_phase_input_source,
     resolve_td_memory_config,
     td_correction_mode_flags,
 )
@@ -667,7 +668,10 @@ def _run_hnn_td_correction_validation(
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
-    use_phi_input = bool(hnn_cfg.get("use_phi_input", False))
+    phase_input_source = resolve_td_phase_input_source(
+        hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
+    )
+    use_phi_input = phase_input_source != "none"
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
     fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
@@ -698,6 +702,7 @@ def _run_hnn_td_correction_validation(
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
     model_dict["use_phi_input"] = use_phi_input
+    model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
     model_dict["use_sigma_inputs"] = use_sigma_inputs
     model_dict["correction_mode"] = correction_mode
     arch_dict = asdict(cfg.architecture)
@@ -1222,7 +1227,10 @@ def _run_vpinn_td_correction_validation(
     diameter = float(getattr(cfg.model, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
-    use_phi_input = bool(vp.get("use_phi_input", False))
+    phase_input_source = resolve_td_phase_input_source(
+        vp.get("phi_input_source", vp.get("use_phi_input", False))
+    )
+    use_phi_input = phase_input_source != "none"
     use_sigma_inputs = bool(vp.get("use_sigma_inputs", False))
     fhat_bound_multiplier = float(vp.get("fhat_bound_multiplier", 1.5))
 
@@ -1238,6 +1246,7 @@ def _run_vpinn_td_correction_validation(
     ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
     setattr(model, "use_phi_input", use_phi_input)
+    setattr(model, "phi_input_source", None if not use_phi_input else phase_input_source)
     setattr(model, "use_sigma_inputs", use_sigma_inputs)
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))

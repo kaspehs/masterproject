@@ -60,6 +60,10 @@ TD_CORRECTION_MODES = (
     "mean_fhat_only",
     "mean_sigma_fhat",
 )
+TD_PHASE_INPUT_SOURCES = (
+    "phi_vy",
+    "theta",
+)
 
 
 def resolve_td_correction_mode(method_cfg: dict[str, Any]) -> str:
@@ -81,6 +85,39 @@ def td_correction_mode_flags(mode: str) -> dict[str, bool]:
         "sigma_active": key in {"mean_sigma_only", "mean_sigma_fhat"},
         "fhat_active": key in {"fhat_only", "mean_fhat_only", "mean_sigma_fhat"},
     }
+
+
+def resolve_td_phase_input_source(
+    raw_value: Any,
+    *,
+    default_enabled_source: str = "phi_vy",
+) -> str:
+    default_source = str(default_enabled_source).strip().lower()
+    if default_source not in TD_PHASE_INPUT_SOURCES:
+        raise ValueError(
+            f"default_enabled_source must be one of {TD_PHASE_INPUT_SOURCES}, got {default_enabled_source!r}."
+        )
+    if raw_value is None:
+        return "none"
+    if isinstance(raw_value, bool):
+        return default_source if raw_value else "none"
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        if not np.isfinite(float(raw_value)):
+            raise ValueError(f"Phase input selector must be finite, got {raw_value!r}.")
+        return default_source if float(raw_value) != 0.0 else "none"
+    key = str(raw_value).strip().lower()
+    if key in {"", "0", "false", "none", "off", "no"}:
+        return "none"
+    if key in {"1", "true", "on", "yes"}:
+        return default_source
+    if key in {"phi", "phi_vy"}:
+        return "phi_vy"
+    if key == "theta":
+        return "theta"
+    raise ValueError(
+        "Phase input selector must be one of: false, true, phi_vy, theta. "
+        f"Got {raw_value!r}."
+    )
 
 
 def td_predict_sigma_from_mode(method_cfg: dict[str, Any]) -> bool:
@@ -1418,7 +1455,8 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_reduced_velocity: bool = True,
         use_td_force_input: bool = False,
-        use_phi_input: bool = False,
+        use_phi_input: bool | str = False,
+        phi_input_source: str | None = None,
         use_sigma_inputs: bool = False,
         use_stochastic_process_noise: bool = True,
         sigma_min: float = 1e-6,
@@ -1443,7 +1481,11 @@ class PHVIV(nn.Module):
         self.force_output = force_output
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
-        self.use_phi_input = bool(use_phi_input)
+        resolved_phase_input_source = resolve_td_phase_input_source(
+            use_phi_input if phi_input_source is None else phi_input_source
+        )
+        self.use_phi_input = resolved_phase_input_source != "none"
+        self.phi_input_source = None if not self.use_phi_input else resolved_phase_input_source
         self.use_sigma_inputs = bool(use_sigma_inputs)
         self.hard_force_symmetry = bool(hard_force_symmetry)
         if self.hard_force_symmetry and (self.use_td_force_input or self.use_phi_input or self.use_sigma_inputs):
@@ -1593,7 +1635,10 @@ class PHVIV(nn.Module):
         force_output = str(cfg.get("force_output", "force")).strip().lower()
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
         use_td_force_input = bool(cfg.get("use_td_force_input", False))
-        use_phi_input = bool(cfg.get("use_phi_input", False))
+        phase_input_source = resolve_td_phase_input_source(
+            cfg.get("phi_input_source", cfg.get("use_phi_input", False))
+        )
+        use_phi_input = phase_input_source != "none"
         use_sigma_inputs = bool(cfg.get("use_sigma_inputs", False))
         use_stochastic_process_noise = bool(cfg.get("use_stochastic_process_noise", True))
         sigma_min = float(cfg.get("sigma_min", 1e-6))
@@ -1639,6 +1684,7 @@ class PHVIV(nn.Module):
             use_reduced_velocity=use_reduced_velocity,
             use_td_force_input=use_td_force_input,
             use_phi_input=use_phi_input,
+            phi_input_source=(None if not use_phi_input else phase_input_source),
             use_sigma_inputs=use_sigma_inputs,
             use_stochastic_process_noise=use_stochastic_process_noise,
             sigma_min=sigma_min,
@@ -1789,7 +1835,9 @@ class PHVIV(nn.Module):
             if phi_feat.ndim == 1 and base_features.ndim == 2 and phi_feat.shape[0] == 2:
                 phi_feat = phi_feat.view(1, 2)
             if phi_feat.ndim != base_features.ndim or phi_feat.shape[-1] != 2:
-                raise ValueError("phi_input must have shape (..., 2) containing [sin(phi), cos(phi)].")
+                raise ValueError(
+                    "phi_input must have shape (..., 2) containing sin/cos of the configured TD phase input."
+                )
             if phi_feat.shape[:-1] != base_features.shape[:-1]:
                 phi_feat = phi_feat.expand(base_features.shape[:-1] + (2,))
             base_features = torch.cat([base_features, phi_feat], dim=-1)
@@ -3982,6 +4030,7 @@ def _td_hidden_inputs_from_arrays_numpy(
     phi_td: np.ndarray,
     sig_dy_td: np.ndarray,
     sig_ddy_td: np.ndarray,
+    theta_td: np.ndarray | None = None,
     structural_mass: float | np.ndarray,
     stiffness: float | np.ndarray,
     diameter: float,
@@ -3999,12 +4048,19 @@ def _td_hidden_inputs_from_arrays_numpy(
     omega = np.sqrt(np.clip(stiffness_arr / np.clip(mass_arr, 1.0e-12, None), 1.0e-12, None))
     vel_scale = np.clip(omega * diameter_val, 1.0e-12, None)
     acc_scale = np.clip((omega**2) * diameter_val, 1.0e-12, None)
-    return {
+    out = {
         "phi_sin": np.sin(phi_arr),
         "phi_cos": np.cos(phi_arr),
         "sig_dy_norm": sig_dy_arr / vel_scale,
         "sig_ddy_norm": sig_ddy_arr / acc_scale,
     }
+    if theta_td is not None:
+        theta_arr = np.asarray(theta_td, dtype=float)
+        if theta_arr.shape != phi_arr.shape:
+            raise ValueError("theta_td must have the same shape as phi_td when provided.")
+        out["theta_sin"] = np.sin(theta_arr)
+        out["theta_cos"] = np.cos(theta_arr)
+    return out
 
 
 def _broadcast_td_hidden_param_torch(
@@ -4032,6 +4088,8 @@ def td_hidden_inputs_from_context_torch(
     structural_mass: torch.Tensor | np.ndarray | float,
     stiffness: torch.Tensor | np.ndarray | float,
     diameter: float,
+    velocity: torch.Tensor | np.ndarray | float | None = None,
+    phase_input_source: str = "phi_vy",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if int(td_context.shape[-1]) < 4:
         raise ValueError("td_context must contain at least [ddy, phi, sig_dy, sig_ddy].")
@@ -4047,7 +4105,28 @@ def td_hidden_inputs_from_context_torch(
     omega = torch.sqrt(torch.clamp(stiffness_t / torch.clamp(mass_t, min=1.0e-12), min=1.0e-12))
     vel_scale = torch.clamp(omega * diameter_t, min=1.0e-12)
     acc_scale = torch.clamp((omega**2) * diameter_t, min=1.0e-12)
-    phi_input = torch.cat([torch.sin(phi_td), torch.cos(phi_td)], dim=-1)
+    resolved_phase_source = resolve_td_phase_input_source(phase_input_source)
+    if resolved_phase_source == "theta":
+        if velocity is None:
+            raise ValueError("velocity is required to build theta-based TD phase inputs.")
+        if int(td_context.shape[-1]) < 5:
+            raise ValueError("td_context must contain flow_speed to build theta-based TD phase inputs.")
+        velocity_t = _broadcast_td_hidden_param_torch(velocity, like=like, name="velocity")
+        flow_speed = td_context[..., 4:5]
+        ddy_td = td_context[..., 0:1]
+        speed_mag = torch.sqrt(torch.clamp(flow_speed * flow_speed + velocity_t * velocity_t, min=1.0e-12))
+        projection = flow_speed / torch.clamp(speed_mag, min=1.0e-12)
+        dy_r = velocity_t * projection
+        ddy_r = ddy_td * projection
+        cos_phi_dy = dy_r / torch.clamp(sig_dy_td, min=1.0e-12)
+        sin_phi_dy = -ddy_r / torch.clamp(sig_ddy_td, min=1.0e-12)
+        phi_dy = torch.atan2(sin_phi_dy, cos_phi_dy)
+        phase_angle = torch.atan2(torch.sin(phi_dy - phi_td), torch.cos(phi_dy - phi_td))
+        phi_input = torch.cat([torch.sin(phase_angle), torch.cos(phase_angle)], dim=-1)
+    elif resolved_phase_source == "phi_vy":
+        phi_input = torch.cat([torch.sin(phi_td), torch.cos(phi_td)], dim=-1)
+    else:
+        phi_input = torch.zeros(td_context.shape[:-1] + (2,), device=td_context.device, dtype=td_context.dtype)
     sigma_inputs = torch.cat([sig_dy_td / vel_scale, sig_ddy_td / acc_scale], dim=-1)
     return phi_input, sigma_inputs
 
@@ -4241,6 +4320,7 @@ def load_td_correction_trajectories(
             phi_td=phi_td,
             sig_dy_td=sig_dy_td,
             sig_ddy_td=sig_ddy_td,
+            theta_td=theta_td,
             structural_mass=dry_mass_kg,
             stiffness=stiffness_n_m,
             diameter=diameter_m,
@@ -4249,6 +4329,7 @@ def load_td_correction_trajectories(
             phi_td=phi_td,
             sig_dy_td=sig_dy_td,
             sig_ddy_td=sig_ddy_td,
+            theta_td=theta_td,
             structural_mass=effective_mass_kg,
             stiffness=stiffness_n_m,
             diameter=diameter_m,
@@ -4268,6 +4349,8 @@ def load_td_correction_trajectories(
                         "phi_td": phi_td,
                         "phi_sin_td": hidden_inputs_dry["phi_sin"],
                         "phi_cos_td": hidden_inputs_dry["phi_cos"],
+                        "theta_sin_td": hidden_inputs_dry["theta_sin"],
+                        "theta_cos_td": hidden_inputs_dry["theta_cos"],
                         "sig_dy_td": sig_dy_td,
                         "sig_ddy_td": sig_ddy_td,
                         "theta_td": theta_td,
@@ -4298,6 +4381,8 @@ def load_td_correction_trajectories(
             phi_td_reduced = reduced["phi_td"]
             phi_sin_td_reduced = reduced["phi_sin_td"]
             phi_cos_td_reduced = reduced["phi_cos_td"]
+            theta_sin_td_reduced = reduced["theta_sin_td"]
+            theta_cos_td_reduced = reduced["theta_cos_td"]
             sig_dy_td_reduced = reduced["sig_dy_td"]
             sig_ddy_td_reduced = reduced["sig_ddy_td"]
             theta_td_reduced = reduced["theta_td"]
@@ -4327,6 +4412,8 @@ def load_td_correction_trajectories(
                 phi_td_reduced = phi_td_reduced[mask]
                 phi_sin_td_reduced = phi_sin_td_reduced[mask]
                 phi_cos_td_reduced = phi_cos_td_reduced[mask]
+                theta_sin_td_reduced = theta_sin_td_reduced[mask]
+                theta_cos_td_reduced = theta_cos_td_reduced[mask]
                 sig_dy_td_reduced = sig_dy_td_reduced[mask]
                 sig_ddy_td_reduced = sig_ddy_td_reduced[mask]
                 theta_td_reduced = theta_td_reduced[mask]
@@ -4367,6 +4454,7 @@ def load_td_correction_trajectories(
                         phi_td=phi_td_reduced,
                         sig_dy_td=sig_dy_td_reduced,
                         sig_ddy_td=sig_ddy_td_reduced,
+                        theta_td=theta_td_reduced,
                         structural_mass=dry_mass_kg,
                         stiffness=stiffness_n_m,
                         diameter=diameter_m,
@@ -4375,12 +4463,15 @@ def load_td_correction_trajectories(
                         phi_td=phi_td_reduced,
                         sig_dy_td=sig_dy_td_reduced,
                         sig_ddy_td=sig_ddy_td_reduced,
+                        theta_td=theta_td_reduced,
                         structural_mass=effective_mass_kg,
                         stiffness=stiffness_n_m,
                         diameter=diameter_m,
                     )
                     phi_sin_td_reduced = hidden_inputs_dry_reduced["phi_sin"]
                     phi_cos_td_reduced = hidden_inputs_dry_reduced["phi_cos"]
+                    theta_sin_td_reduced = hidden_inputs_dry_reduced["theta_sin"]
+                    theta_cos_td_reduced = hidden_inputs_dry_reduced["theta_cos"]
                     sig_dy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_dy_norm"]
                     sig_ddy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_ddy_norm"]
                     sig_dy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_dy_norm"]
@@ -4411,6 +4502,8 @@ def load_td_correction_trajectories(
                     "phi_td": np.asarray(phi_td_reduced, dtype=np.float32),
                     "phi_sin_td": np.asarray(phi_sin_td_reduced, dtype=np.float32),
                     "phi_cos_td": np.asarray(phi_cos_td_reduced, dtype=np.float32),
+                    "theta_sin_td": np.asarray(theta_sin_td_reduced, dtype=np.float32),
+                    "theta_cos_td": np.asarray(theta_cos_td_reduced, dtype=np.float32),
                     "sig_dy_td": np.asarray(sig_dy_td_reduced, dtype=np.float32),
                     "sig_ddy_td": np.asarray(sig_ddy_td_reduced, dtype=np.float32),
                     "theta_td": np.asarray(theta_td_reduced, dtype=np.float32),
