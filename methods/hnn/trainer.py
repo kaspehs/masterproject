@@ -613,24 +613,36 @@ def _td_state_propagated_nll_loss(
     return torch.mean(nll_y + nll_p), z_next_mean
 
 
-def _resolve_constant_dt_value(dt_tensor: torch.Tensor) -> float:
-    flat = dt_tensor.detach().reshape(-1).to(dtype=torch.float64)
-    if flat.numel() == 0:
-        raise ValueError("Rollout dt tensor is empty.")
-    dt0 = float(flat[0].item())
-    if flat.numel() > 1:
-        max_dev = float(torch.max(torch.abs(flat - flat[0])).item())
-        tol = max(1.0e-12, 1.0e-6 * abs(dt0))
-        if max_dev > tol:
+def _normalize_psd_dt_values(dt: float | torch.Tensor, *, batch_size: int) -> torch.Tensor:
+    if isinstance(dt, torch.Tensor):
+        flat = dt.detach().reshape(-1).to(dtype=torch.float64)
+        if flat.numel() == 0:
+            raise ValueError("PSD loss received an empty dt tensor.")
+        if flat.numel() == 1:
+            flat = flat.expand(batch_size)
+        elif flat.numel() != batch_size:
             raise ValueError(
-                f"PSD rollout loss requires a constant dt within a batch, got max deviation {max_dev:g}."
+                f"PSD loss expected 1 or {batch_size} dt values, got {flat.numel()}."
             )
-    if not np.isfinite(dt0) or dt0 <= 0.0:
-        raise ValueError(f"PSD rollout loss requires a positive finite dt, got {dt0!r}.")
-    return dt0
+    else:
+        flat = torch.full((batch_size,), float(dt), dtype=torch.float64)
+    if not torch.isfinite(flat).all():
+        raise ValueError("PSD loss requires finite dt values.")
+    if torch.any(flat <= 0.0):
+        raise ValueError("PSD loss requires positive dt values.")
+    return flat
 
 
-def _area_normalized_psd_error_torch(
+def _dt_values_effectively_constant(dt_values: torch.Tensor, *, rel_tol: float = 1.0e-6) -> bool:
+    if dt_values.numel() <= 1:
+        return True
+    mean_dt = float(torch.mean(dt_values).item())
+    max_dev = float(torch.max(torch.abs(dt_values - mean_dt)).item())
+    rel_dev = max_dev / max(abs(mean_dt), 1.0e-12)
+    return rel_dev <= float(rel_tol)
+
+
+def _area_normalized_psd_error_common_dt_torch(
     *,
     true_signal: torch.Tensor,
     pred_signal: torch.Tensor,
@@ -695,6 +707,47 @@ def _area_normalized_psd_error_torch(
     return torch.sum(tv) / torch.clamp(valid.to(dtype=tv.dtype).sum(), min=1.0)
 
 
+def _area_normalized_psd_error_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    dt: float | torch.Tensor,
+    peak_rel_bandwidth: float = 0.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    if true_signal.ndim != 2 or pred_signal.ndim != 2:
+        raise ValueError("PSD loss expects [batch, time] tensors.")
+    if true_signal.shape != pred_signal.shape:
+        raise ValueError("PSD loss requires true and predicted signals with matching shapes.")
+    batch_size = int(true_signal.shape[0])
+    if batch_size < 1:
+        return true_signal.new_zeros(())
+    dt_values = _normalize_psd_dt_values(dt, batch_size=batch_size)
+    if _dt_values_effectively_constant(dt_values):
+        return _area_normalized_psd_error_common_dt_torch(
+            true_signal=true_signal,
+            pred_signal=pred_signal,
+            dt=float(torch.mean(dt_values).item()),
+            peak_rel_bandwidth=peak_rel_bandwidth,
+            eps=eps,
+        )
+
+    losses: list[torch.Tensor] = []
+    for idx in range(batch_size):
+        losses.append(
+            _area_normalized_psd_error_common_dt_torch(
+                true_signal=true_signal[idx : idx + 1],
+                pred_signal=pred_signal[idx : idx + 1],
+                dt=float(dt_values[idx].item()),
+                peak_rel_bandwidth=peak_rel_bandwidth,
+                eps=eps,
+            )
+        )
+    if not losses:
+        return true_signal.new_zeros(())
+    return torch.mean(torch.stack(losses))
+
+
 def _td_correction_rollout_losses_from_batch(
     *,
     model: PHVIV,
@@ -736,7 +789,7 @@ def _td_correction_rollout_losses_from_batch(
         )
 
     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
-    dt_value = _resolve_constant_dt_value(dt_roll)
+    dt_values = dt_roll[:, 0]
     disp_psd_loss = z_traj.new_zeros(())
     if mode_key == "deterministic" or not sigma_active:
         z_pred, _force_seq, _corr_seq, _delta_fhat_seq = _td_correction_state_rollout(
@@ -763,7 +816,7 @@ def _td_correction_rollout_losses_from_batch(
             disp_psd_loss = _area_normalized_psd_error_torch(
                 true_signal=z_traj[:, :, 0],
                 pred_signal=z_pred[:, :, 0],
-                dt=dt_value,
+                dt=dt_values,
                 peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
             )
         return {
@@ -819,7 +872,7 @@ def _td_correction_rollout_losses_from_batch(
         disp_psd_loss = _area_normalized_psd_error_torch(
             true_signal=z_traj[:, :, 0],
             pred_signal=z_for_psd[:, :, 0],
-            dt=dt_value,
+            dt=dt_values,
             peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
         )
     return {
