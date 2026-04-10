@@ -642,6 +642,27 @@ def _dt_values_effectively_constant(dt_values: torch.Tensor, *, rel_tol: float =
     return rel_dev <= float(rel_tol)
 
 
+def _group_sample_indices_by_dt(
+    dt_values: torch.Tensor,
+    *,
+    rounding_decimals: int = 7,
+) -> list[tuple[float, torch.Tensor]]:
+    if dt_values.ndim != 1:
+        raise ValueError("dt grouping expects a 1D tensor of per-sample dt values.")
+    scale = float(10 ** int(rounding_decimals))
+    groups: dict[int, list[int]] = {}
+    dt_cpu = dt_values.detach().cpu()
+    for idx, dt_val in enumerate(dt_cpu.tolist()):
+        key = int(round(float(dt_val) * scale))
+        groups.setdefault(key, []).append(int(idx))
+    grouped: list[tuple[float, torch.Tensor]] = []
+    for key in sorted(groups):
+        indices = torch.tensor(groups[key], device=dt_values.device, dtype=torch.long)
+        group_dt = float(torch.mean(dt_values.index_select(0, indices)).item())
+        grouped.append((group_dt, indices))
+    return grouped
+
+
 def _area_normalized_psd_error_common_dt_torch(
     *,
     true_signal: torch.Tensor,
@@ -732,20 +753,25 @@ def _area_normalized_psd_error_torch(
             eps=eps,
         )
 
+    grouped = _group_sample_indices_by_dt(dt_values)
     losses: list[torch.Tensor] = []
-    for idx in range(batch_size):
+    weights: list[float] = []
+    for group_dt, group_indices in grouped:
         losses.append(
             _area_normalized_psd_error_common_dt_torch(
-                true_signal=true_signal[idx : idx + 1],
-                pred_signal=pred_signal[idx : idx + 1],
-                dt=float(dt_values[idx].item()),
+                true_signal=true_signal.index_select(0, group_indices),
+                pred_signal=pred_signal.index_select(0, group_indices),
+                dt=group_dt,
                 peak_rel_bandwidth=peak_rel_bandwidth,
                 eps=eps,
             )
         )
+        weights.append(float(group_indices.numel()))
     if not losses:
         return true_signal.new_zeros(())
-    return torch.mean(torch.stack(losses))
+    weight_tensor = torch.tensor(weights, device=true_signal.device, dtype=losses[0].dtype)
+    loss_tensor = torch.stack(losses)
+    return torch.sum(loss_tensor * weight_tensor) / torch.clamp(weight_tensor.sum(), min=1.0)
 
 
 def _td_correction_rollout_losses_from_batch(
