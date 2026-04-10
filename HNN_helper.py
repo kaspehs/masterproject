@@ -248,6 +248,8 @@ class LossConfig:
     rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
+    rollout_disp_psd_weight: float = 0.0
+    rollout_disp_psd_peak_rel_bandwidth: float = 0.0  # <=0 disables narrowbanding
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
     gradnorm_eps: float = 1e-8
@@ -442,6 +444,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "rollout_det_steps_final",
         "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
+        "rollout_disp_psd_weight",
+        "rollout_disp_psd_peak_rel_bandwidth",
         "use_gradnorm",
         "gradnorm_alpha",
         "gradnorm_eps",
@@ -3408,9 +3412,6 @@ def log_final_rollout_errors_vs_ur(
                 ),
             }
         )
-    for metric_name, by_ur in errors_by_ur.items():
-        for ur_key, value in sorted(by_ur.items()):
-            writer.add_scalar(f"final_val/by_ur/{metric_name}/U_r={ur_key:.6g}", float(value), epoch)
     writer.add_text(
         "final_val/errors_vs_ur_text",
         format_loss_vs_ur_text(

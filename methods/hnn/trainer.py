@@ -147,6 +147,53 @@ def _init_fhat_head(module: nn.Module | None, *, mode: str, tiny_std: float) -> 
         nn.init.zeros_(last.bias)
 
 
+def _resolve_checkpoint_path(raw_path: Any) -> Path | None:
+    if raw_path is None:
+        return None
+    path_str = str(raw_path).strip()
+    if not path_str:
+        return None
+    return Path(path_str).expanduser()
+
+
+def _normalize_state_dict_keys(state: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(state)
+    if any(k.startswith("_orig_mod.") for k in normalized):
+        normalized = {k.removeprefix("_orig_mod."): v for k, v in normalized.items()}
+    if any(k.startswith("module.") for k in normalized):
+        normalized = {k.removeprefix("module."): v for k, v in normalized.items()}
+    return normalized
+
+
+def _load_model_checkpoint_for_training(model: nn.Module, checkpoint_path: Path) -> None:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state = ckpt.get("model_state")
+    if state is None:
+        state = ckpt.get("state_dict")
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"Checkpoint '{checkpoint_path}' does not contain a 'model_state' or 'state_dict' mapping."
+        )
+    load_result = model.load_state_dict(_normalize_state_dict_keys(state), strict=False)
+    missing_keys = sorted(str(k) for k in getattr(load_result, "missing_keys", ()))
+    unexpected_keys = sorted(str(k) for k in getattr(load_result, "unexpected_keys", ()))
+    print(f"Loaded pretrained model state from {checkpoint_path}")
+    if missing_keys:
+        print(f"Checkpoint load missing keys ({len(missing_keys)}): {missing_keys}")
+    if unexpected_keys:
+        print(f"Checkpoint load unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
+
+
+def _set_module_trainable(module: nn.Module | None, *, trainable: bool) -> int:
+    if module is None:
+        return 0
+    count = 0
+    for param in module.parameters():
+        param.requires_grad = bool(trainable)
+        count += param.numel()
+    return count
+
+
 def _resolve_td_correction_init_settings(method_cfg: dict[str, Any], model_cfg: Any) -> tuple[str, float]:
     mode = str(method_cfg.get("corr_init_mode", "standard")).strip().lower()
     if mode not in {"zero", "tiny", "standard"}:
@@ -566,7 +613,89 @@ def _td_state_propagated_nll_loss(
     return torch.mean(nll_y + nll_p), z_next_mean
 
 
-def _td_correction_rollout_loss_from_batch(
+def _resolve_constant_dt_value(dt_tensor: torch.Tensor) -> float:
+    flat = dt_tensor.detach().reshape(-1).to(dtype=torch.float64)
+    if flat.numel() == 0:
+        raise ValueError("Rollout dt tensor is empty.")
+    dt0 = float(flat[0].item())
+    if flat.numel() > 1:
+        max_dev = float(torch.max(torch.abs(flat - flat[0])).item())
+        tol = max(1.0e-12, 1.0e-6 * abs(dt0))
+        if max_dev > tol:
+            raise ValueError(
+                f"PSD rollout loss requires a constant dt within a batch, got max deviation {max_dev:g}."
+            )
+    if not np.isfinite(dt0) or dt0 <= 0.0:
+        raise ValueError(f"PSD rollout loss requires a positive finite dt, got {dt0!r}.")
+    return dt0
+
+
+def _area_normalized_psd_error_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    dt: float,
+    peak_rel_bandwidth: float = 0.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    if true_signal.ndim != 2 or pred_signal.ndim != 2:
+        raise ValueError("PSD loss expects [batch, time] tensors.")
+    if true_signal.shape != pred_signal.shape:
+        raise ValueError("PSD loss requires true and predicted signals with matching shapes.")
+    compute_dtype = torch.float32 if true_signal.dtype in {torch.float16, torch.bfloat16} else true_signal.dtype
+    true_signal = true_signal.to(dtype=compute_dtype)
+    pred_signal = pred_signal.to(dtype=compute_dtype)
+    batch_size, length = true_signal.shape
+    if batch_size < 1 or length < 4:
+        return true_signal.new_zeros(())
+
+    true_centered = true_signal - torch.mean(true_signal, dim=1, keepdim=True)
+    pred_centered = pred_signal - torch.mean(pred_signal, dim=1, keepdim=True)
+    window = torch.hann_window(length, periodic=False, device=true_signal.device, dtype=true_signal.dtype).view(1, -1)
+    true_fft = torch.fft.rfft(true_centered * window, dim=1)
+    pred_fft = torch.fft.rfft(pred_centered * window, dim=1)
+    true_psd = torch.abs(true_fft) ** 2
+    pred_psd = torch.abs(pred_fft) ** 2
+    freqs = torch.fft.rfftfreq(length, d=float(dt), device=true_signal.device)
+
+    base_mask = torch.isfinite(freqs) & (freqs > 0.0)
+    if int(base_mask.sum().item()) < 2:
+        return true_signal.new_zeros(())
+
+    band_mask = base_mask.view(1, -1).expand(batch_size, -1)
+    rel_bw = float(peak_rel_bandwidth)
+    if np.isfinite(rel_bw) and rel_bw > 0.0:
+        pos_freqs = freqs[base_mask]
+        peak_idx = torch.argmax(true_psd[:, base_mask], dim=1)
+        peak_freq = pos_freqs[peak_idx]
+        freq_res = float(freqs[1].item() - freqs[0].item()) if freqs.numel() > 1 else float(dt)
+        min_half_width = max(0.5 * freq_res, 1.0e-12)
+        half_width = torch.clamp(peak_freq * rel_bw, min=min_half_width)
+        band_mask = base_mask.view(1, -1) & (
+            torch.abs(freqs.view(1, -1) - peak_freq.view(-1, 1)) <= half_width.view(-1, 1)
+        )
+        fallback = band_mask.sum(dim=1) < 2
+        if torch.any(fallback):
+            band_mask = torch.where(fallback.view(-1, 1), base_mask.view(1, -1), band_mask)
+
+    mask_f = band_mask.to(dtype=true_psd.dtype)
+    p_true = torch.clamp(true_psd, min=0.0) * mask_f
+    p_pred = torch.clamp(pred_psd, min=0.0) * mask_f
+    freq_grid = freqs.view(1, -1).expand(batch_size, -1).to(dtype=true_psd.dtype)
+    area_true = torch.trapz(p_true, freq_grid, dim=1)
+    area_pred = torch.trapz(p_pred, freq_grid, dim=1)
+    valid = (area_true > float(eps)) & (area_pred > float(eps)) & (band_mask.sum(dim=1) >= 2)
+    if not torch.any(valid):
+        return true_signal.new_zeros(())
+
+    p_true_norm = p_true / area_true.clamp_min(float(eps)).view(-1, 1)
+    p_pred_norm = p_pred / area_pred.clamp_min(float(eps)).view(-1, 1)
+    tv = 0.5 * torch.trapz(torch.abs(p_pred_norm - p_true_norm), freq_grid, dim=1)
+    tv = torch.where(valid, tv, torch.zeros_like(tv))
+    return torch.sum(tv) / torch.clamp(valid.to(dtype=tv.dtype).sum(), min=1.0)
+
+
+def _td_correction_rollout_losses_from_batch(
     *,
     model: PHVIV,
     batch: Any,
@@ -583,7 +712,9 @@ def _td_correction_rollout_loss_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
-) -> torch.Tensor:
+    compute_disp_psd_loss: bool = False,
+    disp_psd_peak_rel_bandwidth: float = 0.0,
+) -> dict[str, torch.Tensor]:
     if len(batch) != 8:
         raise ValueError("Unexpected TD correction rollout batch format.")
     z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = batch
@@ -603,7 +734,10 @@ def _td_correction_rollout_loss_from_batch(
         raise ValueError(
             "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
         )
+
     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
+    dt_value = _resolve_constant_dt_value(dt_roll)
+    disp_psd_loss = z_traj.new_zeros(())
     if mode_key == "deterministic" or not sigma_active:
         z_pred, _force_seq, _corr_seq, _delta_fhat_seq = _td_correction_state_rollout(
             model=model,
@@ -624,13 +758,22 @@ def _td_correction_rollout_loss_from_batch(
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
-        return torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
+        trajectory_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
+        if compute_disp_psd_loss:
+            disp_psd_loss = _area_normalized_psd_error_torch(
+                true_signal=z_traj[:, :, 0],
+                pred_signal=z_pred[:, :, 0],
+                dt=dt_value,
+                peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+            )
+        return {
+            "trajectory_loss": trajectory_loss,
+            "disp_psd_loss": disp_psd_loss,
+        }
 
     samples = max(1, int(rollout_stochastic_samples))
     batch_size = int(z0.shape[0])
     z0_in = z0.unsqueeze(0).expand(samples, *z0.shape).reshape(samples * batch_size, *z0.shape[1:])
-    t_seq_in = t_seq.unsqueeze(0).expand(samples, *t_seq.shape).reshape(samples * batch_size, *t_seq.shape[1:])
-    z_traj_ref = z_traj.unsqueeze(0)
     ur0_in = ur0.unsqueeze(0).expand(samples, *ur0.shape).reshape(samples * batch_size, *ur0.shape[1:])
     td_context0_in = td_context0.unsqueeze(0).expand(samples, *td_context0.shape).reshape(samples * batch_size, *td_context0.shape[1:])
     mass0_in = mass0.unsqueeze(0).expand(samples, *mass0.shape).reshape(samples * batch_size, *mass0.shape[1:])
@@ -661,16 +804,67 @@ def _td_correction_rollout_loss_from_batch(
     )
     z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
     if mode_key == "stochastic_mse":
-        err = z_pred - z_traj_ref
+        err = z_pred - z_traj.unsqueeze(0)
         per_samples = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
-        return torch.mean(torch.mean(per_samples, dim=0))
+        trajectory_loss = torch.mean(torch.mean(per_samples, dim=0))
+    else:
+        mu = torch.mean(z_pred, dim=0)
+        var = torch.mean((z_pred - mu.unsqueeze(0)) ** 2, dim=0)
+        var = torch.clamp(var, min=1e-6)
+        nll = 0.5 * (((z_traj - mu) ** 2) / var + torch.log(var))
+        per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
+        trajectory_loss = torch.mean(per)
+    if compute_disp_psd_loss:
+        z_for_psd = torch.mean(z_pred, dim=0)
+        disp_psd_loss = _area_normalized_psd_error_torch(
+            true_signal=z_traj[:, :, 0],
+            pred_signal=z_for_psd[:, :, 0],
+            dt=dt_value,
+            peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+        )
+    return {
+        "trajectory_loss": trajectory_loss,
+        "disp_psd_loss": disp_psd_loss,
+    }
 
-    mu = torch.mean(z_pred, dim=0)
-    var = torch.mean((z_pred - mu.unsqueeze(0)) ** 2, dim=0)
-    var = torch.clamp(var, min=1e-6)
-    nll = 0.5 * (((z_traj - mu) ** 2) / var + torch.log(var))
-    per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
-    return torch.mean(per)
+
+def _td_correction_rollout_loss_from_batch(
+    *,
+    model: PHVIV,
+    batch: Any,
+    device: torch.device,
+    non_blocking: bool,
+    td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
+    mean_active: bool,
+    sigma_active: bool,
+    fhat_active: bool,
+    use_td_force_input: bool,
+    fhat_bound_multiplier: float,
+    force_zero_output: bool,
+    rollout_loss_mode: str,
+    rollout_stochastic_samples: int,
+    rollout_noise_scale: float,
+) -> torch.Tensor:
+    return _td_correction_rollout_losses_from_batch(
+        model=model,
+        batch=batch,
+        device=device,
+        non_blocking=non_blocking,
+        td_params=td_params,
+        td_memory_cfg=td_memory_cfg,
+        mean_active=mean_active,
+        sigma_active=sigma_active,
+        fhat_active=fhat_active,
+        use_td_force_input=use_td_force_input,
+        fhat_bound_multiplier=fhat_bound_multiplier,
+        force_zero_output=force_zero_output,
+        rollout_loss_mode=rollout_loss_mode,
+        rollout_stochastic_samples=rollout_stochastic_samples,
+        rollout_noise_scale=rollout_noise_scale,
+        compute_disp_psd_loss=False,
+        disp_psd_peak_rel_bandwidth=0.0,
+    )["trajectory_loss"]
 
 
 def _td_correction_state_rollout(
@@ -2642,8 +2836,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     use_phi_input = phase_input_source != "none"
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
+    init_from_checkpoint = _resolve_checkpoint_path(hnn_cfg.get("init_from_checkpoint"))
+    freeze_mean_net = bool(hnn_cfg.get("freeze_mean_net", False))
+    freeze_fhat_net = bool(hnn_cfg.get("freeze_fhat_net", False))
+    freeze_sigma_net = bool(hnn_cfg.get("freeze_sigma_net", False))
     if not np.isfinite(fhat_bound_multiplier) or fhat_bound_multiplier <= 0.0:
         raise ValueError("hnn.fhat_bound_multiplier must be finite and positive.")
+    if init_from_checkpoint is not None and not init_from_checkpoint.exists():
+        raise FileNotFoundError(f"hnn.init_from_checkpoint does not exist: '{init_from_checkpoint}'.")
     if fhat_active and use_td_force_input:
         raise ValueError("hnn.use_td_force_input=true is invalid for correction_mode values that include fhat correction.")
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
@@ -2652,6 +2852,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     corr_init_mode, corr_init_tiny_std = _resolve_td_correction_init_settings(hnn_cfg, model_cfg)
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_disp_psd_weight = float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
+    rollout_disp_psd_peak_rel_bandwidth = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
@@ -2695,10 +2897,17 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_det_steps_final must be non-negative.")
     if rollout_det_steps_warmup_epochs < 0:
         raise ValueError("loss.rollout_det_steps_warmup_epochs must be non-negative.")
-    if rollout_det_weight > 0.0 and rollout_det_steps < 1 and rollout_det_steps_final < 1:
+    if rollout_det_weight < 0.0:
+        raise ValueError("loss.rollout_det_weight must be non-negative.")
+    if rollout_disp_psd_weight < 0.0:
+        raise ValueError("loss.rollout_disp_psd_weight must be non-negative.")
+    if not np.isfinite(rollout_disp_psd_peak_rel_bandwidth) or rollout_disp_psd_peak_rel_bandwidth < 0.0:
+        raise ValueError("loss.rollout_disp_psd_peak_rel_bandwidth must be finite and non-negative.")
+    rollout_loss_active = (rollout_det_weight > 0.0) or (rollout_disp_psd_weight > 0.0)
+    if rollout_loss_active and rollout_det_steps < 1 and rollout_det_steps_final < 1:
         raise ValueError(
             "loss.rollout_det_steps or loss.rollout_det_steps_final must be >= 1 when "
-            "loss.rollout_det_weight > 0."
+            "a rollout loss weight is active."
         )
 
     model_dict = asdict(model_cfg)
@@ -2718,13 +2927,21 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
     setattr(model, "force_zero_output", force_zero_output)
-    _apply_td_correction_head_init(
-        model,
-        mode=corr_init_mode,
-        tiny_std=corr_init_tiny_std,
-        predict_sigma=predict_sigma,
-        predict_fhat=fhat_active,
-    )
+    if init_from_checkpoint is not None:
+        _load_model_checkpoint_for_training(model, init_from_checkpoint)
+    else:
+        _apply_td_correction_head_init(
+            model,
+            mode=corr_init_mode,
+            tiny_std=corr_init_tiny_std,
+            predict_sigma=predict_sigma,
+            predict_fhat=fhat_active,
+        )
+    frozen_param_counts = {
+        "mean": _set_module_trainable(model.u_base_net, trainable=not freeze_mean_net),
+        "fhat": _set_module_trainable(model.fhat_net, trainable=not freeze_fhat_net),
+        "sigma": _set_module_trainable(model.sigma_net, trainable=not freeze_sigma_net),
+    }
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
 
     current_rollout_det_steps = _scheduled_rollout_det_steps(
@@ -2746,11 +2963,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     )
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
-    if bool(getattr(loss_cfg, "use_gradnorm", False)) and (use_force_data_loss or rollout_det_weight > 0.0):
+    if bool(getattr(loss_cfg, "use_gradnorm", False)) and (use_force_data_loss or rollout_loss_active):
         gradnorm_loss_names = ["state"]
         if use_force_data_loss:
             gradnorm_loss_names.append("data")
-        if rollout_det_weight > 0.0:
+        if rollout_loss_active:
             gradnorm_loss_names.append("rollout")
         gradnorm_balancer = GradNormBalancer(
             model,
@@ -2872,7 +3089,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"val_samples_per_ur={validation_samples_per_ur}"
         ),
         (
-            f"Rollout setup: weight={rollout_det_weight:g}, steps={current_rollout_det_steps}, "
+            f"Rollout setup: det_weight={rollout_det_weight:g}, psd_weight={rollout_disp_psd_weight:g}, "
+            f"steps={current_rollout_det_steps}, "
             f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}"
         ),
         (
@@ -2880,6 +3098,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
         ),
     ]
+    if init_from_checkpoint is not None:
+        startup_lines.append(f"Initialization: checkpoint={init_from_checkpoint}")
+    startup_lines.append(
+        "Frozen networks: "
+        f"mean={freeze_mean_net} ({frozen_param_counts['mean']} params), "
+        f"fhat={freeze_fhat_net} ({frozen_param_counts['fhat']} params), "
+        f"sigma={freeze_sigma_net} ({frozen_param_counts['sigma']} params)"
+    )
     sigma_identified_by_rollout = (
         rollout_det_weight > 0.0 and rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}
     )
@@ -2888,17 +3114,18 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "Warning: the active correction_mode includes sigma while loss.use_force_data_loss=false. "
             "Sigma is treated as correction-force uncertainty, and no stochastic rollout loss is enabled."
         )
-    if rollout_det_weight > 0.0:
+    if rollout_loss_active:
         rollout_mode_msg = rollout_loss_mode
         if rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}:
             rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
         startup_lines.append(
-            f"Rollout loss mode: {rollout_mode_msg}, state_loss_mode={state_loss_mode}"
+            f"Rollout loss mode: {rollout_mode_msg}, state_loss_mode={state_loss_mode}, "
+            f"disp_psd_peak_rel_bandwidth={rollout_disp_psd_peak_rel_bandwidth:g}"
         )
     print("\n".join(startup_lines))
 
     def _rebuild_td_rollout_loader(steps: int) -> Any | None:
-        if steps <= 0 or rollout_det_weight <= 0.0:
+        if steps <= 0 or not rollout_loss_active:
             return None
         _train_loader_tmp, _val_loader_tmp, rollout_loader_tmp = _build_td_correction_hnn_loaders(
             train_trajs=train_trajs,
@@ -2936,16 +3163,17 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss_reg_sigma": torch.zeros((), device=device),
             "loss_reg_fhat": torch.zeros((), device=device),
             "loss_rollout_det": torch.zeros((), device=device),
+            "loss_rollout_psd": torch.zeros((), device=device),
             "grad_norm": torch.zeros((), device=device),
         }
         gradnorm_state_w_sum = torch.zeros((), device=device) if gradnorm_balancer is not None else None
         gradnorm_data_w_sum = torch.zeros((), device=device) if gradnorm_balancer is not None and use_force_data_loss else None
         gradnorm_rollout_w_sum = (
-            torch.zeros((), device=device) if gradnorm_balancer is not None and rollout_det_weight > 0.0 else None
+            torch.zeros((), device=device) if gradnorm_balancer is not None and rollout_loss_active else None
         )
         gradnorm_count = 0
         batch_count = 0
-        rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_det_weight > 0.0 else None
+        rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_loss_active else None
         for batch in train_loader:
             z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
@@ -2985,13 +3213,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                 fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                 rollout_det_loss = state_loss.new_tensor(0.0)
+                rollout_psd_loss = state_loss.new_tensor(0.0)
                 if rollout_iter is not None:
                     try:
                         rollout_batch = next(rollout_iter)
                     except StopIteration:
                         rollout_iter = iter(rollout_loader)
                         rollout_batch = next(rollout_iter)
-                    rollout_det_loss = _td_correction_rollout_loss_from_batch(
+                    rollout_losses = _td_correction_rollout_losses_from_batch(
                         model=model,
                         batch=rollout_batch,
                         device=device,
@@ -3007,13 +3236,21 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
+                        compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
+                        disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
                     )
+                    rollout_det_loss = rollout_losses["trajectory_loss"]
+                    rollout_psd_loss = rollout_losses["disp_psd_loss"]
+                rollout_total_loss = (
+                    float(rollout_det_weight) * rollout_det_loss
+                    + float(rollout_disp_psd_weight) * rollout_psd_loss
+                )
                 if gradnorm_balancer is not None:
                     loss_inputs: dict[str, torch.Tensor] = {"state": state_loss.float()}
                     if use_force_data_loss:
                         loss_inputs["data"] = data_loss.float()
-                    if rollout_det_weight > 0.0:
-                        loss_inputs["rollout"] = rollout_det_loss.float()
+                    if rollout_loss_active:
+                        loss_inputs["rollout"] = rollout_total_loss.float()
                     weights = gradnorm_balancer.update(loss_inputs)
                     state_w = weights["state"]
                     base_loss = state_w * state_loss
@@ -3024,23 +3261,23 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         base_loss = base_loss + float(force_data_weight) * data_w * data_loss
                         if gradnorm_data_w_sum is not None:
                             gradnorm_data_w_sum = gradnorm_data_w_sum + data_w.detach()
-                    if rollout_det_weight > 0.0:
+                    if rollout_loss_active:
                         rollout_w = weights["rollout"]
                         if gradnorm_rollout_w_sum is not None:
                             gradnorm_rollout_w_sum = gradnorm_rollout_w_sum + rollout_w.detach()
-                        weighted_rollout_det = float(rollout_det_weight) * rollout_w * rollout_det_loss
+                        weighted_rollout_total = rollout_w * rollout_total_loss
                     else:
-                        weighted_rollout_det = float(rollout_det_weight) * rollout_det_loss
+                        weighted_rollout_total = rollout_total_loss
                     gradnorm_count += 1
                 else:
                     base_loss = state_loss + float(force_data_weight) * data_loss
-                    weighted_rollout_det = float(rollout_det_weight) * rollout_det_loss
+                    weighted_rollout_total = rollout_total_loss
                 total_loss = (
                     base_loss
                     + float(mean_reg) * mean_reg_loss
                     + float(sigma_reg) * sigma_reg_loss
                     + float(fhat_reg) * fhat_reg_loss
-                    + weighted_rollout_det
+                    + weighted_rollout_total
                 )
             if total_loss.requires_grad:
                 if scaler.is_enabled():
@@ -3064,6 +3301,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             sums["loss_reg_sigma"] += sigma_reg_loss.detach()
             sums["loss_reg_fhat"] += fhat_reg_loss.detach()
             sums["loss_rollout_det"] += rollout_det_loss.detach()
+            sums["loss_rollout_psd"] += rollout_psd_loss.detach()
             sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
 
         denom = float(max(1, batch_count))
@@ -3089,7 +3327,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             print(
                 f"Epoch {epoch}: loss={train_metrics['loss_total']:.4e}, "
                 f"Lstate={train_metrics['loss_state']:.4e}, Ldata={train_metrics['loss_data']:.4e}, "
-                f"Lroll={train_metrics['loss_rollout_det']:.4e}, lr={train_metrics['lr']:.3e}"
+                f"Lroll={train_metrics['loss_rollout_det']:.4e}, "
+                f"Lpsd={train_metrics['loss_rollout_psd']:.4e}, lr={train_metrics['lr']:.3e}"
             )
 
         if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
@@ -3101,6 +3340,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 "loss_reg_mean": torch.zeros((), device=device),
                 "loss_reg_sigma": torch.zeros((), device=device),
                 "loss_reg_fhat": torch.zeros((), device=device),
+                "loss_rollout_psd": torch.zeros((), device=device),
             }
             val_count = 0
             with torch.no_grad():
@@ -3160,12 +3400,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
             }
             rollout_loss_avg = 0.0
-            if rollout_loader is not None and rollout_det_weight > 0.0:
+            rollout_psd_loss_avg = 0.0
+            if rollout_loader is not None and rollout_loss_active:
                 with torch.no_grad():
                     rollout_loss_sum = torch.zeros((), device=device)
+                    rollout_psd_loss_sum = torch.zeros((), device=device)
                     rollout_count = 0
                     for rollout_batch in rollout_loader:
-                        rollout_loss_sum += _td_correction_rollout_loss_from_batch(
+                        rollout_losses = _td_correction_rollout_losses_from_batch(
                             model=model,
                             batch=rollout_batch,
                             device=device,
@@ -3181,10 +3423,17 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             rollout_loss_mode=rollout_loss_mode,
                             rollout_stochastic_samples=rollout_stochastic_samples,
                             rollout_noise_scale=rollout_noise_scale,
-                        ).detach()
+                            compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
+                            disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
+                        )
+                        rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
+                        rollout_psd_loss_sum += rollout_losses["disp_psd_loss"].detach()
                         rollout_count += 1
                     rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                    rollout_psd_loss_avg = float((rollout_psd_loss_sum / float(max(1, rollout_count))).detach().cpu())
                     writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch + 1)
+                    writer.add_scalar("val/loss_rollout_psd", rollout_psd_loss_avg, epoch + 1)
+            val_metrics["loss_rollout_psd"] = rollout_psd_loss_avg
             val_metrics["loss_total"] = (
                 val_metrics["loss_state"]
                 + float(force_data_weight) * val_metrics["loss_data"]
@@ -3192,6 +3441,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 + float(sigma_reg) * val_metrics["loss_reg_sigma"]
                 + float(fhat_reg) * val_metrics["loss_reg_fhat"]
                 + float(rollout_det_weight) * rollout_loss_avg
+                + float(rollout_disp_psd_weight) * rollout_psd_loss_avg
             )
             for name, value in val_metrics.items():
                 writer.add_scalar(f"val/{name}", value, epoch + 1)
@@ -3563,6 +3813,10 @@ def train(config: Config, config_name: str) -> None:
     train_include_ur = _as_float_list(hnn_cfg.get("train_include_ur"), key="hnn.train_include_ur")
     train_exclude_ur = _as_float_list(hnn_cfg.get("train_exclude_ur"), key="hnn.train_exclude_ur")
     train_ur_filter_tol = float(hnn_cfg.get("train_ur_filter_tol", 1e-6))
+    init_from_checkpoint = _resolve_checkpoint_path(hnn_cfg.get("init_from_checkpoint"))
+    freeze_mean_net = bool(hnn_cfg.get("freeze_mean_net", False))
+    freeze_fhat_net = bool(hnn_cfg.get("freeze_fhat_net", False))
+    freeze_sigma_net = bool(hnn_cfg.get("freeze_sigma_net", False))
     if train_ur_filter_tol < 0.0:
         raise ValueError("hnn.train_ur_filter_tol must be non-negative.")
     if train_include_ur is not None or train_exclude_ur is not None:
@@ -3570,6 +3824,8 @@ def train(config: Config, config_name: str) -> None:
             "Applying training U_r filter: "
             f"include={train_include_ur}, exclude={train_exclude_ur}, tol={train_ur_filter_tol:g}"
         )
+    if init_from_checkpoint is not None and not init_from_checkpoint.exists():
+        raise FileNotFoundError(f"hnn.init_from_checkpoint does not exist: '{init_from_checkpoint}'.")
 
     training_cfg = config.training
     optim_cfg = config.optim
@@ -3671,6 +3927,13 @@ def train(config: Config, config_name: str) -> None:
     model_dict = asdict(model_cfg)
     arch_dict = asdict(config.architecture)
     model, derived_params = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
+    if init_from_checkpoint is not None:
+        _load_model_checkpoint_for_training(model, init_from_checkpoint)
+    frozen_param_counts = {
+        "mean": _set_module_trainable(model.u_base_net, trainable=not freeze_mean_net),
+        "fhat": _set_module_trainable(model.fhat_net, trainable=not freeze_fhat_net),
+        "sigma": _set_module_trainable(model.sigma_net, trainable=not freeze_sigma_net),
+    }
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
     D = derived_params["D"]
     k = derived_params["k"]
@@ -3880,6 +4143,14 @@ def train(config: Config, config_name: str) -> None:
             f"val_samples_per_ur={validation_samples_per_ur}"
         ),
     ]
+    if init_from_checkpoint is not None:
+        startup_lines.append(f"Initialization: checkpoint={init_from_checkpoint}")
+    startup_lines.append(
+        "Frozen networks: "
+        f"mean={freeze_mean_net} ({frozen_param_counts['mean']} params), "
+        f"fhat={freeze_fhat_net} ({frozen_param_counts['fhat']} params), "
+        f"sigma={freeze_sigma_net} ({frozen_param_counts['sigma']} params)"
+    )
     if rollout_det_weight > 0.0 and current_rollout_det_steps > 0:
         startup_lines.append(
             "Rollout loss: "

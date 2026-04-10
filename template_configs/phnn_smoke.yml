@@ -82,6 +82,11 @@ loss:
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
   rollout_det_batch_size: 0
+  # Auxiliary rollout displacement PSD loss using area-normalized spectra.
+  rollout_disp_psd_weight: 0.0
+  # Optional narrowbanding around the ground-truth dominant displacement peak.
+  # 0.0 disables narrowbanding and compares the full non-DC spectrum.
+  rollout_disp_psd_peak_rel_bandwidth: 0.0
 
   # Data / symmetry losses
   use_force_data_loss: false
@@ -166,6 +171,13 @@ hnn:
   # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
   corr_init_mode: zero
   corr_init_tiny_std: 1.0e-4
+
+  # Optional pretrained initialization for PHNN training.
+  init_from_checkpoint: null
+  # Freeze individual TD-correction subnetworks after model init / checkpoint load.
+  freeze_mean_net: false
+  freeze_fhat_net: false
+  freeze_sigma_net: false
 
   # Debug / structural convention
   # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.

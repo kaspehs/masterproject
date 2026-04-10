@@ -20,10 +20,13 @@ def setup_optimizer_and_scheduler(
     optimizer_type = str(optim_cfg.optimizer).lower()
     lr = float(optim_cfg.lr)
     weight_decay = float(optim_cfg.weight_decay)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters remain after applying freeze settings.")
     if optimizer_type == "adamw":
-        opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        opt = optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
     elif optimizer_type == "adam":
-        opt = optim.Adam(model.parameters(), lr=lr)
+        opt = optim.Adam(trainable_params, lr=lr)
     else:
         raise ValueError(f"Unsupported optimizer '{optim_cfg.optimizer}'. Use 'adam' or 'adamw'.")
 
