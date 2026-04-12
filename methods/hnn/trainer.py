@@ -3074,6 +3074,39 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     )
     writer.add_text("hnn/td_correction_config", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
     writer.flush()
+    run_models_dir = Path("models") / run_name
+    run_models_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_td_validation_checkpoint(epoch_idx: int) -> Path:
+        ckpt_path = run_models_dir / f"val_epoch_{epoch_idx + 1:06d}.pt"
+        state_source: torch.nn.Module = model
+        if hasattr(model, "_orig_mod"):
+            state_source = getattr(model, "_orig_mod")
+        checkpoint_config = asdict(config)
+        checkpoint_config["loss"]["rollout_det_steps"] = int(current_rollout_det_steps)
+        torch.save(
+            {
+                "model_state": state_source.state_dict(),
+                "config": checkpoint_config,
+                "run_name": run_name,
+                "dt": dt,
+                "method": "phnn",
+                "td_correction": True,
+                "correction_mode": correction_mode,
+                "predict_sigma": predict_sigma,
+                "mean_active": mean_active,
+                "fhat_active": fhat_active,
+                "use_td_force_input": use_td_force_input,
+                "use_phi_input": use_phi_input,
+                "phi_input_source": (None if not use_phi_input else phase_input_source),
+                "use_sigma_inputs": use_sigma_inputs,
+                "fhat_bound_multiplier": float(fhat_bound_multiplier),
+                "fhat_reg": float(fhat_reg),
+                "fhat_reg_norm": str(fhat_reg_norm),
+            },
+            ckpt_path,
+        )
+        return ckpt_path
 
     def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(batch) != 10:
@@ -3611,6 +3644,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                 )
+            ckpt_path = _save_td_validation_checkpoint(epoch)
+            print(f"Saved validation checkpoint to {ckpt_path}")
 
     if final_rollout_all_validation and val_trajs:
         print("Final validation rollout (all trajectories) started.")
@@ -3798,9 +3833,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 tag="final_val/delta_fhat_distribution_vs_ur",
             )
 
-    models_dir = Path("models")
-    models_dir.mkdir(parents=True, exist_ok=True)
-    model_path = models_dir / f"{run_name}.pt"
+    model_path = run_models_dir / "final.pt"
     state_source: torch.nn.Module = model
     if hasattr(model, "_orig_mod"):
         state_source = getattr(model, "_orig_mod")
