@@ -158,6 +158,8 @@ class DataConfig:
     cut_start_seconds_val: float | None = None
     reduce_time: bool = False
     reduction_factor: int = 1
+    stagger_reduced_time_train: bool | None = None
+    stagger_reduced_time_val: bool = False
     train_series_dir: str = "Data_Gen/generated_series"
 
 @dataclass

@@ -3,8 +3,13 @@ method: hnn
 data:
   cut_start_seconds_train: 0.0
   cut_start_seconds_val: 0.0
+  # Optional temporal downsampling of TD trajectories.
   reduce_time: true
   reduction_factor: 5
+  # Training default is effectively true when reduce_time=true and reduction_factor>1 if left null.
+  stagger_reduced_time_train: null
+  # Validation default is false.
+  stagger_reduced_time_val: false
   train_series_dir: Data_Gen/npz_exports_td_burnin_trimmed
 
 model:
