@@ -557,6 +557,11 @@ def _vpinn_model_uses_phi_input(model: nn.Module) -> bool:
     return bool(getattr(base, "use_phi_input", False))
 
 
+def _vpinn_model_uses_acceleration_input(model: nn.Module) -> bool:
+    base = getattr(model, "_orig_mod", model)
+    return bool(getattr(base, "use_acceleration_input", False))
+
+
 def _vpinn_model_phase_input_source(model: nn.Module) -> str:
     base = getattr(model, "_orig_mod", model)
     raw_value = getattr(
@@ -576,10 +581,18 @@ def _vpinn_input_dim(
     *,
     d: int,
     use_td_force_input: bool,
+    use_acceleration_input: bool,
     use_phi_input: bool,
     use_sigma_inputs: bool,
 ) -> int:
-    return int(2 * d + 1 + (1 if use_td_force_input else 0) + (2 if use_phi_input else 0) + (2 if use_sigma_inputs else 0))
+    return int(
+        2 * d
+        + 1
+        + (1 if use_td_force_input else 0)
+        + (1 if use_acceleration_input else 0)
+        + (2 if use_phi_input else 0)
+        + (2 if use_sigma_inputs else 0)
+    )
 
 
 def _vpinn_output_dim(
@@ -600,10 +613,14 @@ def _vpinn_optional_hidden_inputs_from_context(
     structural_mass: torch.Tensor,
     stiffness: torch.Tensor,
     diameter: float,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if not (_vpinn_model_uses_phi_input(model) or _vpinn_model_uses_sigma_inputs(model)):
-        return None, None
-    phi_input, sigma_inputs = td_hidden_inputs_from_context_torch(
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if not (
+        _vpinn_model_uses_phi_input(model)
+        or _vpinn_model_uses_sigma_inputs(model)
+        or _vpinn_model_uses_acceleration_input(model)
+    ):
+        return None, None, None
+    phi_input, sigma_inputs, acceleration_input = td_hidden_inputs_from_context_torch(
         td_context=td_context,
         structural_mass=structural_mass,
         stiffness=stiffness,
@@ -614,6 +631,7 @@ def _vpinn_optional_hidden_inputs_from_context(
     return (
         phi_input if _vpinn_model_uses_phi_input(model) else None,
         sigma_inputs if _vpinn_model_uses_sigma_inputs(model) else None,
+        acceleration_input if _vpinn_model_uses_acceleration_input(model) else None,
     )
 
 
@@ -623,6 +641,7 @@ def _vpinn_force(
     v: torch.Tensor,
     ur: torch.Tensor,
     td_force_input: torch.Tensor | None = None,
+    acceleration_input: torch.Tensor | None = None,
     phi_input: torch.Tensor | None = None,
     sigma_inputs: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -631,6 +650,10 @@ def _vpinn_force(
         if td_force_input is None:
             raise ValueError("td_force_input is required when vpinn.use_td_force_input is enabled.")
         parts.append(td_force_input)
+    if _vpinn_model_uses_acceleration_input(model):
+        if acceleration_input is None:
+            raise ValueError("acceleration_input is required when vpinn.use_acceleration_input is enabled.")
+        parts.append(acceleration_input)
     if _vpinn_model_uses_phi_input(model):
         if phi_input is None:
             raise ValueError("phi_input is required when vpinn.use_phi_input is enabled.")
@@ -2098,8 +2121,13 @@ def _log_td_correction_rollout_validation(
                 )
             phi_grid = None
             sigma_grid_inputs = None
-            if _vpinn_model_uses_phi_input(model) or _vpinn_model_uses_sigma_inputs(model):
-                phi_series, sigma_series = td_hidden_inputs_from_context_torch(
+            acceleration_grid = None
+            if (
+                _vpinn_model_uses_phi_input(model)
+                or _vpinn_model_uses_sigma_inputs(model)
+                or _vpinn_model_uses_acceleration_input(model)
+            ):
+                phi_series, sigma_series, acceleration_series = td_hidden_inputs_from_context_torch(
                     td_context=td_context_t,
                     structural_mass=torch.full_like(x_true_t, mass_value),
                     stiffness=torch.full_like(x_true_t, stiffness_value),
@@ -2133,6 +2161,13 @@ def _log_td_correction_rollout_validation(
                         dtype=x_true_t.dtype,
                         device=device,
                     )
+                if _vpinn_model_uses_acceleration_input(model):
+                    acceleration_series_np = acceleration_series.detach().cpu().numpy()
+                    acceleration_grid = torch.as_tensor(
+                        nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, acceleration_series_np[:, 0]).reshape(-1, 1),
+                        dtype=x_true_t.dtype,
+                        device=device,
+                    )
             with torch.no_grad():
                 corr_grid, sigma_grid, raw_delta_fhat_grid = _vpinn_predict_outputs(
                     model,
@@ -2140,6 +2175,7 @@ def _log_td_correction_rollout_validation(
                     v_grid,
                     ur_grid,
                     (td_force_grid if use_td_force_input else None),
+                    acceleration_grid,
                     phi_grid,
                     sigma_grid_inputs,
                     mean_active=mean_active,
@@ -2219,6 +2255,7 @@ def _vpinn_predict_outputs(
     v: torch.Tensor,
     ur: torch.Tensor,
     td_force_input: torch.Tensor | None = None,
+    acceleration_input: torch.Tensor | None = None,
     phi_input: torch.Tensor | None = None,
     sigma_inputs: torch.Tensor | None = None,
     *,
@@ -2243,6 +2280,7 @@ def _vpinn_predict_outputs(
         v,
         ur,
         td_force_input,
+        acceleration_input,
         phi_input,
         sigma_inputs,
     )
@@ -2303,7 +2341,7 @@ def _vpinn_step_with_corrections(
         params=td_params,
         return_diagnostics=True,
     )
-    phi_input, sigma_inputs = _vpinn_optional_hidden_inputs_from_context(
+    phi_input, sigma_inputs, acceleration_input = _vpinn_optional_hidden_inputs_from_context(
         model,
         td_context=td_context,
         velocity=v,
@@ -2317,6 +2355,7 @@ def _vpinn_step_with_corrections(
         v,
         ur,
         (baseline_force_next if use_td_force_input else None),
+        acceleration_input,
         phi_input,
         sigma_inputs,
         mean_active=mean_active,
@@ -2856,6 +2895,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     diameter = float(getattr(model_cfg, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
+    use_acceleration_input = bool(vp.get("use_acceleration_input", False))
     phase_input_source = resolve_td_phase_input_source(
         vp.get("phi_input_source", vp.get("use_phi_input", False))
     )
@@ -2867,10 +2907,10 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     if fhat_active and use_td_force_input:
         raise ValueError("vpinn.use_td_force_input=true is invalid for correction_mode values that include fhat correction.")
     hard_force_symmetry = bool(getattr(config.architecture, "hard_force_symmetry", False))
-    if hard_force_symmetry and (use_td_force_input or use_phi_input or use_sigma_inputs):
+    if hard_force_symmetry and (use_td_force_input or use_acceleration_input or use_phi_input or use_sigma_inputs):
         raise ValueError(
             "architecture.hard_force_symmetry requires vpinn.use_td_force_input=false, "
-            "vpinn.use_phi_input=false, and vpinn.use_sigma_inputs=false because those "
+            "vpinn.use_acceleration_input=false, vpinn.use_phi_input=false, and vpinn.use_sigma_inputs=false because those "
             "auxiliary inputs do not have a defined sign-flip symmetry."
         )
 
@@ -2878,6 +2918,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     input_dim = _vpinn_input_dim(
         d=d,
         use_td_force_input=use_td_force_input,
+        use_acceleration_input=use_acceleration_input,
         use_phi_input=use_phi_input,
         use_sigma_inputs=use_sigma_inputs,
     )
@@ -2889,6 +2930,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         mean_output_dim=1,
     ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
+    setattr(model, "use_acceleration_input", use_acceleration_input)
     setattr(model, "use_phi_input", use_phi_input)
     setattr(model, "phi_input_source", None if not use_phi_input else phase_input_source)
     setattr(model, "use_sigma_inputs", use_sigma_inputs)
@@ -3644,6 +3686,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     "mean_active": mean_active,
                     "fhat_active": fhat_active,
                     "use_td_force_input": use_td_force_input,
+                    "use_acceleration_input": use_acceleration_input,
                     "use_phi_input": use_phi_input,
                     "phi_input_source": (None if not use_phi_input else phase_input_source),
                     "use_sigma_inputs": use_sigma_inputs,
@@ -3915,6 +3958,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             "mean_active": mean_active,
             "fhat_active": fhat_active,
             "use_td_force_input": use_td_force_input,
+            "use_acceleration_input": use_acceleration_input,
             "use_phi_input": use_phi_input,
             "phi_input_source": (None if not use_phi_input else phase_input_source),
             "use_sigma_inputs": use_sigma_inputs,

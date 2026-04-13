@@ -173,6 +173,7 @@ class ModelConfig:
     force_output: str = "force"  # "force" or "coefficient"
     use_reduced_velocity: bool = True
     use_td_force_input: bool = False
+    use_acceleration_input: bool = False
     sigma_min: float = 1e-6
     corr_init_mode: str = "zero"  # "zero" | "tiny" | "standard"
     corr_init_tiny_std: float = 1e-4
@@ -1819,6 +1820,7 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_reduced_velocity: bool = True,
         use_td_force_input: bool = False,
+        use_acceleration_input: bool = False,
         use_phi_input: bool | str = False,
         phi_input_source: str | None = None,
         use_sigma_inputs: bool = False,
@@ -1845,6 +1847,7 @@ class PHVIV(nn.Module):
         self.force_output = force_output
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
+        self.use_acceleration_input = bool(use_acceleration_input)
         resolved_phase_input_source = resolve_td_phase_input_source(
             use_phi_input if phi_input_source is None else phi_input_source
         )
@@ -1852,10 +1855,12 @@ class PHVIV(nn.Module):
         self.phi_input_source = None if not self.use_phi_input else resolved_phase_input_source
         self.use_sigma_inputs = bool(use_sigma_inputs)
         self.hard_force_symmetry = bool(hard_force_symmetry)
-        if self.hard_force_symmetry and (self.use_td_force_input or self.use_phi_input or self.use_sigma_inputs):
+        if self.hard_force_symmetry and (
+            self.use_td_force_input or self.use_acceleration_input or self.use_phi_input or self.use_sigma_inputs
+        ):
             raise ValueError(
                 "architecture.hard_force_symmetry requires use_td_force_input=false, "
-                "use_phi_input=false, and use_sigma_inputs=false because those auxiliary "
+                "use_acceleration_input=false, use_phi_input=false, and use_sigma_inputs=false because those auxiliary "
                 "inputs do not have a defined sign-flip symmetry."
             )
         self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
@@ -1872,7 +1877,11 @@ class PHVIV(nn.Module):
             self.base_feature_dim
             + (1 if self.use_reduced_velocity else 0)
             + (1 if self.use_td_force_input else 0)
-            + _td_hidden_input_dim(use_phi_input=self.use_phi_input, use_sigma_inputs=self.use_sigma_inputs)
+            + _td_hidden_input_dim(
+                use_phi_input=self.use_phi_input,
+                use_sigma_inputs=self.use_sigma_inputs,
+                use_acceleration_input=self.use_acceleration_input,
+            )
         )
 
         residual_cfg = _default_residual_kwargs()
@@ -1999,6 +2008,7 @@ class PHVIV(nn.Module):
         force_output = str(cfg.get("force_output", "force")).strip().lower()
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
         use_td_force_input = bool(cfg.get("use_td_force_input", False))
+        use_acceleration_input = bool(cfg.get("use_acceleration_input", False))
         phase_input_source = resolve_td_phase_input_source(
             cfg.get("phi_input_source", cfg.get("use_phi_input", False))
         )
@@ -2047,6 +2057,7 @@ class PHVIV(nn.Module):
             fourier_sigma=fourier_sigma,
             use_reduced_velocity=use_reduced_velocity,
             use_td_force_input=use_td_force_input,
+            use_acceleration_input=use_acceleration_input,
             use_phi_input=use_phi_input,
             phi_input_source=(None if not use_phi_input else phase_input_source),
             use_sigma_inputs=use_sigma_inputs,
@@ -2160,6 +2171,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
@@ -2191,6 +2203,22 @@ class PHVIV(nn.Module):
                 min=1e-12,
             )
             base_features = torch.cat([base_features, td_force_feat], dim=-1)
+        if self.use_acceleration_input:
+            if acceleration_input is None:
+                raise ValueError("acceleration_input is required when model.use_acceleration_input is enabled.")
+            accel_feat = (
+                acceleration_input
+                if torch.is_tensor(acceleration_input)
+                else torch.as_tensor(acceleration_input, device=base_features.device, dtype=base_features.dtype)
+            )
+            accel_feat = accel_feat.to(device=base_features.device, dtype=base_features.dtype)
+            if accel_feat.ndim == base_features.ndim - 1:
+                accel_feat = accel_feat.unsqueeze(-1)
+            if accel_feat.ndim != base_features.ndim or accel_feat.shape[-1] != 1:
+                raise ValueError("acceleration_input must be a scalar or have shape (..., 1).")
+            if accel_feat.shape[:-1] != base_features.shape[:-1]:
+                accel_feat = accel_feat.expand(base_features.shape[:-1] + (1,))
+            base_features = torch.cat([base_features, accel_feat], dim=-1)
         if self.use_phi_input:
             if phi_input is None:
                 raise ValueError("phi_input is required when model.use_phi_input is enabled.")
@@ -2224,6 +2252,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
@@ -2232,6 +2261,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
@@ -2243,6 +2273,7 @@ class PHVIV(nn.Module):
             -x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
@@ -2255,6 +2286,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
@@ -2266,6 +2298,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
@@ -2281,6 +2314,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
@@ -2289,6 +2323,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
@@ -2301,6 +2336,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
     ):
@@ -2310,6 +2346,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
         )
@@ -2327,6 +2364,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
     ):
@@ -2334,6 +2372,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
         )
@@ -2347,6 +2386,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
     ):
@@ -2354,6 +2394,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
         )
@@ -4385,8 +4426,12 @@ def _recompute_td_baseline_on_grid(
     }
 
 
-def _td_hidden_input_dim(*, use_phi_input: bool, use_sigma_inputs: bool) -> int:
-    return (2 if bool(use_phi_input) else 0) + (2 if bool(use_sigma_inputs) else 0)
+def _td_hidden_input_dim(*, use_phi_input: bool, use_sigma_inputs: bool, use_acceleration_input: bool = False) -> int:
+    return (
+        (2 if bool(use_phi_input) else 0)
+        + (2 if bool(use_sigma_inputs) else 0)
+        + (1 if bool(use_acceleration_input) else 0)
+    )
 
 
 def _td_hidden_inputs_from_arrays_numpy(
@@ -4454,7 +4499,7 @@ def td_hidden_inputs_from_context_torch(
     diameter: float,
     velocity: torch.Tensor | np.ndarray | float | None = None,
     phase_input_source: str = "phi_vy",
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if int(td_context.shape[-1]) < 4:
         raise ValueError("td_context must contain at least [ddy, phi, sig_dy, sig_ddy].")
     like = td_context[..., :1]
@@ -4492,7 +4537,8 @@ def td_hidden_inputs_from_context_torch(
     else:
         phi_input = torch.zeros(td_context.shape[:-1] + (2,), device=td_context.device, dtype=td_context.dtype)
     sigma_inputs = torch.cat([sig_dy_td / vel_scale, sig_ddy_td / acc_scale], dim=-1)
-    return phi_input, sigma_inputs
+    acceleration_input = td_context[..., 0:1] / acc_scale
+    return phi_input, sigma_inputs, acceleration_input
 
 
 def load_td_correction_trajectories(

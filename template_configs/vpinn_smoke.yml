@@ -158,6 +158,8 @@ vpinn:
   # If true, append both normalized TD sigma states:
   # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).
   use_sigma_inputs: false
+  # If true, append the normalized current TD acceleration: ddy/(omega^2 D).
+  use_acceleration_input: false
 
   # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
   # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.

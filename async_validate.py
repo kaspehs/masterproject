@@ -682,6 +682,7 @@ def _run_hnn_td_correction_validation(
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
     use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
+    use_acceleration_input = bool(hnn_cfg.get("use_acceleration_input", False))
     phase_input_source = resolve_td_phase_input_source(
         hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
     )
@@ -715,6 +716,7 @@ def _run_hnn_td_correction_validation(
     model_dict["Ca"] = 0.0
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
+    model_dict["use_acceleration_input"] = use_acceleration_input
     model_dict["use_phi_input"] = use_phi_input
     model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
     model_dict["use_sigma_inputs"] = use_sigma_inputs
@@ -1243,6 +1245,7 @@ def _run_vpinn_td_correction_validation(
     diameter = float(getattr(cfg.model, "D", 0.1))
     td_params = resolve_td_correction_params(vp)
     use_td_force_input = bool(vp.get("use_td_force_input", False))
+    use_acceleration_input = bool(vp.get("use_acceleration_input", False))
     phase_input_source = resolve_td_phase_input_source(
         vp.get("phi_input_source", vp.get("use_phi_input", False))
     )
@@ -1255,12 +1258,14 @@ def _run_vpinn_td_correction_validation(
         input_dim=_vpinn_input_dim(
             d=1,
             use_td_force_input=use_td_force_input,
+            use_acceleration_input=use_acceleration_input,
             use_phi_input=use_phi_input,
             use_sigma_inputs=use_sigma_inputs,
         ),
         output_dim=_vpinn_output_dim(mean_active=mean_active, sigma_active=probabilistic, fhat_active=fhat_active, d=1),
     ).to(device)
     setattr(model, "use_td_force_input", use_td_force_input)
+    setattr(model, "use_acceleration_input", use_acceleration_input)
     setattr(model, "use_phi_input", use_phi_input)
     setattr(model, "phi_input_source", None if not use_phi_input else phase_input_source)
     setattr(model, "use_sigma_inputs", use_sigma_inputs)
