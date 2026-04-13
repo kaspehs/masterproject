@@ -856,6 +856,21 @@ def log_validation_epoch(
         title_suffix=title_suffix,
         log_spectra=log_spectra,
     )
+    if log_spectra:
+        log_area_normalized_rollout_spectra(
+            writer,
+            epoch,
+            disp_t=t,
+            disp_true=y_true_norm,
+            disp_pred=rollout["y_norm"],
+            force_t=t_force_plot,
+            force_true=force_coeff_true,
+            force_pred=force_coeff_pred[:plot_len],
+            reduced_velocity=reduced_velocity_scalar,
+            tag=f"{tag_prefix}_spectra",
+            step=step,
+            title_suffix=title_suffix,
+        )
     return metrics
 
 
@@ -1504,6 +1519,64 @@ def _normalized_spectrum_density(freqs: np.ndarray, psd: np.ndarray, eps: float 
     return psd / (area + eps)
 
 
+def _dominant_frequency_from_spectrum(freqs: np.ndarray, psd: np.ndarray, eps: float = 1e-12) -> float:
+    freqs_arr = np.asarray(freqs, dtype=float).reshape(-1)
+    psd_arr = np.asarray(psd, dtype=float).reshape(-1)
+    mask = np.isfinite(freqs_arr) & np.isfinite(psd_arr) & (freqs_arr > 0.0) & (psd_arr > eps)
+    if np.count_nonzero(mask) < 1:
+        return float("nan")
+    freqs_valid = freqs_arr[mask]
+    psd_valid = psd_arr[mask]
+    return float(freqs_valid[int(np.argmax(psd_valid))])
+
+
+def _spectral_focus_xlim(
+    *spectra: tuple[np.ndarray, np.ndarray] | None,
+    dominant_multiplier: float = 3.0,
+    min_visible_bins: int = 8,
+) -> tuple[float, float] | None:
+    valid_specs: list[tuple[np.ndarray, np.ndarray]] = []
+    dominant_freqs: list[float] = []
+    freq_steps: list[float] = []
+    max_freq = 0.0
+
+    for spec in spectra:
+        if spec is None:
+            continue
+        freqs, psd = spec
+        freqs_arr = np.asarray(freqs, dtype=float).reshape(-1)
+        psd_arr = np.asarray(psd, dtype=float).reshape(-1)
+        mask = np.isfinite(freqs_arr) & np.isfinite(psd_arr) & (freqs_arr > 0.0) & (psd_arr >= 0.0)
+        if np.count_nonzero(mask) < 2:
+            continue
+        freqs_valid = freqs_arr[mask]
+        psd_valid = psd_arr[mask]
+        valid_specs.append((freqs_valid, psd_valid))
+        max_freq = max(max_freq, float(freqs_valid[-1]))
+        df = np.diff(freqs_valid)
+        df = df[np.isfinite(df) & (df > 0.0)]
+        if df.size > 0:
+            freq_steps.append(float(np.median(df)))
+        dominant = _dominant_frequency_from_spectrum(freqs_valid, psd_valid)
+        if np.isfinite(dominant) and dominant > 0.0:
+            dominant_freqs.append(float(dominant))
+
+    if not valid_specs or max_freq <= 0.0:
+        return None
+
+    freq_step = max(freq_steps) if freq_steps else float("nan")
+    if dominant_freqs:
+        upper = float(max(dominant_freqs)) * float(dominant_multiplier)
+    else:
+        upper = max_freq
+    if np.isfinite(freq_step) and freq_step > 0.0:
+        upper = max(upper, float(min_visible_bins) * freq_step)
+    upper = min(max_freq, upper)
+    if not np.isfinite(upper) or upper <= 0.0:
+        upper = max_freq
+    return 0.0, float(upper)
+
+
 def _log_spectral_plot(
     writer,
     epoch: int,
@@ -1533,6 +1606,7 @@ def _log_spectral_plot(
 
     true_freqs, true_psd = true_spec
     pred_freqs, pred_psd = pred_spec
+    xlim = _spectral_focus_xlim(true_spec, pred_spec, baseline_spec)
     ax_psd.semilogy(true_freqs, np.maximum(true_psd, tiny), label=f"{value_label} (true)", color="tab:blue", alpha=0.75)
     ax_psd.semilogy(pred_freqs, np.maximum(pred_psd, tiny), label=f"{value_label} (pred)", color="tab:purple")
 
@@ -1553,14 +1627,154 @@ def _log_spectral_plot(
 
     ax_psd.set_ylabel("PSD")
     ax_psd.grid(True, alpha=0.3)
+    if xlim is not None:
+        ax_psd.set_xlim(*xlim)
     ax_psd.set_title(f"{plot_title} spectrum at epoch {epoch+1}{ur_title}{title_suffix}")
     ax_psd.legend(loc="upper right")
 
     ax_shape.set_xlabel("frequency [Hz]")
     ax_shape.set_ylabel("normalized PSD")
     ax_shape.grid(True, alpha=0.3)
+    if xlim is not None:
+        ax_shape.set_xlim(*xlim)
     ax_shape.set_title(f"{plot_title} spectrum shape at epoch {epoch+1}{ur_title}{title_suffix}")
     ax_shape.legend(loc="upper right")
+
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
+def log_area_normalized_rollout_spectra(
+    writer,
+    epoch: int,
+    *,
+    disp_t: np.ndarray,
+    disp_true: np.ndarray,
+    disp_pred: np.ndarray,
+    force_t: np.ndarray,
+    force_true: np.ndarray,
+    force_pred: np.ndarray,
+    reduced_velocity: float | None = None,
+    force_baseline: np.ndarray | None = None,
+    force_baseline_label: str = "baseline",
+    tag: str = "val/rollout_spectra",
+    step: int | None = None,
+    title_suffix: str = "",
+) -> None:
+    disp_true_spec = _power_spectrum(disp_true, disp_t)
+    disp_pred_spec = _power_spectrum(disp_pred, disp_t)
+    force_true_spec = _power_spectrum(force_true, force_t)
+    force_pred_spec = _power_spectrum(force_pred, force_t)
+    force_baseline_spec = None if force_baseline is None else _power_spectrum(force_baseline, force_t)
+
+    if disp_true_spec is None and disp_pred_spec is None and force_true_spec is None and force_pred_spec is None and force_baseline_spec is None:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=False)
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+    tiny = 1e-12
+
+    def _plot_raw(
+        ax: Any,
+        spec: tuple[np.ndarray, np.ndarray] | None,
+        *,
+        label: str,
+        color: str,
+        alpha: float = 1.0,
+    ) -> bool:
+        if spec is None:
+            return False
+        freqs, psd = spec
+        ax.semilogy(freqs, np.maximum(psd, tiny), label=label, color=color, alpha=alpha)
+        return True
+
+    def _plot_area_normalized(
+        ax: Any,
+        spec: tuple[np.ndarray, np.ndarray] | None,
+        *,
+        label: str,
+        color: str,
+        alpha: float = 1.0,
+    ) -> bool:
+        if spec is None:
+            return False
+        freqs, psd = spec
+        density = _normalized_spectrum_density(freqs, psd)
+        if density is None:
+            return False
+        ax.plot(freqs, density, label=label, color=color, alpha=alpha)
+        return True
+
+    disp_xlim = _spectral_focus_xlim(disp_true_spec, disp_pred_spec)
+    force_xlim = _spectral_focus_xlim(force_true_spec, force_pred_spec, force_baseline_spec)
+
+    ax_disp_raw = axes[0, 0]
+    disp_raw_plotted = False
+    disp_raw_plotted |= _plot_raw(ax_disp_raw, disp_true_spec, label="y/D (true)", color="tab:blue", alpha=0.75)
+    disp_raw_plotted |= _plot_raw(ax_disp_raw, disp_pred_spec, label="y/D (pred)", color="tab:purple")
+    ax_disp_raw.set_ylabel("PSD")
+    ax_disp_raw.grid(True, alpha=0.3)
+    disp_xlim = _spectral_focus_xlim(disp_true_spec, disp_pred_spec)
+    if disp_xlim is not None:
+        ax_disp_raw.set_xlim(*disp_xlim)
+    ax_disp_raw.set_title(f"Displacement PSD at epoch {epoch+1}{ur_title}{title_suffix}")
+    if disp_raw_plotted:
+        ax_disp_raw.legend(loc="upper right")
+
+    ax_disp_norm = axes[0, 1]
+    disp_norm_plotted = False
+    disp_norm_plotted |= _plot_area_normalized(ax_disp_norm, disp_true_spec, label="y/D (true)", color="tab:blue", alpha=0.75)
+    disp_norm_plotted |= _plot_area_normalized(ax_disp_norm, disp_pred_spec, label="y/D (pred)", color="tab:purple")
+    ax_disp_norm.set_ylabel("area-normalized PSD")
+    ax_disp_norm.grid(True, alpha=0.3)
+    if disp_xlim is not None:
+        ax_disp_norm.set_xlim(*disp_xlim)
+    ax_disp_norm.set_title(f"Displacement spectral shape at epoch {epoch+1}{ur_title}{title_suffix}")
+    if disp_norm_plotted:
+        ax_disp_norm.legend(loc="upper right")
+
+    ax_force_raw = axes[1, 0]
+    force_raw_plotted = False
+    force_raw_plotted |= _plot_raw(ax_force_raw, force_true_spec, label="C_F (true)", color="tab:blue", alpha=0.75)
+    force_raw_plotted |= _plot_raw(ax_force_raw, force_pred_spec, label="C_F (pred)", color="tab:purple")
+    if force_baseline_spec is not None:
+        force_raw_plotted |= _plot_raw(
+            ax_force_raw,
+            force_baseline_spec,
+            label=force_baseline_label,
+            color="tab:green",
+            alpha=0.85,
+        )
+    ax_force_raw.set_xlabel("frequency [Hz]")
+    ax_force_raw.set_ylabel("PSD")
+    ax_force_raw.grid(True, alpha=0.3)
+    if force_xlim is not None:
+        ax_force_raw.set_xlim(*force_xlim)
+    ax_force_raw.set_title(f"Force PSD at epoch {epoch+1}{ur_title}{title_suffix}")
+    if force_raw_plotted:
+        ax_force_raw.legend(loc="upper right")
+
+    ax_force_norm = axes[1, 1]
+    force_norm_plotted = False
+    force_norm_plotted |= _plot_area_normalized(ax_force_norm, force_true_spec, label="C_F (true)", color="tab:blue", alpha=0.75)
+    force_norm_plotted |= _plot_area_normalized(ax_force_norm, force_pred_spec, label="C_F (pred)", color="tab:purple")
+    if force_baseline_spec is not None:
+        force_norm_plotted |= _plot_area_normalized(
+            ax_force_norm,
+            force_baseline_spec,
+            label=force_baseline_label,
+            color="tab:green",
+            alpha=0.85,
+        )
+    ax_force_norm.set_xlabel("frequency [Hz]")
+    ax_force_norm.set_ylabel("area-normalized PSD")
+    ax_force_norm.grid(True, alpha=0.3)
+    if force_xlim is not None:
+        ax_force_norm.set_xlim(*force_xlim)
+    ax_force_norm.set_title(f"Force spectral shape at epoch {epoch+1}{ur_title}{title_suffix}")
+    if force_norm_plotted:
+        ax_force_norm.legend(loc="upper right")
 
     plt.tight_layout()
     writer.add_figure(tag, fig, epoch + 1 if step is None else step)
@@ -2715,20 +2929,6 @@ def log_displacement_plots(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_displacement", fig, epoch + 1 if step is None else step)
     plt.close(fig)
-    if log_spectra:
-        _log_spectral_plot(
-            writer,
-            epoch,
-            t,
-            y_true_norm,
-            y_pred_norm,
-            value_label="y/D",
-            plot_title="Displacement",
-            tag=f"{tag_prefix}_displacement_spectrum",
-            reduced_velocity=reduced_velocity,
-            step=step,
-            title_suffix=title_suffix,
-        )
 
 def log_force_plots(
     writer,
@@ -2784,22 +2984,6 @@ def log_force_plots(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
     plt.close(fig)
-    if log_spectra:
-        _log_spectral_plot(
-            writer,
-            epoch,
-            t,
-            force_coeff_true,
-            force_coeff_pred,
-            value_label="C_F",
-            plot_title="Force coefficient",
-            tag=f"{tag_prefix}_force_spectrum",
-            reduced_velocity=reduced_velocity,
-            baseline_signal=force_coeff_baseline,
-            baseline_label=baseline_label,
-            step=step,
-            title_suffix=title_suffix,
-        )
 
 
 def log_force_component_plots(
@@ -2912,20 +3096,6 @@ def log_force_plots_with_components(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
     plt.close(fig)
-    if log_spectra:
-        _log_spectral_plot(
-            writer,
-            epoch,
-            t,
-            force_coeff_true,
-            force_coeff_pred,
-            value_label="C_F",
-            plot_title="Force coefficient",
-            tag=f"{tag_prefix}_force_spectrum",
-            reduced_velocity=reduced_velocity,
-            step=step,
-            title_suffix=title_suffix,
-        )
 
 
 def _phase_plot_extent(

@@ -48,6 +48,7 @@ from HNN_helper import (
     format_loss_vs_ur_text,
     create_window_mask,
     create_zoom_mask,
+    log_area_normalized_rollout_spectra,
     log_loss_vs_ur,
     log_displacement_plots,
     log_final_rollout_errors_vs_ur,
@@ -1382,6 +1383,23 @@ def _log_td_correction_rollout_validation(
             title_suffix=title_suffix,
             log_spectra=log_spectra,
         )
+        if log_spectra:
+            log_area_normalized_rollout_spectra(
+                writer,
+                epoch,
+                disp_t=t_np,
+                disp_true=q_true_norm,
+                disp_pred=q_pred_norm,
+                force_t=force_t,
+                force_true=f_true_t[:, 0].detach().cpu().numpy()[:n_force],
+                force_pred=force_total_full[:n_force],
+                reduced_velocity=ur_val,
+                force_baseline=force_td_full[:n_force],
+                force_baseline_label="C_F (Vivana-TD)",
+                tag=f"{tag_prefix}_spectra",
+                step=step,
+                title_suffix=title_suffix,
+            )
         if log_correction_on_data:
             output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
             log_correction_on_data_plot(
@@ -2145,6 +2163,7 @@ def _validate_if_needed(
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
+            log_spectra=True,
         )
         writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
         return
@@ -2170,6 +2189,7 @@ def _validate_if_needed(
         rollout_stochastic=rollout_stochastic,
         rollout_noise_scale=rollout_noise_scale,
         rollout_seed=rollout_seed,
+        log_spectra=True,
     )
     writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
 
@@ -3651,6 +3671,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     rollout_seed=rollout_seed,
                     log_metrics=False,
                     log_plots=True,
+                    log_spectra=True,
                 )
             ckpt_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {ckpt_path}")

@@ -40,6 +40,7 @@ from HNN_helper import (
     create_zoom_mask,
     dominant_frequency,
     format_loss_vs_ur_text,
+    log_area_normalized_rollout_spectra,
     log_final_rollout_errors_vs_ur,
     log_loss_vs_ur,
     log_correction_on_data_plot,
@@ -1739,6 +1740,21 @@ def _log_rollout_validation(
             title_suffix=title_suffix,
             log_spectra=log_spectra,
         )
+        if log_spectra:
+            log_area_normalized_rollout_spectra(
+                writer,
+                epoch,
+                disp_t=t_np,
+                disp_true=y_true_norm,
+                disp_pred=y_pred_norm,
+                force_t=t_np,
+                force_true=f_true,
+                force_pred=f_pred,
+                reduced_velocity=ur_val,
+                tag=f"{tag_prefix}_spectra",
+                step=step,
+                title_suffix=title_suffix,
+            )
     return metrics
 
 
@@ -1970,21 +1986,41 @@ def _log_td_correction_rollout_validation(
             title_suffix=title_suffix,
             log_spectra=log_spectra,
         )
+        n_force = min(len(t_np), len(force_total_full), len(force_true))
+        force_t = t_np[:n_force]
+        force_true_plot = f_true_t[:, 0].detach().cpu().numpy()[:n_force]
         log_force_plots(
             writer,
             epoch,
-            t_np[: min(len(t_np), len(force_total_full), len(force_true))],
-            force_total_full[: min(len(t_np), len(force_total_full), len(force_true))],
-            f_true_t[:, 0].detach().cpu().numpy()[: min(len(t_np), len(force_total_full), len(f_true_t))],
-            create_zoom_mask(t_np[: min(len(t_np), len(force_total_full), len(force_true))]),
+            force_t,
+            force_total_full[:n_force],
+            force_true_plot,
+            create_zoom_mask(force_t),
             reduced_velocity=ur_val,
-            force_coeff_baseline=force_td_full[: min(len(t_np), len(force_total_full), len(force_true))],
+            force_coeff_baseline=force_td_full[:n_force],
             baseline_label="C_F (Vivana-TD)",
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
             log_spectra=log_spectra,
         )
+        if log_spectra:
+            log_area_normalized_rollout_spectra(
+                writer,
+                epoch,
+                disp_t=t_np,
+                disp_true=q_true_norm,
+                disp_pred=q_pred_norm,
+                force_t=force_t,
+                force_true=force_true_plot,
+                force_pred=force_total_full[:n_force],
+                reduced_velocity=ur_val,
+                force_baseline=force_td_full[:n_force],
+                force_baseline_label="C_F (Vivana-TD)",
+                tag=f"{tag_prefix}_spectra",
+                step=step,
+                title_suffix=title_suffix,
+            )
         if log_correction_on_data:
             output_label = (
                 "Correction coefficient"
@@ -3557,6 +3593,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     rollout_seed=rollout_seed,
                     log_metrics=False,
                     log_plots=True,
+                    log_spectra=True,
                 )
             snapshot_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {snapshot_path}")
@@ -4362,6 +4399,7 @@ def train(config: Config, config_name: str) -> None:
                     device=device,
                     log_metrics=False,
                     log_plots=True,
+                    log_spectra=True,
                 )
         if not async_validation and (should_validate or should_rollout):
             snapshot_path = _save_validation_snapshot(epoch)

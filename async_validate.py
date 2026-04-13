@@ -615,6 +615,7 @@ def _run_hnn_validation(
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
+            log_spectra=True,
         )
 
     print(
@@ -1173,6 +1174,7 @@ def _run_vpinn_validation(
             device=device,
             log_metrics=False,
             log_plots=True,
+            log_spectra=True,
         )
 
 
@@ -1562,6 +1564,7 @@ def _run_vpinn_td_correction_validation(
             rollout_seed=rollout_seed,
             log_metrics=False,
             log_plots=True,
+            log_spectra=True,
         )
     return {
         "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
