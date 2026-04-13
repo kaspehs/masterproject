@@ -2969,9 +2969,12 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             td_mass_source=td_mass_source,
         )
 
-    train_loader = DataLoader(train_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_dataset is not None else None
-    val_seen_loader = DataLoader(val_seen_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_seen_dataset is not None else None
+    # TD-correction datasets are prebuilt in memory, so worker processes mainly add
+    # fork/CUDA risk on clusters without meaningful throughput benefit.
+    td_loader_num_workers = 0
+    train_loader = DataLoader(train_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=td_loader_num_workers, pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=td_loader_num_workers, pin_memory=(device.type == "cuda")) if val_dataset is not None else None
+    val_seen_loader = DataLoader(val_seen_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=td_loader_num_workers, pin_memory=(device.type == "cuda")) if val_seen_dataset is not None else None
     current_rollout_steps = _scheduled_rollout_det_steps(
         epoch=0,
         base_steps=rollout_steps,
@@ -2999,7 +3002,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     train_roll_ds,
                     batch_size=rollout_batch_size,
                     shuffle=True,
-                    num_workers=int(runtime_cfg.num_workers),
+                    num_workers=td_loader_num_workers,
                     pin_memory=(device.type == "cuda"),
                 )
             if val_trajs:
@@ -3015,7 +3018,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         val_roll_ds,
                         batch_size=rollout_batch_size,
                         shuffle=False,
-                        num_workers=int(runtime_cfg.num_workers),
+                        num_workers=td_loader_num_workers,
                         pin_memory=(device.type == "cuda"),
                     )
             if val_seen_trajs:
@@ -3031,7 +3034,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         val_seen_roll_ds,
                         batch_size=rollout_batch_size,
                         shuffle=False,
-                        num_workers=int(runtime_cfg.num_workers),
+                        num_workers=td_loader_num_workers,
                         pin_memory=(device.type == "cuda"),
                     )
         return train_roll_ds, train_roll_loader, val_roll_ds, val_roll_loader, val_seen_roll_ds, val_seen_roll_loader
@@ -3162,7 +3165,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             f"val_samples_per_ur={validation_samples_per_ur}"
         ),
         (
-            f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)}, amp={amp_enabled}, "
+            f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)} "
+            f"(td_loader_workers=0), amp={amp_enabled}, "
             f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
         ),
         (

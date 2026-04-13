@@ -1204,6 +1204,7 @@ def _run_vpinn_td_correction_validation(
     num_workers: int,
 ) -> dict[str, Any]:
     tb_step = int(epoch) + 1
+    td_loader_num_workers = 0
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
@@ -1284,7 +1285,7 @@ def _run_vpinn_td_correction_validation(
         val_dataset,
         batch_size=int(cfg.training.batch_size),
         shuffle=False,
-        num_workers=int(num_workers),
+        num_workers=td_loader_num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
@@ -1293,7 +1294,7 @@ def _run_vpinn_td_correction_validation(
             val_rollout_dataset,
             batch_size=int(cfg.training.batch_size),
             shuffle=False,
-            num_workers=int(num_workers),
+            num_workers=td_loader_num_workers,
             pin_memory=(device.type == "cuda"),
             drop_last=False,
         )

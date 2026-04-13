@@ -1082,6 +1082,9 @@ def _build_td_correction_hnn_loaders(
     num_workers: int,
     pin_memory: bool,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+    # These datasets are fully materialized in CPU tensors, so worker processes add
+    # little value and can crash on CUDA clusters due to forked worker initialization.
+    loader_num_workers = 0
     mass_key = {
         "dry": "dry_mass_kg",
         "effective": "effective_mass_kg",
@@ -1179,7 +1182,7 @@ def _build_td_correction_hnn_loaders(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=loader_num_workers,
         pin_memory=pin_memory,
     )
     val_loader = None
@@ -1188,7 +1191,7 @@ def _build_td_correction_hnn_loaders(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=loader_num_workers,
             pin_memory=pin_memory,
         )
     rollout_loader = None
@@ -1197,7 +1200,7 @@ def _build_td_correction_hnn_loaders(
             rollout_dataset,
             batch_size=rollout_batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=loader_num_workers,
             pin_memory=pin_memory,
         )
     return train_loader, val_loader, rollout_loader
@@ -3275,7 +3278,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}"
         ),
         (
-            f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)}, amp={amp_enabled}, "
+            f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)} "
+            f"(td_loader_workers=0), amp={amp_enabled}, "
             f"compile={bool(compile_cfg.use_compile)}, lr={float(optim_cfg.lr):g}"
         ),
     ]
