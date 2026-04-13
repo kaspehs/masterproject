@@ -1159,26 +1159,42 @@ class CausalTCNEncoder(nn.Module):
         return self.out(last)
 
 def dominant_frequency(signal: np.ndarray, dt: float) -> float:
-    """Return dominant frequency (Hz) of the provided signal using FFT."""
+    """Return dominant frequency (Hz) from the dominant peak of the Welch PSD."""
     if dt <= 0.0:
         return float("nan")
-    signal = np.asarray(signal)
+    signal = np.asarray(signal, dtype=float).reshape(-1)
     if signal.size < 2:
         return float("nan")
     centered = signal - np.mean(signal)
     if np.allclose(centered, 0.0):
         return float("nan")
-    fft_vals = np.fft.rfft(centered)
-    freqs = np.fft.rfftfreq(centered.size, d=dt)
-    if freqs.size <= 1:
+    length = int(centered.size)
+    if welch is not None:
+        fs = 1.0 / float(dt)
+        seg = int(length)
+        ov = 0 if seg < 16 else min(seg // 2, seg - 1)
+        freqs, psd = welch(
+            centered,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend="constant",
+            scaling="density",
+        )
+    else:
+        freqs = np.fft.rfftfreq(length, d=float(dt))
+        psd = np.abs(np.fft.rfft(centered)) ** 2
+    mask = np.isfinite(freqs) & np.isfinite(psd) & (freqs > 0.0)
+    if np.count_nonzero(mask) < 1:
         return float("nan")
-    magnitudes = np.abs(fft_vals)
-    magnitudes[0] = 0.0  # ignore DC component
-    dominant_idx = int(np.argmax(magnitudes))
-    dominant_mag = magnitudes[dominant_idx]
-    if dominant_mag <= 0.0:
+    freqs_valid = np.asarray(freqs[mask], dtype=float)
+    psd_valid = np.asarray(psd[mask], dtype=float)
+    dominant_idx = int(np.argmax(psd_valid))
+    dominant_val = float(psd_valid[dominant_idx])
+    if dominant_val <= 0.0:
         return float("nan")
-    return float(freqs[dominant_idx])
+    return float(freqs_valid[dominant_idx])
 
 
 def mean_displacement_amplitude(signal: np.ndarray) -> float:
