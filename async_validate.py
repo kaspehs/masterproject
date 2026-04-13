@@ -1,7 +1,7 @@
 """
 Asynchronous validation runner.
 
-Loads a checkpoint saved during training and runs validation on the val split.
+Loads a checkpoint saved during training and runs validation on the unseen val split.
 Intended to be spawned as a child process so training can continue.
 """
 
@@ -88,6 +88,8 @@ from methods.vpinn.trainer import (
     _weak_residual,
 )
 
+ASYNC_VAL_SPLIT_TAG = "val_unseen"
+
 
 def _set_threading(num_threads: int) -> None:
     num_threads = max(1, int(num_threads))
@@ -112,6 +114,18 @@ def _rollout_index(
 
 def _async_summary_path(log_dir: Path, epoch: int) -> Path:
     return Path(log_dir) / "async_validation" / "results" / f"epoch_{int(epoch):06d}.json"
+
+
+def _resolve_val_unseen_dir(train_series_root: Path) -> Path:
+    val_unseen_dir = train_series_root / ASYNC_VAL_SPLIT_TAG
+    if val_unseen_dir.exists():
+        return val_unseen_dir
+    legacy_val_dir = train_series_root / "val"
+    if legacy_val_dir.exists():
+        return legacy_val_dir
+    raise FileNotFoundError(
+        f"Validation directory '{val_unseen_dir}' not found and legacy fallback '{legacy_val_dir}' is also missing."
+    )
 
 
 def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
@@ -302,7 +316,7 @@ def _log_td_correction_hnn_rollout_validation(
     td_params: dict[str, float],
     td_memory_cfg: dict[str, Any],
     device: torch.device,
-    tag_prefix: str = "val/rollout",
+    tag_prefix: str = f"{ASYNC_VAL_SPLIT_TAG}/rollout",
     step: int | None = None,
     log_metrics: bool = True,
     log_plots: bool = True,
@@ -351,6 +365,7 @@ def _run_hnn_validation(
     do_rollout: bool,
     num_workers: int,
 ) -> None:
+    tb_step = int(epoch) + 1
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
@@ -397,9 +412,7 @@ def _run_hnn_validation(
     if rollout_det_batch_size < 1:
         raise ValueError("loss.rollout_det_batch_size must be >= 1 after fallback resolution.")
 
-    val_dir = Path(data_cfg.train_series_dir) / "val"
-    if not val_dir.exists():
-        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_dir = _resolve_val_unseen_dir(Path(data_cfg.train_series_dir))
     val_files = sorted(val_dir.glob("*.npz"))
     if not val_files:
         raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
@@ -442,7 +455,7 @@ def _run_hnn_validation(
     D = float(derived["D"])
     k = float(derived["k"])
 
-    series_dir = Path(data_cfg.train_series_dir) / "val"
+    series_dir = _resolve_val_unseen_dir(Path(data_cfg.train_series_dir))
     val_require_force = bool(getattr(loss_cfg, "use_force_data_loss", False) or has_force_data)
     val_series_raw, _ = load_training_series(
         y_data,
@@ -526,7 +539,7 @@ def _run_hnn_validation(
             if not np.isfinite(value_f):
                 print(f"[async-val] epoch {epoch}: skipping non-finite loss metric '{name}'={value_f}")
                 continue
-            writer.add_scalar(f"val/{name}", value_f, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value_f, tb_step)
             num_loss_scalars_written += 1
     if do_rollout:
         metrics_sum: dict[str, float] = {}
@@ -580,9 +593,9 @@ def _run_hnn_validation(
                 if not np.isfinite(value_f):
                     print(f"[async-val] epoch {epoch}: skipping non-finite rollout metric '{name}'={value_f}")
                     continue
-                writer.add_scalar(f"val/{name}", value_f, epoch)
+                writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value_f, tb_step)
                 num_rollout_scalars_written += 1
-            writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
             num_rollout_scalars_written += 1
 
         ur_values = [float(np.asarray(series_raw[5]).reshape(-1)[0]) for series_raw in val_series_raw]
@@ -594,7 +607,7 @@ def _run_hnn_validation(
         y_tensor, vel_tensor, _t_tensor, ur_tensor = val_sequences[rollout_idx]
         log_validation_epoch(
             writer,
-            epoch,
+            tb_step,
             model,
             y_tensor,
             vel_tensor,
@@ -616,6 +629,7 @@ def _run_hnn_validation(
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
             log_spectra=True,
+            tag_prefix=f"{ASYNC_VAL_SPLIT_TAG}/rollout",
         )
 
     print(
@@ -635,6 +649,7 @@ def _run_hnn_td_correction_validation(
     do_rollout: bool,
     num_workers: int,
 ) -> dict[str, Any]:
+    tb_step = int(epoch) + 1
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     hnn_cfg = dict(cfg.hnn or {})
@@ -644,9 +659,7 @@ def _run_hnn_td_correction_validation(
         raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
 
     train_series_root = Path(data_cfg.train_series_dir)
-    val_dir = train_series_root / "val"
-    if not val_dir.exists():
-        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_dir = _resolve_val_unseen_dir(train_series_root)
     val_paths = sorted(val_dir.glob("*.npz"))
     if not val_paths:
         raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
@@ -863,7 +876,7 @@ def _run_hnn_td_correction_validation(
                     ).detach()
                     rollout_count += 1
             rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
-            writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/loss_rollout_det", rollout_loss_avg, tb_step)
             num_loss_scalars_written += 1
         val_metrics["loss_total"] = (
             val_metrics["loss_state"]
@@ -874,7 +887,7 @@ def _run_hnn_td_correction_validation(
             + float(rollout_det_weight) * rollout_loss_avg
         )
         for name, value in val_metrics.items():
-            writer.add_scalar(f"val/{name}", value, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value, tb_step)
             num_loss_scalars_written += 1
 
     if do_rollout:
@@ -896,7 +909,7 @@ def _run_hnn_td_correction_validation(
         for sidx in sampled_metric_indices:
             metrics = _hnn_td_rollout_validation(
                 writer=writer,
-                epoch=epoch,
+                epoch=tb_step,
                 model=model,
                 traj=val_trajs_np[sidx],
                 dt=dt,
@@ -925,9 +938,9 @@ def _run_hnn_td_correction_validation(
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
                 metrics_count[name] = metrics_count.get(name, 0) + 1
         for name, total in metrics_sum.items():
-            writer.add_scalar(f"val/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", total / float(max(1, metrics_count.get(name, 0))), tb_step)
             num_rollout_scalars_written += 1
-        writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
+        writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
         num_rollout_scalars_written += 1
 
         rollout_idx = _rollout_index(
@@ -946,7 +959,7 @@ def _run_hnn_td_correction_validation(
         )
         _hnn_td_rollout_validation(
             writer=writer,
-            epoch=epoch + 1,
+            epoch=tb_step,
             model=model,
             traj=rollout_traj,
             dt=dt,
@@ -965,6 +978,7 @@ def _run_hnn_td_correction_validation(
             rollout_seed=rollout_seed,
             log_metrics=False,
             log_plots=True,
+            tag_prefix=f"{ASYNC_VAL_SPLIT_TAG}/rollout",
         )
 
     print(
@@ -988,6 +1002,7 @@ def _run_vpinn_validation(
     do_rollout: bool,
     num_workers: int,
 ) -> None:
+    tb_step = int(epoch) + 1
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
@@ -998,9 +1013,7 @@ def _run_vpinn_validation(
     num_poly = int(vp.get("num_poly_test", 2))
     num_sine = int(vp.get("num_sine_test", 0))
 
-    val_dir = Path(data_cfg.train_series_dir) / "val"
-    if not val_dir.exists():
-        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_dir = _resolve_val_unseen_dir(Path(data_cfg.train_series_dir))
     val_files = sorted(val_dir.glob("*.npz"))
     if not val_files:
         raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
@@ -1115,11 +1128,11 @@ def _run_vpinn_validation(
             expect_f0=(force_representation == "coefficient"),
         )
         for name, value in val_metrics.items():
-            writer.add_scalar(f"val/{name}", value, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value, tb_step)
         force_map = _force_mapping_nrmse_over_trajs(model=model, val_trajs=val_trajs, device=device)
         if force_map is not None:
             for k_name, v_value in force_map.items():
-                writer.add_scalar(f"val/{k_name}", v_value, epoch)
+                writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{k_name}", v_value, tb_step)
     if do_rollout:
         ur_values_all = [float(traj["ur"][0, 0].detach().cpu().item()) for traj in val_trajs]
         sample_seed = 1
@@ -1133,7 +1146,7 @@ def _run_vpinn_validation(
         for sidx in sampled_metric_indices:
             metrics = _log_rollout_validation(
                 writer=writer,
-                epoch=epoch,
+                epoch=tb_step,
                 model=model,
                 traj=val_trajs[sidx],
                 dt=dt,
@@ -1153,7 +1166,7 @@ def _run_vpinn_validation(
                 metrics_count[name] = metrics_count.get(name, 0) + 1
         for name, total in metrics_sum.items():
             denom = float(max(1, metrics_count.get(name, 0)))
-            writer.add_scalar(f"val/{name}", total / denom, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", total / denom, tb_step)
 
         ur_values = ur_values_all
         rollout_idx = _rollout_index(
@@ -1162,7 +1175,7 @@ def _run_vpinn_validation(
         )
         _log_rollout_validation(
             writer=writer,
-            epoch=epoch,
+            epoch=tb_step,
             model=model,
             traj=val_trajs[rollout_idx],
             dt=dt,
@@ -1175,6 +1188,7 @@ def _run_vpinn_validation(
             log_metrics=False,
             log_plots=True,
             log_spectra=True,
+            tag_prefix=f"{ASYNC_VAL_SPLIT_TAG}/rollout",
         )
 
 
@@ -1189,6 +1203,7 @@ def _run_vpinn_td_correction_validation(
     do_rollout: bool,
     num_workers: int,
 ) -> dict[str, Any]:
+    tb_step = int(epoch) + 1
     data_cfg = cfg.data
     monitoring_cfg = cfg.monitoring
     vp = dict(cfg.vpinn or {})
@@ -1210,9 +1225,7 @@ def _run_vpinn_td_correction_validation(
         raise ValueError("vpinn.td_mass_source must be one of: dry, effective.")
 
     train_series_root = Path(data_cfg.train_series_dir)
-    val_dir = train_series_root / "val"
-    if not val_dir.exists():
-        raise FileNotFoundError(f"Validation directory '{val_dir}' not found.")
+    val_dir = _resolve_val_unseen_dir(train_series_root)
     val_paths = sorted(val_dir.glob("*.npz"))
     if not val_paths:
         raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
@@ -1460,7 +1473,7 @@ def _run_vpinn_td_correction_validation(
                     ).detach()
                     roll_batches += 1
             rollout_loss_avg = float((roll_sum / float(max(1, roll_batches))).detach().cpu())
-            writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/loss_rollout_det", rollout_loss_avg, tb_step)
         rollout_weight = float(vp.get("rollout_force_weight", float(getattr(loss_cfg, "rollout_det_weight", 0.0))))
         val_metrics["loss_total"] = (
             val_metrics["loss_data"]
@@ -1471,7 +1484,7 @@ def _run_vpinn_td_correction_validation(
             + rollout_weight * rollout_loss_avg
         )
         for name, value in val_metrics.items():
-            writer.add_scalar(f"val/{name}", value, epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value, tb_step)
 
     if do_rollout:
         validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
@@ -1494,7 +1507,7 @@ def _run_vpinn_td_correction_validation(
         for sidx in sampled_metric_indices:
             metrics = _log_td_correction_rollout_validation(
                 writer=writer,
-                epoch=epoch,
+                epoch=tb_step,
                 model=model,
                 traj=val_trajs_plot[sidx],
                 dt=dt,
@@ -1525,8 +1538,8 @@ def _run_vpinn_td_correction_validation(
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
                 metrics_count[name] = metrics_count.get(name, 0) + 1
         for name, total in metrics_sum.items():
-            writer.add_scalar(f"val/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch)
-        writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch)
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", total / float(max(1, metrics_count.get(name, 0))), tb_step)
+        writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
 
         rollout_idx = _rollout_index(
             len(val_trajs_plot),
@@ -1543,7 +1556,7 @@ def _run_vpinn_td_correction_validation(
         )
         _log_td_correction_rollout_validation(
             writer=writer,
-            epoch=epoch,
+            epoch=tb_step,
             model=model,
             traj=rollout_traj,
             dt=dt,
@@ -1565,6 +1578,7 @@ def _run_vpinn_td_correction_validation(
             log_metrics=False,
             log_plots=True,
             log_spectra=True,
+            tag_prefix=f"{ASYNC_VAL_SPLIT_TAG}/rollout",
         )
     return {
         "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
@@ -2099,8 +2113,9 @@ def main() -> None:
         elapsed = time.perf_counter() - validation_start
         summary["status"] = "completed"
         summary["validation_wall_time_s"] = float(elapsed)
-        writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(args.epoch))
-        writer.add_scalar("val/validation_total_wall_time_s", float(elapsed), int(args.epoch))
+        tb_step = int(args.epoch) + 1
+        writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/validation_wall_time_s", float(elapsed), tb_step)
+        writer.flush()
         summary_path = _async_summary_path(args.log_dir, int(args.epoch))
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

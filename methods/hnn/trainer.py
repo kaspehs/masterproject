@@ -2047,7 +2047,6 @@ def _validate_if_needed(
     def _log_validation_timing() -> None:
         elapsed = float(time.perf_counter() - validation_start)
         writer.add_scalar("val/validation_wall_time_s", elapsed, epoch + 1)
-        writer.add_scalar("val/validation_total_wall_time_s", elapsed, epoch + 1)
     if validate_now and val_loader is not None:
         val_loss_metrics = _evaluate_val_losses(
             model=model,
@@ -2402,9 +2401,9 @@ def _reap_async_processes(
             print(
                 f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s"
             )
-            if writer is not None and epoch > 0:
-                writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(epoch))
-                writer.add_scalar("val/validation_total_wall_time_s", float(elapsed), int(epoch))
+            if writer is not None:
+                writer.add_scalar("val_unseen/validation_wall_time_s", float(elapsed), int(epoch) + 1)
+                writer.flush()
         else:
             print(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
@@ -2441,7 +2440,7 @@ def _reap_async_processes(
                                 }
                             )
                             print(
-                                f"[async-val] epoch {epoch}: new best val/loss_total={loss_total_f:.6e}; "
+                                f"[async-val] epoch {epoch}: new best val_unseen/loss_total={loss_total_f:.6e}; "
                                 f"kept {best_model_path}"
                             )
                 except Exception as exc:
@@ -2882,11 +2881,19 @@ def _train_td_correction(config: Config, config_name: str) -> None:
 
     train_series_root = Path(data_cfg.train_series_dir)
     train_dir = train_series_root / "train"
-    val_dir = train_series_root / "val"
-    if not train_dir.exists() or not val_dir.exists():
-        raise FileNotFoundError("TD correction mode expects train/ and val/ directories under data.train_series_dir.")
+    val_unseen_dir = train_series_root / "val_unseen"
+    legacy_val_dir = train_series_root / "val"
+    if not val_unseen_dir.exists():
+        val_unseen_dir = legacy_val_dir
+    val_seen_dir = train_series_root / "val_seen"
+    if not train_dir.exists() or not val_unseen_dir.exists():
+        raise FileNotFoundError(
+            "TD correction mode expects train/ and val_unseen/ under data.train_series_dir "
+            "(legacy val/ is still supported as a fallback)."
+        )
     train_paths = sorted(train_dir.glob("*.npz"))
-    val_paths = sorted(val_dir.glob("*.npz"))
+    val_paths = sorted(val_unseen_dir.glob("*.npz"))
+    val_seen_paths = sorted(val_seen_dir.glob("*.npz")) if val_seen_dir.exists() else []
     if not train_paths:
         raise FileNotFoundError("No TD correction training trajectories were found.")
 
@@ -2929,6 +2936,20 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             td_memory_cfg=td_memory_cfg,
         )
         if val_paths
+        else []
+    )
+    val_seen_trajs = (
+        load_td_correction_trajectories(
+            paths=val_seen_paths,
+            cut_start_seconds=val_cut,
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+            stagger_reduced_time=stagger_val_reduce,
+            ur_source=td_mass_source,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+        )
+        if val_seen_paths
         else []
     )
     dt = float(train_trajs[0]["t"][1] - train_trajs[0]["t"][0])
@@ -3069,6 +3090,21 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         num_workers=int(runtime_cfg.num_workers),
         pin_memory=(device.type == "cuda"),
     )
+    _seen_train_loader_unused = None
+    val_seen_loader = None
+    val_seen_rollout_loader = None
+    if val_seen_trajs:
+        _seen_train_loader_unused, val_seen_loader, val_seen_rollout_loader = _build_td_correction_hnn_loaders(
+            train_trajs=train_trajs,
+            val_trajs=val_seen_trajs,
+            mass_source=td_mass_source,
+            batch_size=int(training_cfg.batch_size),
+            rollout_batch_size=rollout_batch_size,
+            rollout_steps=current_rollout_det_steps,
+            num_workers=int(runtime_cfg.num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
+        del _seen_train_loader_unused
 
     gradnorm_balancer: Optional[GradNormBalancer] = None
     if bool(getattr(loss_cfg, "use_gradnorm", False)) and (use_force_data_loss or rollout_loss_active):
@@ -3229,8 +3265,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"train_trajectories={len(train_trajs)}, correction_mode={correction_mode}"
         ),
         (
-            f"Validation setup: steps={val_steps_per_epoch}, val_instances={val_instances}, "
-            f"val_trajectories={len(val_trajs)}, validate_every={validate_every}, "
+            f"Validation setup: unseen_steps={val_steps_per_epoch}, unseen_instances={val_instances}, "
+            f"val_unseen_trajectories={len(val_trajs)}, val_seen_trajectories={len(val_seen_trajs)}, validate_every={validate_every}, "
             f"val_samples_per_ur={validation_samples_per_ur}"
         ),
         (
@@ -3269,12 +3305,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         )
     print("\n".join(startup_lines))
 
-    def _rebuild_td_rollout_loader(steps: int) -> Any | None:
+    def _rebuild_td_rollout_loader(steps: int, *, split_trajs: list[dict[str, np.ndarray]]) -> Any | None:
         if steps <= 0 or not rollout_loss_active:
             return None
         _train_loader_tmp, _val_loader_tmp, rollout_loader_tmp = _build_td_correction_hnn_loaders(
             train_trajs=train_trajs,
-            val_trajs=val_trajs,
+            val_trajs=split_trajs,
             mass_source=td_mass_source,
             batch_size=int(training_cfg.batch_size),
             rollout_batch_size=rollout_batch_size,
@@ -3286,6 +3322,225 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         del _val_loader_tmp
         return rollout_loader_tmp
 
+    def _run_td_validation_for_split(
+        *,
+        epoch_idx: int,
+        split_tag: str,
+        split_name: str,
+        split_loader: Any | None,
+        split_rollout_loader: Any | None,
+        split_trajs: list[dict[str, np.ndarray]],
+    ) -> None:
+        if split_loader is None:
+            return
+        split_start = time.perf_counter()
+        model.eval()
+        val_sums = {
+            "loss_total": torch.zeros((), device=device),
+            "loss_state": torch.zeros((), device=device),
+            "loss_data": torch.zeros((), device=device),
+            "loss_reg_mean": torch.zeros((), device=device),
+            "loss_reg_sigma": torch.zeros((), device=device),
+            "loss_reg_fhat": torch.zeros((), device=device),
+            "loss_rollout_psd": torch.zeros((), device=device),
+        }
+        val_count = 0
+        with torch.no_grad():
+            for batch in split_loader:
+                z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
+                z_i = z_i.to(device, non_blocking=non_blocking)
+                t_i = t_i.to(device, non_blocking=non_blocking)
+                z_next = z_next.to(device, non_blocking=non_blocking)
+                t_next = t_next.to(device, non_blocking=non_blocking)
+                ur_i = ur_i.to(device, non_blocking=non_blocking)
+                force_true_next = force_true_next.to(device, non_blocking=non_blocking)
+                td_context_i = td_context_i.to(device, non_blocking=non_blocking)
+                mass_i = mass_i.to(device, non_blocking=non_blocking)
+                damping_i = damping_i.to(device, non_blocking=non_blocking)
+                stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
+                    state_loss, step = _state_loss(
+                        z_i=z_i,
+                        dt_i=dt_i,
+                        z_next=z_next,
+                        ur_i=ur_i,
+                        td_context_i=td_context_i,
+                        mass_i=mass_i,
+                        damping_i=damping_i,
+                        stiffness_i=stiffness_i,
+                    )
+                    corr_mu = step["corr_mu"]
+                    sigma_corr = step["sigma_corr"]
+                    if use_force_data_loss:
+                        if predict_sigma:
+                            var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                            data_loss = torch.mean(0.5 * (((force_true_next - step["total_force_next"]) ** 2) / var + torch.log(var)))
+                        else:
+                            data_loss = torch.mean((force_true_next - step["total_force_next"]) ** 2)
+                    else:
+                        data_loss = state_loss.new_tensor(0.0)
+                    mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
+                    sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                    fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
+                    total_loss = (
+                        state_loss
+                        + float(force_data_weight) * data_loss
+                        + float(mean_reg) * mean_reg_loss
+                        + float(sigma_reg) * sigma_reg_loss
+                        + float(fhat_reg) * fhat_reg_loss
+                    )
+                val_sums["loss_total"] += total_loss.detach()
+                val_sums["loss_state"] += state_loss.detach()
+                val_sums["loss_data"] += data_loss.detach()
+                val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
+                val_count += 1
+        val_denom = float(max(1, val_count))
+        val_metrics = {
+            name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
+        }
+        rollout_loss_avg = 0.0
+        rollout_psd_loss_avg = 0.0
+        if split_rollout_loader is not None and rollout_loss_active:
+            with torch.no_grad():
+                rollout_loss_sum = torch.zeros((), device=device)
+                rollout_psd_loss_sum = torch.zeros((), device=device)
+                rollout_count = 0
+                for rollout_batch in split_rollout_loader:
+                    rollout_losses = _td_correction_rollout_losses_from_batch(
+                        model=model,
+                        batch=rollout_batch,
+                        device=device,
+                        non_blocking=non_blocking,
+                        td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
+                        mean_active=mean_active,
+                        sigma_active=predict_sigma,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
+                        force_zero_output=force_zero_output,
+                        rollout_loss_mode=rollout_loss_mode,
+                        rollout_stochastic_samples=rollout_stochastic_samples,
+                        rollout_noise_scale=rollout_noise_scale,
+                        compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
+                        disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
+                    )
+                    rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
+                    rollout_psd_loss_sum += rollout_losses["disp_psd_loss"].detach()
+                    rollout_count += 1
+                rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                rollout_psd_loss_avg = float((rollout_psd_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                writer.add_scalar(f"{split_tag}/loss_rollout_det", rollout_loss_avg, epoch_idx + 1)
+                writer.add_scalar(f"{split_tag}/loss_rollout_psd", rollout_psd_loss_avg, epoch_idx + 1)
+        val_metrics["loss_rollout_psd"] = rollout_psd_loss_avg
+        val_metrics["loss_total"] = (
+            val_metrics["loss_state"]
+            + float(force_data_weight) * val_metrics["loss_data"]
+            + float(mean_reg) * val_metrics["loss_reg_mean"]
+            + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+            + float(fhat_reg) * val_metrics["loss_reg_fhat"]
+            + float(rollout_det_weight) * rollout_loss_avg
+            + float(rollout_disp_psd_weight) * rollout_psd_loss_avg
+        )
+        for name, value in val_metrics.items():
+            writer.add_scalar(f"{split_tag}/{name}", value, epoch_idx + 1)
+
+        if split_trajs and ((epoch_idx % validate_every) == 0 or epoch_idx == epochs - 1):
+            ur_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in split_trajs]
+            sampled_metric_indices = sample_indices_per_ur(
+                ur_all,
+                samples_per_ur=validation_samples_per_ur,
+                seed=1,
+            )
+            sampled_names = [str(split_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
+            print(
+                f"[td-{split_name}][phnn] epoch {epoch_idx + 1}: sampled metric trajectories={sampled_names} "
+                f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+            )
+            metrics_sum: dict[str, float] = {}
+            metrics_count: dict[str, int] = {}
+            diverged_count = 0
+            for sidx in sampled_metric_indices:
+                metrics_roll = _log_td_correction_rollout_validation(
+                    writer=writer,
+                    epoch=epoch_idx + 1,
+                    model=model,
+                    traj=split_trajs[sidx],
+                    dt=dt,
+                    td_mass_source=td_mass_source,
+                    td_params=td_params,
+                    td_memory_cfg=td_memory_cfg,
+                    device=device,
+                    mean_active=mean_active,
+                    predict_sigma=predict_sigma,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
+                    force_zero_output=force_zero_output,
+                    rollout_stochastic=rollout_stochastic,
+                    rollout_noise_scale=rollout_noise_scale,
+                    rollout_seed=rollout_seed,
+                    tag_prefix=f"{split_tag}/rollout",
+                    log_metrics=False,
+                    log_plots=False,
+                )
+                diverged_flag = float(metrics_roll.get(ROLLOUT_DIVERGED_KEY, 0.0))
+                if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                    diverged_count += 1
+                for name, value in metrics_roll.items():
+                    if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
+                        continue
+                    metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                    metrics_count[name] = metrics_count.get(name, 0) + 1
+            for name, total in metrics_sum.items():
+                writer.add_scalar(f"{split_tag}/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch_idx + 1)
+            writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch_idx + 1)
+
+            selected_indices = sample_one_index_per_ur(ur_all, seed=0)
+            if not selected_indices:
+                selected_indices = list(range(len(split_trajs)))
+            rollout_idx = selected_indices[0]
+            rollout_traj = split_trajs[rollout_idx]
+            rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
+            print(
+                f"[td-{split_name}][phnn] epoch {epoch_idx + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+                f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+                f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
+                f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+                f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+                f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+            )
+            _log_td_correction_rollout_validation(
+                writer=writer,
+                epoch=epoch_idx + 1,
+                model=model,
+                traj=rollout_traj,
+                dt=dt,
+                td_mass_source=td_mass_source,
+                td_params=td_params,
+                td_memory_cfg=td_memory_cfg,
+                device=device,
+                mean_active=mean_active,
+                predict_sigma=predict_sigma,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
+                force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
+                tag_prefix=f"{split_tag}/rollout",
+                log_metrics=False,
+                log_plots=True,
+                log_spectra=True,
+            )
+        elapsed = float(time.perf_counter() - split_start)
+        writer.add_scalar(f"{split_tag}/validation_wall_time_s", elapsed, epoch_idx + 1)
+        writer.flush()
+
     for epoch in range(epochs):
         scheduled_rollout_det_steps = _scheduled_rollout_det_steps(
             epoch=epoch,
@@ -3295,7 +3550,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         )
         if scheduled_rollout_det_steps != current_rollout_det_steps:
             current_rollout_det_steps = scheduled_rollout_det_steps
-            rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps)
+            rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps, split_trajs=val_trajs)
+            if val_seen_trajs:
+                val_seen_rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps, split_trajs=val_seen_trajs)
         model.train()
         if bool(optim_cfg.use_lr_scheduler):
             for group in opt.param_groups:
@@ -3477,206 +3734,22 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             )
 
         if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
-            model.eval()
-            val_sums = {
-                "loss_total": torch.zeros((), device=device),
-                "loss_state": torch.zeros((), device=device),
-                "loss_data": torch.zeros((), device=device),
-                "loss_reg_mean": torch.zeros((), device=device),
-                "loss_reg_sigma": torch.zeros((), device=device),
-                "loss_reg_fhat": torch.zeros((), device=device),
-                "loss_rollout_psd": torch.zeros((), device=device),
-            }
-            val_count = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
-                    z_i = z_i.to(device, non_blocking=non_blocking)
-                    t_i = t_i.to(device, non_blocking=non_blocking)
-                    z_next = z_next.to(device, non_blocking=non_blocking)
-                    t_next = t_next.to(device, non_blocking=non_blocking)
-                    ur_i = ur_i.to(device, non_blocking=non_blocking)
-                    force_true_next = force_true_next.to(device, non_blocking=non_blocking)
-                    td_context_i = td_context_i.to(device, non_blocking=non_blocking)
-                    mass_i = mass_i.to(device, non_blocking=non_blocking)
-                    damping_i = damping_i.to(device, non_blocking=non_blocking)
-                    stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
-                    with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                        dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                        state_loss, step = _state_loss(
-                            z_i=z_i,
-                            dt_i=dt_i,
-                            z_next=z_next,
-                            ur_i=ur_i,
-                            td_context_i=td_context_i,
-                            mass_i=mass_i,
-                            damping_i=damping_i,
-                            stiffness_i=stiffness_i,
-                        )
-                        corr_mu = step["corr_mu"]
-                        sigma_corr = step["sigma_corr"]
-                        if use_force_data_loss:
-                            if predict_sigma:
-                                var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                                data_loss = torch.mean(0.5 * (((force_true_next - step["total_force_next"]) ** 2) / var + torch.log(var)))
-                            else:
-                                data_loss = torch.mean((force_true_next - step["total_force_next"]) ** 2)
-                        else:
-                            data_loss = state_loss.new_tensor(0.0)
-                        mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
-                        sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
-                        fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
-                        total_loss = (
-                            state_loss
-                            + float(force_data_weight) * data_loss
-                            + float(mean_reg) * mean_reg_loss
-                            + float(sigma_reg) * sigma_reg_loss
-                            + float(fhat_reg) * fhat_reg_loss
-                        )
-                    val_sums["loss_total"] += total_loss.detach()
-                    val_sums["loss_state"] += state_loss.detach()
-                    val_sums["loss_data"] += data_loss.detach()
-                    val_sums["loss_reg_mean"] += mean_reg_loss.detach()
-                    val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
-                    val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
-                    val_count += 1
-            val_denom = float(max(1, val_count))
-            val_metrics = {
-                name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
-            }
-            rollout_loss_avg = 0.0
-            rollout_psd_loss_avg = 0.0
-            if rollout_loader is not None and rollout_loss_active:
-                with torch.no_grad():
-                    rollout_loss_sum = torch.zeros((), device=device)
-                    rollout_psd_loss_sum = torch.zeros((), device=device)
-                    rollout_count = 0
-                    for rollout_batch in rollout_loader:
-                        rollout_losses = _td_correction_rollout_losses_from_batch(
-                            model=model,
-                            batch=rollout_batch,
-                            device=device,
-                            non_blocking=non_blocking,
-                            td_params=td_params,
-                            td_memory_cfg=td_memory_cfg,
-                            mean_active=mean_active,
-                            sigma_active=predict_sigma,
-                            fhat_active=fhat_active,
-                            use_td_force_input=use_td_force_input,
-                            fhat_bound_multiplier=fhat_bound_multiplier,
-                            force_zero_output=force_zero_output,
-                            rollout_loss_mode=rollout_loss_mode,
-                            rollout_stochastic_samples=rollout_stochastic_samples,
-                            rollout_noise_scale=rollout_noise_scale,
-                            compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
-                            disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
-                        )
-                        rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
-                        rollout_psd_loss_sum += rollout_losses["disp_psd_loss"].detach()
-                        rollout_count += 1
-                    rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
-                    rollout_psd_loss_avg = float((rollout_psd_loss_sum / float(max(1, rollout_count))).detach().cpu())
-                    writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch + 1)
-                    writer.add_scalar("val/loss_rollout_psd", rollout_psd_loss_avg, epoch + 1)
-            val_metrics["loss_rollout_psd"] = rollout_psd_loss_avg
-            val_metrics["loss_total"] = (
-                val_metrics["loss_state"]
-                + float(force_data_weight) * val_metrics["loss_data"]
-                + float(mean_reg) * val_metrics["loss_reg_mean"]
-                + float(sigma_reg) * val_metrics["loss_reg_sigma"]
-                + float(fhat_reg) * val_metrics["loss_reg_fhat"]
-                + float(rollout_det_weight) * rollout_loss_avg
-                + float(rollout_disp_psd_weight) * rollout_psd_loss_avg
+            _run_td_validation_for_split(
+                epoch_idx=epoch,
+                split_tag="val_unseen",
+                split_name="val_unseen",
+                split_loader=val_loader,
+                split_rollout_loader=rollout_loader,
+                split_trajs=val_trajs,
             )
-            for name, value in val_metrics.items():
-                writer.add_scalar(f"val/{name}", value, epoch + 1)
-
-            if val_trajs and ((epoch % validate_every) == 0 or epoch == epochs - 1):
-                ur_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs]
-                sampled_metric_indices = sample_indices_per_ur(
-                    ur_all,
-                    samples_per_ur=validation_samples_per_ur,
-                    seed=1,
-                )
-                sampled_names = [str(val_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
-                print(
-                    f"[td-val][phnn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
-                    f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
-                )
-                metrics_sum: dict[str, float] = {}
-                metrics_count: dict[str, int] = {}
-                diverged_count = 0
-                for sidx in sampled_metric_indices:
-                    metrics_roll = _log_td_correction_rollout_validation(
-                        writer=writer,
-                        epoch=epoch + 1,
-                        model=model,
-                        traj=val_trajs[sidx],
-                        dt=dt,
-                        td_mass_source=td_mass_source,
-                        td_params=td_params,
-                        td_memory_cfg=td_memory_cfg,
-                        device=device,
-                        mean_active=mean_active,
-                        predict_sigma=predict_sigma,
-                        fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
-                        fhat_bound_multiplier=fhat_bound_multiplier,
-                        force_zero_output=force_zero_output,
-                        rollout_stochastic=rollout_stochastic,
-                        rollout_noise_scale=rollout_noise_scale,
-                        rollout_seed=rollout_seed,
-                        log_metrics=False,
-                        log_plots=False,
-                    )
-                    diverged_flag = float(metrics_roll.get(ROLLOUT_DIVERGED_KEY, 0.0))
-                    if np.isfinite(diverged_flag) and diverged_flag > 0.5:
-                        diverged_count += 1
-                    for name, value in metrics_roll.items():
-                        if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
-                            continue
-                        metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-                        metrics_count[name] = metrics_count.get(name, 0) + 1
-                for name, total in metrics_sum.items():
-                    writer.add_scalar(f"val/{name}", total / float(max(1, metrics_count.get(name, 0))), epoch + 1)
-                writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
-
-                selected_indices = sample_one_index_per_ur(ur_all, seed=0)
-                if not selected_indices:
-                    selected_indices = list(range(len(val_trajs)))
-                rollout_idx = selected_indices[0]
-                rollout_traj = val_trajs[rollout_idx]
-                rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
-                print(
-                    f"[td-val][phnn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
-                    f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-                    f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
-                    f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
-                    f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
-                    f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
-                )
-                _log_td_correction_rollout_validation(
-                    writer=writer,
-                    epoch=epoch + 1,
-                    model=model,
-                    traj=rollout_traj,
-                    dt=dt,
-                    td_mass_source=td_mass_source,
-                    td_params=td_params,
-                    td_memory_cfg=td_memory_cfg,
-                    device=device,
-                    mean_active=mean_active,
-                    predict_sigma=predict_sigma,
-                    fhat_active=fhat_active,
-                    use_td_force_input=use_td_force_input,
-                    fhat_bound_multiplier=fhat_bound_multiplier,
-                    force_zero_output=force_zero_output,
-                    rollout_stochastic=rollout_stochastic,
-                    rollout_noise_scale=rollout_noise_scale,
-                    rollout_seed=rollout_seed,
-                    log_metrics=False,
-                    log_plots=True,
-                    log_spectra=True,
+            if val_seen_loader is not None:
+                _run_td_validation_for_split(
+                    epoch_idx=epoch,
+                    split_tag="val_seen",
+                    split_name="val_seen",
+                    split_loader=val_seen_loader,
+                    split_rollout_loader=val_seen_rollout_loader,
+                    split_trajs=val_seen_trajs,
                 )
             ckpt_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {ckpt_path}")

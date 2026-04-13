@@ -870,9 +870,9 @@ def _reap_async_processes(
 
         if return_code == 0:
             print(f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s")
-            if writer is not None and epoch > 0:
-                writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(epoch))
-                writer.add_scalar("val/validation_total_wall_time_s", float(elapsed), int(epoch))
+            if writer is not None:
+                writer.add_scalar("val_unseen/validation_wall_time_s", float(elapsed), int(epoch) + 1)
+                writer.flush()
         else:
             print(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
@@ -909,7 +909,7 @@ def _reap_async_processes(
                                 }
                             )
                             print(
-                                f"[async-val] epoch {epoch}: new best val/loss_total={loss_total_f:.6e}; "
+                                f"[async-val] epoch {epoch}: new best val_unseen/loss_total={loss_total_f:.6e}; "
                                 f"kept {best_model_path}"
                             )
                 except Exception as exc:
@@ -2793,9 +2793,14 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
 
     train_series_root = Path(data_cfg.train_series_dir)
     train_dir = train_series_root / "train"
-    val_dir = train_series_root / "val"
+    val_unseen_dir = train_series_root / "val_unseen"
+    legacy_val_dir = train_series_root / "val"
+    if not val_unseen_dir.exists():
+        val_unseen_dir = legacy_val_dir
+    val_seen_dir = train_series_root / "val_seen"
     train_paths = sorted(train_dir.glob("*.npz"))
-    val_paths = sorted(val_dir.glob("*.npz"))
+    val_paths = sorted(val_unseen_dir.glob("*.npz"))
+    val_seen_paths = sorted(val_seen_dir.glob("*.npz")) if val_seen_dir.exists() else []
     if not train_paths:
         raise FileNotFoundError("No TD correction VPINN training trajectories were found.")
     td_mass_source = str(vp.get("td_mass_source", "dry")).strip().lower()
@@ -2831,6 +2836,18 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             ur_source=td_mass_source,
         )
         if val_paths
+        else []
+    )
+    val_seen_trajs = (
+        load_td_correction_trajectories(
+            paths=val_seen_paths,
+            cut_start_seconds=val_cut,
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+            stagger_reduced_time=stagger_val_reduce,
+            ur_source=td_mass_source,
+        )
+        if val_seen_paths
         else []
     )
 
@@ -2942,9 +2959,19 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             stride=stride,
             td_mass_source=td_mass_source,
         )
+    val_seen_dataset = None
+    if val_seen_trajs:
+        val_seen_dataset, _ = _build_td_correction_vpinn_datasets(
+            trajs=val_seen_trajs,
+            rollout_steps=0,
+            window_M=window_M,
+            stride=stride,
+            td_mass_source=td_mass_source,
+        )
 
     train_loader = DataLoader(train_dataset, batch_size=int(training_cfg.batch_size), shuffle=True, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_dataset is not None else None
+    val_seen_loader = DataLoader(val_seen_dataset, batch_size=int(training_cfg.batch_size), shuffle=False, num_workers=int(runtime_cfg.num_workers), pin_memory=(device.type == "cuda")) if val_seen_dataset is not None else None
     current_rollout_steps = _scheduled_rollout_det_steps(
         epoch=0,
         base_steps=rollout_steps,
@@ -2952,11 +2979,13 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         warmup_epochs=rollout_steps_warmup_epochs,
     )
 
-    def _rebuild_rollout_loaders(steps: int) -> tuple[Dataset | None, DataLoader | None, Dataset | None, DataLoader | None]:
+    def _rebuild_rollout_loaders(steps: int) -> tuple[Dataset | None, DataLoader | None, Dataset | None, DataLoader | None, Dataset | None, DataLoader | None]:
         train_roll_ds = None
         train_roll_loader = None
         val_roll_ds = None
         val_roll_loader = None
+        val_seen_roll_ds = None
+        val_seen_roll_loader = None
         if rollout_weight > 0.0 and steps > 0:
             train_roll_ds = _build_td_correction_vpinn_datasets(
                 trajs=train_trajs,
@@ -2989,9 +3018,25 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         num_workers=int(runtime_cfg.num_workers),
                         pin_memory=(device.type == "cuda"),
                     )
-        return train_roll_ds, train_roll_loader, val_roll_ds, val_roll_loader
+            if val_seen_trajs:
+                val_seen_roll_ds = _build_td_correction_vpinn_datasets(
+                    trajs=val_seen_trajs,
+                    rollout_steps=steps,
+                    window_M=window_M,
+                    stride=stride,
+                    td_mass_source=td_mass_source,
+                )[1]
+                if val_seen_roll_ds is not None:
+                    val_seen_roll_loader = DataLoader(
+                        val_seen_roll_ds,
+                        batch_size=rollout_batch_size,
+                        shuffle=False,
+                        num_workers=int(runtime_cfg.num_workers),
+                        pin_memory=(device.type == "cuda"),
+                    )
+        return train_roll_ds, train_roll_loader, val_roll_ds, val_roll_loader, val_seen_roll_ds, val_seen_roll_loader
 
-    train_rollout_dataset, rollout_loader, val_rollout_dataset, val_rollout_loader = _rebuild_rollout_loaders(current_rollout_steps)
+    train_rollout_dataset, rollout_loader, val_rollout_dataset, val_rollout_loader, val_seen_rollout_dataset, val_seen_rollout_loader = _rebuild_rollout_loaders(current_rollout_steps)
 
     opt, lr_scheduler = setup_optimizer_and_scheduler(model, optim_cfg=optim_cfg, scheduler_cfg=optim_cfg.scheduler, epochs=int(training_cfg.epochs))
     amp_enabled, amp_dtype, scaler = setup_amp(device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype))
@@ -3086,6 +3131,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     train_steps_per_epoch = len(train_loader)
     val_instances = len(val_dataset) if val_dataset is not None else 0
     val_steps_per_epoch = len(val_loader) if val_loader is not None else 0
+    val_seen_instances = len(val_seen_dataset) if val_seen_dataset is not None else 0
+    val_seen_steps_per_epoch = len(val_seen_loader) if val_seen_loader is not None else 0
     train_rollout_instances = len(train_rollout_dataset) if train_rollout_dataset is not None else 0
     train_rollout_steps_per_epoch = len(rollout_loader) if rollout_loader is not None else 0
     val_rollout_instances = len(val_rollout_dataset) if val_rollout_dataset is not None else 0
@@ -3100,8 +3147,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             f"train_trajectories={len(train_trajs)}, correction_mode={correction_mode}"
         ),
         (
-            f"Validation setup: steps={val_steps_per_epoch}, val_instances={val_instances}, "
-            f"val_trajectories={len(val_trajs)}"
+            f"Validation setup: unseen_steps={val_steps_per_epoch}, unseen_instances={val_instances}, "
+            f"val_unseen_trajectories={len(val_trajs)}, seen_steps={val_seen_steps_per_epoch}, "
+            f"seen_instances={val_seen_instances}, val_seen_trajectories={len(val_seen_trajs)}"
         ),
         (
             f"Rollout setup: weight={rollout_weight:g}, steps={rollout_steps}, "
@@ -3148,6 +3196,246 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     async_processes: list[dict[str, Any]] = []
     async_best_state: dict[str, Any] = {"loss_total": float("inf")}
 
+    def _run_sync_validation_for_split(
+        *,
+        epoch_idx: int,
+        split_tag: str,
+        split_name: str,
+        split_loader: DataLoader | None,
+        split_rollout_loader: DataLoader | None,
+        split_trajs: list[dict[str, Any]],
+    ) -> None:
+        if split_loader is None:
+            return
+        split_start = time.perf_counter()
+        model.eval()
+        val_sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]}
+        val_batches = 0
+        with torch.no_grad():
+            for batch in split_loader:
+                x_win, v_win, force_true, ur_win, td_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    step = _vpinn_step_with_corrections(
+                        model=model,
+                        x=x_win,
+                        v=v_win,
+                        ur=ur_win,
+                        td_context=td_win,
+                        dt=dt,
+                        m=m_win,
+                        c=c_win,
+                        k=k_win,
+                        rho=rho,
+                        diameter=diameter,
+                        td_params=td_params,
+                        mean_active=mean_active,
+                        sigma_active=probabilistic,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
+                        sigma_min=sigma_min,
+                        force_zero_output=force_zero_output,
+                    )
+                    mu_corr = step["corr_mu"]
+                    sigma_corr = step["corr_sigma"]
+                    total_force_mu = step["total_force_next"]
+                    if use_force_loss:
+                        if probabilistic:
+                            var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                            loss_data = torch.mean(0.5 * (((force_true - total_force_mu) ** 2) / var + torch.log(var)))
+                        else:
+                            loss_data = torch.mean((force_true - total_force_mu) ** 2)
+                    else:
+                        loss_data = mu_corr.new_tensor(0.0)
+                    if use_weak_loss:
+                        R_mean = _weak_residual(
+                            x=x_win,
+                            v=v_win,
+                            f_pred=total_force_mu,
+                            m=m_win[:, 0, :],
+                            c=c_win[:, 0, :],
+                            k=k_win[:, 0, :],
+                            dt=dt,
+                            w=w,
+                            wdot=wdot,
+                            alpha=alpha,
+                            f0=None,
+                        )
+                        p_scale = None
+                        if normalize_by_ur_bin_std:
+                            R_mean, p_scale = _vpinn_scale_weak_residual(
+                                R_mean,
+                                ur_values=ur_win[:, 0, :],
+                                mass=m_win[:, 0, :],
+                                scale_info=ur_bin_state_scale_info,
+                                ur_bin_size=ur_bin_size,
+                            )
+                        if probabilistic:
+                            coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
+                            weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
+                            if p_scale is not None:
+                                weak_var = weak_var / torch.clamp(p_scale.unsqueeze(1) ** 2, min=1e-12)
+                            weak_var = torch.clamp(weak_var, min=1e-9)
+                            loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
+                        else:
+                            loss_physics = torch.mean(R_mean * R_mean)
+                    else:
+                        loss_physics = mu_corr.new_tensor(0.0)
+                    mean_reg_loss = _reg(mu_corr, mean_reg_norm)
+                    sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
+                    fhat_reg_loss = _reg(step["delta_fhat"], str(getattr(loss_cfg, "fhat_reg_norm", "l2"))) if fhat_active else mu_corr.new_tensor(0.0)
+                    total_loss = (
+                        loss_data
+                        + loss_physics
+                        + float(mean_reg) * mean_reg_loss
+                        + float(sigma_reg) * sigma_reg_loss
+                        + float(getattr(loss_cfg, "fhat_reg", 0.0)) * fhat_reg_loss
+                    )
+                val_sums["loss_total"] += total_loss.detach()
+                val_sums["loss_data"] += loss_data.detach()
+                val_sums["loss_physics"] += loss_physics.detach()
+                val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
+                val_batches += 1
+        val_denom = float(max(1, val_batches))
+        val_metrics = {
+            name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
+        }
+        rollout_loss_avg = 0.0
+        if split_rollout_loader is not None and rollout_weight > 0.0 and current_rollout_steps > 0:
+            with torch.no_grad():
+                roll_sum = torch.zeros((), device=device)
+                roll_batches = 0
+                for rb in split_rollout_loader:
+                    roll_sum += _vpinn_td_rollout_loss_from_batch(
+                        model=model,
+                        batch=rb,
+                        device=device,
+                        non_blocking=non_blocking,
+                        dt=dt,
+                        rho=rho,
+                        diameter=diameter,
+                        td_params=td_params,
+                        mean_active=mean_active,
+                        sigma_active=probabilistic,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
+                        sigma_min=sigma_min,
+                        force_zero_output=force_zero_output,
+                        rollout_loss_mode="deterministic",
+                        rollout_stochastic_samples=1,
+                        rollout_noise_scale=rollout_noise_scale,
+                        ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
+                        ur_bin_size=ur_bin_size,
+                    ).detach()
+                    roll_batches += 1
+                rollout_loss_avg = float((roll_sum / float(max(1, roll_batches))).detach().cpu())
+                writer.add_scalar(f"{split_tag}/loss_rollout_det", rollout_loss_avg, epoch_idx + 1)
+        val_metrics["loss_total"] = (
+            val_metrics["loss_data"]
+            + val_metrics["loss_physics"]
+            + float(mean_reg) * val_metrics["loss_reg_mean"]
+            + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+            + float(getattr(loss_cfg, "fhat_reg", 0.0)) * val_metrics["loss_reg_fhat"]
+            + float(rollout_weight) * rollout_loss_avg
+        )
+        for name, value in val_metrics.items():
+            writer.add_scalar(f"{split_tag}/{name}", value, epoch_idx + 1)
+
+        if should_rollout and split_trajs:
+            ur_all = [float(traj["ur"][0]) for traj in split_trajs]
+            sampled_metric_indices = sample_indices_per_ur(
+                ur_all,
+                samples_per_ur=validation_samples_per_ur,
+                seed=1,
+            )
+            sampled_names = [str(split_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
+            print(
+                f"[td-{split_name}][vpinn] epoch {epoch_idx + 1}: sampled metric trajectories={sampled_names} "
+                f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+            )
+            metrics_sum: dict[str, float] = {}
+            metrics_count: dict[str, int] = {}
+            for sidx in sampled_metric_indices:
+                metrics_roll = _log_td_correction_rollout_validation(
+                    writer=writer,
+                    epoch=epoch_idx + 1,
+                    model=model,
+                    traj=split_trajs[sidx],
+                    dt=dt,
+                    td_mass_source=td_mass_source,
+                    rho=rho,
+                    diameter=diameter,
+                    td_params=td_params,
+                    device=device,
+                    sigma_min=sigma_min,
+                    mean_active=mean_active,
+                    probabilistic=probabilistic,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
+                    force_zero_output=force_zero_output,
+                    rollout_stochastic=rollout_stochastic,
+                    rollout_noise_scale=rollout_noise_scale,
+                    rollout_seed=rollout_seed,
+                    tag_prefix=f"{split_tag}/rollout",
+                    log_metrics=False,
+                    log_plots=False,
+                )
+                for name, value in metrics_roll.items():
+                    if not np.isfinite(float(value)):
+                        continue
+                    metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                    metrics_count[name] = metrics_count.get(name, 0) + 1
+            for name, total in metrics_sum.items():
+                denom_roll = float(max(1, metrics_count.get(name, 0)))
+                writer.add_scalar(f"{split_tag}/{name}", total / denom_roll, epoch_idx + 1)
+
+            selected_indices = sample_one_index_per_ur(ur_all, seed=0)
+            if not selected_indices:
+                selected_indices = list(range(len(split_trajs)))
+            rollout_idx = selected_indices[0]
+            rollout_traj = split_trajs[rollout_idx]
+            print(
+                f"[td-{split_name}][vpinn] epoch {epoch_idx + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+                f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+                f"dt={float(dt):.6g} rho={float(rho):.6g} D={float(diameter):.6g} "
+                f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+                f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+                f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+            )
+            _log_td_correction_rollout_validation(
+                writer=writer,
+                epoch=epoch_idx + 1,
+                model=model,
+                traj=rollout_traj,
+                dt=dt,
+                td_mass_source=td_mass_source,
+                rho=rho,
+                diameter=diameter,
+                td_params=td_params,
+                device=device,
+                sigma_min=sigma_min,
+                mean_active=mean_active,
+                probabilistic=probabilistic,
+                fhat_active=fhat_active,
+                use_td_force_input=use_td_force_input,
+                fhat_bound_multiplier=fhat_bound_multiplier,
+                force_zero_output=force_zero_output,
+                rollout_stochastic=rollout_stochastic,
+                rollout_noise_scale=rollout_noise_scale,
+                rollout_seed=rollout_seed,
+                tag_prefix=f"{split_tag}/rollout",
+                log_metrics=False,
+                log_plots=True,
+                log_spectra=True,
+            )
+        elapsed = float(time.perf_counter() - split_start)
+        writer.add_scalar(f"{split_tag}/validation_wall_time_s", elapsed, epoch_idx + 1)
+        writer.flush()
+
     for epoch in range(epochs):
         model.train()
         if bool(optim_cfg.use_lr_scheduler):
@@ -3161,7 +3449,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         )
         if scheduled_rollout_steps != current_rollout_steps:
             current_rollout_steps = scheduled_rollout_steps
-            train_rollout_dataset, rollout_loader, val_rollout_dataset, val_rollout_loader = _rebuild_rollout_loaders(current_rollout_steps)
+            train_rollout_dataset, rollout_loader, val_rollout_dataset, val_rollout_loader, val_seen_rollout_dataset, val_seen_rollout_loader = _rebuild_rollout_loaders(current_rollout_steps)
             print(
                 f"Epoch {epoch}: updated rollout loss horizon to {current_rollout_steps} step(s)."
             )
@@ -3375,235 +3663,35 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 do_rollout=should_rollout,
                 best_state=async_best_state,
             )
+            if val_seen_loader is not None and (should_validate or should_rollout):
+                _run_sync_validation_for_split(
+                    epoch_idx=epoch,
+                    split_tag="val_seen",
+                    split_name="val_seen",
+                    split_loader=val_seen_loader,
+                    split_rollout_loader=val_seen_rollout_loader,
+                    split_trajs=val_seen_trajs,
+                )
         elif should_validate:
-            model.eval()
-            val_sums = {name: torch.zeros((), device=device) for name in ["loss_total", "loss_data", "loss_physics", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]}
-            val_batches = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    x_win, v_win, force_true, ur_win, td_win, m_win, c_win, k_win = [item.to(device, non_blocking=non_blocking) for item in batch]
-                    with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                        step = _vpinn_step_with_corrections(
-                            model=model,
-                            x=x_win,
-                            v=v_win,
-                            ur=ur_win,
-                            td_context=td_win,
-                            dt=dt,
-                            m=m_win,
-                            c=c_win,
-                            k=k_win,
-                            rho=rho,
-                            diameter=diameter,
-                            td_params=td_params,
-                            mean_active=mean_active,
-                            sigma_active=probabilistic,
-                            fhat_active=fhat_active,
-                            use_td_force_input=use_td_force_input,
-                            fhat_bound_multiplier=fhat_bound_multiplier,
-                            sigma_min=sigma_min,
-                            force_zero_output=force_zero_output,
-                        )
-                        mu_corr = step["corr_mu"]
-                        sigma_corr = step["corr_sigma"]
-                        total_force_mu = step["total_force_next"]
-                        if use_force_loss:
-                            if probabilistic:
-                                var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                                loss_data = torch.mean(0.5 * (((force_true - total_force_mu) ** 2) / var + torch.log(var)))
-                            else:
-                                loss_data = torch.mean((force_true - total_force_mu) ** 2)
-                        else:
-                            loss_data = mu_corr.new_tensor(0.0)
-                        if use_weak_loss:
-                            R_mean = _weak_residual(
-                                x=x_win,
-                                v=v_win,
-                                f_pred=total_force_mu,
-                                m=m_win[:, 0, :],
-                                c=c_win[:, 0, :],
-                                k=k_win[:, 0, :],
-                                dt=dt,
-                                w=w,
-                                wdot=wdot,
-                                alpha=alpha,
-                                f0=None,
-                            )
-                            p_scale = None
-                            if normalize_by_ur_bin_std:
-                                R_mean, p_scale = _vpinn_scale_weak_residual(
-                                    R_mean,
-                                    ur_values=ur_win[:, 0, :],
-                                    mass=m_win[:, 0, :],
-                                    scale_info=ur_bin_state_scale_info,
-                                    ur_bin_size=ur_bin_size,
-                                )
-                            if probabilistic:
-                                coeff = (float(dt) * alpha.view(1, 1, -1, 1) * w.view(1, w.shape[0], w.shape[1], 1)) ** 2
-                                weak_var = torch.sum(coeff * (sigma_corr.unsqueeze(1) ** 2), dim=2)
-                                if p_scale is not None:
-                                    weak_var = weak_var / torch.clamp(p_scale.unsqueeze(1) ** 2, min=1e-12)
-                                weak_var = torch.clamp(weak_var, min=1e-9)
-                                loss_physics = torch.mean(0.5 * ((R_mean * R_mean) / weak_var + torch.log(weak_var)))
-                            else:
-                                loss_physics = torch.mean(R_mean * R_mean)
-                        else:
-                            loss_physics = mu_corr.new_tensor(0.0)
-                        mean_reg_loss = _reg(mu_corr, mean_reg_norm)
-                        sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if probabilistic else mu_corr.new_tensor(0.0)
-                        fhat_reg_loss = _reg(step["delta_fhat"], str(getattr(loss_cfg, "fhat_reg_norm", "l2"))) if fhat_active else mu_corr.new_tensor(0.0)
-                        total_loss = (
-                            loss_data
-                            + loss_physics
-                            + float(mean_reg) * mean_reg_loss
-                            + float(sigma_reg) * sigma_reg_loss
-                            + float(getattr(loss_cfg, "fhat_reg", 0.0)) * fhat_reg_loss
-                        )
-                    val_sums["loss_total"] += total_loss.detach()
-                    val_sums["loss_data"] += loss_data.detach()
-                    val_sums["loss_physics"] += loss_physics.detach()
-                    val_sums["loss_reg_mean"] += mean_reg_loss.detach()
-                    val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
-                    val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
-                    val_batches += 1
-            val_denom = float(max(1, val_batches))
-            val_metrics = {
-                name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
-            }
-            rollout_loss_avg = 0.0
-            if val_rollout_loader is not None and rollout_weight > 0.0 and current_rollout_steps > 0:
-                with torch.no_grad():
-                    roll_sum = torch.zeros((), device=device)
-                    roll_batches = 0
-                    for rb in val_rollout_loader:
-                        roll_sum += _vpinn_td_rollout_loss_from_batch(
-                            model=model,
-                            batch=rb,
-                            device=device,
-                            non_blocking=non_blocking,
-                            dt=dt,
-                        rho=rho,
-                        diameter=diameter,
-                        td_params=td_params,
-                        mean_active=mean_active,
-                        sigma_active=probabilistic,
-                        fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
-                        fhat_bound_multiplier=fhat_bound_multiplier,
-                        sigma_min=sigma_min,
-                        force_zero_output=force_zero_output,
-                        rollout_loss_mode="deterministic",
-                            rollout_stochastic_samples=1,
-                            rollout_noise_scale=rollout_noise_scale,
-                            ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
-                            ur_bin_size=ur_bin_size,
-                        ).detach()
-                        roll_batches += 1
-                    rollout_loss_avg = float((roll_sum / float(max(1, roll_batches))).detach().cpu())
-                    writer.add_scalar("val/loss_rollout_det", rollout_loss_avg, epoch + 1)
-            val_metrics["loss_total"] = (
-                val_metrics["loss_data"]
-                + val_metrics["loss_physics"]
-                + float(mean_reg) * val_metrics["loss_reg_mean"]
-                + float(sigma_reg) * val_metrics["loss_reg_sigma"]
-                + float(getattr(loss_cfg, "fhat_reg", 0.0)) * val_metrics["loss_reg_fhat"]
-                + float(rollout_weight) * rollout_loss_avg
+            _run_sync_validation_for_split(
+                epoch_idx=epoch,
+                split_tag="val_unseen",
+                split_name="val_unseen",
+                split_loader=val_loader,
+                split_rollout_loader=val_rollout_loader,
+                split_trajs=val_trajs,
             )
-            for name, value in val_metrics.items():
-                writer.add_scalar(f"val/{name}", value, epoch + 1)
-
-            if should_rollout and val_trajs:
-                ur_all = [float(traj["ur"][0]) for traj in val_trajs]
-                sampled_metric_indices = sample_indices_per_ur(
-                    ur_all,
-                    samples_per_ur=validation_samples_per_ur,
-                    seed=1,
-                )
-                sampled_names = [str(val_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
-                print(
-                    f"[td-val][vpinn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
-                    f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
-                )
-                metrics_sum: dict[str, float] = {}
-                metrics_count: dict[str, int] = {}
-                for sidx in sampled_metric_indices:
-                    metrics_roll = _log_td_correction_rollout_validation(
-                        writer=writer,
-                        epoch=epoch + 1,
-                        model=model,
-                        traj=val_trajs[sidx],
-                        dt=dt,
-                        td_mass_source=td_mass_source,
-                        rho=rho,
-                        diameter=diameter,
-                        td_params=td_params,
-                        device=device,
-                        sigma_min=sigma_min,
-                        mean_active=mean_active,
-                        probabilistic=probabilistic,
-                        fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
-                        fhat_bound_multiplier=fhat_bound_multiplier,
-                        force_zero_output=force_zero_output,
-                        rollout_stochastic=rollout_stochastic,
-                        rollout_noise_scale=rollout_noise_scale,
-                        rollout_seed=rollout_seed,
-                        log_metrics=False,
-                        log_plots=False,
-                    )
-                    for name, value in metrics_roll.items():
-                        if not np.isfinite(float(value)):
-                            continue
-                        metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-                        metrics_count[name] = metrics_count.get(name, 0) + 1
-                for name, total in metrics_sum.items():
-                    denom_roll = float(max(1, metrics_count.get(name, 0)))
-                    writer.add_scalar(f"val/{name}", total / denom_roll, epoch + 1)
-
-                selected_indices = sample_one_index_per_ur(ur_all, seed=0)
-                if not selected_indices:
-                    selected_indices = list(range(len(val_trajs)))
-                rollout_idx = selected_indices[0]
-                rollout_traj = val_trajs[rollout_idx]
-                print(
-                    f"[td-val][vpinn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
-                    f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-                    f"dt={float(dt):.6g} rho={float(rho):.6g} D={float(diameter):.6g} "
-                    f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
-                    f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
-                    f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
-                )
-                _log_td_correction_rollout_validation(
-                    writer=writer,
-                    epoch=epoch + 1,
-                    model=model,
-                    traj=rollout_traj,
-                    dt=dt,
-                    td_mass_source=td_mass_source,
-                    rho=rho,
-                    diameter=diameter,
-                    td_params=td_params,
-                    device=device,
-                    sigma_min=sigma_min,
-                    mean_active=mean_active,
-                    probabilistic=probabilistic,
-                    fhat_active=fhat_active,
-                    use_td_force_input=use_td_force_input,
-                    fhat_bound_multiplier=fhat_bound_multiplier,
-                    force_zero_output=force_zero_output,
-                    rollout_stochastic=rollout_stochastic,
-                    rollout_noise_scale=rollout_noise_scale,
-                    rollout_seed=rollout_seed,
-                    log_metrics=False,
-                    log_plots=True,
-                    log_spectra=True,
+            if val_seen_loader is not None:
+                _run_sync_validation_for_split(
+                    epoch_idx=epoch,
+                    split_tag="val_seen",
+                    split_name="val_seen",
+                    split_loader=val_seen_loader,
+                    split_rollout_loader=val_seen_rollout_loader,
+                    split_trajs=val_seen_trajs,
                 )
             snapshot_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {snapshot_path}")
-            if sync_validation_start is not None:
-                elapsed = float(time.perf_counter() - sync_validation_start)
-                writer.add_scalar("val/validation_wall_time_s", elapsed, epoch + 1)
-                writer.add_scalar("val/validation_total_wall_time_s", elapsed, epoch + 1)
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
@@ -4412,7 +4500,6 @@ def train(config: Config, config_name: str) -> None:
         if sync_validation_start is not None:
             elapsed = float(time.perf_counter() - sync_validation_start)
             writer.add_scalar("val/validation_wall_time_s", elapsed, epoch)
-            writer.add_scalar("val/validation_total_wall_time_s", elapsed, epoch)
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
