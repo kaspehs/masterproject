@@ -3598,7 +3598,9 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             snapshot_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {snapshot_path}")
             if sync_validation_start is not None:
-                writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - sync_validation_start, epoch + 1)
+                elapsed = float(time.perf_counter() - sync_validation_start)
+                writer.add_scalar("val/validation_wall_time_s", elapsed, epoch + 1)
+                writer.add_scalar("val/validation_total_wall_time_s", elapsed, epoch + 1)
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
@@ -4405,7 +4407,9 @@ def train(config: Config, config_name: str) -> None:
             snapshot_path = _save_validation_snapshot(epoch)
             print(f"Saved validation checkpoint to {snapshot_path}")
         if sync_validation_start is not None:
-            writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - sync_validation_start, epoch)
+            elapsed = float(time.perf_counter() - sync_validation_start)
+            writer.add_scalar("val/validation_wall_time_s", elapsed, epoch)
+            writer.add_scalar("val/validation_total_wall_time_s", elapsed, epoch)
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")

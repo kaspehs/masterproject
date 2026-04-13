@@ -2100,6 +2100,7 @@ def main() -> None:
         summary["status"] = "completed"
         summary["validation_wall_time_s"] = float(elapsed)
         writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(args.epoch))
+        writer.add_scalar("val/validation_total_wall_time_s", float(elapsed), int(args.epoch))
         summary_path = _async_summary_path(args.log_dir, int(args.epoch))
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

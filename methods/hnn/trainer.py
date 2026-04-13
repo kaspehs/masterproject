@@ -2044,6 +2044,10 @@ def _validate_if_needed(
     if not validate_now and not rollout_now:
         return
     validation_start = time.perf_counter()
+    def _log_validation_timing() -> None:
+        elapsed = float(time.perf_counter() - validation_start)
+        writer.add_scalar("val/validation_wall_time_s", elapsed, epoch + 1)
+        writer.add_scalar("val/validation_total_wall_time_s", elapsed, epoch + 1)
     if validate_now and val_loader is not None:
         val_loss_metrics = _evaluate_val_losses(
             model=model,
@@ -2073,7 +2077,7 @@ def _validate_if_needed(
         for name, value in val_loss_metrics.items():
             writer.add_scalar(f"val/{name}", value, epoch + 1)
     if not rollout_now:
-        writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
+        _log_validation_timing()
         return
 
     if val_series_raw is not None and val_sequences is not None:
@@ -2165,7 +2169,7 @@ def _validate_if_needed(
             rollout_seed=rollout_seed,
             log_spectra=True,
         )
-        writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
+        _log_validation_timing()
         return
     log_validation_epoch(
         writer,
@@ -2191,7 +2195,7 @@ def _validate_if_needed(
         rollout_seed=rollout_seed,
         log_spectra=True,
     )
-    writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - validation_start, epoch + 1)
+    _log_validation_timing()
 
 
 def _log_final_rollouts_all(
