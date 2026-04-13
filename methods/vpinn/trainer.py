@@ -870,6 +870,9 @@ def _reap_async_processes(
 
         if return_code == 0:
             print(f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s")
+            if writer is not None and epoch > 0:
+                writer.add_scalar("val/validation_wall_time_s", float(elapsed), int(epoch))
+                writer.add_scalar("val/validation_total_wall_time_s", float(elapsed), int(epoch))
         else:
             print(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
