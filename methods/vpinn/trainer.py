@@ -3208,6 +3208,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         split_loader: DataLoader | None,
         split_rollout_loader: DataLoader | None,
         split_trajs: list[dict[str, Any]],
+        log_rollout_plots: bool,
     ) -> None:
         if split_loader is None:
             return
@@ -3397,45 +3398,46 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 denom_roll = float(max(1, metrics_count.get(name, 0)))
                 writer.add_scalar(f"{split_tag}/{name}", total / denom_roll, epoch_idx + 1)
 
-            selected_indices = sample_one_index_per_ur(ur_all, seed=0)
-            if not selected_indices:
-                selected_indices = list(range(len(split_trajs)))
-            rollout_idx = selected_indices[0]
-            rollout_traj = split_trajs[rollout_idx]
-            print(
-                f"[td-{split_name}][vpinn] epoch {epoch_idx + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
-                f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-                f"dt={float(dt):.6g} rho={float(rho):.6g} D={float(diameter):.6g} "
-                f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
-                f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
-                f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
-            )
-            _log_td_correction_rollout_validation(
-                writer=writer,
-                epoch=epoch_idx + 1,
-                model=model,
-                traj=rollout_traj,
-                dt=dt,
-                td_mass_source=td_mass_source,
-                rho=rho,
-                diameter=diameter,
-                td_params=td_params,
-                device=device,
-                sigma_min=sigma_min,
-                mean_active=mean_active,
-                probabilistic=probabilistic,
-                fhat_active=fhat_active,
-                use_td_force_input=use_td_force_input,
-                fhat_bound_multiplier=fhat_bound_multiplier,
-                force_zero_output=force_zero_output,
-                rollout_stochastic=rollout_stochastic,
-                rollout_noise_scale=rollout_noise_scale,
-                rollout_seed=rollout_seed,
-                tag_prefix=f"{split_tag}/rollout",
-                log_metrics=False,
-                log_plots=True,
-                log_spectra=True,
-            )
+            if log_rollout_plots:
+                selected_indices = sample_one_index_per_ur(ur_all, seed=0)
+                if not selected_indices:
+                    selected_indices = list(range(len(split_trajs)))
+                rollout_idx = selected_indices[0]
+                rollout_traj = split_trajs[rollout_idx]
+                print(
+                    f"[td-{split_name}][vpinn] epoch {epoch_idx + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+                    f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+                    f"dt={float(dt):.6g} rho={float(rho):.6g} D={float(diameter):.6g} "
+                    f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+                    f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+                    f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+                )
+                _log_td_correction_rollout_validation(
+                    writer=writer,
+                    epoch=epoch_idx + 1,
+                    model=model,
+                    traj=rollout_traj,
+                    dt=dt,
+                    td_mass_source=td_mass_source,
+                    rho=rho,
+                    diameter=diameter,
+                    td_params=td_params,
+                    device=device,
+                    sigma_min=sigma_min,
+                    mean_active=mean_active,
+                    probabilistic=probabilistic,
+                    fhat_active=fhat_active,
+                    use_td_force_input=use_td_force_input,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
+                    force_zero_output=force_zero_output,
+                    rollout_stochastic=rollout_stochastic,
+                    rollout_noise_scale=rollout_noise_scale,
+                    rollout_seed=rollout_seed,
+                    tag_prefix=f"{split_tag}/rollout",
+                    log_metrics=False,
+                    log_plots=True,
+                    log_spectra=True,
+                )
         elapsed = float(time.perf_counter() - split_start)
         writer.add_scalar(f"{split_tag}/validation_wall_time_s", elapsed, epoch_idx + 1)
         writer.flush()
@@ -3675,6 +3677,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     split_loader=val_seen_loader,
                     split_rollout_loader=val_seen_rollout_loader,
                     split_trajs=val_seen_trajs,
+                    log_rollout_plots=False,
                 )
         elif should_validate:
             _run_sync_validation_for_split(
@@ -3684,6 +3687,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 split_loader=val_loader,
                 split_rollout_loader=val_rollout_loader,
                 split_trajs=val_trajs,
+                log_rollout_plots=True,
             )
             if val_seen_loader is not None:
                 _run_sync_validation_for_split(
@@ -3693,6 +3697,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     split_loader=val_seen_loader,
                     split_rollout_loader=val_seen_rollout_loader,
                     split_trajs=val_seen_trajs,
+                    log_rollout_plots=False,
                 )
             snapshot_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {snapshot_path}")
