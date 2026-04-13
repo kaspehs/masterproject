@@ -1643,6 +1643,7 @@ def _log_rollout_validation(
     log_metrics: bool = True,
     log_plots: bool = True,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ) -> dict[str, float]:
     x_true_t = traj["x"].to(device)
     v_true_t = traj["v"].to(device)
@@ -1723,6 +1724,7 @@ def _log_rollout_validation(
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
+            log_spectra=log_spectra,
         )
         log_force_plots(
             writer,
@@ -1735,6 +1737,7 @@ def _log_rollout_validation(
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
+            log_spectra=log_spectra,
         )
     return metrics
 
@@ -1814,6 +1817,7 @@ def _log_td_correction_rollout_validation(
     log_phase_map: bool = False,
     log_correction_on_data: bool = False,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ) -> dict[str, float]:
     traj_t = _td_rollout_traj_to_tensors(traj)
     x_true_t = traj_t["x"].to(device)
@@ -1964,6 +1968,7 @@ def _log_td_correction_rollout_validation(
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
+            log_spectra=log_spectra,
         )
         log_force_plots(
             writer,
@@ -1978,6 +1983,7 @@ def _log_td_correction_rollout_validation(
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
+            log_spectra=log_spectra,
         )
         if log_correction_on_data:
             output_label = (
@@ -2958,6 +2964,42 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     )
     writer.add_text("vpinn/td_correction_config", json.dumps(vp, indent=2, sort_keys=True), 0)
     writer.flush()
+    run_models_dir = Path("models") / run_name
+    run_models_dir.mkdir(parents=True, exist_ok=True)
+    validation_models_dir = run_models_dir / "async_validation"
+    validation_models_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_td_validation_checkpoint(epoch_idx: int) -> Path:
+        ckpt_path = validation_models_dir / f"model_epoch_{epoch_idx + 1:06d}.pt"
+        latest_path = validation_models_dir / "model.pt"
+        state_source: nn.Module = model
+        if hasattr(model, "_orig_mod"):
+            state_source = getattr(model, "_orig_mod")
+        torch.save(
+            {
+                "model_state": state_source.state_dict(),
+                "config": asdict(config),
+                "run_name": run_name,
+                "dt": dt,
+                "method": "vpinn",
+                "td_correction": True,
+                "ur_bin_state_scale_info": ur_bin_state_scale_info,
+                "correction_mode": correction_mode,
+                "predict_sigma": probabilistic,
+                "mean_active": mean_active,
+                "fhat_active": fhat_active,
+                "use_td_force_input": use_td_force_input,
+                "use_phi_input": use_phi_input,
+                "phi_input_source": (None if not use_phi_input else phase_input_source),
+                "use_sigma_inputs": use_sigma_inputs,
+                "fhat_bound_multiplier": float(fhat_bound_multiplier),
+                "fhat_reg": float(fhat_reg),
+                "fhat_reg_norm": str(fhat_reg_norm),
+            },
+            ckpt_path,
+        )
+        shutil.copyfile(ckpt_path, latest_path)
+        return ckpt_path
 
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
     sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
@@ -3278,6 +3320,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 },
                 ckpt_path,
             )
+            snapshot_path = _save_td_validation_checkpoint(epoch)
+            print(f"Saved validation checkpoint to {snapshot_path}")
             async_processes = _launch_async_validation(
                 processes=async_processes,
                 max_concurrent=async_max_concurrent,
@@ -3514,6 +3558,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                 )
+            snapshot_path = _save_td_validation_checkpoint(epoch)
+            print(f"Saved validation checkpoint to {snapshot_path}")
             if sync_validation_start is not None:
                 writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - sync_validation_start, epoch + 1)
 
@@ -3656,6 +3702,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                 log_correction_on_data=True,
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
+                log_spectra=True,
             )
             filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
             if filtered_plot_metrics:
@@ -3944,6 +3991,29 @@ def train(config: Config, config_name: str) -> None:
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
         async_dir.mkdir(parents=True, exist_ok=True)
+    run_models_dir = Path("models") / run_name
+    run_models_dir.mkdir(parents=True, exist_ok=True)
+    validation_models_dir = run_models_dir / "async_validation"
+    validation_models_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_validation_snapshot(epoch_idx: int) -> Path:
+        ckpt_path = validation_models_dir / f"model_epoch_{epoch_idx + 1:06d}.pt"
+        latest_path = validation_models_dir / "model.pt"
+        state_source: nn.Module = model
+        if hasattr(model, "_orig_mod"):
+            state_source = getattr(model, "_orig_mod")
+        torch.save(
+            {
+                "model_state": state_source.state_dict(),
+                "config": asdict(config),
+                "run_name": run_name,
+                "dt": dt,
+                "method": "vpinn",
+            },
+            ckpt_path,
+        )
+        shutil.copyfile(ckpt_path, latest_path)
+        return ckpt_path
 
     use_lr_scheduler = bool(optim_cfg.use_lr_scheduler)
     base_lr = float(optim_cfg.lr)
@@ -4199,6 +4269,8 @@ def train(config: Config, config_name: str) -> None:
                 },
                 ckpt_path,
             )
+            snapshot_path = _save_validation_snapshot(epoch)
+            print(f"Saved validation checkpoint to {snapshot_path}")
             async_processes = _launch_async_validation(
                 processes=async_processes,
                 max_concurrent=async_max_concurrent,
@@ -4291,6 +4363,9 @@ def train(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                 )
+        if not async_validation and (should_validate or should_rollout):
+            snapshot_path = _save_validation_snapshot(epoch)
+            print(f"Saved validation checkpoint to {snapshot_path}")
         if sync_validation_start is not None:
             writer.add_scalar("val/validation_wall_time_s", time.perf_counter() - sync_validation_start, epoch)
 
@@ -4370,6 +4445,7 @@ def train(config: Config, config_name: str) -> None:
                 step=idx,
                 log_metrics=False,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
+                log_spectra=True,
             )
             filtered_plot_metrics = {name: float(value) for name, value in metrics.items() if np.isfinite(float(value))}
             if filtered_plot_metrics:

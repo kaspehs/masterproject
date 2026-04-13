@@ -1229,6 +1229,7 @@ def _log_td_correction_rollout_validation(
     log_phase_map: bool = False,
     log_correction_on_data: bool = False,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ) -> dict[str, float]:
     mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
     mass_value = float(np.asarray(traj[mass_key]).reshape(()))
@@ -1362,6 +1363,7 @@ def _log_td_correction_rollout_validation(
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
+            log_spectra=log_spectra,
         )
         n_force = min(len(t_np), len(force_total_full), len(force_true), len(force_td_full))
         force_t = t_np[:n_force]
@@ -1378,6 +1380,7 @@ def _log_td_correction_rollout_validation(
             tag_prefix=tag_prefix,
             step=step,
             title_suffix=title_suffix,
+            log_spectra=log_spectra,
         )
         if log_correction_on_data:
             output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
@@ -2296,6 +2299,7 @@ def _log_final_rollouts_all(
             tag_prefix="final_val/rollout",
             step=step_idx,
             title_suffix=f" [final {step_idx}/{len(plot_pairs)}]",
+            log_spectra=True,
         )
         filtered_plot_metrics = {
             name: float(value)
@@ -3076,9 +3080,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     writer.flush()
     run_models_dir = Path("models") / run_name
     run_models_dir.mkdir(parents=True, exist_ok=True)
+    validation_models_dir = run_models_dir / "async_validation"
+    validation_models_dir.mkdir(parents=True, exist_ok=True)
 
     def _save_td_validation_checkpoint(epoch_idx: int) -> Path:
-        ckpt_path = run_models_dir / f"val_epoch_{epoch_idx + 1:06d}.pt"
+        ckpt_path = validation_models_dir / f"model_epoch_{epoch_idx + 1:06d}.pt"
+        latest_path = validation_models_dir / "model.pt"
         state_source: torch.nn.Module = model
         if hasattr(model, "_orig_mod"):
             state_source = getattr(model, "_orig_mod")
@@ -3106,6 +3113,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             },
             ckpt_path,
         )
+        shutil.copyfile(ckpt_path, latest_path)
         return ckpt_path
 
     def _parse_td_train_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3780,6 +3788,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_correction_on_data=True,
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
+                log_spectra=True,
             )
             filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
             if filtered_plot_metrics:
@@ -4189,6 +4198,44 @@ def train(config: Config, config_name: str) -> None:
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
         async_dir.mkdir(parents=True, exist_ok=True)
+    run_models_dir = Path("models") / run_name
+    run_models_dir.mkdir(parents=True, exist_ok=True)
+    validation_models_dir = run_models_dir / "async_validation"
+    validation_models_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_validation_snapshot(epoch_idx: int) -> Path:
+        ckpt_path = validation_models_dir / f"model_epoch_{epoch_idx + 1:06d}.pt"
+        latest_path = validation_models_dir / "model.pt"
+        state_source = model
+        if hasattr(model, "_orig_mod"):
+            state_source = getattr(model, "_orig_mod")
+        checkpoint_config = asdict(config)
+        checkpoint_config["loss"]["rollout_det_steps"] = int(current_rollout_det_steps)
+        torch.save(
+            {
+                "model_state": state_source.state_dict(),
+                "config": checkpoint_config,
+                "ur_bin_state_scale_info": ur_bin_state_scale_info,
+                "run_name": run_name,
+                "dt": dt,
+                "method": str(config.method),
+                "td_correction": True,
+                "correction_mode": correction_mode,
+                "predict_sigma": predict_sigma,
+                "mean_active": mean_active,
+                "fhat_active": fhat_active,
+                "use_td_force_input": use_td_force_input,
+                "use_phi_input": use_phi_input,
+                "phi_input_source": (None if not use_phi_input else phase_input_source),
+                "use_sigma_inputs": use_sigma_inputs,
+                "fhat_bound_multiplier": float(fhat_bound_multiplier),
+                "fhat_reg": float(fhat_reg),
+                "fhat_reg_norm": str(fhat_reg_norm),
+            },
+            ckpt_path,
+        )
+        shutil.copyfile(ckpt_path, latest_path)
+        return ckpt_path
 
     y_true_norm = y_data / D
     force_data = F_data if has_force_data else None
@@ -4422,6 +4469,8 @@ def train(config: Config, config_name: str) -> None:
                 },
                 ckpt_path,
             )
+            snapshot_path = _save_validation_snapshot(epoch)
+            print(f"Saved validation checkpoint to {snapshot_path}")
             async_processes = _launch_async_validation(
                 processes=async_processes,
                 max_concurrent=async_max_concurrent,
@@ -4484,6 +4533,9 @@ def train(config: Config, config_name: str) -> None:
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
             )
+            if should_validate_losses or should_validate_rollout:
+                snapshot_path = _save_validation_snapshot(epoch)
+                print(f"Saved validation checkpoint to {snapshot_path}")
 
     if async_validation and async_processes:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")

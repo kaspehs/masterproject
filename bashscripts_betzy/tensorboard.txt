@@ -1,0 +1,40 @@
+Betzy TensorBoard
+=================
+
+If you use the CPU virtualenv from `bashscripts_betzy/build_betzy_env.sh`, start TensorBoard on Betzy like this:
+
+```bash
+ssh <username>@betzy.sigma2.no
+cd /cluster/work/<project>/<path-to-repo>
+source "$HOME/betzy-env/bin/activate"
+tensorboard --logdir runs --host 127.0.0.1 --port 6006
+```
+
+Then, from your own laptop:
+
+```bash
+ssh -N -L 6006:127.0.0.1:6006 <username>@betzy.sigma2.no
+```
+
+Open this in your browser:
+
+```text
+http://127.0.0.1:6006
+```
+
+If TensorBoard is running inside an interactive allocation on a compute node instead of on the login node, first find the node name:
+
+```bash
+squeue -u "$USER"
+```
+
+Then tunnel through the Betzy login node to that compute node:
+
+```bash
+ssh -N -L 6006:<compute-node-name>:6006 <username>@betzy.sigma2.no
+```
+
+Notes:
+- Keep the `tensorboard` command running on Betzy while the SSH tunnel is open.
+- Change `runs` if your event files are stored somewhere else.
+- If port `6006` is already in use on your laptop, use another local port such as `16006:127.0.0.1:6006` and open `http://127.0.0.1:16006`.

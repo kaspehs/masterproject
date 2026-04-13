@@ -755,6 +755,7 @@ def log_validation_epoch(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ) -> dict[str, float]:
     rollout = rollout_model(
         model,
@@ -813,6 +814,7 @@ def log_validation_epoch(
         tag_prefix=tag_prefix,
         step=step,
         title_suffix=title_suffix,
+        log_spectra=log_spectra,
     )
     force_coeff_pred = np.asarray(rollout["force_coeff_total"], dtype=float).reshape(-1)
     force_coeff_delta = np.asarray(rollout["force_coeff_delta"], dtype=float).reshape(-1)
@@ -852,6 +854,7 @@ def log_validation_epoch(
         tag_prefix=tag_prefix,
         step=step,
         title_suffix=title_suffix,
+        log_spectra=log_spectra,
     )
     return metrics
 
@@ -1437,6 +1440,131 @@ def spectral_l1_relative_error(
     if not np.isfinite(rel):
         return float("nan")
     return rel
+
+
+def _estimate_series_dt(t: np.ndarray) -> float:
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    if t_arr.size < 2:
+        return float("nan")
+    dt_candidates = np.diff(t_arr)
+    dt_candidates = dt_candidates[np.isfinite(dt_candidates) & (dt_candidates > 0.0)]
+    if dt_candidates.size == 0:
+        return float("nan")
+    return float(np.median(dt_candidates))
+
+
+def _power_spectrum(signal: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    signal_arr = np.asarray(signal, dtype=float).reshape(-1)
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    length = min(signal_arr.size, t_arr.size)
+    if length < 8:
+        return None
+    signal_arr = signal_arr[:length]
+    t_arr = t_arr[:length]
+    if not np.all(np.isfinite(signal_arr)) or not np.all(np.isfinite(t_arr)):
+        return None
+    dt = _estimate_series_dt(t_arr)
+    if not np.isfinite(dt) or dt <= 0.0:
+        return None
+    centered = signal_arr - float(np.mean(signal_arr))
+    if np.allclose(centered, 0.0):
+        return None
+
+    if welch is not None:
+        fs = 1.0 / dt
+        seg = int(length)
+        ov = 0 if seg < 16 else min(seg // 2, seg - 1)
+        freqs, psd = welch(
+            centered,
+            fs=fs,
+            window="hann",
+            nperseg=seg,
+            noverlap=ov,
+            detrend="constant",
+            scaling="density",
+        )
+    else:
+        freqs = np.fft.rfftfreq(length, d=dt)
+        psd = np.abs(np.fft.rfft(centered)) ** 2
+
+    mask = np.isfinite(freqs) & np.isfinite(psd) & (freqs > 0.0)
+    if np.count_nonzero(mask) < 2:
+        return None
+    freqs = np.asarray(freqs[mask], dtype=float)
+    psd = np.clip(np.asarray(psd[mask], dtype=float), a_min=0.0, a_max=None)
+    if not np.any(psd > 0.0):
+        return None
+    return freqs, psd
+
+
+def _normalized_spectrum_density(freqs: np.ndarray, psd: np.ndarray, eps: float = 1e-12) -> np.ndarray | None:
+    area = float(np.trapz(psd, freqs))
+    if not np.isfinite(area) or area <= eps:
+        return None
+    return psd / (area + eps)
+
+
+def _log_spectral_plot(
+    writer,
+    epoch: int,
+    t: np.ndarray,
+    true_signal: np.ndarray,
+    pred_signal: np.ndarray,
+    *,
+    value_label: str,
+    plot_title: str,
+    tag: str,
+    reduced_velocity: float | None = None,
+    baseline_signal: np.ndarray | None = None,
+    baseline_label: str | None = None,
+    step: int | None = None,
+    title_suffix: str = "",
+) -> None:
+    true_spec = _power_spectrum(true_signal, t)
+    pred_spec = _power_spectrum(pred_signal, t)
+    baseline_spec = None if baseline_signal is None else _power_spectrum(baseline_signal, t)
+    if true_spec is None or pred_spec is None:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(6, 8), sharex=True)
+    ax_psd, ax_shape = axes
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+    tiny = 1e-12
+
+    true_freqs, true_psd = true_spec
+    pred_freqs, pred_psd = pred_spec
+    ax_psd.semilogy(true_freqs, np.maximum(true_psd, tiny), label=f"{value_label} (true)", color="tab:blue", alpha=0.75)
+    ax_psd.semilogy(pred_freqs, np.maximum(pred_psd, tiny), label=f"{value_label} (pred)", color="tab:purple")
+
+    true_shape = _normalized_spectrum_density(true_freqs, true_psd)
+    pred_shape = _normalized_spectrum_density(pred_freqs, pred_psd)
+    if true_shape is not None:
+        ax_shape.plot(true_freqs, true_shape, label=f"{value_label} (true)", color="tab:blue", alpha=0.75)
+    if pred_shape is not None:
+        ax_shape.plot(pred_freqs, pred_shape, label=f"{value_label} (pred)", color="tab:purple")
+
+    if baseline_spec is not None:
+        base_freqs, base_psd = baseline_spec
+        label = baseline_label or f"{value_label} (baseline)"
+        ax_psd.semilogy(base_freqs, np.maximum(base_psd, tiny), label=label, color="tab:green", alpha=0.85)
+        base_shape = _normalized_spectrum_density(base_freqs, base_psd)
+        if base_shape is not None:
+            ax_shape.plot(base_freqs, base_shape, label=label, color="tab:green", alpha=0.85)
+
+    ax_psd.set_ylabel("PSD")
+    ax_psd.grid(True, alpha=0.3)
+    ax_psd.set_title(f"{plot_title} spectrum at epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_psd.legend(loc="upper right")
+
+    ax_shape.set_xlabel("frequency [Hz]")
+    ax_shape.set_ylabel("normalized PSD")
+    ax_shape.grid(True, alpha=0.3)
+    ax_shape.set_title(f"{plot_title} spectrum shape at epoch {epoch+1}{ur_title}{title_suffix}")
+    ax_shape.legend(loc="upper right")
+
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch + 1 if step is None else step)
+    plt.close(fig)
 
 
 class PHVIV(nn.Module):
@@ -2553,6 +2681,7 @@ def log_displacement_plots(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ):
     fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
     ax_full, ax_diff, ax_zoom = axes
@@ -2586,6 +2715,20 @@ def log_displacement_plots(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_displacement", fig, epoch + 1 if step is None else step)
     plt.close(fig)
+    if log_spectra:
+        _log_spectral_plot(
+            writer,
+            epoch,
+            t,
+            y_true_norm,
+            y_pred_norm,
+            value_label="y/D",
+            plot_title="Displacement",
+            tag=f"{tag_prefix}_displacement_spectrum",
+            reduced_velocity=reduced_velocity,
+            step=step,
+            title_suffix=title_suffix,
+        )
 
 def log_force_plots(
     writer,
@@ -2601,6 +2744,7 @@ def log_force_plots(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ):
     fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
     ax_full, ax_diff, ax_zoom = axes
@@ -2640,6 +2784,22 @@ def log_force_plots(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
     plt.close(fig)
+    if log_spectra:
+        _log_spectral_plot(
+            writer,
+            epoch,
+            t,
+            force_coeff_true,
+            force_coeff_pred,
+            value_label="C_F",
+            plot_title="Force coefficient",
+            tag=f"{tag_prefix}_force_spectrum",
+            reduced_velocity=reduced_velocity,
+            baseline_signal=force_coeff_baseline,
+            baseline_label=baseline_label,
+            step=step,
+            title_suffix=title_suffix,
+        )
 
 
 def log_force_component_plots(
@@ -2709,6 +2869,7 @@ def log_force_plots_with_components(
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
+    log_spectra: bool = False,
 ):
     fig, axes = plt.subplots(4, 1, figsize=(6, 12), sharex=False)
     ax_full, ax_diff, ax_zoom, ax_components = axes
@@ -2751,6 +2912,20 @@ def log_force_plots_with_components(
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
     plt.close(fig)
+    if log_spectra:
+        _log_spectral_plot(
+            writer,
+            epoch,
+            t,
+            force_coeff_true,
+            force_coeff_pred,
+            value_label="C_F",
+            plot_title="Force coefficient",
+            tag=f"{tag_prefix}_force_spectrum",
+            reduced_velocity=reduced_velocity,
+            step=step,
+            title_suffix=title_suffix,
+        )
 
 
 def _phase_plot_extent(
