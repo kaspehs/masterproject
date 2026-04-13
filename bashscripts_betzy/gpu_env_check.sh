@@ -16,22 +16,15 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p output error
 
-if command -v apptainer >/dev/null 2>&1; then
-  CONTAINER_RUNTIME="apptainer"
-elif command -v singularity >/dev/null 2>&1; then
-  CONTAINER_RUNTIME="singularity"
-else
-  echo "Missing apptainer/singularity in PATH. Load a container runtime module before submitting." >&2
+ENV_PREFIX="${ENV_PREFIX:-$HOME/ml-env}"
+if [ ! -x "$ENV_PREFIX/bin/python" ]; then
+  echo "Missing virtualenv at $ENV_PREFIX. Set ENV_PREFIX to your Betzy env before submitting." >&2
   exit 1
 fi
 
-CONTAINER="${CONTAINER:-$HOME/containers/pytorch_24.05-py3.sif}"
-if [ ! -f "$CONTAINER" ]; then
-  echo "Missing container at $CONTAINER. Set CONTAINER to an x86_64 CUDA/PyTorch SIF for Betzy." >&2
-  exit 1
-fi
+source "$ENV_PREFIX/bin/activate"
 
-srun "$CONTAINER_RUNTIME" exec --nv "$CONTAINER" python - <<'PY'
+srun python - <<'PY'
 import torch, numpy, scipy, matplotlib, sklearn, yaml, tensorboard
 print("imports OK")
 print("cuda:", torch.cuda.is_available(), "gpus:", torch.cuda.device_count())
