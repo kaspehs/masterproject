@@ -1244,6 +1244,7 @@ def _log_td_correction_rollout_validation(
     log_correction_on_data: bool = False,
     title_suffix: str = "",
     log_spectra: bool = False,
+    log_only_spectra: bool = False,
 ) -> dict[str, float]:
     mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
     mass_value = float(np.asarray(traj[mass_key]).reshape(()))
@@ -1357,7 +1358,7 @@ def _log_td_correction_rollout_validation(
             if np.isfinite(float(value)):
                 writer.add_scalar(f"val/{name}", float(value), epoch)
 
-    if log_plots:
+    if log_plots or (log_only_spectra and log_spectra):
         zoom_mask = create_zoom_mask(t_np)
         ur_val = float(ur_t[0, 0].detach().cpu().item())
         omega = float(np.sqrt(stiffness_value / mass_value))
@@ -1365,37 +1366,38 @@ def _log_td_correction_rollout_validation(
         p_true_norm = v_true_t[:, 0].detach().cpu().numpy() / (omega * float(model.D))
         q_pred_norm = y_pred / float(model.D)
         p_pred_norm = v_pred / (omega * float(model.D))
-        log_displacement_plots(
-            writer,
-            epoch,
-            t_np,
-            q_true_norm,
-            q_pred_norm,
-            p_pred_norm,
-            zoom_mask,
-            reduced_velocity=ur_val,
-            tag_prefix=tag_prefix,
-            step=step,
-            title_suffix=title_suffix,
-            log_spectra=log_spectra,
-        )
         n_force = min(len(t_np), len(force_total_full), len(force_true), len(force_td_full))
         force_t = t_np[:n_force]
-        log_force_plots(
-            writer,
-            epoch,
-            force_t,
-            force_total_full[:n_force],
-            f_true_t[:, 0].detach().cpu().numpy()[:n_force],
-            create_zoom_mask(force_t),
-            reduced_velocity=ur_val,
-            force_coeff_baseline=force_td_full[:n_force],
-            baseline_label="C_F (Vivana-TD)",
-            tag_prefix=tag_prefix,
-            step=step,
-            title_suffix=title_suffix,
-            log_spectra=log_spectra,
-        )
+        if log_plots:
+            log_displacement_plots(
+                writer,
+                epoch,
+                t_np,
+                q_true_norm,
+                q_pred_norm,
+                p_pred_norm,
+                zoom_mask,
+                reduced_velocity=ur_val,
+                tag_prefix=tag_prefix,
+                step=step,
+                title_suffix=title_suffix,
+                log_spectra=log_spectra,
+            )
+            log_force_plots(
+                writer,
+                epoch,
+                force_t,
+                force_total_full[:n_force],
+                f_true_t[:, 0].detach().cpu().numpy()[:n_force],
+                create_zoom_mask(force_t),
+                reduced_velocity=ur_val,
+                force_coeff_baseline=force_td_full[:n_force],
+                baseline_label="C_F (Vivana-TD)",
+                tag_prefix=tag_prefix,
+                step=step,
+                title_suffix=title_suffix,
+                log_spectra=log_spectra,
+            )
         if log_spectra:
             log_area_normalized_rollout_spectra(
                 writer,
@@ -1413,7 +1415,7 @@ def _log_td_correction_rollout_validation(
                 step=step,
                 title_suffix=title_suffix,
             )
-        if log_correction_on_data:
+        if log_plots and log_correction_on_data:
             output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
             log_correction_on_data_plot(
                 writer,
@@ -3366,6 +3368,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         split_rollout_loader: Any | None,
         split_trajs: list[dict[str, np.ndarray]],
         log_rollout_plots: bool,
+        log_all_rollout_spectra: bool = False,
     ) -> None:
         if split_loader is None:
             return
@@ -3574,6 +3577,42 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     log_plots=True,
                     log_spectra=True,
                 )
+            if log_all_rollout_spectra:
+                def _safe_tag_component(raw: Any) -> str:
+                    text = str(raw).strip()
+                    if not text:
+                        return "unnamed"
+                    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+                    return cleaned or "unnamed"
+
+                for traj in split_trajs:
+                    traj_name = str(traj.get("name", "unnamed"))
+                    _log_td_correction_rollout_validation(
+                        writer=writer,
+                        epoch=epoch_idx + 1,
+                        model=model,
+                        traj=traj,
+                        dt=dt,
+                        td_mass_source=td_mass_source,
+                        td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
+                        device=device,
+                        mean_active=mean_active,
+                        predict_sigma=predict_sigma,
+                        fhat_active=fhat_active,
+                        use_td_force_input=use_td_force_input,
+                        fhat_bound_multiplier=fhat_bound_multiplier,
+                        force_zero_output=force_zero_output,
+                        rollout_stochastic=rollout_stochastic,
+                        rollout_noise_scale=rollout_noise_scale,
+                        rollout_seed=rollout_seed,
+                        tag_prefix=f"{split_tag}/rollout/{_safe_tag_component(traj_name)}",
+                        log_metrics=False,
+                        log_plots=False,
+                        log_spectra=True,
+                        log_only_spectra=True,
+                        title_suffix=f" [{traj_name}]",
+                    )
         elapsed = float(time.perf_counter() - split_start)
         writer.add_scalar(f"{split_tag}/validation_wall_time_s", elapsed, epoch_idx + 1)
         writer.flush()
@@ -3785,11 +3824,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     epoch_idx=epoch,
                     split_tag="val_seen",
                     split_name="val_seen",
-                    split_loader=val_seen_loader,
-                    split_rollout_loader=val_seen_rollout_loader,
-                    split_trajs=val_seen_trajs,
-                    log_rollout_plots=False,
-                )
+                split_loader=val_seen_loader,
+                split_rollout_loader=val_seen_rollout_loader,
+                split_trajs=val_seen_trajs,
+                log_rollout_plots=False,
+                log_all_rollout_spectra=True,
+            )
             ckpt_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {ckpt_path}")
 
@@ -3923,7 +3963,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 step=idx,
                 log_metrics=False,
                 log_plots=True,
-                log_correction_on_data=True,
+                log_correction_on_data=False,
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
                 log_spectra=True,

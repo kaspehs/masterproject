@@ -1529,6 +1529,35 @@ def _power_spectrum(signal: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.n
     return freqs, psd
 
 
+def _loss_style_power_spectrum(signal: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    signal_arr = np.asarray(signal, dtype=float).reshape(-1)
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    length = min(signal_arr.size, t_arr.size)
+    if length < 4:
+        return None
+    signal_arr = signal_arr[:length]
+    t_arr = t_arr[:length]
+    if not np.all(np.isfinite(signal_arr)) or not np.all(np.isfinite(t_arr)):
+        return None
+    dt = _estimate_series_dt(t_arr)
+    if not np.isfinite(dt) or dt <= 0.0:
+        return None
+    centered = signal_arr - float(np.mean(signal_arr))
+    if np.allclose(centered, 0.0):
+        return None
+    window = np.hanning(length)
+    spectrum = np.abs(np.fft.rfft(centered * window)) ** 2
+    freqs = np.fft.rfftfreq(length, d=dt)
+    mask = np.isfinite(freqs) & np.isfinite(spectrum) & (freqs > 0.0)
+    if np.count_nonzero(mask) < 2:
+        return None
+    freqs = np.asarray(freqs[mask], dtype=float)
+    spectrum = np.clip(np.asarray(spectrum[mask], dtype=float), a_min=0.0, a_max=None)
+    if not np.any(spectrum > 0.0):
+        return None
+    return freqs, spectrum
+
+
 def _normalized_spectrum_density(freqs: np.ndarray, psd: np.ndarray, eps: float = 1e-12) -> np.ndarray | None:
     area = float(np.trapz(psd, freqs))
     if not np.isfinite(area) or area <= eps:
@@ -1624,8 +1653,8 @@ def _log_spectral_plot(
     true_freqs, true_psd = true_spec
     pred_freqs, pred_psd = pred_spec
     xlim = _spectral_focus_xlim(true_spec, pred_spec, baseline_spec)
-    ax_psd.semilogy(true_freqs, np.maximum(true_psd, tiny), label=f"{value_label} (true)", color="tab:blue", alpha=0.75)
-    ax_psd.semilogy(pred_freqs, np.maximum(pred_psd, tiny), label=f"{value_label} (pred)", color="tab:purple")
+    ax_psd.plot(true_freqs, np.maximum(true_psd, tiny), label=f"{value_label} (true)", color="tab:blue", alpha=0.75)
+    ax_psd.plot(pred_freqs, np.maximum(pred_psd, tiny), label=f"{value_label} (pred)", color="tab:purple")
 
     true_shape = _normalized_spectrum_density(true_freqs, true_psd)
     pred_shape = _normalized_spectrum_density(pred_freqs, pred_psd)
@@ -1637,7 +1666,7 @@ def _log_spectral_plot(
     if baseline_spec is not None:
         base_freqs, base_psd = baseline_spec
         label = baseline_label or f"{value_label} (baseline)"
-        ax_psd.semilogy(base_freqs, np.maximum(base_psd, tiny), label=label, color="tab:green", alpha=0.85)
+        ax_psd.plot(base_freqs, np.maximum(base_psd, tiny), label=label, color="tab:green", alpha=0.85)
         base_shape = _normalized_spectrum_density(base_freqs, base_psd)
         if base_shape is not None:
             ax_shape.plot(base_freqs, base_shape, label=label, color="tab:green", alpha=0.85)
@@ -1679,13 +1708,30 @@ def log_area_normalized_rollout_spectra(
     step: int | None = None,
     title_suffix: str = "",
 ) -> None:
-    disp_true_spec = _power_spectrum(disp_true, disp_t)
-    disp_pred_spec = _power_spectrum(disp_pred, disp_t)
-    force_true_spec = _power_spectrum(force_true, force_t)
-    force_pred_spec = _power_spectrum(force_pred, force_t)
-    force_baseline_spec = None if force_baseline is None else _power_spectrum(force_baseline, force_t)
+    disp_true_welch = _power_spectrum(disp_true, disp_t)
+    disp_pred_welch = _power_spectrum(disp_pred, disp_t)
+    force_true_welch = _power_spectrum(force_true, force_t)
+    force_pred_welch = _power_spectrum(force_pred, force_t)
+    force_baseline_welch = None if force_baseline is None else _power_spectrum(force_baseline, force_t)
 
-    if disp_true_spec is None and disp_pred_spec is None and force_true_spec is None and force_pred_spec is None and force_baseline_spec is None:
+    disp_true_loss = _loss_style_power_spectrum(disp_true, disp_t)
+    disp_pred_loss = _loss_style_power_spectrum(disp_pred, disp_t)
+    force_true_loss = _loss_style_power_spectrum(force_true, force_t)
+    force_pred_loss = _loss_style_power_spectrum(force_pred, force_t)
+    force_baseline_loss = None if force_baseline is None else _loss_style_power_spectrum(force_baseline, force_t)
+
+    if (
+        disp_true_welch is None
+        and disp_pred_welch is None
+        and force_true_welch is None
+        and force_pred_welch is None
+        and force_baseline_welch is None
+        and disp_true_loss is None
+        and disp_pred_loss is None
+        and force_true_loss is None
+        and force_pred_loss is None
+        and force_baseline_loss is None
+    ):
         return
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 7), sharex=False)
@@ -1703,7 +1749,7 @@ def log_area_normalized_rollout_spectra(
         if spec is None:
             return False
         freqs, psd = spec
-        ax.semilogy(freqs, np.maximum(psd, tiny), label=label, color=color, alpha=alpha)
+        ax.plot(freqs, np.maximum(psd, tiny), label=label, color=color, alpha=alpha)
         return True
 
     def _plot_area_normalized(
@@ -1723,75 +1769,81 @@ def log_area_normalized_rollout_spectra(
         ax.plot(freqs, density, label=label, color=color, alpha=alpha)
         return True
 
-    disp_xlim = _spectral_focus_xlim(disp_true_spec, disp_pred_spec)
-    force_xlim = _spectral_focus_xlim(force_true_spec, force_pred_spec, force_baseline_spec)
+    disp_xlim = _spectral_focus_xlim(disp_true_welch, disp_pred_welch, disp_true_loss, disp_pred_loss)
+    force_xlim = _spectral_focus_xlim(
+        force_true_welch,
+        force_pred_welch,
+        force_baseline_welch,
+        force_true_loss,
+        force_pred_loss,
+        force_baseline_loss,
+    )
 
-    ax_disp_raw = axes[0, 0]
-    disp_raw_plotted = False
-    disp_raw_plotted |= _plot_raw(ax_disp_raw, disp_true_spec, label="y/D (true)", color="tab:blue", alpha=0.75)
-    disp_raw_plotted |= _plot_raw(ax_disp_raw, disp_pred_spec, label="y/D (pred)", color="tab:purple")
-    ax_disp_raw.set_ylabel("PSD")
-    ax_disp_raw.grid(True, alpha=0.3)
-    disp_xlim = _spectral_focus_xlim(disp_true_spec, disp_pred_spec)
+    ax_disp_welch = axes[0, 0]
+    disp_welch_plotted = False
+    disp_welch_plotted |= _plot_raw(ax_disp_welch, disp_true_welch, label="y/D (true)", color="tab:blue", alpha=0.75)
+    disp_welch_plotted |= _plot_raw(ax_disp_welch, disp_pred_welch, label="y/D (pred)", color="tab:purple")
+    ax_disp_welch.set_ylabel("Welch PSD")
+    ax_disp_welch.grid(True, alpha=0.3)
     if disp_xlim is not None:
-        ax_disp_raw.set_xlim(*disp_xlim)
-    ax_disp_raw.set_title(f"Displacement PSD at epoch {epoch+1}{ur_title}{title_suffix}")
-    if disp_raw_plotted:
-        ax_disp_raw.legend(loc="upper right")
+        ax_disp_welch.set_xlim(*disp_xlim)
+    ax_disp_welch.set_title(f"Displacement Welch PSD at epoch {epoch+1}{ur_title}{title_suffix}")
+    if disp_welch_plotted:
+        ax_disp_welch.legend(loc="upper right")
 
-    ax_disp_norm = axes[0, 1]
-    disp_norm_plotted = False
-    disp_norm_plotted |= _plot_area_normalized(ax_disp_norm, disp_true_spec, label="y/D (true)", color="tab:blue", alpha=0.75)
-    disp_norm_plotted |= _plot_area_normalized(ax_disp_norm, disp_pred_spec, label="y/D (pred)", color="tab:purple")
-    ax_disp_norm.set_ylabel("area-normalized PSD")
-    ax_disp_norm.grid(True, alpha=0.3)
+    ax_disp_loss = axes[0, 1]
+    disp_loss_plotted = False
+    disp_loss_plotted |= _plot_area_normalized(ax_disp_loss, disp_true_loss, label="y/D (true)", color="tab:blue", alpha=0.75)
+    disp_loss_plotted |= _plot_area_normalized(ax_disp_loss, disp_pred_loss, label="y/D (pred)", color="tab:purple")
+    ax_disp_loss.set_ylabel("area-normalized loss-style spectrum")
+    ax_disp_loss.grid(True, alpha=0.3)
     if disp_xlim is not None:
-        ax_disp_norm.set_xlim(*disp_xlim)
-    ax_disp_norm.set_title(f"Displacement spectral shape at epoch {epoch+1}{ur_title}{title_suffix}")
-    if disp_norm_plotted:
-        ax_disp_norm.legend(loc="upper right")
+        ax_disp_loss.set_xlim(*disp_xlim)
+    ax_disp_loss.set_title(f"Displacement PSD-loss view at epoch {epoch+1}{ur_title}{title_suffix}")
+    if disp_loss_plotted:
+        ax_disp_loss.legend(loc="upper right")
 
-    ax_force_raw = axes[1, 0]
-    force_raw_plotted = False
-    force_raw_plotted |= _plot_raw(ax_force_raw, force_true_spec, label="C_F (true)", color="tab:blue", alpha=0.75)
-    force_raw_plotted |= _plot_raw(ax_force_raw, force_pred_spec, label="C_F (pred)", color="tab:purple")
-    if force_baseline_spec is not None:
-        force_raw_plotted |= _plot_raw(
-            ax_force_raw,
-            force_baseline_spec,
+    ax_force_welch = axes[1, 0]
+    force_welch_plotted = False
+    force_welch_plotted |= _plot_raw(ax_force_welch, force_true_welch, label="C_F (true)", color="tab:blue", alpha=0.75)
+    force_welch_plotted |= _plot_raw(ax_force_welch, force_pred_welch, label="C_F (pred)", color="tab:purple")
+    if force_baseline_welch is not None:
+        force_welch_plotted |= _plot_raw(
+            ax_force_welch,
+            force_baseline_welch,
             label=force_baseline_label,
             color="tab:green",
             alpha=0.85,
         )
-    ax_force_raw.set_xlabel("frequency [Hz]")
-    ax_force_raw.set_ylabel("PSD")
-    ax_force_raw.grid(True, alpha=0.3)
+    ax_force_welch.set_xlabel("frequency [Hz]")
+    ax_force_welch.set_ylabel("Welch PSD")
+    ax_force_welch.grid(True, alpha=0.3)
     if force_xlim is not None:
-        ax_force_raw.set_xlim(*force_xlim)
-    ax_force_raw.set_title(f"Force PSD at epoch {epoch+1}{ur_title}{title_suffix}")
-    if force_raw_plotted:
-        ax_force_raw.legend(loc="upper right")
+        ax_force_welch.set_xlim(*force_xlim)
+    ax_force_welch.set_title(f"Force Welch PSD at epoch {epoch+1}{ur_title}{title_suffix}")
+    if force_welch_plotted:
+        ax_force_welch.legend(loc="upper right")
 
-    ax_force_norm = axes[1, 1]
-    force_norm_plotted = False
-    force_norm_plotted |= _plot_area_normalized(ax_force_norm, force_true_spec, label="C_F (true)", color="tab:blue", alpha=0.75)
-    force_norm_plotted |= _plot_area_normalized(ax_force_norm, force_pred_spec, label="C_F (pred)", color="tab:purple")
-    if force_baseline_spec is not None:
-        force_norm_plotted |= _plot_area_normalized(
-            ax_force_norm,
-            force_baseline_spec,
+    ax_force_loss = axes[1, 1]
+    force_loss_plotted = False
+    force_loss_plotted |= _plot_area_normalized(ax_force_loss, force_true_loss, label="C_F (true)", color="tab:blue", alpha=0.75)
+    force_loss_plotted |= _plot_area_normalized(ax_force_loss, force_pred_loss, label="C_F (pred)", color="tab:purple")
+    if force_baseline_loss is not None:
+        force_loss_plotted |= _plot_area_normalized(
+            ax_force_loss,
+            force_baseline_loss,
             label=force_baseline_label,
             color="tab:green",
             alpha=0.85,
         )
-    ax_force_norm.set_xlabel("frequency [Hz]")
-    ax_force_norm.set_ylabel("area-normalized PSD")
-    ax_force_norm.grid(True, alpha=0.3)
+    ax_force_loss.set_xlabel("frequency [Hz]")
+    ax_force_loss.set_ylabel("area-normalized loss-style spectrum")
+    ax_force_loss.grid(True, alpha=0.3)
     if force_xlim is not None:
-        ax_force_norm.set_xlim(*force_xlim)
-    ax_force_norm.set_title(f"Force spectral shape at epoch {epoch+1}{ur_title}{title_suffix}")
-    if force_norm_plotted:
-        ax_force_norm.legend(loc="upper right")
+        ax_force_loss.set_xlim(*force_xlim)
+    ax_force_loss.set_title(f"Force PSD-loss view at epoch {epoch+1}{ur_title}{title_suffix}")
+    if force_loss_plotted:
+        ax_force_loss.legend(loc="upper right")
 
     plt.tight_layout()
     writer.add_figure(tag, fig, epoch + 1 if step is None else step)
