@@ -186,6 +186,7 @@ def _vpinn_rollout_state_loss(
     ur_values: torch.Tensor,
     scale_info: dict[str, Any] | None,
     ur_bin_size: float,
+    amplitude_normalized_mse: bool = False,
 ) -> torch.Tensor:
     per = _vpinn_rollout_state_loss_per_sample(
         x_pred=x_pred,
@@ -195,6 +196,7 @@ def _vpinn_rollout_state_loss(
         ur_values=ur_values,
         scale_info=scale_info,
         ur_bin_size=ur_bin_size,
+        amplitude_normalized_mse=amplitude_normalized_mse,
     )
     return torch.mean(per)
 
@@ -208,9 +210,23 @@ def _vpinn_rollout_state_loss_per_sample(
     ur_values: torch.Tensor,
     scale_info: dict[str, Any] | None,
     ur_bin_size: float,
+    amplitude_normalized_mse: bool = False,
 ) -> torch.Tensor:
+    if bool(amplitude_normalized_mse):
+        x_centered = x_true - torch.mean(x_true, dim=1, keepdim=True)
+        v_centered = v_true - torch.mean(v_true, dim=1, keepdim=True)
+        x_amp_scale = torch.clamp(torch.sqrt(torch.mean(x_centered * x_centered, dim=1, keepdim=True)), min=1e-6)
+        v_amp_scale = torch.clamp(torch.sqrt(torch.mean(v_centered * v_centered, dim=1, keepdim=True)), min=1e-6)
+    else:
+        x_amp_scale = None
+        v_amp_scale = None
     if scale_info is None:
-        return torch.mean((x_pred - x_true) ** 2 + (v_pred - v_true) ** 2, dim=(1, 2))
+        x_err = x_pred - x_true
+        v_err = v_pred - v_true
+        if x_amp_scale is not None:
+            x_err = x_err / x_amp_scale
+            v_err = v_err / v_amp_scale
+        return torch.mean(x_err * x_err + v_err * v_err, dim=(1, 2))
     batch_size = int(x_pred.shape[0])
     state_scale = _vpinn_lookup_state_scale(
         ur_values,
@@ -222,6 +238,9 @@ def _vpinn_rollout_state_loss_per_sample(
     )
     x_scale = torch.clamp(state_scale[..., 0:1], min=1e-12).unsqueeze(1)
     v_scale = torch.clamp(state_scale[..., 1:2], min=1e-12).unsqueeze(1)
+    if x_amp_scale is not None:
+        x_scale = x_scale * x_amp_scale
+        v_scale = v_scale * v_amp_scale
     return torch.mean(((x_pred - x_true) / x_scale) ** 2 + ((v_pred - v_true) / v_scale) ** 2, dim=(1, 2))
 
 
@@ -2529,6 +2548,7 @@ def _vpinn_td_rollout_loss_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
+    amplitude_normalized_mse: bool,
     ur_bin_state_scale_info: dict[str, Any] | None,
     ur_bin_size: float,
 ) -> torch.Tensor:
@@ -2592,6 +2612,17 @@ def _vpinn_td_rollout_loss_from_batch(
         else:
             x_scale = torch.clamp(state_scale[..., 0:1], min=1e-12).view(1, batch_size, 1, 1)
             v_scale = torch.clamp(state_scale[..., 1:2], min=1e-12).view(1, batch_size, 1, 1)
+        if amplitude_normalized_mse:
+            x_true_centered = x_true_seq - torch.mean(x_true_seq, dim=1, keepdim=True)
+            v_true_centered = v_true_seq - torch.mean(v_true_seq, dim=1, keepdim=True)
+            x_scale = x_scale * torch.clamp(
+                torch.sqrt(torch.mean(x_true_centered * x_true_centered, dim=1, keepdim=True)),
+                min=1e-6,
+            ).unsqueeze(0)
+            v_scale = v_scale * torch.clamp(
+                torch.sqrt(torch.mean(v_true_centered * v_true_centered, dim=1, keepdim=True)),
+                min=1e-6,
+            ).unsqueeze(0)
         x_true_ref = x_true_seq.unsqueeze(0)
         v_true_ref = v_true_seq.unsqueeze(0)
         if mode_key == "stochastic_nll":
@@ -2647,6 +2678,7 @@ def _vpinn_td_rollout_loss_from_batch(
         ur_values=ur0,
         scale_info=ur_bin_state_scale_info,
         ur_bin_size=ur_bin_size,
+        amplitude_normalized_mse=amplitude_normalized_mse,
     )
 
 
@@ -2954,6 +2986,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
     rollout_steps = int(vp.get("rollout_force_steps", int(getattr(loss_cfg, "rollout_det_steps", 0))))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
+    rollout_det_amplitude_normalized_mse = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
     rollout_steps_final_raw = int(getattr(loss_cfg, "rollout_det_steps_final", 0))
     rollout_steps_warmup_epochs = int(getattr(loss_cfg, "rollout_det_steps_warmup_epochs", 0))
     rollout_steps_final = rollout_steps if rollout_steps_final_raw <= 0 else rollout_steps_final_raw
@@ -3225,6 +3258,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         startup_lines.append(
             "Rollout loss mode: "
             f"{rollout_mode_msg}, batch_size={rollout_batch_size}, "
+            f"amplitude_normalized_mse={rollout_det_amplitude_normalized_mse}, "
             f"scheduled_steps={current_rollout_steps}"
         )
         if rollout_steps_final > rollout_steps and rollout_steps_warmup_epochs > 0:
@@ -3377,6 +3411,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         rollout_loss_mode="deterministic",
                         rollout_stochastic_samples=1,
                         rollout_noise_scale=rollout_noise_scale,
+                        amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
                         ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
                         ur_bin_size=ur_bin_size,
                     ).detach()
@@ -3652,6 +3687,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
+                        amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
                         ur_bin_state_scale_info=(ur_bin_state_scale_info if normalize_by_ur_bin_std else None),
                         ur_bin_size=ur_bin_size,
                     )

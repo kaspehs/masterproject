@@ -87,11 +87,15 @@ loss:
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
   rollout_det_batch_size: 0
+  # If true, divide rollout state MSE by the target signal's centered RMS per state channel.
+  rollout_det_amplitude_normalized_mse: false
   # Auxiliary rollout displacement PSD loss using area-normalized spectra.
   rollout_disp_psd_weight: 0.0
   # Optional narrowbanding around the ground-truth dominant displacement peak.
   # 0.0 disables narrowbanding and compares the full non-DC spectrum.
   rollout_disp_psd_peak_rel_bandwidth: 0.0
+  # If true, apply a Hann window before the FFT in the rollout displacement PSD loss.
+  rollout_disp_psd_use_hann_window: true
 
   # Data / symmetry losses
   use_force_data_loss: false

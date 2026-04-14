@@ -92,6 +92,8 @@ loss:
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
   rollout_det_batch_size: 0
+  # If true, divide rollout state MSE by the target signal's centered RMS per state channel.
+  rollout_det_amplitude_normalized_mse: false
 
   # GradNorm balancing
   use_gradnorm: true

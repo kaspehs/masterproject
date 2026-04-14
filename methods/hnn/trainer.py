@@ -680,6 +680,7 @@ def _area_normalized_psd_error_common_dt_torch(
     pred_signal: torch.Tensor,
     dt: float,
     peak_rel_bandwidth: float = 0.0,
+    use_hann_window: bool = True,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     if true_signal.ndim != 2 or pred_signal.ndim != 2:
@@ -695,7 +696,10 @@ def _area_normalized_psd_error_common_dt_torch(
 
     true_centered = true_signal - torch.mean(true_signal, dim=1, keepdim=True)
     pred_centered = pred_signal - torch.mean(pred_signal, dim=1, keepdim=True)
-    window = torch.hann_window(length, periodic=False, device=true_signal.device, dtype=true_signal.dtype).view(1, -1)
+    if bool(use_hann_window):
+        window = torch.hann_window(length, periodic=False, device=true_signal.device, dtype=true_signal.dtype).view(1, -1)
+    else:
+        window = torch.ones((1, length), device=true_signal.device, dtype=true_signal.dtype)
     true_fft = torch.fft.rfft(true_centered * window, dim=1)
     pred_fft = torch.fft.rfft(pred_centered * window, dim=1)
     true_psd = torch.abs(true_fft) ** 2
@@ -745,6 +749,7 @@ def _area_normalized_psd_error_torch(
     pred_signal: torch.Tensor,
     dt: float | torch.Tensor,
     peak_rel_bandwidth: float = 0.0,
+    use_hann_window: bool = True,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     if true_signal.ndim != 2 or pred_signal.ndim != 2:
@@ -761,6 +766,7 @@ def _area_normalized_psd_error_torch(
             pred_signal=pred_signal,
             dt=float(torch.mean(dt_values).item()),
             peak_rel_bandwidth=peak_rel_bandwidth,
+            use_hann_window=use_hann_window,
             eps=eps,
         )
 
@@ -774,6 +780,7 @@ def _area_normalized_psd_error_torch(
                 pred_signal=pred_signal.index_select(0, group_indices),
                 dt=group_dt,
                 peak_rel_bandwidth=peak_rel_bandwidth,
+                use_hann_window=use_hann_window,
                 eps=eps,
             )
         )
@@ -783,6 +790,17 @@ def _area_normalized_psd_error_torch(
     weight_tensor = torch.tensor(weights, device=true_signal.device, dtype=losses[0].dtype)
     loss_tensor = torch.stack(losses)
     return torch.sum(loss_tensor * weight_tensor) / torch.clamp(weight_tensor.sum(), min=1.0)
+
+
+def _target_centered_rms_scale_torch(
+    target: torch.Tensor,
+    *,
+    time_dim: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    centered = target - torch.mean(target, dim=time_dim, keepdim=True)
+    scale = torch.sqrt(torch.mean(centered * centered, dim=time_dim, keepdim=True))
+    return torch.clamp(scale, min=float(eps))
 
 
 def _td_correction_rollout_losses_from_batch(
@@ -802,8 +820,10 @@ def _td_correction_rollout_losses_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
+    amplitude_normalized_mse: bool = False,
     compute_disp_psd_loss: bool = False,
     disp_psd_peak_rel_bandwidth: float = 0.0,
+    disp_psd_use_hann_window: bool = True,
 ) -> dict[str, torch.Tensor]:
     if len(batch) != 8:
         raise ValueError("Unexpected TD correction rollout batch format.")
@@ -848,13 +868,19 @@ def _td_correction_rollout_losses_from_batch(
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
-        trajectory_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
+        if amplitude_normalized_mse:
+            z_scale = _target_centered_rms_scale_torch(z_traj, time_dim=1)
+            err = (z_pred - z_traj) / z_scale
+            trajectory_loss = torch.mean(torch.sum(err * err, dim=2))
+        else:
+            trajectory_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
         if compute_disp_psd_loss:
             disp_psd_loss = _area_normalized_psd_error_torch(
                 true_signal=z_traj[:, :, 0],
                 pred_signal=z_pred[:, :, 0],
                 dt=dt_values,
                 peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                use_hann_window=disp_psd_use_hann_window,
             )
         return {
             "trajectory_loss": trajectory_loss,
@@ -895,6 +921,9 @@ def _td_correction_rollout_losses_from_batch(
     z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
     if mode_key == "stochastic_mse":
         err = z_pred - z_traj.unsqueeze(0)
+        if amplitude_normalized_mse:
+            z_scale = _target_centered_rms_scale_torch(z_traj, time_dim=1).unsqueeze(0)
+            err = err / z_scale
         per_samples = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
         trajectory_loss = torch.mean(torch.mean(per_samples, dim=0))
     else:
@@ -911,6 +940,7 @@ def _td_correction_rollout_losses_from_batch(
             pred_signal=z_for_psd[:, :, 0],
             dt=dt_values,
             peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+            use_hann_window=disp_psd_use_hann_window,
         )
     return {
         "trajectory_loss": trajectory_loss,
@@ -935,6 +965,7 @@ def _td_correction_rollout_loss_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
+    amplitude_normalized_mse: bool = False,
 ) -> torch.Tensor:
     return _td_correction_rollout_losses_from_batch(
         model=model,
@@ -952,6 +983,7 @@ def _td_correction_rollout_loss_from_batch(
         rollout_loss_mode=rollout_loss_mode,
         rollout_stochastic_samples=rollout_stochastic_samples,
         rollout_noise_scale=rollout_noise_scale,
+        amplitude_normalized_mse=amplitude_normalized_mse,
         compute_disp_psd_loss=False,
         disp_psd_peak_rel_bandwidth=0.0,
     )["trajectory_loss"]
@@ -1646,6 +1678,7 @@ def _rollout_loss_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
+    amplitude_normalized_mse: bool = False,
     ur_bin_state_scale_info: dict[str, Any] | None = None,
     ur_bin_size: float = 1e-6,
     return_per_sample: bool = False,
@@ -1691,6 +1724,8 @@ def _rollout_loss_from_batch(
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, 1, -1)
         if extra_state_scale is not None:
             z_scale = z_scale * extra_state_scale.view(1, batch_size, 1, -1).to(device=z_pred.device, dtype=z_pred.dtype)
+        if amplitude_normalized_mse:
+            z_scale = z_scale * _target_centered_rms_scale_torch(z_traj_ref, time_dim=2)
         if mode_key == "stochastic_nll":
             z_pred_scaled = z_pred / z_scale
             z_true_scaled = z_traj_ref / z_scale
@@ -1715,6 +1750,8 @@ def _rollout_loss_from_batch(
         z_scale = model.res_scale.to(device=z_pred.device, dtype=z_pred.dtype).view(1, 1, -1)
         if extra_state_scale is not None:
             z_scale = z_scale * extra_state_scale.view(batch_size, 1, -1).to(device=z_pred.device, dtype=z_pred.dtype)
+        if amplitude_normalized_mse:
+            z_scale = z_scale * _target_centered_rms_scale_torch(z_traj, time_dim=1)
         err = (z_pred - z_traj) / z_scale
         per = torch.mean(err[..., 0] * err[..., 0], dim=1) + torch.mean(err[..., 1] * err[..., 1], dim=1)
     if return_per_sample:
@@ -3018,6 +3055,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_disp_psd_weight = float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
     rollout_disp_psd_peak_rel_bandwidth = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
+    rollout_disp_psd_use_hann_window = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
+    rollout_det_amplitude_normalized_mse = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
@@ -3338,7 +3377,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
         startup_lines.append(
             f"Rollout loss mode: {rollout_mode_msg}, state_loss_mode={state_loss_mode}, "
-            f"disp_psd_peak_rel_bandwidth={rollout_disp_psd_peak_rel_bandwidth:g}"
+            f"amplitude_normalized_mse={rollout_det_amplitude_normalized_mse}, "
+            f"disp_psd_peak_rel_bandwidth={rollout_disp_psd_peak_rel_bandwidth:g}, "
+            f"disp_psd_use_hann_window={rollout_disp_psd_use_hann_window}"
         )
     print("\n".join(startup_lines))
 
@@ -3464,8 +3505,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
+                        amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
                         compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
                         disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
+                        disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                     )
                     rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
                     rollout_psd_loss_sum += rollout_losses["disp_psd_loss"].detach()
@@ -3714,8 +3757,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
+                        amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
                         compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
                         disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
+                        disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                     )
                     rollout_det_loss = rollout_losses["trajectory_loss"]
                     rollout_psd_loss = rollout_losses["disp_psd_loss"]
