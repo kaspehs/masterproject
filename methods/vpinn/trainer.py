@@ -47,6 +47,7 @@ from HNN_helper import (
     log_displacement_plots,
     log_force_plots,
     log_output_distribution_vs_ur,
+    log_rollout_phase_trajectory_plot,
     log_signed_phase_output_plot,
     lookup_ur_bin_state_scale_tensor,
     mean_displacement_amplitude,
@@ -1909,7 +1910,7 @@ def _log_td_correction_rollout_validation(
     c = torch.full((1, d), damping_value, dtype=x_true_t.dtype, device=device)
     k = torch.full((1, d), stiffness_value, dtype=x_true_t.dtype, device=device)
 
-    x_seq, v_seq, f_seq, td_roll_seq, _corr_roll_seq, delta_fhat_roll_seq = _vpinn_td_rollout(
+    x_seq, v_seq, f_seq, td_roll_seq, corr_roll_seq, sigma_roll_seq, delta_fhat_roll_seq = _vpinn_td_rollout(
         model=model,
         x0=x_true_t[0:1, :],
         v0=v_true_t[0:1, :],
@@ -1938,6 +1939,8 @@ def _log_td_correction_rollout_validation(
     v_pred = v_seq[0, :, 0].detach().cpu().numpy()
     f_roll = f_seq[0, :, 0].detach().cpu().numpy()
     td_roll = td_roll_seq[0, :, 0].detach().cpu().numpy()
+    corr_roll = corr_roll_seq[0, :, 0].detach().cpu().numpy()
+    sigma_roll = sigma_roll_seq[0, :, 0].detach().cpu().numpy()
     delta_fhat_roll = delta_fhat_roll_seq[0, :, 0].detach().cpu().numpy()
 
     with torch.no_grad():
@@ -2101,172 +2104,48 @@ def _log_td_correction_rollout_validation(
                     writer,
                     epoch,
                     t=t_np[1:],
-                    corr_true=np.zeros_like(delta_fhat_on_data),
-                    corr_pred=delta_fhat_on_data,
+                    corr_true=np.zeros_like(delta_fhat_roll),
+                    corr_pred=delta_fhat_roll,
                     sigma=None,
                     reduced_velocity=ur_val,
                     value_label="Delta fhat",
                     sigma_label="",
-                    tag="final_val/delta_fhat_on_data",
+                    tag="final_val/delta_fhat_on_rollout",
                     step=step,
                     title_suffix=title_suffix,
+                    trajectory_label="rollout",
                 )
         if log_phase_map:
-            q_extent = np.concatenate([np.asarray(q_true_norm, dtype=float), np.asarray(q_pred_norm, dtype=float)])
-            p_extent = np.concatenate([np.asarray(p_true_norm, dtype=float), np.asarray(p_pred_norm, dtype=float)])
-            q_grid, p_grid = build_phase_plot_grid(q_extent, p_extent, bins=96, extent_scale=1.2)
-            x_grid = torch.as_tensor(
-                (q_grid.reshape(-1) * float(diameter)).reshape(-1, 1),
-                dtype=x_true_t.dtype,
-                device=device,
-            )
-            v_grid = torch.as_tensor(
-                (p_grid.reshape(-1) * (omega * float(diameter))).reshape(-1, 1),
-                dtype=x_true_t.dtype,
-                device=device,
-            )
-            ur_grid = torch.full((x_grid.shape[0], 1), ur_val, dtype=x_true_t.dtype, device=device)
-            td_force_grid = None
-            if _vpinn_model_uses_td_force_input(model):
-                td_force_grid_np = nearest_phase_series_values(
-                    q_grid,
-                    p_grid,
-                    q_true_norm,
-                    p_true_norm,
-                    td_true_t[:, 0].detach().cpu().numpy(),
-                )
-                td_force_grid = torch.as_tensor(
-                    td_force_grid_np.reshape(-1, 1),
-                    dtype=x_true_t.dtype,
-                    device=device,
-                )
-            phi_grid = None
-            sigma_grid_inputs = None
-            acceleration_grid = None
-            if (
-                _vpinn_model_uses_phi_input(model)
-                or _vpinn_model_uses_sigma_inputs(model)
-                or _vpinn_model_uses_acceleration_input(model)
-            ):
-                phi_series, sigma_series, acceleration_series = td_hidden_inputs_from_context_torch(
-                    td_context=td_context_t,
-                    structural_mass=torch.full_like(x_true_t, mass_value),
-                    stiffness=torch.full_like(x_true_t, stiffness_value),
-                    diameter=diameter,
-                    velocity=v_true_t,
-                    phase_input_source=_vpinn_model_phase_input_source(model),
-                )
-                phi_series_np = phi_series.detach().cpu().numpy()
-                sigma_series_np = sigma_series.detach().cpu().numpy()
-                if _vpinn_model_uses_phi_input(model):
-                    phi_grid = torch.as_tensor(
-                        np.stack(
-                            [
-                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, phi_series_np[:, 0]),
-                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, phi_series_np[:, 1]),
-                            ],
-                            axis=-1,
-                        ).reshape(-1, 2),
-                        dtype=x_true_t.dtype,
-                        device=device,
-                    )
-                if _vpinn_model_uses_sigma_inputs(model):
-                    sigma_grid_inputs = torch.as_tensor(
-                        np.stack(
-                            [
-                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, sigma_series_np[:, 0]),
-                                nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, sigma_series_np[:, 1]),
-                            ],
-                            axis=-1,
-                        ).reshape(-1, 2),
-                        dtype=x_true_t.dtype,
-                        device=device,
-                    )
-                if _vpinn_model_uses_acceleration_input(model):
-                    acceleration_series_np = acceleration_series.detach().cpu().numpy()
-                    acceleration_grid = torch.as_tensor(
-                        nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, acceleration_series_np[:, 0]).reshape(-1, 1),
-                        dtype=x_true_t.dtype,
-                        device=device,
-                    )
-            with torch.no_grad():
-                corr_grid, sigma_grid, raw_delta_fhat_grid = _vpinn_predict_outputs(
-                    model,
-                    x_grid,
-                    v_grid,
-                    ur_grid,
-                    (td_force_grid if use_td_force_input else None),
-                    acceleration_grid,
-                    phi_grid,
-                    sigma_grid_inputs,
-                    mean_active=mean_active,
-                    sigma_active=probabilistic,
-                    fhat_active=fhat_active,
-                    sigma_min=sigma_min,
-                    force_zero_output=force_zero_output,
-                )
+            phase_specs: list[tuple[str, np.ndarray, bool]] = []
             if mean_active:
                 output_label = (
                     "Correction coefficient"
                     if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
                     else "Correction force"
                 )
-                log_signed_phase_output_plot(
-                    writer,
-                    epoch,
-                    q_grid=q_grid,
-                    p_grid=p_grid,
-                    values=corr_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
-                    q_true=q_true_norm,
-                    p_true=p_true_norm,
-                    q_pred=q_pred_norm,
-                    p_pred=p_pred_norm,
-                    reduced_velocity=ur_val,
-                    output_label=output_label,
-                    sigma_values=(
-                        sigma_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape)
-                        if probabilistic
-                        else None
-                    ),
-                    sigma_label=(
-                        "Sigma coefficient"
-                        if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
-                        else "Sigma force"
-                    ),
-                    tag="final_val/phase_output",
-                    step=step,
-                    title_suffix=title_suffix,
+                phase_specs.append((output_label, corr_roll, True))
+            if probabilistic:
+                sigma_label = (
+                    "Sigma coefficient"
+                    if str(getattr(model, "force_representation", "force")).strip().lower() == "coefficient"
+                    else "Sigma force"
                 )
+                phase_specs.append((sigma_label, sigma_roll, False))
             if fhat_active:
-                delta_fhat_grid, _ = td_bounded_delta_fhat_torch(
-                    raw_delta_fhat_grid,
-                    fhat_td=torch.as_tensor(
-                        nearest_phase_series_values(q_grid, p_grid, q_true_norm, p_true_norm, np.asarray(traj["fhat_td"], dtype=float)).reshape(-1, 1),
-                        dtype=x_true_t.dtype,
-                        device=device,
-                    ),
-                    fhat_min=float(td_params["fhat_min"]),
-                    fhat_max=float(td_params["fhat_max"]),
-                    fhat_bound_multiplier=float(fhat_bound_multiplier),
-                )
-                log_signed_phase_output_plot(
-                    writer,
-                    epoch,
-                    q_grid=q_grid,
-                    p_grid=p_grid,
-                    values=delta_fhat_grid[:, 0].detach().cpu().numpy().reshape(q_grid.shape),
-                    q_true=q_true_norm,
-                    p_true=p_true_norm,
-                    q_pred=q_pred_norm,
-                    p_pred=p_pred_norm,
-                    reduced_velocity=ur_val,
-                    output_label="Delta fhat",
-                    sigma_values=None,
-                    sigma_label="",
-                    tag="final_val/phase_output_delta_fhat",
-                    step=step,
-                    title_suffix=title_suffix,
-                )
+                phase_specs.append(("Delta fhat", delta_fhat_roll, True))
+            log_rollout_phase_trajectory_plot(
+                writer,
+                epoch,
+                q_true=q_true_norm,
+                p_true=p_true_norm,
+                q_pred=q_pred_norm,
+                p_pred=p_pred_norm,
+                value_specs=phase_specs,
+                reduced_velocity=ur_val,
+                tag="final_val/phase_rollout_outputs",
+                step=step,
+                title_suffix=title_suffix,
+            )
     return metrics
 
 
@@ -2469,7 +2348,7 @@ def _vpinn_td_rollout(
     rollout_stochastic: bool = False,
     rollout_noise_scale: float = 1.0,
     rollout_seed: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     x = x0
     v = v0
     td_context = td_context0
@@ -2478,6 +2357,7 @@ def _vpinn_td_rollout(
     total_fs: list[torch.Tensor] = []
     td_fs: list[torch.Tensor] = []
     corr_fs: list[torch.Tensor] = []
+    sigma_fs: list[torch.Tensor] = []
     delta_fhats: list[torch.Tensor] = []
     generator: torch.Generator | None = None
     if rollout_seed is not None:
@@ -2516,6 +2396,7 @@ def _vpinn_td_rollout(
         total_fs.append(step["total_force_next"])
         td_fs.append(step["td_force_next"])
         corr_fs.append(step["corr_force"])
+        sigma_fs.append(step["corr_sigma"])
         delta_fhats.append(step["delta_fhat"])
     empty_force = x0.new_zeros((x0.shape[0], 0, x0.shape[1]))
     return (
@@ -2524,6 +2405,7 @@ def _vpinn_td_rollout(
         torch.stack(total_fs, dim=1) if total_fs else empty_force,
         torch.stack(td_fs, dim=1) if td_fs else empty_force,
         torch.stack(corr_fs, dim=1) if corr_fs else empty_force,
+        torch.stack(sigma_fs, dim=1) if sigma_fs else empty_force,
         torch.stack(delta_fhats, dim=1) if delta_fhats else empty_force,
     )
 
@@ -2569,7 +2451,7 @@ def _vpinn_td_rollout_loss_from_batch(
         m0_in = m0.unsqueeze(0).expand(samples, *m0.shape).reshape(samples * batch_size, *m0.shape[1:])
         c0_in = c0.unsqueeze(0).expand(samples, *c0.shape).reshape(samples * batch_size, *c0.shape[1:])
         k0_in = k0.unsqueeze(0).expand(samples, *k0.shape).reshape(samples * batch_size, *k0.shape[1:])
-        x_pred, v_pred, _, _, _, _ = _vpinn_td_rollout(
+        x_pred, v_pred, _, _, _, _, _ = _vpinn_td_rollout(
             model=model,
             x0=x0_in,
             v0=v0_in,
@@ -2645,7 +2527,7 @@ def _vpinn_td_rollout_loss_from_batch(
         per_samples = torch.mean(err_x * err_x, dim=(2, 3)) + torch.mean(err_v * err_v, dim=(2, 3))
         return torch.mean(torch.mean(per_samples, dim=0))
 
-    x_pred, v_pred, _, _, _, _ = _vpinn_td_rollout(
+    x_pred, v_pred, _, _, _, _, _ = _vpinn_td_rollout(
         model=model,
         x0=x0,
         v0=v0,

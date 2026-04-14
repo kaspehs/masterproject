@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm
 import numpy as np
 import torch
@@ -3500,6 +3501,97 @@ def log_signed_phase_output_plot(
     plt.close(fig)
 
 
+def log_rollout_phase_trajectory_plot(
+    writer: SummaryWriter,
+    epoch: int,
+    *,
+    q_true: np.ndarray,
+    p_true: np.ndarray,
+    q_pred: np.ndarray,
+    p_pred: np.ndarray,
+    value_specs: Sequence[tuple[str, np.ndarray, bool]],
+    reduced_velocity: float | None = None,
+    tag: str = "final_val/phase_rollout_outputs",
+    step: int | None = None,
+    title_suffix: str = "",
+) -> None:
+    q_true_arr = np.asarray(q_true, dtype=float).reshape(-1)
+    p_true_arr = np.asarray(p_true, dtype=float).reshape(-1)
+    q_pred_arr = np.asarray(q_pred, dtype=float).reshape(-1)
+    p_pred_arr = np.asarray(p_pred, dtype=float).reshape(-1)
+    if q_pred_arr.size < 2 or p_pred_arr.size < 2:
+        return
+
+    filtered_specs: list[tuple[str, np.ndarray, bool]] = []
+    nseg = int(min(q_pred_arr.size, p_pred_arr.size) - 1)
+    for label, values, is_signed in value_specs:
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        if arr.size < 1:
+            continue
+        arr = arr[:nseg]
+        if not np.any(np.isfinite(arr)):
+            continue
+        filtered_specs.append((str(label), arr, bool(is_signed)))
+    if not filtered_specs:
+        return
+
+    ncols = min(3, len(filtered_specs))
+    fig, axes = plt.subplots(1, ncols, figsize=(5.8 * ncols, 5.0), sharex=True, sharey=True)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+    ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
+
+    points = np.column_stack([q_pred_arr, p_pred_arr])
+    segments = np.stack([points[:-1], points[1:]], axis=1)
+    q_all = np.concatenate([q_true_arr, q_pred_arr])
+    p_all = np.concatenate([p_true_arr, p_pred_arr])
+    q_min, q_max = float(np.min(q_all)), float(np.max(q_all))
+    p_min, p_max = float(np.min(p_all)), float(np.max(p_all))
+    q_pad = max(0.05 * max(abs(q_min), abs(q_max), 1.0), 1e-6)
+    p_pad = max(0.05 * max(abs(p_min), abs(p_max), 1.0), 1e-6)
+
+    sigma_cmap = LinearSegmentedColormap.from_list(
+        "sigma_rollout_phase",
+        [(0.0, "#b8b8b8"), (1.0, "#2ca02c")],
+    )
+    for ax, (label, values, is_signed) in zip(axes, filtered_specs):
+        finite_vals = values[np.isfinite(values)]
+        if finite_vals.size == 0:
+            continue
+        if is_signed:
+            vmax = max(float(np.max(np.abs(finite_vals))), 1e-12)
+            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+            cmap = SIGNED_PHASE_CMAP
+        else:
+            vmin = float(np.min(finite_vals))
+            vmax = float(np.max(finite_vals))
+            if not np.isfinite(vmin):
+                vmin = 0.0
+            if not np.isfinite(vmax) or vmax <= vmin:
+                vmax = vmin + 1e-12
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            cmap = sigma_cmap
+        lc = LineCollection(segments, cmap=cmap, norm=norm, linewidth=2.2)
+        lc.set_array(values)
+        ax.add_collection(lc)
+        ax.plot(q_true_arr, p_true_arr, color="black", linewidth=1.1, linestyle="--", alpha=0.7, label="Ground truth")
+        ax.plot(q_pred_arr, p_pred_arr, color="black", linewidth=0.6, alpha=0.25, label="Predicted rollout path")
+        ax.plot(q_pred_arr[0], p_pred_arr[0], marker="o", color="black", markersize=3)
+        ax.set_title(f"{label} on rollout{ur_title}{title_suffix}")
+        ax.set_xlabel("y/D")
+        ax.set_ylabel("v/(omega D)")
+        ax.set_xlim(q_min - q_pad, q_max + q_pad)
+        ax.set_ylim(p_min - p_pad, p_max + p_pad)
+        ax.grid(True, alpha=0.15)
+        ax.legend(loc="upper right")
+        cbar = fig.colorbar(lc, ax=ax)
+        cbar.set_label(label)
+
+    plt.tight_layout()
+    writer.add_figure(tag, fig, epoch + 1 if step is None else step)
+    plt.close(fig)
+
+
 def log_correction_on_data_plot(
     writer: SummaryWriter,
     epoch: int,
@@ -3514,6 +3606,7 @@ def log_correction_on_data_plot(
     tag: str = "final_val/correction_on_data",
     step: int | None = None,
     title_suffix: str = "",
+    trajectory_label: str = "measured",
 ) -> None:
     t_arr = np.asarray(t, dtype=float).reshape(-1)
     corr_true_arr = np.asarray(corr_true, dtype=float).reshape(-1)
@@ -3549,7 +3642,7 @@ def log_correction_on_data_plot(
             label="Predicted ± sigma",
         )
     axes[0].set_ylabel(value_label)
-    axes[0].set_title(f"{value_label} on measured trajectory{ur_title}{title_suffix}")
+    axes[0].set_title(f"{value_label} on {trajectory_label} trajectory{ur_title}{title_suffix}")
     axes[0].grid(True, alpha=0.2)
     axes[0].legend(loc="upper right")
 
