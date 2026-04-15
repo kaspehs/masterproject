@@ -66,6 +66,7 @@ from HNN_helper import (
     resolve_middle_time_plot,
     resolve_td_correction_params,
     resolve_td_correction_mode,
+    resolve_td_force_input_source,
     resolve_td_memory_config,
     resolve_td_n_memory_torch,
     rollout_model,
@@ -378,6 +379,7 @@ def _td_predict_outputs(
     z: torch.Tensor,
     reduced_velocity: torch.Tensor,
     td_force_input: torch.Tensor | None,
+    td_fhat_input: torch.Tensor | None,
     acceleration_input: torch.Tensor | None,
     phi_input: torch.Tensor | None,
     sigma_inputs: torch.Tensor | None,
@@ -408,6 +410,7 @@ def _td_predict_outputs(
             z_model,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -422,6 +425,7 @@ def _td_predict_outputs(
                 z_model,
                 reduced_velocity=reduced_velocity,
                 td_force_input=td_force_input,
+                td_fhat_input=td_fhat_input,
                 acceleration_input=acceleration_input,
                 phi_input=phi_input,
                 sigma_inputs=sigma_inputs,
@@ -438,12 +442,29 @@ def _td_predict_outputs(
             z_model,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=output_scale,
         )
     return corr_mu, sigma, raw_delta_fhat
+
+
+def _td_force_input_tensor_from_source(
+    *,
+    source: str,
+    baseline_force_next: torch.Tensor,
+    baseline_diag: dict[str, torch.Tensor],
+) -> torch.Tensor | None:
+    key = str(source).strip().lower()
+    if key == "none":
+        return None
+    if key == "total":
+        return baseline_force_next
+    if key == "fcv":
+        return baseline_diag["force_cv"]
+    raise ValueError(f"Unsupported TD force input source {source!r}.")
 
 
 def _td_step_with_corrections(
@@ -461,7 +482,7 @@ def _td_step_with_corrections(
     mean_active: bool,
     sigma_active: bool,
     fhat_active: bool,
-    use_td_force_input: bool,
+    td_force_input_source: str,
     fhat_bound_multiplier: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
@@ -498,7 +519,12 @@ def _td_step_with_corrections(
         model,
         z=z,
         reduced_velocity=reduced_velocity,
-        td_force_input=(baseline_force_next if use_td_force_input else None),
+        td_force_input=_td_force_input_tensor_from_source(
+            source=td_force_input_source,
+            baseline_force_next=baseline_force_next,
+            baseline_diag=baseline_diag,
+        ),
+        td_fhat_input=(baseline_diag["fhat_td"] if bool(getattr(model, "use_td_fhat_input", False)) else None),
         acceleration_input=acceleration_input,
         phi_input=phi_input,
         sigma_inputs=sigma_inputs,
@@ -1002,7 +1028,7 @@ def _td_correction_rollout_losses_from_batch(
     mean_active: bool,
     sigma_active: bool,
     fhat_active: bool,
-    use_td_force_input: bool,
+    td_force_input_source: str,
     fhat_bound_multiplier: float,
     force_zero_output: bool,
     rollout_loss_mode: str,
@@ -1056,7 +1082,7 @@ def _td_correction_rollout_losses_from_batch(
             mean_active=mean_active,
             sigma_active=False,
             fhat_active=fhat_active,
-            use_td_force_input=use_td_force_input,
+            td_force_input_source=td_force_input_source,
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
@@ -1120,7 +1146,7 @@ def _td_correction_rollout_losses_from_batch(
         mean_active=mean_active,
         sigma_active=sigma_active,
         fhat_active=fhat_active,
-        use_td_force_input=use_td_force_input,
+        td_force_input_source=td_force_input_source,
         fhat_bound_multiplier=fhat_bound_multiplier,
         force_zero_output=force_zero_output,
         rollout_stochastic=True,
@@ -1184,7 +1210,7 @@ def _td_correction_rollout_loss_from_batch(
     mean_active: bool,
     sigma_active: bool,
     fhat_active: bool,
-    use_td_force_input: bool,
+    td_force_input_source: str,
     fhat_bound_multiplier: float,
     force_zero_output: bool,
     rollout_loss_mode: str,
@@ -1202,7 +1228,7 @@ def _td_correction_rollout_loss_from_batch(
         mean_active=mean_active,
         sigma_active=sigma_active,
         fhat_active=fhat_active,
-        use_td_force_input=use_td_force_input,
+        td_force_input_source=td_force_input_source,
         fhat_bound_multiplier=fhat_bound_multiplier,
         force_zero_output=force_zero_output,
         rollout_loss_mode=rollout_loss_mode,
@@ -1233,7 +1259,7 @@ def _td_correction_state_rollout(
     mean_active: bool,
     sigma_active: bool,
     fhat_active: bool,
-    use_td_force_input: bool,
+    td_force_input_source: str,
     fhat_bound_multiplier: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
@@ -1266,7 +1292,7 @@ def _td_correction_state_rollout(
             mean_active=mean_active,
             sigma_active=sigma_active,
             fhat_active=fhat_active,
-            use_td_force_input=use_td_force_input,
+            td_force_input_source=td_force_input_source,
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
             rollout_stochastic=rollout_stochastic,
@@ -1493,7 +1519,7 @@ def _log_td_correction_rollout_validation(
     mean_active: bool,
     predict_sigma: bool,
     fhat_active: bool,
-    use_td_force_input: bool,
+    td_force_input_source: str,
     fhat_bound_multiplier: float,
     force_zero_output: bool = False,
     rollout_stochastic: bool = False,
@@ -1543,7 +1569,7 @@ def _log_td_correction_rollout_validation(
         mean_active=mean_active,
         sigma_active=predict_sigma,
         fhat_active=fhat_active,
-        use_td_force_input=use_td_force_input,
+        td_force_input_source=td_force_input_source,
         fhat_bound_multiplier=fhat_bound_multiplier,
         force_zero_output=force_zero_output,
         rollout_stochastic=rollout_stochastic,
@@ -1573,7 +1599,7 @@ def _log_td_correction_rollout_validation(
             mean_active=mean_active,
             sigma_active=predict_sigma,
             fhat_active=fhat_active,
-            use_td_force_input=use_td_force_input,
+            td_force_input_source=td_force_input_source,
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
@@ -1665,23 +1691,6 @@ def _log_td_correction_rollout_validation(
                 step=step,
                 title_suffix=title_suffix,
                 log_spectra=log_spectra,
-            )
-        if log_spectra:
-            log_area_normalized_rollout_spectra(
-                writer,
-                epoch,
-                disp_t=t_np,
-                disp_true=q_true_norm,
-                disp_pred=q_pred_norm,
-                force_t=force_t,
-                force_true=f_true_t[:, 0].detach().cpu().numpy()[:n_force],
-                force_pred=force_total_full[:n_force],
-                reduced_velocity=ur_val,
-                force_baseline=force_td_full[:n_force],
-                force_baseline_label="C_F (Vivana-TD)",
-                tag=f"{tag_prefix}_spectra",
-                step=step,
-                title_suffix=title_suffix,
             )
         if log_plots and log_correction_on_data:
             output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
@@ -2335,7 +2344,7 @@ def _validate_if_needed(
             rollout_stochastic=rollout_stochastic,
             rollout_noise_scale=rollout_noise_scale,
             rollout_seed=rollout_seed,
-            log_spectra=True,
+            log_spectra=False,
         )
         _log_validation_timing()
         return
@@ -2361,7 +2370,7 @@ def _validate_if_needed(
         rollout_stochastic=rollout_stochastic,
         rollout_noise_scale=rollout_noise_scale,
         rollout_seed=rollout_seed,
-        log_spectra=True,
+        log_spectra=False,
     )
     _log_validation_timing()
 
@@ -2491,7 +2500,7 @@ def _log_final_rollouts_all(
             tag_prefix="final_val/rollout",
             step=step_idx,
             title_suffix=f" [final {step_idx}/{len(plot_pairs)}]",
-            log_spectra=True,
+            log_spectra=False,
         )
         filtered_plot_metrics = {
             name: float(value)
@@ -3127,7 +3136,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     mean_active = bool(mode_flags["mean_active"])
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
-    use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
+    td_force_input_source = resolve_td_force_input_source(hnn_cfg.get("use_td_force_input", False))
+    use_td_force_input = td_force_input_source != "none"
+    use_td_fhat_input = bool(hnn_cfg.get("use_td_fhat_input", False))
     phase_input_source = resolve_td_phase_input_source(
         hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
     )
@@ -3143,8 +3154,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("hnn.fhat_bound_multiplier must be finite and positive.")
     if init_from_checkpoint is not None and not init_from_checkpoint.exists():
         raise FileNotFoundError(f"hnn.init_from_checkpoint does not exist: '{init_from_checkpoint}'.")
-    if fhat_active and use_td_force_input:
-        raise ValueError("hnn.use_td_force_input=true is invalid for correction_mode values that include fhat correction.")
+    if use_td_force_input and fhat_active and correction_mode != "fhat_only":
+        raise ValueError(
+            "hnn.use_td_force_input with total/fcv input is only supported for correction_mode='fhat_only' among the modes that include fhat correction."
+        )
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
     if state_loss_mode not in {"mse", "propagated_nll"}:
         raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
@@ -3174,6 +3187,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
+    state_loss_weight = float(getattr(loss_cfg, "state_weight", 1.0))
     mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
     sigma_reg = float(getattr(loss_cfg, "sigma_reg", 0.0))
     fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
@@ -3212,6 +3226,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_det_steps_final must be non-negative.")
     if rollout_det_steps_warmup_epochs < 0:
         raise ValueError("loss.rollout_det_steps_warmup_epochs must be non-negative.")
+    if state_loss_weight < 0.0:
+        raise ValueError("loss.state_weight must be non-negative.")
     if rollout_det_weight < 0.0:
         raise ValueError("loss.rollout_det_weight must be non-negative.")
     if rollout_disp_std_weight < 0.0:
@@ -3239,6 +3255,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     model_dict["Ca"] = 0.0
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
+    model_dict["use_td_fhat_input"] = use_td_fhat_input
     model_dict["use_acceleration_input"] = use_acceleration_input
     model_dict["use_phi_input"] = use_phi_input
     model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
@@ -3299,21 +3316,26 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         )
         del _seen_train_loader_unused
 
+    state_loss_active = state_loss_weight > 0.0
+    data_loss_active = use_force_data_loss and (force_data_weight > 0.0)
     gradnorm_balancer: Optional[GradNormBalancer] = None
-    if bool(getattr(loss_cfg, "use_gradnorm", False)) and (use_force_data_loss or rollout_loss_active):
-        gradnorm_loss_names = ["state"]
-        if use_force_data_loss:
+    if bool(getattr(loss_cfg, "use_gradnorm", False)):
+        gradnorm_loss_names: list[str] = []
+        if state_loss_active:
+            gradnorm_loss_names.append("state")
+        if data_loss_active:
             gradnorm_loss_names.append("data")
         if rollout_loss_active:
             gradnorm_loss_names.append("rollout")
-        gradnorm_balancer = GradNormBalancer(
-            model,
-            gradnorm_loss_names,
-            alpha=float(getattr(loss_cfg, "gradnorm_alpha", 0.9)),
-            eps=float(getattr(loss_cfg, "gradnorm_eps", 1e-8)),
-            min_weight=float(getattr(loss_cfg, "gradnorm_min_weight", 0.1)),
-            max_weight=float(getattr(loss_cfg, "gradnorm_max_weight", 10.0)),
-        )
+        if len(gradnorm_loss_names) >= 2:
+            gradnorm_balancer = GradNormBalancer(
+                model,
+                gradnorm_loss_names,
+                alpha=float(getattr(loss_cfg, "gradnorm_alpha", 0.9)),
+                eps=float(getattr(loss_cfg, "gradnorm_eps", 1e-8)),
+                min_weight=float(getattr(loss_cfg, "gradnorm_min_weight", 0.1)),
+                max_weight=float(getattr(loss_cfg, "gradnorm_max_weight", 10.0)),
+            )
 
     opt, lr_scheduler = setup_optimizer_and_scheduler(
         model,
@@ -3358,6 +3380,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 "mean_active": mean_active,
                 "fhat_active": fhat_active,
                 "use_td_force_input": use_td_force_input,
+                "td_force_input_source": td_force_input_source,
+                "use_td_fhat_input": use_td_fhat_input,
                 "use_phi_input": use_phi_input,
                 "phi_input_source": (None if not use_phi_input else phase_input_source),
                 "use_sigma_inputs": use_sigma_inputs,
@@ -3401,7 +3425,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             mean_active=mean_active,
             sigma_active=predict_sigma,
             fhat_active=fhat_active,
-            use_td_force_input=use_td_force_input,
+            td_force_input_source=td_force_input_source,
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
@@ -3481,6 +3505,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         f"mean={freeze_mean_net} ({frozen_param_counts['mean']} params), "
         f"fhat={freeze_fhat_net} ({frozen_param_counts['fhat']} params), "
         f"sigma={freeze_sigma_net} ({frozen_param_counts['sigma']} params)"
+    )
+    startup_lines.append(
+        f"Loss weights: state={state_loss_weight:g}, data={force_data_weight:g}, "
+        f"rollout_det={rollout_det_weight:g}, rollout_disp_std={rollout_disp_std_weight:g}, "
+        f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
     )
     sigma_identified_by_rollout = (
         rollout_det_weight > 0.0 and rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}
@@ -3585,7 +3614,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                     fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                     total_loss = (
-                        state_loss
+                        float(state_loss_weight) * state_loss
                         + float(force_data_weight) * data_loss
                         + float(mean_reg) * mean_reg_loss
                         + float(sigma_reg) * sigma_reg_loss
@@ -3622,7 +3651,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         mean_active=mean_active,
                         sigma_active=predict_sigma,
                         fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
+                        td_force_input_source=td_force_input_source,
                         fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
@@ -3651,7 +3680,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         val_metrics["loss_rollout_disp_std"] = rollout_std_loss_avg
         val_metrics["loss_rollout_spectral"] = rollout_spectral_loss_avg
         val_metrics["loss_total"] = (
-            val_metrics["loss_state"]
+            float(state_loss_weight) * val_metrics["loss_state"]
             + float(force_data_weight) * val_metrics["loss_data"]
             + float(mean_reg) * val_metrics["loss_reg_mean"]
             + float(sigma_reg) * val_metrics["loss_reg_sigma"]
@@ -3692,7 +3721,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     mean_active=mean_active,
                     predict_sigma=predict_sigma,
                     fhat_active=fhat_active,
-                    use_td_force_input=use_td_force_input,
+                    td_force_input_source=td_force_input_source,
                     fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                     rollout_stochastic=rollout_stochastic,
@@ -3742,7 +3771,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     mean_active=mean_active,
                     predict_sigma=predict_sigma,
                     fhat_active=fhat_active,
-                    use_td_force_input=use_td_force_input,
+                    td_force_input_source=td_force_input_source,
                     fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                     rollout_stochastic=rollout_stochastic,
@@ -3751,7 +3780,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     tag_prefix=f"{split_tag}/rollout",
                     log_metrics=False,
                     log_plots=True,
-                    log_spectra=True,
+                    log_spectra=False,
                 )
             if log_all_rollout_spectra:
                 def _safe_tag_component(raw: Any) -> str:
@@ -3776,7 +3805,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         mean_active=mean_active,
                         predict_sigma=predict_sigma,
                         fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
+                        td_force_input_source=td_force_input_source,
                         fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_stochastic=rollout_stochastic,
@@ -3785,8 +3814,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         tag_prefix=f"{split_tag}/rollout/{_safe_tag_component(traj_name)}",
                         log_metrics=False,
                         log_plots=False,
-                        log_spectra=True,
-                        log_only_spectra=True,
+                        log_spectra=False,
+                        log_only_spectra=False,
                         title_suffix=f" [{traj_name}]",
                     )
         elapsed = float(time.perf_counter() - split_start)
@@ -3821,8 +3850,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss_rollout_spectral": torch.zeros((), device=device),
             "grad_norm": torch.zeros((), device=device),
         }
-        gradnorm_state_w_sum = torch.zeros((), device=device) if gradnorm_balancer is not None else None
-        gradnorm_data_w_sum = torch.zeros((), device=device) if gradnorm_balancer is not None and use_force_data_loss else None
+        gradnorm_state_w_sum = (
+            torch.zeros((), device=device) if gradnorm_balancer is not None and state_loss_active else None
+        )
+        gradnorm_data_w_sum = (
+            torch.zeros((), device=device) if gradnorm_balancer is not None and data_loss_active else None
+        )
         gradnorm_rollout_w_sum = (
             torch.zeros((), device=device) if gradnorm_balancer is not None and rollout_loss_active else None
         )
@@ -3886,7 +3919,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         mean_active=mean_active,
                         sigma_active=predict_sigma,
                         fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
+                        td_force_input_source=td_force_input_source,
                         fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
                         rollout_loss_mode=rollout_loss_mode,
@@ -3909,17 +3942,21 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     + float(rollout_disp_spectral_weight) * rollout_spectral_loss
                 )
                 if gradnorm_balancer is not None:
-                    loss_inputs: dict[str, torch.Tensor] = {"state": state_loss.float()}
-                    if use_force_data_loss:
+                    loss_inputs: dict[str, torch.Tensor] = {}
+                    if state_loss_active:
+                        loss_inputs["state"] = state_loss.float()
+                    if data_loss_active:
                         loss_inputs["data"] = data_loss.float()
                     if rollout_loss_active:
                         loss_inputs["rollout"] = rollout_total_loss.float()
                     weights = gradnorm_balancer.update(loss_inputs)
-                    state_w = weights["state"]
-                    base_loss = state_w * state_loss
-                    if gradnorm_state_w_sum is not None:
-                        gradnorm_state_w_sum = gradnorm_state_w_sum + state_w.detach()
-                    if use_force_data_loss:
+                    base_loss = state_loss.new_tensor(0.0)
+                    if state_loss_active:
+                        state_w = weights["state"]
+                        base_loss = base_loss + float(state_loss_weight) * state_w * state_loss
+                        if gradnorm_state_w_sum is not None:
+                            gradnorm_state_w_sum = gradnorm_state_w_sum + state_w.detach()
+                    if data_loss_active:
                         data_w = weights["data"]
                         base_loss = base_loss + float(force_data_weight) * data_w * data_loss
                         if gradnorm_data_w_sum is not None:
@@ -3933,7 +3970,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         weighted_rollout_total = rollout_total_loss
                     gradnorm_count += 1
                 else:
-                    base_loss = state_loss + float(force_data_weight) * data_loss
+                    base_loss = float(state_loss_weight) * state_loss + float(force_data_weight) * data_loss
                     weighted_rollout_total = rollout_total_loss
                 total_loss = (
                     base_loss
@@ -4065,7 +4102,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 mean_active=mean_active,
                 predict_sigma=predict_sigma,
                 fhat_active=fhat_active,
-                use_td_force_input=use_td_force_input,
+                td_force_input_source=td_force_input_source,
                 fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
@@ -4113,7 +4150,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     mean_active=mean_active,
                     sigma_active=predict_sigma,
                     fhat_active=fhat_active,
-                    use_td_force_input=use_td_force_input,
+                    td_force_input_source=td_force_input_source,
                     fhat_bound_multiplier=fhat_bound_multiplier,
                     force_zero_output=force_zero_output,
                 )
@@ -4140,7 +4177,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 mean_active=mean_active,
                 predict_sigma=predict_sigma,
                 fhat_active=fhat_active,
-                use_td_force_input=use_td_force_input,
+                td_force_input_source=td_force_input_source,
                 fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
@@ -4153,7 +4190,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_correction_on_data=False,
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
-                log_spectra=True,
+                log_spectra=False,
             )
             filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
             if filtered_plot_metrics:
@@ -4224,6 +4261,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "mean_active": mean_active,
             "fhat_active": fhat_active,
             "use_td_force_input": use_td_force_input,
+            "td_force_input_source": td_force_input_source,
+            "use_td_fhat_input": use_td_fhat_input,
             "use_acceleration_input": use_acceleration_input,
             "use_phi_input": use_phi_input,
             "phi_input_source": (None if not use_phi_input else phase_input_source),
@@ -4591,6 +4630,8 @@ def train(config: Config, config_name: str) -> None:
                 "mean_active": mean_active,
                 "fhat_active": fhat_active,
                 "use_td_force_input": use_td_force_input,
+                "td_force_input_source": td_force_input_source,
+                "use_td_fhat_input": use_td_fhat_input,
                 "use_acceleration_input": use_acceleration_input,
                 "use_phi_input": use_phi_input,
                 "phi_input_source": (None if not use_phi_input else phase_input_source),
@@ -4827,6 +4868,8 @@ def train(config: Config, config_name: str) -> None:
                     "mean_active": mean_active,
                     "fhat_active": fhat_active,
                     "use_td_force_input": use_td_force_input,
+                    "td_force_input_source": td_force_input_source,
+                    "use_td_fhat_input": use_td_fhat_input,
                     "use_acceleration_input": use_acceleration_input,
                     "use_phi_input": use_phi_input,
                     "phi_input_source": (None if not use_phi_input else phase_input_source),

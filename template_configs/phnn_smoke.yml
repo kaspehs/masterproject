@@ -25,7 +25,7 @@ model:
 
 architecture:
   # If true, enforce odd force symmetry by construction: f(-state, U_r) = -f(state, U_r).
-  # Requires hnn.use_td_force_input: false.
+  # Requires hnn.use_td_force_input: false and hnn.use_td_fhat_input: false.
   hard_force_symmetry: false
   use_fourier_features: false
   fourier_features: 64
@@ -76,6 +76,8 @@ loss:
   ur_bin_size: 1.0e-6
   normalize_by_ur_bin_std: false
   ur_bin_scale_eps: 1.0e-6
+  # One-step state loss weight. Set to 0.0 to disable the PHNN one-step state loss.
+  state_weight: 1.0
 
   # Rollout loss
   rollout_det_weight: 0.0
@@ -170,9 +172,12 @@ hnn:
   # Unified TD correction output mode:
   # mean_only | mean_sigma_only | fhat_only | mean_fhat_only | mean_sigma_fhat
   correction_mode: mean_only
-  # If true, include the current Vivana-TD predicted force as an extra force-network input.
-  # Invalid for correction_mode values that include fhat correction.
+  # Extra TD force input selector for the correction networks:
+  # false -> disabled, true/total -> total Vivana-TD force, fcv -> vortex-shedding force component only.
+  # For fhat correction modes, this is currently only supported with correction_mode: fhat_only.
   use_td_force_input: false
+  # If true, include the current baseline Vivana-TD fhat as an extra correction-network input.
+  use_td_fhat_input: false
   # Phase-input selector for TD hidden-state inputs:
   # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td),
   # theta -> sin/cos(theta_td), both -> [sin(phi_vy_td), cos(phi_vy_td), sin(theta_td), cos(theta_td)]

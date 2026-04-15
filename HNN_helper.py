@@ -29,6 +29,8 @@ FORCE_MAPPING_NRMSE_COEFF_KEY = "Force mapping NRMSE (coeff)"
 DOMINANT_FREQ_REL_ERROR_KEY = "Dominant frequency relative error"
 DISP_SPECTRAL_REL_ERROR_KEY = "Displacement spectral relative error"
 DISP_STD_REL_ERROR_KEY = "Displacement std relative error"
+FORCE_DOMINANT_FREQ_REL_ERROR_KEY = "Force dominant frequency relative error"
+FORCE_STD_REL_ERROR_KEY = "Force std relative error"
 # Backward-compat: VPINN still imports this legacy key name.
 MEAN_DISP_AMP_REL_ERROR_KEY = DISP_STD_REL_ERROR_KEY
 DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
@@ -65,6 +67,10 @@ TD_PHASE_INPUT_SOURCES = (
     "phi_vy",
     "theta",
     "both",
+)
+TD_FORCE_INPUT_SOURCES = (
+    "total",
+    "fcv",
 )
 
 
@@ -124,6 +130,39 @@ def resolve_td_phase_input_source(
     )
 
 
+def resolve_td_force_input_source(
+    raw_value: Any,
+    *,
+    default_enabled_source: str = "total",
+) -> str:
+    default_source = str(default_enabled_source).strip().lower()
+    if default_source not in TD_FORCE_INPUT_SOURCES:
+        raise ValueError(
+            f"default_enabled_source must be one of {TD_FORCE_INPUT_SOURCES}, got {default_enabled_source!r}."
+        )
+    if raw_value is None:
+        return "none"
+    if isinstance(raw_value, bool):
+        return default_source if raw_value else "none"
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        if not np.isfinite(float(raw_value)):
+            raise ValueError(f"Force input selector must be finite, got {raw_value!r}.")
+        return default_source if float(raw_value) != 0.0 else "none"
+    key = str(raw_value).strip().lower()
+    if key in {"", "0", "false", "none", "off", "no"}:
+        return "none"
+    if key in {"1", "true", "on", "yes"}:
+        return default_source
+    if key in {"total", "force", "fy"}:
+        return "total"
+    if key in {"fcv", "force_cv", "cv"}:
+        return "fcv"
+    raise ValueError(
+        "Force input selector must be one of: false, true, total, fcv. "
+        f"Got {raw_value!r}."
+    )
+
+
 def td_predict_sigma_from_mode(method_cfg: dict[str, Any]) -> bool:
     return bool(td_correction_mode_flags(resolve_td_correction_mode(method_cfg))["sigma_active"])
 
@@ -176,7 +215,8 @@ class ModelConfig:
     damping_c: float = 1e-4
     force_output: str = "force"  # "force" or "coefficient"
     use_reduced_velocity: bool = True
-    use_td_force_input: bool = False
+    use_td_force_input: bool | str = False
+    use_td_fhat_input: bool = False
     use_acceleration_input: bool = False
     sigma_min: float = 1e-6
     corr_init_mode: str = "zero"  # "zero" | "tiny" | "standard"
@@ -248,6 +288,7 @@ class LossConfig:
     ur_bin_size: float = 1e-6
     normalize_by_ur_bin_std: bool = False
     ur_bin_scale_eps: float = 1e-6
+    state_weight: float = 1.0
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
     rollout_loss_mode: str = "deterministic"  # "deterministic" | "stochastic_nll" | "stochastic_mse"
@@ -450,6 +491,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "ur_bin_size",
         "normalize_by_ur_bin_std",
         "ur_bin_scale_eps",
+        "state_weight",
         "rollout_det_weight",
         "rollout_det_steps",
         "rollout_loss_mode",
@@ -873,21 +915,6 @@ def log_validation_epoch(
         title_suffix=title_suffix,
         log_spectra=log_spectra,
     )
-    if log_spectra:
-        log_area_normalized_rollout_spectra(
-            writer,
-            epoch,
-            disp_t=t,
-            disp_true=y_true_norm,
-            disp_pred=rollout["y_norm"],
-            force_t=t_force_plot,
-            force_true=force_coeff_true,
-            force_pred=force_coeff_pred[:plot_len],
-            reduced_velocity=reduced_velocity_scalar,
-            tag=f"{tag_prefix}_spectra",
-            step=step,
-            title_suffix=title_suffix,
-        )
     return metrics
 
 
@@ -956,11 +983,6 @@ def compute_validation_metrics(
     if min_len_y > 1:
         y_pred_aligned = y_pred[:min_len_y]
         y_true_aligned = y_true[:min_len_y]
-        if y_true_aligned.size > 0 and y_pred_aligned.size > 0:
-            disp_spectral_rel = spectral_l1_relative_error(y_true_aligned, y_pred_aligned, dt)
-            if np.isfinite(disp_spectral_rel):
-                metrics[DISP_SPECTRAL_REL_ERROR_KEY] = float(disp_spectral_rel)
-
         true_dom = dominant_frequency(y_true_aligned, dt)
         pred_dom = dominant_frequency(y_pred_aligned, dt)
         dom_rel = relative_error(pred_dom, true_dom)
@@ -980,10 +1002,17 @@ def compute_validation_metrics(
         if min_len_force > 1:
             force_pred_aligned = force_total_pred[:min_len_force]
             force_true_aligned = force_target[:min_len_force]
-            if force_true_aligned.size > 0 and force_pred_aligned.size > 0:
-                force_spectral_rel = spectral_l1_relative_error(force_true_aligned, force_pred_aligned, dt)
-                if np.isfinite(force_spectral_rel):
-                    metrics[FORCE_SPECTRAL_REL_ERROR_KEY] = float(force_spectral_rel)
+            true_force_dom = dominant_frequency(force_true_aligned, dt)
+            pred_force_dom = dominant_frequency(force_pred_aligned, dt)
+            force_dom_rel = relative_error(pred_force_dom, true_force_dom)
+            if np.isfinite(force_dom_rel):
+                metrics[FORCE_DOMINANT_FREQ_REL_ERROR_KEY] = abs(float(force_dom_rel))
+
+            true_force_std = float(np.std(force_true_aligned))
+            pred_force_std = float(np.std(force_pred_aligned))
+            force_std_rel = relative_error(pred_force_std, true_force_std)
+            if np.isfinite(force_std_rel):
+                metrics[FORCE_STD_REL_ERROR_KEY] = abs(float(force_std_rel))
     return metrics
 
 
@@ -1888,6 +1917,7 @@ class PHVIV(nn.Module):
         fourier_sigma: float = 1.0,
         use_reduced_velocity: bool = True,
         use_td_force_input: bool = False,
+        use_td_fhat_input: bool = False,
         use_acceleration_input: bool = False,
         use_phi_input: bool | str = False,
         phi_input_source: str | None = None,
@@ -1915,6 +1945,7 @@ class PHVIV(nn.Module):
         self.force_output = force_output
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
+        self.use_td_fhat_input = bool(use_td_fhat_input)
         self.use_acceleration_input = bool(use_acceleration_input)
         resolved_phase_input_source = resolve_td_phase_input_source(
             use_phi_input if phi_input_source is None else phi_input_source
@@ -1924,12 +1955,16 @@ class PHVIV(nn.Module):
         self.use_sigma_inputs = bool(use_sigma_inputs)
         self.hard_force_symmetry = bool(hard_force_symmetry)
         if self.hard_force_symmetry and (
-            self.use_td_force_input or self.use_acceleration_input or self.use_phi_input or self.use_sigma_inputs
+            self.use_td_force_input
+            or self.use_td_fhat_input
+            or self.use_acceleration_input
+            or self.use_phi_input
+            or self.use_sigma_inputs
         ):
             raise ValueError(
                 "architecture.hard_force_symmetry requires use_td_force_input=false, "
-                "use_acceleration_input=false, use_phi_input=false, and use_sigma_inputs=false because those auxiliary "
-                "inputs do not have a defined sign-flip symmetry."
+                "use_td_fhat_input=false, use_acceleration_input=false, use_phi_input=false, and "
+                "use_sigma_inputs=false because those auxiliary inputs do not have a defined sign-flip symmetry."
             )
         self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
         sigma_min_val = float(sigma_min)
@@ -1945,6 +1980,7 @@ class PHVIV(nn.Module):
             self.base_feature_dim
             + (1 if self.use_reduced_velocity else 0)
             + (1 if self.use_td_force_input else 0)
+            + (1 if self.use_td_fhat_input else 0)
             + _td_hidden_input_dim(
                 use_phi_input=self.use_phi_input,
                 use_sigma_inputs=self.use_sigma_inputs,
@@ -2076,7 +2112,9 @@ class PHVIV(nn.Module):
         structural_mass = float(cfg.get("structural_mass", 16.79))
         force_output = str(cfg.get("force_output", "force")).strip().lower()
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
-        use_td_force_input = bool(cfg.get("use_td_force_input", False))
+        td_force_input_source = resolve_td_force_input_source(cfg.get("use_td_force_input", False))
+        use_td_force_input = td_force_input_source != "none"
+        use_td_fhat_input = bool(cfg.get("use_td_fhat_input", False))
         use_acceleration_input = bool(cfg.get("use_acceleration_input", False))
         phase_input_source = resolve_td_phase_input_source(
             cfg.get("phi_input_source", cfg.get("use_phi_input", False))
@@ -2126,6 +2164,7 @@ class PHVIV(nn.Module):
             fourier_sigma=fourier_sigma,
             use_reduced_velocity=use_reduced_velocity,
             use_td_force_input=use_td_force_input,
+            use_td_fhat_input=use_td_fhat_input,
             use_acceleration_input=use_acceleration_input,
             use_phi_input=use_phi_input,
             phi_input_source=(None if not use_phi_input else phase_input_source),
@@ -2240,6 +2279,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2272,6 +2312,20 @@ class PHVIV(nn.Module):
                 min=1e-12,
             )
             base_features = torch.cat([base_features, td_force_feat], dim=-1)
+        if self.use_td_fhat_input:
+            if td_fhat_input is None:
+                raise ValueError("td_fhat_input is required when model.use_td_fhat_input is enabled.")
+            if torch.is_tensor(td_fhat_input):
+                td_fhat = td_fhat_input.to(device=base_features.device, dtype=base_features.dtype)
+            else:
+                td_fhat = torch.as_tensor(td_fhat_input, device=base_features.device, dtype=base_features.dtype)
+            if td_fhat.ndim == base_features.ndim - 1:
+                td_fhat = td_fhat.unsqueeze(-1)
+            if td_fhat.ndim != base_features.ndim or td_fhat.shape[-1] != 1:
+                raise ValueError("td_fhat_input must be a scalar or have shape (..., 1).")
+            if td_fhat.shape[:-1] != base_features.shape[:-1]:
+                td_fhat = td_fhat.expand(base_features.shape[:-1] + (1,))
+            base_features = torch.cat([base_features, td_fhat], dim=-1)
         if self.use_acceleration_input:
             if acceleration_input is None:
                 raise ValueError("acceleration_input is required when model.use_acceleration_input is enabled.")
@@ -2322,6 +2376,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2331,6 +2386,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -2343,6 +2399,7 @@ class PHVIV(nn.Module):
             -x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -2356,6 +2413,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2368,6 +2426,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -2384,6 +2443,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2393,6 +2453,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -2406,6 +2467,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2416,6 +2478,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -2434,6 +2497,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2442,6 +2506,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -2456,6 +2521,7 @@ class PHVIV(nn.Module):
         x,
         reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
         td_force_input: torch.Tensor | np.ndarray | float | None = None,
+        td_fhat_input: torch.Tensor | np.ndarray | float | None = None,
         acceleration_input: torch.Tensor | np.ndarray | float | None = None,
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
@@ -2464,6 +2530,7 @@ class PHVIV(nn.Module):
             x,
             reduced_velocity=reduced_velocity,
             td_force_input=td_force_input,
+            td_fhat_input=td_fhat_input,
             acceleration_input=acceleration_input,
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
@@ -3984,10 +4051,11 @@ def log_final_rollout_errors_vs_ur(
     metrics_all = [p[1] for p in pairs]
 
     series = [
-        (DISP_SPECTRAL_REL_ERROR_KEY, DISP_SPECTRAL_REL_ERROR_KEY),
+        (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
         (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
         (DISP_STD_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
-        (FORCE_SPECTRAL_REL_ERROR_KEY, FORCE_SPECTRAL_REL_ERROR_KEY),
+        (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, FORCE_DOMINANT_FREQ_REL_ERROR_KEY),
+        (FORCE_STD_REL_ERROR_KEY, FORCE_STD_REL_ERROR_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
     for ur_val, metrics in pairs:
