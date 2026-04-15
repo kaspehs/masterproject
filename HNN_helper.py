@@ -64,6 +64,7 @@ TD_CORRECTION_MODES = (
 TD_PHASE_INPUT_SOURCES = (
     "phi_vy",
     "theta",
+    "both",
 )
 
 
@@ -115,8 +116,10 @@ def resolve_td_phase_input_source(
         return "phi_vy"
     if key == "theta":
         return "theta"
+    if key in {"both", "phi_theta", "theta_phi", "phi+theta", "theta+phi"}:
+        return "both"
     raise ValueError(
-        "Phase input selector must be one of: false, true, phi_vy, theta. "
+        "Phase input selector must be one of: false, true, phi_vy, theta, both. "
         f"Got {raw_value!r}."
     )
 
@@ -253,6 +256,10 @@ class LossConfig:
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
     rollout_det_amplitude_normalized_mse: bool = False
+    rollout_disp_std_weight: float = 0.0
+    rollout_disp_std_normalize_by_true: bool | None = None  # None -> reuse rollout_det_amplitude_normalized_mse
+    rollout_disp_spectral_weight: float | None = None  # preferred name; falls back to rollout_disp_psd_weight when unset
+    rollout_disp_spectral_loss: str = "psd"  # "psd" | "dominant_frequency"
     rollout_disp_psd_weight: float = 0.0
     rollout_disp_psd_peak_rel_bandwidth: float = 0.0  # <=0 disables narrowbanding
     rollout_disp_psd_use_hann_window: bool = True
@@ -451,6 +458,10 @@ def parse_config(raw: dict[str, Any]) -> Config:
         "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
         "rollout_det_amplitude_normalized_mse",
+        "rollout_disp_std_weight",
+        "rollout_disp_std_normalize_by_true",
+        "rollout_disp_spectral_weight",
+        "rollout_disp_spectral_loss",
         "rollout_disp_psd_weight",
         "rollout_disp_psd_peak_rel_bandwidth",
         "rollout_disp_psd_use_hann_window",
@@ -1938,6 +1949,7 @@ class PHVIV(nn.Module):
                 use_phi_input=self.use_phi_input,
                 use_sigma_inputs=self.use_sigma_inputs,
                 use_acceleration_input=self.use_acceleration_input,
+                phase_input_source=(self.phi_input_source if self.use_phi_input else False),
             )
         )
 
@@ -2281,14 +2293,15 @@ class PHVIV(nn.Module):
                 raise ValueError("phi_input is required when model.use_phi_input is enabled.")
             phi_feat = phi_input if torch.is_tensor(phi_input) else torch.as_tensor(phi_input, device=base_features.device, dtype=base_features.dtype)
             phi_feat = phi_feat.to(device=base_features.device, dtype=base_features.dtype)
-            if phi_feat.ndim == 1 and base_features.ndim == 2 and phi_feat.shape[0] == 2:
-                phi_feat = phi_feat.view(1, 2)
-            if phi_feat.ndim != base_features.ndim or phi_feat.shape[-1] != 2:
+            expected_phi_dim = td_phase_input_dim(self.phi_input_source if self.use_phi_input else False)
+            if phi_feat.ndim == 1 and base_features.ndim == 2 and phi_feat.shape[0] == expected_phi_dim:
+                phi_feat = phi_feat.view(1, expected_phi_dim)
+            if phi_feat.ndim != base_features.ndim or phi_feat.shape[-1] != expected_phi_dim:
                 raise ValueError(
-                    "phi_input must have shape (..., 2) containing sin/cos of the configured TD phase input."
+                    f"phi_input must have shape (..., {expected_phi_dim}) containing the configured TD phase features."
                 )
             if phi_feat.shape[:-1] != base_features.shape[:-1]:
-                phi_feat = phi_feat.expand(base_features.shape[:-1] + (2,))
+                phi_feat = phi_feat.expand(base_features.shape[:-1] + (expected_phi_dim,))
             base_features = torch.cat([base_features, phi_feat], dim=-1)
         if self.use_sigma_inputs:
             if sigma_inputs is None:
@@ -3011,8 +3024,8 @@ def log_displacement_plots(
     title_suffix: str = "",
     log_spectra: bool = False,
 ):
-    fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
-    ax_full, ax_diff, ax_zoom = axes
+    fig, axes = plt.subplots(2, 1, figsize=(6, 6.5), sharex=False)
+    ax_full, ax_diff = axes
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
 
     ax_full.plot(t, y_true_norm, label="y/D (true)")
@@ -3032,14 +3045,6 @@ def log_displacement_plots(
     ax_diff.set_title(f"Difference (pred - true) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_diff.legend(loc="upper right")
 
-    ax_zoom.plot(t[zoom_mask], y_true_norm[zoom_mask], label="y/D (true)")
-    ax_zoom.plot(t[zoom_mask], y_pred_norm[zoom_mask], label="y/D (pred)")
-    ax_zoom.set_xlabel("time")
-    ax_zoom.set_ylabel("y/D")
-    ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Normalized rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
-    ax_zoom.legend(loc="upper right")
-
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_displacement", fig, epoch + 1 if step is None else step)
     plt.close(fig)
@@ -3054,14 +3059,22 @@ def log_force_plots(
     reduced_velocity: float | None = None,
     *,
     force_coeff_baseline=None,
+    force_coeff_delta_pred=None,
+    force_coeff_sigma_pred=None,
+    delta_fhat_pred=None,
+    delta_fhat_t=None,
     baseline_label: str = "C_F (Vivana-TD)",
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
     log_spectra: bool = False,
 ):
-    fig, axes = plt.subplots(3, 1, figsize=(6, 9), sharex=False)
-    ax_full, ax_diff, ax_zoom = axes
+    has_delta_fhat = delta_fhat_pred is not None
+    fig, axes = plt.subplots(3 if has_delta_fhat else 2, 1, figsize=(6, 9 if has_delta_fhat else 6.5), sharex=False)
+    if has_delta_fhat:
+        ax_full, ax_diff, ax_delta_fhat = axes
+    else:
+        ax_full, ax_diff = axes
     ur_title = f" (U_r={float(reduced_velocity):.3f})" if reduced_velocity is not None else ""
     ax_full.plot(t, force_coeff_true, label="C_F (true)", color="tab:blue", alpha=0.7)
     ax_full.plot(t, force_coeff_pred, label="C_F (pred)", color="tab:purple")
@@ -3085,15 +3098,59 @@ def log_force_plots(
     ax_diff.set_title(f"Force coefficient difference (pred - true) epoch {epoch+1}{ur_title}{title_suffix}")
     ax_diff.legend(loc="upper right")
 
-    ax_zoom.plot(t[zoom_mask], force_coeff_true[zoom_mask], label="C_F (true)", color="tab:blue", alpha=0.7)
-    ax_zoom.plot(t[zoom_mask], force_coeff_pred[zoom_mask], label="C_F (pred)", color="tab:purple")
-    if force_coeff_baseline is not None:
-        ax_zoom.plot(t[zoom_mask], force_coeff_baseline[zoom_mask], label=baseline_label, color="tab:green", alpha=0.85)
-    ax_zoom.set_xlabel("time")
-    ax_zoom.set_ylabel("C_F")
-    ax_zoom.grid(True, alpha=0.3)
-    ax_zoom.set_title(f"Force coefficient rollout (first 1s) epoch {epoch+1}{ur_title}{title_suffix}")
-    ax_zoom.legend(loc="upper right")
+    if has_delta_fhat:
+        ax_corr = ax_delta_fhat
+        ax_corr_right = ax_corr.twinx()
+        delta_fhat_arr = np.asarray(delta_fhat_pred, dtype=float).reshape(-1)
+        if delta_fhat_t is None:
+            delta_fhat_time = np.asarray(t, dtype=float)[: delta_fhat_arr.size]
+        else:
+            delta_fhat_time = np.asarray(delta_fhat_t, dtype=float).reshape(-1)[: delta_fhat_arr.size]
+        plot_len = int(min(delta_fhat_arr.size, delta_fhat_time.size))
+        coeff_handles: list[Any] = []
+        coeff_labels: list[str] = []
+        if force_coeff_delta_pred is not None:
+            delta_cf_arr = np.asarray(force_coeff_delta_pred, dtype=float).reshape(-1)
+            cf_len = int(min(delta_cf_arr.size, delta_fhat_time.size))
+            if cf_len > 0:
+                line_delta_cf = ax_corr.plot(
+                    delta_fhat_time[:cf_len],
+                    delta_cf_arr[:cf_len],
+                    label="predicted ΔC_F",
+                    color="tab:orange",
+                )[0]
+                coeff_handles.append(line_delta_cf)
+                coeff_labels.append("predicted ΔC_F")
+        if force_coeff_sigma_pred is not None:
+            sigma_cf_arr = np.asarray(force_coeff_sigma_pred, dtype=float).reshape(-1)
+            sigma_len = int(min(sigma_cf_arr.size, delta_fhat_time.size))
+            if sigma_len > 0:
+                line_sigma_cf = ax_corr.plot(
+                    delta_fhat_time[:sigma_len],
+                    sigma_cf_arr[:sigma_len],
+                    label="predicted σC_F",
+                    color="tab:green",
+                )[0]
+                coeff_handles.append(line_sigma_cf)
+                coeff_labels.append("predicted σC_F")
+        fhat_handle = None
+        if plot_len > 0:
+            fhat_handle = ax_corr_right.plot(
+                delta_fhat_time[:plot_len],
+                delta_fhat_arr[:plot_len],
+                label="predicted Δfhat",
+                color="tab:red",
+            )[0]
+        ax_corr.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+        ax_corr.set_xlabel("time")
+        ax_corr.set_ylabel("ΔC_F / σC_F")
+        ax_corr_right.set_ylabel("Δfhat")
+        ax_corr.grid(True, alpha=0.3)
+        ax_corr.set_title(f"Predicted correction outputs rollout epoch {epoch+1}{ur_title}{title_suffix}")
+        legend_handles = coeff_handles + ([fhat_handle] if fhat_handle is not None else [])
+        legend_labels = coeff_labels + (["predicted Δfhat"] if fhat_handle is not None else [])
+        if legend_handles:
+            ax_corr.legend(legend_handles, legend_labels, loc="upper right")
 
     plt.tight_layout()
     writer.add_figure(f"{tag_prefix}_force", fig, epoch + 1 if step is None else step)
@@ -4575,9 +4632,26 @@ def _recompute_td_baseline_on_grid(
     }
 
 
-def _td_hidden_input_dim(*, use_phi_input: bool, use_sigma_inputs: bool, use_acceleration_input: bool = False) -> int:
+def td_phase_input_dim(phase_input_source: Any) -> int:
+    resolved = resolve_td_phase_input_source(phase_input_source)
+    if resolved == "none":
+        return 0
+    if resolved in {"phi_vy", "theta"}:
+        return 2
+    if resolved == "both":
+        return 4
+    raise ValueError(f"Unsupported phase_input_source {phase_input_source!r}.")
+
+
+def _td_hidden_input_dim(
+    *,
+    use_phi_input: bool,
+    use_sigma_inputs: bool,
+    use_acceleration_input: bool = False,
+    phase_input_source: Any = False,
+) -> int:
     return (
-        (2 if bool(use_phi_input) else 0)
+        (td_phase_input_dim(phase_input_source) if bool(use_phi_input) else 0)
         + (2 if bool(use_sigma_inputs) else 0)
         + (1 if bool(use_acceleration_input) else 0)
     )
@@ -4681,6 +4755,31 @@ def td_hidden_inputs_from_context_torch(
         phi_dy = torch.atan2(sin_phi_dy, cos_phi_dy)
         phase_angle = torch.atan2(torch.sin(phi_dy - phi_td), torch.cos(phi_dy - phi_td))
         phi_input = torch.cat([torch.sin(phase_angle), torch.cos(phase_angle)], dim=-1)
+    elif resolved_phase_source == "both":
+        if velocity is None:
+            raise ValueError("velocity is required to build combined phi/theta TD phase inputs.")
+        if int(td_context.shape[-1]) < 5:
+            raise ValueError("td_context must contain flow_speed to build combined phi/theta TD phase inputs.")
+        velocity_t = _broadcast_td_hidden_param_torch(velocity, like=like, name="velocity")
+        flow_speed = td_context[..., 4:5]
+        ddy_td = td_context[..., 0:1]
+        speed_mag = torch.sqrt(torch.clamp(flow_speed * flow_speed + velocity_t * velocity_t, min=1.0e-12))
+        projection = flow_speed / torch.clamp(speed_mag, min=1.0e-12)
+        dy_r = velocity_t * projection
+        ddy_r = ddy_td * projection
+        cos_phi_dy = dy_r / torch.clamp(sig_dy_td, min=1.0e-12)
+        sin_phi_dy = -ddy_r / torch.clamp(sig_ddy_td, min=1.0e-12)
+        phi_dy = torch.atan2(sin_phi_dy, cos_phi_dy)
+        theta_td = torch.atan2(torch.sin(phi_dy - phi_td), torch.cos(phi_dy - phi_td))
+        phi_input = torch.cat(
+            [
+                torch.sin(phi_td),
+                torch.cos(phi_td),
+                torch.sin(theta_td),
+                torch.cos(theta_td),
+            ],
+            dim=-1,
+        )
     elif resolved_phase_source == "phi_vy":
         phi_input = torch.cat([torch.sin(phi_td), torch.cos(phi_td)], dim=-1)
     else:

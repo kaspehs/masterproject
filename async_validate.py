@@ -1260,6 +1260,7 @@ def _run_vpinn_td_correction_validation(
             use_td_force_input=use_td_force_input,
             use_acceleration_input=use_acceleration_input,
             use_phi_input=use_phi_input,
+            phase_input_source=phase_input_source,
             use_sigma_inputs=use_sigma_inputs,
         ),
         output_dim=_vpinn_output_dim(mean_active=mean_active, sigma_active=probabilistic, fhat_active=fhat_active, d=1),

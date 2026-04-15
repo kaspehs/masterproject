@@ -155,7 +155,8 @@ vpinn:
   # Invalid for correction_mode values that include fhat correction.
   use_td_force_input: false
   # Phase-input selector for TD hidden-state inputs:
-  # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td), theta -> sin/cos(theta_td)
+  # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td),
+  # theta -> sin/cos(theta_td), both -> [sin(phi_vy_td), cos(phi_vy_td), sin(theta_td), cos(theta_td)]
   use_phi_input: false
   # If true, append both normalized TD sigma states:
   # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).

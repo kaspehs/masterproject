@@ -675,25 +675,23 @@ def _group_sample_indices_by_dt(
     return grouped
 
 
-def _area_normalized_psd_error_common_dt_torch(
+def _rollout_disp_spectra_common_dt_torch(
     *,
     true_signal: torch.Tensor,
     pred_signal: torch.Tensor,
     dt: float,
-    peak_rel_bandwidth: float = 0.0,
     use_hann_window: bool = True,
-    eps: float = 1e-12,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if true_signal.ndim != 2 or pred_signal.ndim != 2:
-        raise ValueError("PSD loss expects [batch, time] tensors.")
+        raise ValueError("Spectral rollout loss expects [batch, time] tensors.")
     if true_signal.shape != pred_signal.shape:
-        raise ValueError("PSD loss requires true and predicted signals with matching shapes.")
+        raise ValueError("Spectral rollout loss requires true and predicted signals with matching shapes.")
     compute_dtype = torch.float32 if true_signal.dtype in {torch.float16, torch.bfloat16} else true_signal.dtype
     true_signal = true_signal.to(dtype=compute_dtype)
     pred_signal = pred_signal.to(dtype=compute_dtype)
     batch_size, length = true_signal.shape
     if batch_size < 1 or length < 4:
-        return true_signal.new_zeros(())
+        return None
 
     true_centered = true_signal - torch.mean(true_signal, dim=1, keepdim=True)
     pred_centered = pred_signal - torch.mean(pred_signal, dim=1, keepdim=True)
@@ -706,31 +704,68 @@ def _area_normalized_psd_error_common_dt_torch(
     true_psd = torch.abs(true_fft) ** 2
     pred_psd = torch.abs(pred_fft) ** 2
     freqs = torch.fft.rfftfreq(length, d=float(dt), device=true_signal.device)
-
     base_mask = torch.isfinite(freqs) & (freqs > 0.0)
     if int(base_mask.sum().item()) < 2:
-        return true_signal.new_zeros(())
+        return None
+    return true_psd, pred_psd, freqs, base_mask
 
+
+def _spectral_band_mask_from_true_peak_torch(
+    *,
+    true_psd: torch.Tensor,
+    freqs: torch.Tensor,
+    base_mask: torch.Tensor,
+    peak_rel_bandwidth: float,
+) -> torch.Tensor:
+    batch_size = int(true_psd.shape[0])
     band_mask = base_mask.view(1, -1).expand(batch_size, -1)
     rel_bw = float(peak_rel_bandwidth)
-    if np.isfinite(rel_bw) and rel_bw > 0.0:
-        pos_freqs = freqs[base_mask]
-        peak_idx = torch.argmax(true_psd[:, base_mask], dim=1)
-        peak_freq = pos_freqs[peak_idx]
-        freq_res = float(freqs[1].item() - freqs[0].item()) if freqs.numel() > 1 else float(dt)
-        min_half_width = max(0.5 * freq_res, 1.0e-12)
-        half_width = torch.clamp(peak_freq * rel_bw, min=min_half_width)
-        band_mask = base_mask.view(1, -1) & (
-            torch.abs(freqs.view(1, -1) - peak_freq.view(-1, 1)) <= half_width.view(-1, 1)
-        )
-        fallback = band_mask.sum(dim=1) < 2
-        if torch.any(fallback):
-            band_mask = torch.where(fallback.view(-1, 1), base_mask.view(1, -1), band_mask)
+    if not (np.isfinite(rel_bw) and rel_bw > 0.0):
+        return band_mask
 
+    pos_freqs = freqs[base_mask]
+    peak_idx = torch.argmax(true_psd[:, base_mask], dim=1)
+    peak_freq = pos_freqs[peak_idx]
+    freq_res = float(freqs[1].item() - freqs[0].item()) if freqs.numel() > 1 else float("nan")
+    min_half_width = max(0.5 * freq_res if np.isfinite(freq_res) and freq_res > 0.0 else 0.0, 1.0e-12)
+    half_width = torch.clamp(peak_freq * rel_bw, min=min_half_width)
+    band_mask = base_mask.view(1, -1) & (
+        torch.abs(freqs.view(1, -1) - peak_freq.view(-1, 1)) <= half_width.view(-1, 1)
+    )
+    fallback = band_mask.sum(dim=1) < 2
+    if torch.any(fallback):
+        band_mask = torch.where(fallback.view(-1, 1), base_mask.view(1, -1), band_mask)
+    return band_mask
+
+
+def _area_normalized_psd_error_common_dt_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    dt: float,
+    peak_rel_bandwidth: float = 0.0,
+    use_hann_window: bool = True,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    spec = _rollout_disp_spectra_common_dt_torch(
+        true_signal=true_signal,
+        pred_signal=pred_signal,
+        dt=dt,
+        use_hann_window=use_hann_window,
+    )
+    if spec is None:
+        return true_signal.new_zeros(())
+    true_psd, pred_psd, freqs, base_mask = spec
+    band_mask = _spectral_band_mask_from_true_peak_torch(
+        true_psd=true_psd,
+        freqs=freqs,
+        base_mask=base_mask,
+        peak_rel_bandwidth=peak_rel_bandwidth,
+    )
     mask_f = band_mask.to(dtype=true_psd.dtype)
     p_true = torch.clamp(true_psd, min=0.0) * mask_f
     p_pred = torch.clamp(pred_psd, min=0.0) * mask_f
-    freq_grid = freqs.view(1, -1).expand(batch_size, -1).to(dtype=true_psd.dtype)
+    freq_grid = freqs.view(1, -1).expand(int(true_psd.shape[0]), -1).to(dtype=true_psd.dtype)
     area_true = torch.trapz(p_true, freq_grid, dim=1)
     area_pred = torch.trapz(p_pred, freq_grid, dim=1)
     valid = (area_true > float(eps)) & (area_pred > float(eps)) & (band_mask.sum(dim=1) >= 2)
@@ -793,6 +828,120 @@ def _area_normalized_psd_error_torch(
     return torch.sum(loss_tensor * weight_tensor) / torch.clamp(weight_tensor.sum(), min=1.0)
 
 
+def _soft_dominant_frequency_from_psd_torch(
+    *,
+    psd: torch.Tensor,
+    freqs: torch.Tensor,
+    band_mask: torch.Tensor,
+    sharpness: float = 12.0,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mask_f = band_mask.to(dtype=psd.dtype)
+    p_masked = torch.clamp(psd, min=0.0) * mask_f
+    peak_power = torch.amax(p_masked, dim=1, keepdim=True)
+    valid = (peak_power[:, 0] > float(eps)) & (band_mask.sum(dim=1) >= 1)
+    scaled = p_masked / peak_power.clamp_min(float(eps))
+    weights = torch.pow(torch.clamp(scaled, min=0.0), float(sharpness)) * mask_f
+    weight_sum = torch.sum(weights, dim=1, keepdim=True)
+    freq_grid = freqs.view(1, -1).to(dtype=psd.dtype)
+    dominant = torch.sum(weights * freq_grid, dim=1) / weight_sum.clamp_min(float(eps)).view(-1)
+    dominant = torch.where(valid, dominant, torch.zeros_like(dominant))
+    return dominant, valid
+
+
+def _dominant_frequency_error_common_dt_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    dt: float,
+    peak_rel_bandwidth: float = 0.0,
+    use_hann_window: bool = True,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    spec = _rollout_disp_spectra_common_dt_torch(
+        true_signal=true_signal,
+        pred_signal=pred_signal,
+        dt=dt,
+        use_hann_window=use_hann_window,
+    )
+    if spec is None:
+        return true_signal.new_zeros(())
+    true_psd, pred_psd, freqs, base_mask = spec
+    band_mask = _spectral_band_mask_from_true_peak_torch(
+        true_psd=true_psd,
+        freqs=freqs,
+        base_mask=base_mask,
+        peak_rel_bandwidth=peak_rel_bandwidth,
+    )
+    true_dom, true_valid = _soft_dominant_frequency_from_psd_torch(
+        psd=true_psd,
+        freqs=freqs,
+        band_mask=band_mask,
+        eps=eps,
+    )
+    pred_dom, pred_valid = _soft_dominant_frequency_from_psd_torch(
+        psd=pred_psd,
+        freqs=freqs,
+        band_mask=band_mask,
+        eps=eps,
+    )
+    valid = true_valid & pred_valid & (true_dom > float(eps))
+    if not torch.any(valid):
+        return true_signal.new_zeros(())
+    rel = torch.abs(pred_dom - true_dom) / true_dom.clamp_min(float(eps))
+    rel = torch.where(valid, rel, torch.zeros_like(rel))
+    return torch.sum(rel) / torch.clamp(valid.to(dtype=rel.dtype).sum(), min=1.0)
+
+
+def _dominant_frequency_error_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    dt: float | torch.Tensor,
+    peak_rel_bandwidth: float = 0.0,
+    use_hann_window: bool = True,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    if true_signal.ndim != 2 or pred_signal.ndim != 2:
+        raise ValueError("Dominant-frequency loss expects [batch, time] tensors.")
+    if true_signal.shape != pred_signal.shape:
+        raise ValueError("Dominant-frequency loss requires true and predicted signals with matching shapes.")
+    batch_size = int(true_signal.shape[0])
+    if batch_size < 1:
+        return true_signal.new_zeros(())
+    dt_values = _normalize_psd_dt_values(dt, batch_size=batch_size)
+    if _dt_values_effectively_constant(dt_values):
+        return _dominant_frequency_error_common_dt_torch(
+            true_signal=true_signal,
+            pred_signal=pred_signal,
+            dt=float(torch.mean(dt_values).item()),
+            peak_rel_bandwidth=peak_rel_bandwidth,
+            use_hann_window=use_hann_window,
+            eps=eps,
+        )
+
+    grouped = _group_sample_indices_by_dt(dt_values)
+    losses: list[torch.Tensor] = []
+    weights: list[float] = []
+    for group_dt, group_indices in grouped:
+        losses.append(
+            _dominant_frequency_error_common_dt_torch(
+                true_signal=true_signal.index_select(0, group_indices),
+                pred_signal=pred_signal.index_select(0, group_indices),
+                dt=group_dt,
+                peak_rel_bandwidth=peak_rel_bandwidth,
+                use_hann_window=use_hann_window,
+                eps=eps,
+            )
+        )
+        weights.append(float(group_indices.numel()))
+    if not losses:
+        return true_signal.new_zeros(())
+    weight_tensor = torch.tensor(weights, device=true_signal.device, dtype=losses[0].dtype)
+    loss_tensor = torch.stack(losses)
+    return torch.sum(loss_tensor * weight_tensor) / torch.clamp(weight_tensor.sum(), min=1.0)
+
+
 def _target_centered_rms_scale_torch(
     target: torch.Tensor,
     *,
@@ -802,6 +951,44 @@ def _target_centered_rms_scale_torch(
     centered = target - torch.mean(target, dim=time_dim, keepdim=True)
     scale = torch.sqrt(torch.mean(centered * centered, dim=time_dim, keepdim=True))
     return torch.clamp(scale, min=float(eps))
+
+
+def _displacement_std_error_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    normalize_by_true: bool = False,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if true_signal.ndim != 2 or pred_signal.ndim != 2:
+        raise ValueError("Std rollout loss expects [batch, time] tensors.")
+    if true_signal.shape != pred_signal.shape:
+        raise ValueError("Std rollout loss requires true and predicted signals with matching shapes.")
+    compute_dtype = torch.float32 if true_signal.dtype in {torch.float16, torch.bfloat16} else true_signal.dtype
+    true_signal = true_signal.to(dtype=compute_dtype)
+    pred_signal = pred_signal.to(dtype=compute_dtype)
+    if int(true_signal.shape[0]) < 1 or int(true_signal.shape[1]) < 2:
+        return true_signal.new_zeros(())
+
+    true_centered = true_signal - torch.mean(true_signal, dim=1, keepdim=True)
+    pred_centered = pred_signal - torch.mean(pred_signal, dim=1, keepdim=True)
+    true_std = torch.sqrt(torch.mean(true_centered * true_centered, dim=1))
+    pred_std = torch.sqrt(torch.mean(pred_centered * pred_centered, dim=1))
+    loss = torch.abs(pred_std - true_std)
+    if bool(normalize_by_true):
+        loss = loss / true_std.clamp_min(float(eps))
+    return torch.mean(loss)
+
+
+def _normalize_rollout_disp_spectral_loss_mode(raw_mode: Any) -> str:
+    key = str(raw_mode).strip().lower()
+    if key in {"", "psd", "psd_shape", "area_normalized_psd", "area_normalized"}:
+        return "psd"
+    if key in {"dominant_frequency", "dominant_freq", "dom_freq", "peak_frequency"}:
+        return "dominant_frequency"
+    raise ValueError(
+        "loss.rollout_disp_spectral_loss must be one of: psd, dominant_frequency."
+    )
 
 
 def _td_correction_rollout_losses_from_batch(
@@ -822,7 +1009,10 @@ def _td_correction_rollout_losses_from_batch(
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
     amplitude_normalized_mse: bool = False,
-    compute_disp_psd_loss: bool = False,
+    compute_disp_std_loss: bool = False,
+    disp_std_normalize_by_true: bool = False,
+    compute_disp_spectral_loss: bool = False,
+    disp_spectral_loss_mode: str = "psd",
     disp_psd_peak_rel_bandwidth: float = 0.0,
     disp_psd_use_hann_window: bool = True,
 ) -> dict[str, torch.Tensor]:
@@ -848,7 +1038,8 @@ def _td_correction_rollout_losses_from_batch(
 
     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
     dt_values = dt_roll[:, 0]
-    disp_psd_loss = z_traj.new_zeros(())
+    disp_std_loss = z_traj.new_zeros(())
+    disp_spectral_loss = z_traj.new_zeros(())
     if mode_key == "deterministic" or not sigma_active:
         z_pred, _force_seq, _corr_seq, _sigma_seq, _delta_fhat_seq = _td_correction_state_rollout(
             model=model,
@@ -875,17 +1066,33 @@ def _td_correction_rollout_losses_from_batch(
             trajectory_loss = torch.mean(torch.sum(err * err, dim=2))
         else:
             trajectory_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
-        if compute_disp_psd_loss:
-            disp_psd_loss = _area_normalized_psd_error_torch(
+        if compute_disp_std_loss:
+            disp_std_loss = _displacement_std_error_torch(
                 true_signal=z_traj[:, :, 0],
                 pred_signal=z_pred[:, :, 0],
-                dt=dt_values,
-                peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
-                use_hann_window=disp_psd_use_hann_window,
+                normalize_by_true=disp_std_normalize_by_true,
             )
+        if compute_disp_spectral_loss:
+            if disp_spectral_loss_mode == "dominant_frequency":
+                disp_spectral_loss = _dominant_frequency_error_torch(
+                    true_signal=z_traj[:, :, 0],
+                    pred_signal=z_pred[:, :, 0],
+                    dt=dt_values,
+                    peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                    use_hann_window=disp_psd_use_hann_window,
+                )
+            else:
+                disp_spectral_loss = _area_normalized_psd_error_torch(
+                    true_signal=z_traj[:, :, 0],
+                    pred_signal=z_pred[:, :, 0],
+                    dt=dt_values,
+                    peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                    use_hann_window=disp_psd_use_hann_window,
+                )
         return {
             "trajectory_loss": trajectory_loss,
-            "disp_psd_loss": disp_psd_loss,
+            "disp_std_loss": disp_std_loss,
+            "disp_spectral_loss": disp_spectral_loss,
         }
 
     samples = max(1, int(rollout_stochastic_samples))
@@ -934,18 +1141,35 @@ def _td_correction_rollout_losses_from_batch(
         nll = 0.5 * (((z_traj - mu) ** 2) / var + torch.log(var))
         per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
         trajectory_loss = torch.mean(per)
-    if compute_disp_psd_loss:
-        z_for_psd = torch.mean(z_pred, dim=0)
-        disp_psd_loss = _area_normalized_psd_error_torch(
+    if compute_disp_std_loss:
+        z_for_std = torch.mean(z_pred, dim=0)
+        disp_std_loss = _displacement_std_error_torch(
             true_signal=z_traj[:, :, 0],
-            pred_signal=z_for_psd[:, :, 0],
-            dt=dt_values,
-            peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
-            use_hann_window=disp_psd_use_hann_window,
+            pred_signal=z_for_std[:, :, 0],
+            normalize_by_true=disp_std_normalize_by_true,
         )
+    if compute_disp_spectral_loss:
+        z_for_psd = torch.mean(z_pred, dim=0)
+        if disp_spectral_loss_mode == "dominant_frequency":
+            disp_spectral_loss = _dominant_frequency_error_torch(
+                true_signal=z_traj[:, :, 0],
+                pred_signal=z_for_psd[:, :, 0],
+                dt=dt_values,
+                peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                use_hann_window=disp_psd_use_hann_window,
+            )
+        else:
+            disp_spectral_loss = _area_normalized_psd_error_torch(
+                true_signal=z_traj[:, :, 0],
+                pred_signal=z_for_psd[:, :, 0],
+                dt=dt_values,
+                peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                use_hann_window=disp_psd_use_hann_window,
+            )
     return {
         "trajectory_loss": trajectory_loss,
-        "disp_psd_loss": disp_psd_loss,
+        "disp_std_loss": disp_std_loss,
+        "disp_spectral_loss": disp_spectral_loss,
     }
 
 
@@ -985,7 +1209,10 @@ def _td_correction_rollout_loss_from_batch(
         rollout_stochastic_samples=rollout_stochastic_samples,
         rollout_noise_scale=rollout_noise_scale,
         amplitude_normalized_mse=amplitude_normalized_mse,
-        compute_disp_psd_loss=False,
+        compute_disp_std_loss=False,
+        disp_std_normalize_by_true=False,
+        compute_disp_spectral_loss=False,
+        disp_spectral_loss_mode="psd",
         disp_psd_peak_rel_bandwidth=0.0,
     )["trajectory_loss"]
 
@@ -1429,6 +1656,10 @@ def _log_td_correction_rollout_validation(
                 create_zoom_mask(force_t),
                 reduced_velocity=ur_val,
                 force_coeff_baseline=force_td_full[:n_force],
+                force_coeff_delta_pred=(corr_roll if mean_active else None),
+                force_coeff_sigma_pred=(sigma_roll if predict_sigma else None),
+                delta_fhat_pred=(delta_fhat_roll if fhat_active else None),
+                delta_fhat_t=(t_np[1 : 1 + delta_fhat_roll.shape[0]] if fhat_active else None),
                 baseline_label="C_F (Vivana-TD)",
                 tag_prefix=tag_prefix,
                 step=step,
@@ -2920,10 +3151,24 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     corr_init_mode, corr_init_tiny_std = _resolve_td_correction_init_settings(hnn_cfg, model_cfg)
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
-    rollout_disp_psd_weight = float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
+    rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
+    rollout_disp_spectral_weight_raw = getattr(loss_cfg, "rollout_disp_spectral_weight", None)
+    if rollout_disp_spectral_weight_raw is None:
+        rollout_disp_spectral_weight = float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
+    else:
+        rollout_disp_spectral_weight = float(rollout_disp_spectral_weight_raw)
+    rollout_disp_spectral_loss = _normalize_rollout_disp_spectral_loss_mode(
+        getattr(loss_cfg, "rollout_disp_spectral_loss", "psd")
+    )
     rollout_disp_psd_peak_rel_bandwidth = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
     rollout_disp_psd_use_hann_window = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
     rollout_det_amplitude_normalized_mse = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
+    rollout_disp_std_normalize_raw = getattr(loss_cfg, "rollout_disp_std_normalize_by_true", None)
+    rollout_disp_std_normalize_by_true = (
+        rollout_det_amplitude_normalized_mse
+        if rollout_disp_std_normalize_raw is None
+        else bool(rollout_disp_std_normalize_raw)
+    )
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
@@ -2969,11 +3214,17 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("loss.rollout_det_steps_warmup_epochs must be non-negative.")
     if rollout_det_weight < 0.0:
         raise ValueError("loss.rollout_det_weight must be non-negative.")
-    if rollout_disp_psd_weight < 0.0:
-        raise ValueError("loss.rollout_disp_psd_weight must be non-negative.")
+    if rollout_disp_std_weight < 0.0:
+        raise ValueError("loss.rollout_disp_std_weight must be non-negative.")
+    if rollout_disp_spectral_weight < 0.0:
+        raise ValueError("loss.rollout_disp_spectral_weight must be non-negative.")
     if not np.isfinite(rollout_disp_psd_peak_rel_bandwidth) or rollout_disp_psd_peak_rel_bandwidth < 0.0:
         raise ValueError("loss.rollout_disp_psd_peak_rel_bandwidth must be finite and non-negative.")
-    rollout_loss_active = (rollout_det_weight > 0.0) or (rollout_disp_psd_weight > 0.0)
+    rollout_loss_active = (
+        (rollout_det_weight > 0.0)
+        or (rollout_disp_std_weight > 0.0)
+        or (rollout_disp_spectral_weight > 0.0)
+    )
     if rollout_loss_active and rollout_det_steps < 1 and rollout_det_steps_final < 1:
         raise ValueError(
             "loss.rollout_det_steps or loss.rollout_det_steps_final must be >= 1 when "
@@ -3212,7 +3463,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"val_samples_per_ur={validation_samples_per_ur}"
         ),
         (
-            f"Rollout setup: det_weight={rollout_det_weight:g}, psd_weight={rollout_disp_psd_weight:g}, "
+            f"Rollout setup: det_weight={rollout_det_weight:g}, std_weight={rollout_disp_std_weight:g}, "
+            f"spectral_weight={rollout_disp_spectral_weight:g}, "
             f"steps={current_rollout_det_steps}, "
             f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}"
         ),
@@ -3245,6 +3497,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         startup_lines.append(
             f"Rollout loss mode: {rollout_mode_msg}, state_loss_mode={state_loss_mode}, "
             f"amplitude_normalized_mse={rollout_det_amplitude_normalized_mse}, "
+            f"disp_std_normalize_by_true={rollout_disp_std_normalize_by_true}, "
+            f"disp_spectral_loss={rollout_disp_spectral_loss}, "
             f"disp_psd_peak_rel_bandwidth={rollout_disp_psd_peak_rel_bandwidth:g}, "
             f"disp_psd_use_hann_window={rollout_disp_psd_use_hann_window}"
         )
@@ -3289,7 +3543,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss_reg_mean": torch.zeros((), device=device),
             "loss_reg_sigma": torch.zeros((), device=device),
             "loss_reg_fhat": torch.zeros((), device=device),
-            "loss_rollout_psd": torch.zeros((), device=device),
+            "loss_rollout_spectral": torch.zeros((), device=device),
         }
         val_count = 0
         with torch.no_grad():
@@ -3349,11 +3603,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
         }
         rollout_loss_avg = 0.0
-        rollout_psd_loss_avg = 0.0
+        rollout_std_loss_avg = 0.0
+        rollout_spectral_loss_avg = 0.0
         if split_rollout_loader is not None and rollout_loss_active:
             with torch.no_grad():
                 rollout_loss_sum = torch.zeros((), device=device)
-                rollout_psd_loss_sum = torch.zeros((), device=device)
+                rollout_std_loss_sum = torch.zeros((), device=device)
+                rollout_spectral_loss_sum = torch.zeros((), device=device)
                 rollout_count = 0
                 for rollout_batch in split_rollout_loader:
                     rollout_losses = _td_correction_rollout_losses_from_batch(
@@ -3373,18 +3629,27 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
                         amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
-                        compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
+                        compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
+                        disp_std_normalize_by_true=rollout_disp_std_normalize_by_true,
+                        compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
+                        disp_spectral_loss_mode=rollout_disp_spectral_loss,
                         disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
                         disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                     )
                     rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
-                    rollout_psd_loss_sum += rollout_losses["disp_psd_loss"].detach()
+                    rollout_std_loss_sum += rollout_losses["disp_std_loss"].detach()
+                    rollout_spectral_loss_sum += rollout_losses["disp_spectral_loss"].detach()
                     rollout_count += 1
                 rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
-                rollout_psd_loss_avg = float((rollout_psd_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                rollout_std_loss_avg = float((rollout_std_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                rollout_spectral_loss_avg = float(
+                    (rollout_spectral_loss_sum / float(max(1, rollout_count))).detach().cpu()
+                )
                 writer.add_scalar(f"{split_tag}/loss_rollout_det", rollout_loss_avg, epoch_idx + 1)
-                writer.add_scalar(f"{split_tag}/loss_rollout_psd", rollout_psd_loss_avg, epoch_idx + 1)
-        val_metrics["loss_rollout_psd"] = rollout_psd_loss_avg
+                writer.add_scalar(f"{split_tag}/loss_rollout_disp_std", rollout_std_loss_avg, epoch_idx + 1)
+                writer.add_scalar(f"{split_tag}/loss_rollout_spectral", rollout_spectral_loss_avg, epoch_idx + 1)
+        val_metrics["loss_rollout_disp_std"] = rollout_std_loss_avg
+        val_metrics["loss_rollout_spectral"] = rollout_spectral_loss_avg
         val_metrics["loss_total"] = (
             val_metrics["loss_state"]
             + float(force_data_weight) * val_metrics["loss_data"]
@@ -3392,7 +3657,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             + float(sigma_reg) * val_metrics["loss_reg_sigma"]
             + float(fhat_reg) * val_metrics["loss_reg_fhat"]
             + float(rollout_det_weight) * rollout_loss_avg
-            + float(rollout_disp_psd_weight) * rollout_psd_loss_avg
+            + float(rollout_disp_std_weight) * rollout_std_loss_avg
+            + float(rollout_disp_spectral_weight) * rollout_spectral_loss_avg
         )
         for name, value in val_metrics.items():
             writer.add_scalar(f"{split_tag}/{name}", value, epoch_idx + 1)
@@ -3551,7 +3817,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss_reg_sigma": torch.zeros((), device=device),
             "loss_reg_fhat": torch.zeros((), device=device),
             "loss_rollout_det": torch.zeros((), device=device),
-            "loss_rollout_psd": torch.zeros((), device=device),
+            "loss_rollout_disp_std": torch.zeros((), device=device),
+            "loss_rollout_spectral": torch.zeros((), device=device),
             "grad_norm": torch.zeros((), device=device),
         }
         gradnorm_state_w_sum = torch.zeros((), device=device) if gradnorm_balancer is not None else None
@@ -3601,7 +3868,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                 fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                 rollout_det_loss = state_loss.new_tensor(0.0)
-                rollout_psd_loss = state_loss.new_tensor(0.0)
+                rollout_std_loss = state_loss.new_tensor(0.0)
+                rollout_spectral_loss = state_loss.new_tensor(0.0)
                 if rollout_iter is not None:
                     try:
                         rollout_batch = next(rollout_iter)
@@ -3625,15 +3893,20 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
                         amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
-                        compute_disp_psd_loss=(rollout_disp_psd_weight > 0.0),
+                        compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
+                        disp_std_normalize_by_true=rollout_disp_std_normalize_by_true,
+                        compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
+                        disp_spectral_loss_mode=rollout_disp_spectral_loss,
                         disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
                         disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                     )
                     rollout_det_loss = rollout_losses["trajectory_loss"]
-                    rollout_psd_loss = rollout_losses["disp_psd_loss"]
+                    rollout_std_loss = rollout_losses["disp_std_loss"]
+                    rollout_spectral_loss = rollout_losses["disp_spectral_loss"]
                 rollout_total_loss = (
                     float(rollout_det_weight) * rollout_det_loss
-                    + float(rollout_disp_psd_weight) * rollout_psd_loss
+                    + float(rollout_disp_std_weight) * rollout_std_loss
+                    + float(rollout_disp_spectral_weight) * rollout_spectral_loss
                 )
                 if gradnorm_balancer is not None:
                     loss_inputs: dict[str, torch.Tensor] = {"state": state_loss.float()}
@@ -3691,7 +3964,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             sums["loss_reg_sigma"] += sigma_reg_loss.detach()
             sums["loss_reg_fhat"] += fhat_reg_loss.detach()
             sums["loss_rollout_det"] += rollout_det_loss.detach()
-            sums["loss_rollout_psd"] += rollout_psd_loss.detach()
+            sums["loss_rollout_disp_std"] += rollout_std_loss.detach()
+            sums["loss_rollout_spectral"] += rollout_spectral_loss.detach()
             sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
 
         denom = float(max(1, batch_count))
@@ -3718,7 +3992,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 f"Epoch {epoch}: loss={train_metrics['loss_total']:.4e}, "
                 f"Lstate={train_metrics['loss_state']:.4e}, Ldata={train_metrics['loss_data']:.4e}, "
                 f"Lroll={train_metrics['loss_rollout_det']:.4e}, "
-                f"Lpsd={train_metrics['loss_rollout_psd']:.4e}, lr={train_metrics['lr']:.3e}"
+                f"Lstd={train_metrics['loss_rollout_disp_std']:.4e}, "
+                f"Lspec={train_metrics['loss_rollout_spectral']:.4e}, lr={train_metrics['lr']:.3e}"
             )
 
         if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):

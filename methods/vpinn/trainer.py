@@ -67,6 +67,7 @@ from HNN_helper import (
     td_hidden_inputs_from_context_torch,
     td_baseline_step_torch,
     td_correction_mode_flags,
+    td_phase_input_dim,
 )
 from architectures import FourierFeatures, ODEPirateNet
 
@@ -603,6 +604,7 @@ def _vpinn_input_dim(
     use_td_force_input: bool,
     use_acceleration_input: bool,
     use_phi_input: bool,
+    phase_input_source: Any = False,
     use_sigma_inputs: bool,
 ) -> int:
     return int(
@@ -610,7 +612,7 @@ def _vpinn_input_dim(
         + 1
         + (1 if use_td_force_input else 0)
         + (1 if use_acceleration_input else 0)
-        + (2 if use_phi_input else 0)
+        + (td_phase_input_dim(phase_input_source) if use_phi_input else 0)
         + (2 if use_sigma_inputs else 0)
     )
 
@@ -2836,6 +2838,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         use_td_force_input=use_td_force_input,
         use_acceleration_input=use_acceleration_input,
         use_phi_input=use_phi_input,
+        phase_input_source=phase_input_source,
         use_sigma_inputs=use_sigma_inputs,
     )
     output_dim = _vpinn_output_dim(mean_active=mean_active, sigma_active=probabilistic, fhat_active=fhat_active, d=d)

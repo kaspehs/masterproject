@@ -89,7 +89,15 @@ loss:
   rollout_det_batch_size: 0
   # If true, divide rollout state MSE by the target signal's centered RMS per state channel.
   rollout_det_amplitude_normalized_mse: false
-  # Auxiliary rollout displacement PSD loss using area-normalized spectra.
+  # Auxiliary rollout displacement-std loss weight.
+  rollout_disp_std_weight: 0.0
+  # If null, reuse rollout_det_amplitude_normalized_mse for std-loss normalization.
+  rollout_disp_std_normalize_by_true: null
+  # Auxiliary rollout displacement spectral loss weight. If left null, legacy rollout_disp_psd_weight is used.
+  rollout_disp_spectral_weight: 0.0
+  # Spectral loss mode: psd | dominant_frequency
+  rollout_disp_spectral_loss: psd
+  # Legacy alias for rollout_disp_spectral_weight.
   rollout_disp_psd_weight: 0.0
   # Optional narrowbanding around the ground-truth dominant displacement peak.
   # 0.0 disables narrowbanding and compares the full non-DC spectrum.
@@ -166,7 +174,8 @@ hnn:
   # Invalid for correction_mode values that include fhat correction.
   use_td_force_input: false
   # Phase-input selector for TD hidden-state inputs:
-  # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td), theta -> sin/cos(theta_td)
+  # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td),
+  # theta -> sin/cos(theta_td), both -> [sin(phi_vy_td), cos(phi_vy_td), sin(theta_td), cos(theta_td)]
   use_phi_input: false
   # If true, append both normalized TD sigma states:
   # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).
