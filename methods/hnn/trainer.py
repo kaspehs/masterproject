@@ -4111,12 +4111,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     epoch_idx=epoch,
                     split_tag="val_seen",
                     split_name="val_seen",
-                split_loader=val_seen_loader,
-                split_rollout_loader=val_seen_rollout_loader,
-                split_trajs=val_seen_trajs,
-                log_rollout_plots=False,
-                log_all_rollout_spectra=True,
-            )
+                    split_loader=val_seen_loader,
+                    split_rollout_loader=val_seen_rollout_loader,
+                    split_trajs=val_seen_trajs,
+                    log_rollout_plots=True,
+                    log_all_rollout_spectra=True,
+                )
             ckpt_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {ckpt_path}")
 
