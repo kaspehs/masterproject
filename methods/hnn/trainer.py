@@ -69,6 +69,7 @@ from HNN_helper import (
     resolve_td_force_input_source,
     resolve_td_memory_config,
     resolve_td_n_memory_torch,
+    resolve_phnn_input_scaling_mode,
     rollout_model,
     resolve_td_phase_input_source,
     structural_step_constant_force_torch,
@@ -269,6 +270,22 @@ def _parse_rollout_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any]:
     return z0, t_seq, z_traj, ur0, None, scale
 
 
+def _td_flow_feature_from_traj(
+    traj: dict[str, np.ndarray],
+    *,
+    input_scaling_mode: str,
+    diameter: float,
+) -> np.ndarray:
+    mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
+    if mode == "current":
+        return np.asarray(traj["ur"], dtype=np.float32).reshape(-1)
+    diameter_value = float(diameter)
+    if not np.isfinite(diameter_value) or abs(diameter_value) <= 0.0:
+        raise ValueError(f"diameter must be finite and non-zero for convective PHNN scaling, got {diameter!r}.")
+    flow_speed = np.asarray(traj["flow_speed"], dtype=np.float32).reshape(-1)
+    return flow_speed / np.float32(diameter_value)
+
+
 def _td_output_scale_tensor(
     model: PHVIV,
     *,
@@ -294,9 +311,12 @@ def _td_output_scale_tensor(
         rv_raw = model._prepare_reduced_velocity_raw(reduced_velocity, like=like)
         if rv_raw is None:
             raise ValueError("reduced_velocity is required for PHNN coefficient-force scaling.")
-        omega_n = torch.sqrt(torch.clamp(stiffness_t / mass_t, min=1e-12))
-        f_n = omega_n / (2.0 * np.pi)
-        u_flow = rv_raw * f_n * float(model.D)
+        if getattr(model, "input_scaling_mode", "current") == "convective":
+            u_flow = rv_raw * float(model.D)
+        else:
+            omega_n = torch.sqrt(torch.clamp(stiffness_t / mass_t, min=1e-12))
+            f_n = omega_n / (2.0 * np.pi)
+            u_flow = rv_raw * f_n * float(model.D)
         f0 = 0.5 * float(model.rho) * float(model.D) * (u_flow**2)
         return torch.clamp(f0, min=1e-12)
     return stiffness_t * float(model.D)
@@ -305,6 +325,7 @@ def _td_output_scale_tensor(
 def _td_p_scale_tensor(
     model: PHVIV,
     *,
+    reduced_velocity: torch.Tensor,
     structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
     like: torch.Tensor,
@@ -322,6 +343,12 @@ def _td_p_scale_tensor(
     shape = like.shape[:-1] + (1,)
     mass_t = mass_t.expand(shape)
     stiffness_t = stiffness_t.expand(shape)
+    if getattr(model, "input_scaling_mode", "current") == "convective":
+        rv_raw = model._prepare_reduced_velocity_raw(reduced_velocity, like=like)
+        if rv_raw is None:
+            raise ValueError("reduced_velocity is required for convective PHNN momentum scaling.")
+        u_flow = torch.clamp(torch.abs(rv_raw * float(model.D)), min=1e-12)
+        return torch.clamp(mass_t * u_flow, min=1e-12)
     return torch.sqrt(torch.clamp(mass_t * stiffness_t, min=1e-12)) * float(model.D)
 
 
@@ -329,11 +356,13 @@ def _td_state_for_model_scaling(
     model: PHVIV,
     *,
     z: torch.Tensor,
+    reduced_velocity: torch.Tensor,
     structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
 ) -> torch.Tensor:
     p_scale_actual = _td_p_scale_tensor(
         model,
+        reduced_velocity=reduced_velocity,
         structural_mass=structural_mass,
         stiffness=stiffness,
         like=z[..., :1],
@@ -365,6 +394,7 @@ def _td_optional_hidden_inputs_for_model(
         diameter=float(model.D),
         velocity=velocity,
         phase_input_source=phase_input_source,
+        input_scaling_mode=getattr(model, "input_scaling_mode", "current"),
     )
     return (
         phi_input if bool(getattr(model, "use_phi_input", False)) else None,
@@ -393,6 +423,7 @@ def _td_predict_outputs(
     z_model = _td_state_for_model_scaling(
         model,
         z=z,
+        reduced_velocity=reduced_velocity,
         structural_mass=structural_mass,
         stiffness=stiffness,
     )
@@ -1375,6 +1406,8 @@ def _build_td_correction_hnn_loaders(
     train_trajs: list[dict[str, np.ndarray]],
     val_trajs: list[dict[str, np.ndarray]],
     mass_source: str,
+    input_scaling_mode: str,
+    diameter: float,
     batch_size: int,
     rollout_batch_size: int,
     rollout_steps: int,
@@ -1398,7 +1431,15 @@ def _build_td_correction_hnn_loaders(
             y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float()
             dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
-            ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+            flow_feature = torch.from_numpy(
+                np.ascontiguousarray(
+                    _td_flow_feature_from_traj(
+                        traj,
+                        input_scaling_mode=input_scaling_mode,
+                        diameter=diameter,
+                    )
+                )
+            ).float().unsqueeze(1)
             force_true = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1)
             td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
             mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
@@ -1410,7 +1451,7 @@ def _build_td_correction_hnn_loaders(
                 t[:-1].unsqueeze(1),
                 z[1:],
                 t[1:].unsqueeze(1),
-                ur[:-1],
+                flow_feature[:-1],
                 force_true[1:],
                 td_context[:-1],
                 mass[:-1],
@@ -1431,7 +1472,15 @@ def _build_td_correction_hnn_loaders(
             y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float()
             dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
             t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
-            ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+            flow_feature = torch.from_numpy(
+                np.ascontiguousarray(
+                    _td_flow_feature_from_traj(
+                        traj,
+                        input_scaling_mode=input_scaling_mode,
+                        diameter=diameter,
+                    )
+                )
+            ).float().unsqueeze(1)
             td_context = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float()
             mass = torch.full((y.shape[0], 1), float(np.asarray(traj[mass_key]).reshape(())), dtype=torch.float32)
             damping = torch.full((y.shape[0], 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=torch.float32)
@@ -1452,7 +1501,7 @@ def _build_td_correction_hnn_loaders(
                 z0_list.append(z[start])
                 t_list.append(t[start:end])
                 ztraj_list.append(z[start:end])
-                ur0_list.append(ur[start])
+                ur0_list.append(flow_feature[start])
                 td0_list.append(td_context[start])
                 mass0_list.append(mass[start])
                 damping0_list.append(damping[start])
@@ -1544,7 +1593,15 @@ def _log_td_correction_rollout_validation(
     z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
     f_true_t = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1).to(device)
     td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
-    ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
+    ur_t = torch.from_numpy(
+        np.ascontiguousarray(
+            _td_flow_feature_from_traj(
+                traj,
+                input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
+                diameter=float(model.D),
+            )
+        )
+    ).float().unsqueeze(1).to(device)
     td_context_t = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float().to(device)
     t_np = np.asarray(traj["t"], dtype=float).reshape(-1)
     if z_true_t.shape[0] < 2:
@@ -3294,6 +3351,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         train_trajs=train_trajs,
         val_trajs=val_trajs,
         mass_source=td_mass_source,
+        input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
+        diameter=float(model.D),
         batch_size=int(training_cfg.batch_size),
         rollout_batch_size=rollout_batch_size,
         rollout_steps=current_rollout_det_steps,
@@ -3308,6 +3367,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             train_trajs=train_trajs,
             val_trajs=val_seen_trajs,
             mass_source=td_mass_source,
+            input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
+            diameter=float(model.D),
             batch_size=int(training_cfg.batch_size),
             rollout_batch_size=rollout_batch_size,
             rollout_steps=current_rollout_det_steps,
@@ -3540,6 +3601,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             train_trajs=train_trajs,
             val_trajs=split_trajs,
             mass_source=td_mass_source,
+            input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
+            diameter=float(model.D),
             batch_size=int(training_cfg.batch_size),
             rollout_batch_size=rollout_batch_size,
             rollout_steps=steps,
@@ -4134,7 +4197,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
             z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
             td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
-            ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
+            ur_t = torch.from_numpy(
+                np.ascontiguousarray(
+                    _td_flow_feature_from_traj(
+                        traj,
+                        input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
+                        diameter=float(model.D),
+                    )
+                )
+            ).float().unsqueeze(1).to(device)
             with torch.no_grad():
                 step_on_data = _td_step_with_corrections(
                     model=model,

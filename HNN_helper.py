@@ -31,6 +31,7 @@ DISP_SPECTRAL_REL_ERROR_KEY = "Displacement spectral relative error"
 DISP_STD_REL_ERROR_KEY = "Displacement std relative error"
 FORCE_DOMINANT_FREQ_REL_ERROR_KEY = "Force dominant frequency relative error"
 FORCE_STD_REL_ERROR_KEY = "Force std relative error"
+AGGREGATE_VALIDATION_ERROR_KEY = "Aggregate validation error"
 # Backward-compat: VPINN still imports this legacy key name.
 MEAN_DISP_AMP_REL_ERROR_KEY = DISP_STD_REL_ERROR_KEY
 DISP_SPECTRAL_SHAPE_ERROR_KEY = "Disp spectral shape error"
@@ -44,6 +45,13 @@ SPECTRAL_ERROR_FMAX_HZ = float("inf")
 SPECTRAL_ERROR_NPERSEG = 0
 ROLLOUT_DIVERGENCE_ABS_Y_NORM_LIMIT = 1e3
 ROLLOUT_DIVERGENCE_REL_Y_NORM_MULTIPLIER = 20.0
+
+AGGREGATE_VALIDATION_ERROR_COMPONENT_KEYS = (
+    DOMINANT_FREQ_REL_ERROR_KEY,
+    DISP_STD_REL_ERROR_KEY,
+    FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
+    FORCE_STD_REL_ERROR_KEY,
+)
 
 SIGNED_PHASE_CMAP = LinearSegmentedColormap.from_list(
     "signed_phase_map",
@@ -67,6 +75,10 @@ TD_PHASE_INPUT_SOURCES = (
     "phi_vy",
     "theta",
     "both",
+)
+PHNN_INPUT_SCALING_MODES = (
+    "current",
+    "convective",
 )
 TD_FORCE_INPUT_SOURCES = (
     "total",
@@ -128,6 +140,17 @@ def resolve_td_phase_input_source(
         "Phase input selector must be one of: false, true, phi_vy, theta, both. "
         f"Got {raw_value!r}."
     )
+
+
+def resolve_phnn_input_scaling_mode(raw_value: Any) -> str:
+    if raw_value is None:
+        return "current"
+    mode = str(raw_value).strip().lower()
+    if mode not in PHNN_INPUT_SCALING_MODES:
+        raise ValueError(
+            f"input_scaling_mode must be one of {PHNN_INPUT_SCALING_MODES}, got {raw_value!r}."
+        )
+    return mode
 
 
 def resolve_td_force_input_source(
@@ -224,6 +247,7 @@ class ModelConfig:
     q_scale: float | None = None
     p_scale: float | None = None
     ur_scale: float | None = None
+    input_scaling_mode: str = "current"
 
 def _default_residual_kwargs() -> dict[str, Any]:
     return {"hidden": 128, "layers": 2, "activation": "gelu"}
@@ -1013,6 +1037,19 @@ def compute_validation_metrics(
             force_std_rel = relative_error(pred_force_std, true_force_std)
             if np.isfinite(force_std_rel):
                 metrics[FORCE_STD_REL_ERROR_KEY] = abs(float(force_std_rel))
+    aggregate_values: list[float] = []
+    for key in AGGREGATE_VALIDATION_ERROR_COMPONENT_KEYS:
+        value = metrics.get(key)
+        if value is None:
+            aggregate_values = []
+            break
+        value = float(value)
+        if not np.isfinite(value):
+            aggregate_values = []
+            break
+        aggregate_values.append(value)
+    if aggregate_values:
+        metrics[AGGREGATE_VALIDATION_ERROR_KEY] = float(np.mean(aggregate_values))
     return metrics
 
 
@@ -1205,42 +1242,45 @@ class CausalTCNEncoder(nn.Module):
         return self.out(last)
 
 def dominant_frequency(signal: np.ndarray, dt: float) -> float:
-    """Return dominant frequency (Hz) from the dominant peak of the Welch PSD."""
+    """Return dominant frequency (Hz) from a full-window FFT peak with quadratic interpolation."""
     if dt <= 0.0:
         return float("nan")
     signal = np.asarray(signal, dtype=float).reshape(-1)
-    if signal.size < 2:
+    if signal.size < 4:
         return float("nan")
     centered = signal - np.mean(signal)
     if np.allclose(centered, 0.0):
         return float("nan")
-    length = int(centered.size)
-    if welch is not None:
-        fs = 1.0 / float(dt)
-        seg = int(length)
-        ov = 0 if seg < 16 else min(seg // 2, seg - 1)
-        freqs, psd = welch(
-            centered,
-            fs=fs,
-            window="hann",
-            nperseg=seg,
-            noverlap=ov,
-            detrend="constant",
-            scaling="density",
-        )
-    else:
-        freqs = np.fft.rfftfreq(length, d=float(dt))
-        psd = np.abs(np.fft.rfft(centered)) ** 2
-    mask = np.isfinite(freqs) & np.isfinite(psd) & (freqs > 0.0)
+    freqs = np.fft.rfftfreq(int(centered.size), d=float(dt))
+    power = np.abs(np.fft.rfft(centered)) ** 2
+    if freqs.size < 2 or power.size < 2:
+        return float("nan")
+    power = np.asarray(power, dtype=float)
+    power[0] = 0.0
+    mask = np.isfinite(freqs) & np.isfinite(power) & (freqs > 0.0)
     if np.count_nonzero(mask) < 1:
         return float("nan")
-    freqs_valid = np.asarray(freqs[mask], dtype=float)
-    psd_valid = np.asarray(psd[mask], dtype=float)
-    dominant_idx = int(np.argmax(psd_valid))
-    dominant_val = float(psd_valid[dominant_idx])
-    if dominant_val <= 0.0:
+    valid_indices = np.flatnonzero(mask)
+    peak_index = int(valid_indices[int(np.argmax(power[mask]))])
+    peak_power = float(power[peak_index])
+    if not np.isfinite(peak_power) or peak_power <= 0.0:
         return float("nan")
-    return float(freqs_valid[dominant_idx])
+
+    interpolated_index = float(peak_index)
+    if 1 <= peak_index < (power.size - 1):
+        y_prev = float(power[peak_index - 1])
+        y_peak = float(power[peak_index])
+        y_next = float(power[peak_index + 1])
+        denom = y_prev - 2.0 * y_peak + y_next
+        if np.isfinite(denom) and abs(denom) > 1.0e-18:
+            delta = 0.5 * (y_prev - y_next) / denom
+            if np.isfinite(delta):
+                interpolated_index += float(np.clip(delta, -1.0, 1.0))
+
+    df = float(freqs[1] - freqs[0])
+    if not np.isfinite(df) or df <= 0.0:
+        return float(freqs[peak_index])
+    return float(max(interpolated_index * df, 0.0))
 
 
 def mean_displacement_amplitude(signal: np.ndarray) -> float:
@@ -1925,6 +1965,7 @@ class PHVIV(nn.Module):
         use_stochastic_process_noise: bool = True,
         sigma_min: float = 1e-6,
         ur_scale: float | None = None,
+        input_scaling_mode: str = "current",
         force_net_type: str | None = None,
         hard_force_symmetry: bool = False,
         arch_pirate_force_kwargs: dict[str, Any] | None = None,
@@ -1943,6 +1984,7 @@ class PHVIV(nn.Module):
         if force_output not in {"force", "coefficient"}:
             raise ValueError("force_output must be one of: force, coefficient")
         self.force_output = force_output
+        self.input_scaling_mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
         self.use_td_fhat_input = bool(use_td_fhat_input)
@@ -2125,6 +2167,7 @@ class PHVIV(nn.Module):
         sigma_min = float(cfg.get("sigma_min", 1e-6))
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
+        input_scaling_mode = resolve_phnn_input_scaling_mode(cfg.get("input_scaling_mode", "current"))
         arch_cfg = arch_cfg or {}
         force_net_type = arch_cfg.get("force_net_type")
         hard_force_symmetry = bool(arch_cfg.get("hard_force_symmetry", False))
@@ -2172,6 +2215,7 @@ class PHVIV(nn.Module):
             use_stochastic_process_noise=use_stochastic_process_noise,
             sigma_min=sigma_min,
             ur_scale=ur_scale,
+            input_scaling_mode=input_scaling_mode,
             force_net_type=force_net_type,
             hard_force_symmetry=hard_force_symmetry,
             arch_pirate_force_kwargs=pirate_arch_kwargs,
@@ -2219,7 +2263,8 @@ class PHVIV(nn.Module):
             rv = reduced_velocity.to(device=like.device, dtype=like.dtype)
         else:
             rv = torch.as_tensor(reduced_velocity, device=like.device, dtype=like.dtype)
-        rv = rv / self.ur_scale.to(device=rv.device, dtype=rv.dtype)
+        if self.input_scaling_mode == "current":
+            rv = rv / self.ur_scale.to(device=rv.device, dtype=rv.dtype)
         if rv.ndim == 0:
             rv = rv.view(1, 1)
         elif rv.ndim == like.ndim - 1:
@@ -2229,6 +2274,23 @@ class PHVIV(nn.Module):
         if rv.shape[:-1] != like.shape[:-1]:
             rv = rv.expand(like.shape[:-1] + (1,))
         return rv
+
+    def _flow_speed_from_reduced_velocity(
+        self,
+        reduced_velocity: torch.Tensor | np.ndarray | float | None,
+        *,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
+        if rv_raw is None:
+            raise ValueError("reduced_velocity is required to resolve the PHNN flow speed.")
+        if self.input_scaling_mode == "convective":
+            return rv_raw * float(self.D)
+        omega_n = torch.sqrt(
+            torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
+        )
+        f_n = omega_n / (2.0 * math.pi)
+        return rv_raw * f_n * float(self.D)
 
     def _prepare_reduced_velocity_raw(
         self,
@@ -2262,14 +2324,7 @@ class PHVIV(nn.Module):
         state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # `state` is intentionally unused; kept for backward-compatible call sites.
-        rv_raw = self._prepare_reduced_velocity_raw(reduced_velocity, like=like)
-        if rv_raw is None:
-            raise ValueError("reduced_velocity is required to compute the PHNN force scale.")
-        omega_n = torch.sqrt(
-            torch.as_tensor(float(self.k) / float(self.m), device=like.device, dtype=like.dtype)
-        )
-        f_n = omega_n / (2.0 * math.pi)
-        u_flow = rv_raw * f_n * float(self.D)
+        u_flow = self._flow_speed_from_reduced_velocity(reduced_velocity, like=like)
         # Dynamic-pressure force scale (unit span): f0 = 0.5 * rho * D * U^2
         f0 = 0.5 * float(self.rho) * float(self.D) * (u_flow**2)
         return torch.clamp(f0, min=1e-12)
@@ -4056,6 +4111,7 @@ def log_final_rollout_errors_vs_ur(
         (DISP_STD_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
         (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, FORCE_DOMINANT_FREQ_REL_ERROR_KEY),
         (FORCE_STD_REL_ERROR_KEY, FORCE_STD_REL_ERROR_KEY),
+        (AGGREGATE_VALIDATION_ERROR_KEY, AGGREGATE_VALIDATION_ERROR_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
     for ur_val, metrics in pairs:
@@ -4790,6 +4846,7 @@ def td_hidden_inputs_from_context_torch(
     diameter: float,
     velocity: torch.Tensor | np.ndarray | float | None = None,
     phase_input_source: str = "phi_vy",
+    input_scaling_mode: str = "current",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if int(td_context.shape[-1]) < 4:
         raise ValueError("td_context must contain at least [ddy, phi, sig_dy, sig_ddy].")
@@ -4802,9 +4859,17 @@ def td_hidden_inputs_from_context_torch(
     phi_td = td_context[..., 1:2]
     sig_dy_td = td_context[..., 2:3]
     sig_ddy_td = td_context[..., 3:4]
-    omega = torch.sqrt(torch.clamp(stiffness_t / torch.clamp(mass_t, min=1.0e-12), min=1.0e-12))
-    vel_scale = torch.clamp(omega * diameter_t, min=1.0e-12)
-    acc_scale = torch.clamp((omega**2) * diameter_t, min=1.0e-12)
+    scaling_mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
+    if scaling_mode == "convective" and int(td_context.shape[-1]) < 5:
+        raise ValueError("td_context must contain flow_speed to build convective TD hidden-state inputs.")
+    flow_speed_scale = torch.clamp(torch.abs(td_context[..., 4:5]), min=1.0e-12) if int(td_context.shape[-1]) >= 5 else None
+    if scaling_mode == "convective":
+        vel_scale = flow_speed_scale
+        acc_scale = torch.clamp((flow_speed_scale * flow_speed_scale) / diameter_t, min=1.0e-12)
+    else:
+        omega = torch.sqrt(torch.clamp(stiffness_t / torch.clamp(mass_t, min=1.0e-12), min=1.0e-12))
+        vel_scale = torch.clamp(omega * diameter_t, min=1.0e-12)
+        acc_scale = torch.clamp((omega**2) * diameter_t, min=1.0e-12)
     resolved_phase_source = resolve_td_phase_input_source(phase_input_source)
     if resolved_phase_source == "theta":
         if velocity is None:

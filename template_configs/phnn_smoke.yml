@@ -21,6 +21,11 @@ model:
   damping_c: 1e-4
   force_output: coefficient
   sigma_min: 1.0e-6
+  # PHNN input scaling:
+  # current    -> y/D, v/(sqrt(k/m) D), optional TD inputs with omega=sqrt(k/m), flow feature U_r/ur_scale
+  # convective -> y/D, v/U, a D/U^2, sigma_dy/U, sigma_ddy D/U^2, flow feature U/D
+  input_scaling_mode: current
+  # Only used when input_scaling_mode: current.
   ur_scale: 10.0
 
 architecture:
