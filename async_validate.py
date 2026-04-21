@@ -44,12 +44,14 @@ from HNN_helper import (
     log_validation_epoch,
     parse_config,
     preprocess_timeseries,
+    resolve_phnn_input_scaling_mode,
     resolve_cut_start_seconds,
     sample_indices_per_ur,
     scaled_residual_loss_per_sample,
     sample_one_index_per_ur,
     resolve_td_correction_params,
     resolve_td_correction_mode,
+    resolve_td_force_input_source,
     resolve_td_phase_input_source,
     resolve_td_memory_config,
     td_correction_mode_flags,
@@ -126,6 +128,11 @@ def _resolve_val_unseen_dir(train_series_root: Path) -> Path:
     raise FileNotFoundError(
         f"Validation directory '{val_unseen_dir}' not found and legacy fallback '{legacy_val_dir}' is also missing."
     )
+
+
+def _resolve_optional_val_split_dir(train_series_root: Path, split_tag: str) -> Path | None:
+    split_dir = train_series_root / str(split_tag).strip()
+    return split_dir if split_dir.exists() else None
 
 
 def _parse_hnn_batch(batch: Any) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
@@ -343,7 +350,7 @@ def _log_td_correction_hnn_rollout_validation(
         mean_active=bool(mode_flags["mean_active"]),
         predict_sigma=bool(mode_flags["sigma_active"]),
         fhat_active=bool(mode_flags["fhat_active"]),
-        use_td_force_input=bool(getattr(model, "use_td_force_input", False)),
+        td_force_input_source=str(getattr(model, "td_force_input_source", "none")),
         fhat_bound_multiplier=float(getattr(model, "fhat_bound_multiplier", 1.5)),
         force_zero_output=bool(getattr(model, "force_zero_output", False)),
         tag_prefix=tag_prefix,
@@ -657,38 +664,44 @@ def _run_hnn_td_correction_validation(
     td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
     if td_mass_source not in {"dry", "effective"}:
         raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
+    rollout_stochastic = bool(hnn_cfg.get("rollout_stochastic", False))
+    rollout_noise_scale = float(hnn_cfg.get("rollout_noise_scale", 1.0))
+    if not np.isfinite(rollout_noise_scale) or rollout_noise_scale < 0.0:
+        raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
+    rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
+    rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
+    rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
+    rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
+    if rollout_loss_mode == "stochastic":
+        rollout_loss_mode = "stochastic_nll"
+    if rollout_loss_mode not in {"deterministic", "stochastic_nll", "stochastic_mse"}:
+        raise ValueError(
+            "loss.rollout_loss_mode must be one of: deterministic, stochastic_nll, stochastic_mse."
+        )
+    if rollout_stochastic_samples < 1:
+        raise ValueError("loss.rollout_stochastic_samples must be >= 1.")
 
     train_series_root = Path(data_cfg.train_series_dir)
-    val_dir = _resolve_val_unseen_dir(train_series_root)
-    val_paths = sorted(val_dir.glob("*.npz"))
-    if not val_paths:
-        raise FileNotFoundError(f"No '.npz' files found in '{val_dir}'.")
-
-    val_trajs_np = load_td_correction_trajectories(
-        paths=val_paths,
-        cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
-        reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
-        reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
-        ur_source=td_mass_source,
-        td_params=resolve_td_correction_params(hnn_cfg),
-        td_memory_cfg=resolve_td_memory_config(hnn_cfg),
-    )
-    dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
     td_params = resolve_td_correction_params(hnn_cfg)
     td_memory_cfg = resolve_td_memory_config(hnn_cfg)
-    correction_mode = resolve_td_correction_mode(hnn_cfg)
+    correction_mode = str(ckpt.get("correction_mode", resolve_td_correction_mode(hnn_cfg))).strip().lower()
     mode_flags = td_correction_mode_flags(correction_mode)
     mean_active = bool(mode_flags["mean_active"])
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
-    use_td_force_input = bool(hnn_cfg.get("use_td_force_input", False))
+    td_force_input_source = resolve_td_force_input_source(
+        ckpt.get("td_force_input_source", hnn_cfg.get("use_td_force_input", False))
+    )
+    use_td_force_input = td_force_input_source != "none"
+    use_td_fhat_input = bool(ckpt.get("use_td_fhat_input", hnn_cfg.get("use_td_fhat_input", False)))
     use_acceleration_input = bool(hnn_cfg.get("use_acceleration_input", False))
     phase_input_source = resolve_td_phase_input_source(
         hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
     )
     use_phi_input = phase_input_source != "none"
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
-    fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
+    input_scaling_mode = resolve_phnn_input_scaling_mode(getattr(cfg.model, "input_scaling_mode", "current"))
+    fhat_bound_multiplier = float(ckpt.get("fhat_bound_multiplier", hnn_cfg.get("fhat_bound_multiplier", 1.5)))
     fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
     fhat_reg_norm = str(getattr(loss_cfg, "fhat_reg_norm", "l2")).strip().lower()
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
@@ -707,6 +720,33 @@ def _run_hnn_td_correction_validation(
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
 
+    split_dirs: dict[str, Path] = {ASYNC_VAL_SPLIT_TAG: _resolve_val_unseen_dir(train_series_root)}
+    val_seen_dir = _resolve_optional_val_split_dir(train_series_root, "val_seen")
+    if val_seen_dir is not None:
+        split_dirs["val_seen"] = val_seen_dir
+    cut_start_seconds = resolve_cut_start_seconds(data_cfg, "val")
+    split_trajs_map: dict[str, list[dict[str, Any]]] = {}
+    for split_tag, split_dir in split_dirs.items():
+        split_paths = sorted(split_dir.glob("*.npz"))
+        if not split_paths:
+            if split_tag == ASYNC_VAL_SPLIT_TAG:
+                raise FileNotFoundError(f"No '.npz' files found in '{split_dir}'.")
+            continue
+        split_trajs_map[split_tag] = load_td_correction_trajectories(
+            paths=split_paths,
+            cut_start_seconds=cut_start_seconds,
+            reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+            reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+            ur_source=td_mass_source,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+        )
+
+    val_trajs_np = split_trajs_map.get(ASYNC_VAL_SPLIT_TAG, [])
+    if not val_trajs_np:
+        raise FileNotFoundError("Async PHNN validation requires a non-empty val_unseen split.")
+    dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
+
     model_dict = asdict(cfg.model)
     first_val_traj = val_trajs_np[0]
     mass_key = "dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"
@@ -716,6 +756,7 @@ def _run_hnn_td_correction_validation(
     model_dict["Ca"] = 0.0
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
+    model_dict["use_td_fhat_input"] = use_td_fhat_input
     model_dict["use_acceleration_input"] = use_acceleration_input
     model_dict["use_phi_input"] = use_phi_input
     model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
@@ -724,196 +765,242 @@ def _run_hnn_td_correction_validation(
     arch_dict = asdict(cfg.architecture)
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
     setattr(model, "correction_mode", correction_mode)
+    setattr(model, "td_force_input_source", td_force_input_source)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
     setattr(model, "force_zero_output", force_zero_output)
     _load_state(model, ckpt["model_state"])
     model.eval()
 
-    _train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
-        train_trajs=val_trajs_np,
-        val_trajs=val_trajs_np,
-        mass_source=td_mass_source,
-        batch_size=int(cfg.training.batch_size),
-        rollout_batch_size=rollout_batch_size,
-        rollout_steps=rollout_det_steps,
-        num_workers=int(num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
-
     def _reg(value: torch.Tensor, norm: str) -> torch.Tensor:
         return torch.mean(torch.abs(value)) if str(norm).strip().lower() == "l1" else torch.mean(value * value)
 
-    num_loss_scalars_written = 0
-    num_rollout_scalars_written = 0
-    val_metrics: dict[str, float] = {}
+    def _run_split(split_tag: str, split_trajs_np: list[dict[str, Any]]) -> dict[str, Any]:
+        split_start = time.perf_counter()
+        _train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
+            train_trajs=split_trajs_np,
+            val_trajs=split_trajs_np,
+            mass_source=td_mass_source,
+            input_scaling_mode=input_scaling_mode,
+            diameter=float(model.D),
+            batch_size=int(cfg.training.batch_size),
+            rollout_batch_size=rollout_batch_size,
+            rollout_steps=rollout_det_steps,
+            num_workers=int(num_workers),
+            pin_memory=(device.type == "cuda"),
+        )
 
-    if do_losses and val_loader is not None:
-        val_sums = {
-            name: torch.zeros((), device=device)
-            for name in ["loss_total", "loss_state", "loss_data", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]
-        }
-        val_count = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                if len(batch) != 10:
-                    raise ValueError("Unexpected TD correction HNN batch format.")
-                z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = batch
-                z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
-                t_i = t_i.to(device, non_blocking=(device.type == "cuda"))
-                z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
-                t_next = t_next.to(device, non_blocking=(device.type == "cuda"))
-                ur_i = ur_i.to(device, non_blocking=(device.type == "cuda"))
-                force_true_next = force_true_next.to(device, non_blocking=(device.type == "cuda"))
-                td_context_i = td_context_i.to(device, non_blocking=(device.type == "cuda"))
-                mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
-                damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
-                stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
-                dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
-                step = _td_step_with_corrections(
-                    model=model,
-                    z=z_i,
-                    reduced_velocity=ur_i,
-                    td_context=td_context_i,
-                    dt=dt_i,
-                    structural_mass=mass_i,
-                    damping_c=damping_i,
-                    stiffness=stiffness_i,
-                    td_params=td_params,
-                    td_memory_cfg=td_memory_cfg,
-                    mean_active=mean_active,
-                    sigma_active=predict_sigma,
-                    fhat_active=fhat_active,
-                    use_td_force_input=use_td_force_input,
-                    fhat_bound_multiplier=fhat_bound_multiplier,
-                    force_zero_output=force_zero_output,
-                )
-                corr_mu = step["corr_mu"]
-                sigma_corr = step["sigma_corr"]
-                total_force_next = step["total_force_next"]
-                if predict_sigma and state_loss_mode == "propagated_nll":
-                    state_loss, _z_next_mean = _td_state_propagated_nll_loss(
-                        z_i=z_i,
-                        dt_i=dt_i,
-                        z_next=z_next,
-                        total_force_next=total_force_next,
-                        sigma_corr=sigma_corr,
-                        mass_i=mass_i,
-                        damping_i=damping_i,
-                        stiffness_i=stiffness_i,
-                    )
-                else:
-                    state_loss, _z_next_mean = _td_state_mse_loss(
-                        z_i=z_i,
-                        dt_i=dt_i,
-                        z_next=z_next,
-                        total_force_next=total_force_next,
-                        mass_i=mass_i,
-                        damping_i=damping_i,
-                        stiffness_i=stiffness_i,
-                    )
-                if use_force_data_loss:
-                    if predict_sigma:
-                        var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
-                        data_loss = torch.mean(0.5 * (((force_true_next - total_force_next) ** 2) / var + torch.log(var)))
-                    else:
-                        data_loss = torch.mean((force_true_next - total_force_next) ** 2)
-                else:
-                    data_loss = state_loss.new_tensor(0.0)
-                mean_reg_loss = _reg(corr_mu, mean_reg_norm)
-                sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
-                fhat_reg_loss = _reg(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
-                total_loss = (
-                    state_loss
-                    + float(force_data_weight) * data_loss
-                    + float(mean_reg) * mean_reg_loss
-                    + float(sigma_reg) * sigma_reg_loss
-                    + float(fhat_reg) * fhat_reg_loss
-                )
-                val_sums["loss_total"] += total_loss.detach()
-                val_sums["loss_state"] += state_loss.detach()
-                val_sums["loss_data"] += data_loss.detach()
-                val_sums["loss_reg_mean"] += mean_reg_loss.detach()
-                val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
-                val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
-                val_count += 1
-        val_denom = float(max(1, val_count))
-        val_metrics = {
-            name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
-        }
-        rollout_loss_avg = 0.0
+        num_loss_scalars_written = 0
+        num_rollout_scalars_written = 0
+        val_metrics: dict[str, float] = {}
 
-        if rollout_loader is not None and rollout_det_weight > 0.0:
-            rollout_loss_sum = torch.zeros((), device=device)
-            rollout_count = 0
+        if do_losses and val_loader is not None:
+            val_sums = {
+                name: torch.zeros((), device=device)
+                for name in ["loss_total", "loss_state", "loss_data", "loss_reg_mean", "loss_reg_sigma", "loss_reg_fhat"]
+            }
+            val_count = 0
             with torch.no_grad():
-                for rollout_batch in rollout_loader:
-                    if len(rollout_batch) != 8:
-                        raise ValueError("Unexpected TD correction rollout batch format.")
-                    z0, t_seq, z_traj, ur0, td_context0, mass0, damping0, stiffness0 = rollout_batch
-                    z0 = z0.to(device, non_blocking=(device.type == "cuda"))
-                    t_seq = t_seq.to(device, non_blocking=(device.type == "cuda"))
-                    z_traj = z_traj.to(device, non_blocking=(device.type == "cuda"))
-                    ur0 = ur0.to(device, non_blocking=(device.type == "cuda"))
-                    td_context0 = td_context0.to(device, non_blocking=(device.type == "cuda"))
-                    mass0 = mass0.to(device, non_blocking=(device.type == "cuda"))
-                    damping0 = damping0.to(device, non_blocking=(device.type == "cuda"))
-                    stiffness0 = stiffness0.to(device, non_blocking=(device.type == "cuda"))
-                    dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
-                    rollout_loss_sum += _td_correction_rollout_loss_from_batch(
+                for batch in val_loader:
+                    if len(batch) != 10:
+                        raise ValueError("Unexpected TD correction HNN batch format.")
+                    z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = batch
+                    z_i = z_i.to(device, non_blocking=(device.type == "cuda"))
+                    t_i = t_i.to(device, non_blocking=(device.type == "cuda"))
+                    z_next = z_next.to(device, non_blocking=(device.type == "cuda"))
+                    t_next = t_next.to(device, non_blocking=(device.type == "cuda"))
+                    ur_i = ur_i.to(device, non_blocking=(device.type == "cuda"))
+                    force_true_next = force_true_next.to(device, non_blocking=(device.type == "cuda"))
+                    td_context_i = td_context_i.to(device, non_blocking=(device.type == "cuda"))
+                    mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
+                    damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
+                    stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
+                    dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
+                    step = _td_step_with_corrections(
                         model=model,
-                        batch=rollout_batch,
-                        device=device,
-                        non_blocking=(device.type == "cuda"),
+                        z=z_i,
+                        reduced_velocity=ur_i,
+                        td_context=td_context_i,
+                        dt=dt_i,
+                        structural_mass=mass_i,
+                        damping_c=damping_i,
+                        stiffness=stiffness_i,
                         td_params=td_params,
                         td_memory_cfg=td_memory_cfg,
                         mean_active=mean_active,
                         sigma_active=predict_sigma,
                         fhat_active=fhat_active,
-                        use_td_force_input=use_td_force_input,
+                        td_force_input_source=td_force_input_source,
                         fhat_bound_multiplier=fhat_bound_multiplier,
                         force_zero_output=force_zero_output,
-                        rollout_loss_mode=rollout_loss_mode,
-                        rollout_stochastic_samples=rollout_stochastic_samples,
-                        rollout_noise_scale=rollout_noise_scale,
-                    ).detach()
-                    rollout_count += 1
-            rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
-            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/loss_rollout_det", rollout_loss_avg, tb_step)
-            num_loss_scalars_written += 1
-        val_metrics["loss_total"] = (
-            val_metrics["loss_state"]
-            + float(force_data_weight) * val_metrics["loss_data"]
-            + float(mean_reg) * val_metrics["loss_reg_mean"]
-            + float(sigma_reg) * val_metrics["loss_reg_sigma"]
-            + float(fhat_reg) * val_metrics["loss_reg_fhat"]
-            + float(rollout_det_weight) * rollout_loss_avg
-        )
-        for name, value in val_metrics.items():
-            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value, tb_step)
-            num_loss_scalars_written += 1
+                    )
+                    corr_mu = step["corr_mu"]
+                    sigma_corr = step["sigma_corr"]
+                    total_force_next = step["total_force_next"]
+                    if predict_sigma and state_loss_mode == "propagated_nll":
+                        state_loss, _z_next_mean = _td_state_propagated_nll_loss(
+                            z_i=z_i,
+                            dt_i=dt_i,
+                            z_next=z_next,
+                            total_force_next=total_force_next,
+                            sigma_corr=sigma_corr,
+                            mass_i=mass_i,
+                            damping_i=damping_i,
+                            stiffness_i=stiffness_i,
+                        )
+                    else:
+                        state_loss, _z_next_mean = _td_state_mse_loss(
+                            z_i=z_i,
+                            dt_i=dt_i,
+                            z_next=z_next,
+                            total_force_next=total_force_next,
+                            mass_i=mass_i,
+                            damping_i=damping_i,
+                            stiffness_i=stiffness_i,
+                        )
+                    if use_force_data_loss:
+                        if predict_sigma:
+                            var = torch.clamp(sigma_corr * sigma_corr, min=1e-9)
+                            data_loss = torch.mean(
+                                0.5 * (((force_true_next - total_force_next) ** 2) / var + torch.log(var))
+                            )
+                        else:
+                            data_loss = torch.mean((force_true_next - total_force_next) ** 2)
+                    else:
+                        data_loss = state_loss.new_tensor(0.0)
+                    mean_reg_loss = _reg(corr_mu, mean_reg_norm)
+                    sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
+                    fhat_reg_loss = _reg(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
+                    total_loss = (
+                        state_loss
+                        + float(force_data_weight) * data_loss
+                        + float(mean_reg) * mean_reg_loss
+                        + float(sigma_reg) * sigma_reg_loss
+                        + float(fhat_reg) * fhat_reg_loss
+                    )
+                    val_sums["loss_total"] += total_loss.detach()
+                    val_sums["loss_state"] += state_loss.detach()
+                    val_sums["loss_data"] += data_loss.detach()
+                    val_sums["loss_reg_mean"] += mean_reg_loss.detach()
+                    val_sums["loss_reg_sigma"] += sigma_reg_loss.detach()
+                    val_sums["loss_reg_fhat"] += fhat_reg_loss.detach()
+                    val_count += 1
+            val_denom = float(max(1, val_count))
+            val_metrics = {
+                name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
+            }
+            rollout_loss_avg = 0.0
 
-    if do_rollout:
-        ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in val_trajs_np]
-        sample_seed = 1
-        sampled_metric_indices = sample_indices_per_ur(
-            ur_values_all,
-            samples_per_ur=validation_samples_per_ur,
-            seed=sample_seed,
-        )
-        sampled_names = [str(val_trajs_np[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
-        print(
-            f"[async-val][phnn] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
-            f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
-        )
-        metrics_sum: dict[str, float] = {}
-        metrics_count: dict[str, int] = {}
-        diverged_count = 0
-        for sidx in sampled_metric_indices:
-            metrics = _hnn_td_rollout_validation(
+            if rollout_loader is not None and rollout_det_weight > 0.0:
+                rollout_loss_sum = torch.zeros((), device=device)
+                rollout_count = 0
+                with torch.no_grad():
+                    for rollout_batch in rollout_loader:
+                        if len(rollout_batch) != 8:
+                            raise ValueError("Unexpected TD correction rollout batch format.")
+                        rollout_loss_sum += _td_correction_rollout_loss_from_batch(
+                            model=model,
+                            batch=rollout_batch,
+                            device=device,
+                            non_blocking=(device.type == "cuda"),
+                            td_params=td_params,
+                            td_memory_cfg=td_memory_cfg,
+                            mean_active=mean_active,
+                            sigma_active=predict_sigma,
+                            fhat_active=fhat_active,
+                            td_force_input_source=td_force_input_source,
+                            fhat_bound_multiplier=fhat_bound_multiplier,
+                            force_zero_output=force_zero_output,
+                            rollout_loss_mode=rollout_loss_mode,
+                            rollout_stochastic_samples=rollout_stochastic_samples,
+                            rollout_noise_scale=rollout_noise_scale,
+                        ).detach()
+                        rollout_count += 1
+                rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                writer.add_scalar(f"{split_tag}/loss_rollout_det", rollout_loss_avg, tb_step)
+                num_loss_scalars_written += 1
+            val_metrics["loss_total"] = (
+                val_metrics["loss_state"]
+                + float(force_data_weight) * val_metrics["loss_data"]
+                + float(mean_reg) * val_metrics["loss_reg_mean"]
+                + float(sigma_reg) * val_metrics["loss_reg_sigma"]
+                + float(fhat_reg) * val_metrics["loss_reg_fhat"]
+                + float(rollout_det_weight) * rollout_loss_avg
+            )
+            for name, value in val_metrics.items():
+                writer.add_scalar(f"{split_tag}/{name}", value, tb_step)
+                num_loss_scalars_written += 1
+
+        if do_rollout:
+            ur_values_all = [float(np.asarray(traj["ur"]).reshape(-1)[0]) for traj in split_trajs_np]
+            sampled_metric_indices = sample_indices_per_ur(
+                ur_values_all,
+                samples_per_ur=validation_samples_per_ur,
+                seed=1,
+            )
+            sampled_names = [str(split_trajs_np[idx].get("name", f"traj_{idx}")) for idx in sampled_metric_indices]
+            print(
+                f"[async-val][phnn][{split_tag}] epoch {epoch + 1}: sampled metric trajectories={sampled_names} "
+                f"(force_zero_output={force_zero_output}, mass_source={td_mass_source})"
+            )
+            metrics_sum: dict[str, float] = {}
+            metrics_count: dict[str, int] = {}
+            diverged_count = 0
+            for sidx in sampled_metric_indices:
+                metrics = _hnn_td_rollout_validation(
+                    writer=writer,
+                    epoch=tb_step,
+                    model=model,
+                    traj=split_trajs_np[sidx],
+                    dt=dt,
+                    td_mass_source=td_mass_source,
+                    td_params=td_params,
+                    td_memory_cfg=td_memory_cfg,
+                    device=device,
+                    mean_active=mean_active,
+                    predict_sigma=predict_sigma,
+                    fhat_active=fhat_active,
+                    td_force_input_source=td_force_input_source,
+                    fhat_bound_multiplier=fhat_bound_multiplier,
+                    force_zero_output=force_zero_output,
+                    rollout_stochastic=rollout_stochastic,
+                    rollout_noise_scale=rollout_noise_scale,
+                    rollout_seed=rollout_seed,
+                    log_metrics=False,
+                    log_plots=False,
+                )
+                diverged_flag = float(metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+                if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                    diverged_count += 1
+                for name, value in metrics.items():
+                    if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
+                        continue
+                    metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                    metrics_count[name] = metrics_count.get(name, 0) + 1
+            for name, total in metrics_sum.items():
+                writer.add_scalar(f"{split_tag}/{name}", total / float(max(1, metrics_count.get(name, 0))), tb_step)
+                num_rollout_scalars_written += 1
+            writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
+            num_rollout_scalars_written += 1
+
+            rollout_idx = _rollout_index(
+                len(split_trajs_np),
+                ur_values=ur_values_all,
+            )
+            rollout_traj = split_trajs_np[rollout_idx]
+            rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
+            print(
+                f"[async-val][phnn][{split_tag}] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
+                f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
+                f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
+                f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
+                f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
+                f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+            )
+            _hnn_td_rollout_validation(
                 writer=writer,
                 epoch=tb_step,
                 model=model,
-                traj=val_trajs_np[sidx],
+                traj=rollout_traj,
                 dt=dt,
                 td_mass_source=td_mass_source,
                 td_params=td_params,
@@ -922,75 +1009,43 @@ def _run_hnn_td_correction_validation(
                 mean_active=mean_active,
                 predict_sigma=predict_sigma,
                 fhat_active=fhat_active,
-                use_td_force_input=use_td_force_input,
+                td_force_input_source=td_force_input_source,
                 fhat_bound_multiplier=fhat_bound_multiplier,
                 force_zero_output=force_zero_output,
                 rollout_stochastic=rollout_stochastic,
                 rollout_noise_scale=rollout_noise_scale,
                 rollout_seed=rollout_seed,
                 log_metrics=False,
-                log_plots=False,
+                log_plots=True,
+                tag_prefix=f"{split_tag}/rollout",
             )
-            diverged_flag = float(metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
-            if np.isfinite(diverged_flag) and diverged_flag > 0.5:
-                diverged_count += 1
-            for name, value in metrics.items():
-                if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
-                    continue
-                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
-                metrics_count[name] = metrics_count.get(name, 0) + 1
-        for name, total in metrics_sum.items():
-            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", total / float(max(1, metrics_count.get(name, 0))), tb_step)
-            num_rollout_scalars_written += 1
-        writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
-        num_rollout_scalars_written += 1
 
-        rollout_idx = _rollout_index(
-            len(val_trajs_np),
-            ur_values=ur_values_all,
-        )
-        rollout_traj = val_trajs_np[rollout_idx]
-        rollout_dt = float(np.asarray(rollout_traj["t"])[1] - np.asarray(rollout_traj["t"])[0])
+        split_elapsed = time.perf_counter() - split_start
+        writer.add_scalar(f"{split_tag}/validation_wall_time_s", float(split_elapsed), tb_step)
         print(
-            f"[async-val][phnn] epoch {epoch + 1}: plot trajectory={rollout_traj.get('name', f'traj_{rollout_idx}')} "
-            f"U_r={float(np.asarray(rollout_traj['ur']).reshape(-1)[0]):.6g} "
-            f"dt={rollout_dt:.6g} rho={float(model.rho):.6g} D={float(model.D):.6g} "
-            f"m={float(np.asarray(rollout_traj['dry_mass_kg' if td_mass_source == 'dry' else 'effective_mass_kg']).reshape(())):.6g} "
-            f"c={float(np.asarray(rollout_traj['damping_c']).reshape(())):.6g} "
-            f"k={float(np.asarray(rollout_traj['stiffness_n_m']).reshape(())):.6g}"
+            f"[async-val] epoch {epoch}: HNN TD split='{split_tag}' scalar writes "
+            f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
         )
-        _hnn_td_rollout_validation(
-            writer=writer,
-            epoch=tb_step,
-            model=model,
-            traj=rollout_traj,
-            dt=dt,
-            td_mass_source=td_mass_source,
-            td_params=td_params,
-            td_memory_cfg=td_memory_cfg,
-            device=device,
-            mean_active=mean_active,
-            predict_sigma=predict_sigma,
-            fhat_active=fhat_active,
-            use_td_force_input=use_td_force_input,
-            fhat_bound_multiplier=fhat_bound_multiplier,
-            force_zero_output=force_zero_output,
-            rollout_stochastic=rollout_stochastic,
-            rollout_noise_scale=rollout_noise_scale,
-            rollout_seed=rollout_seed,
-            log_metrics=False,
-            log_plots=True,
-            tag_prefix=f"{ASYNC_VAL_SPLIT_TAG}/rollout",
-        )
+        return {
+            "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
+            "val_metrics": val_metrics,
+            "validation_wall_time_s": float(split_elapsed),
+        }
 
-    print(
-        f"[async-val] epoch {epoch}: HNN TD scalar writes "
-        f"(loss={num_loss_scalars_written}, rollout={num_rollout_scalars_written})"
-    )
-    return {
-        "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
-        "val_metrics": val_metrics,
+    split_results = {
+        split_tag: _run_split(split_tag, split_trajs_np)
+        for split_tag, split_trajs_np in split_trajs_map.items()
+        if split_trajs_np
     }
+    unseen_result = split_results.get(ASYNC_VAL_SPLIT_TAG, {})
+    summary: dict[str, Any] = {
+        "loss_total": unseen_result.get("loss_total"),
+        "val_metrics": unseen_result.get("val_metrics", {}),
+        "split_results": split_results,
+    }
+    if "val_seen" in split_results:
+        summary["val_seen_loss_total"] = split_results["val_seen"].get("loss_total")
+    return summary
 
 
 def _run_vpinn_validation(
