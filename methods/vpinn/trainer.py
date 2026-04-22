@@ -3713,7 +3713,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
         async_processes = _reap_async_processes(async_processes, best_state=async_best_state, wait=True)
 
-    if final_rollout_all_validation and val_trajs:
+    final_val_trajs = [*val_trajs, *val_seen_trajs]
+    if final_rollout_all_validation and final_val_trajs:
         print("Final validation rollout (all trajectories) started.")
         metrics_sum: dict[str, float] = {}
         metrics_count: dict[str, int] = {}
@@ -3725,24 +3726,8 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         corr_series_list: list[np.ndarray] = []
         sigma_series_list: list[np.ndarray] = []
         delta_fhat_series_list: list[np.ndarray] = []
-        metric_trajs: list[dict[str, Any]] = []
-        seen_metric_ur: set[float] = set()
-        for traj in val_trajs:
-            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
-            ur_key = round(ur_val, 6)
-            if ur_key in seen_metric_ur:
-                continue
-            seen_metric_ur.add(ur_key)
-            metric_trajs.append(traj)
-        plot_trajs = list(metric_trajs)
-        seen_plot_ur = set(seen_metric_ur)
-        for traj in train_trajs:
-            ur_val = float(np.asarray(traj["ur"]).reshape(-1)[0])
-            ur_key = round(ur_val, 6)
-            if ur_key in seen_plot_ur:
-                continue
-            seen_plot_ur.add(ur_key)
-            plot_trajs.append(traj)
+        metric_trajs = list(final_val_trajs)
+        plot_trajs = list(final_val_trajs)
         plot_trajs.sort(key=lambda traj: round(float(np.asarray(traj["ur"]).reshape(-1)[0]), 6))
         for traj in metric_trajs:
             metrics = _log_td_correction_rollout_validation(
@@ -3860,7 +3845,10 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
             if metrics_count.get(name, 0) > 0
         }
         if avg_metrics:
-            summary_lines = [f"Final rollout over {len(metric_trajs)} validation trajectories (unique U_r):"]
+            summary_lines = [
+                "Final rollout over all validation trajectories:",
+                f"val_unseen={len(val_trajs)}, val_seen={len(val_seen_trajs)}, total={len(metric_trajs)}",
+            ]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
@@ -3868,7 +3856,7 @@ def _train_td_correction_vpinn(config: Config, config_name: str) -> None:
         if plot_ur_values and plot_metrics_list:
             reference_ur_values = [
                 float(np.asarray(traj["ur"]).reshape(-1)[0])
-                for traj in [*val_trajs, *train_trajs]
+                for traj in final_val_trajs
                 if np.asarray(traj["ur"]).reshape(-1).size > 0
             ]
             log_final_rollout_errors_vs_ur(
