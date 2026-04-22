@@ -939,6 +939,22 @@ def log_validation_epoch(
         title_suffix=title_suffix,
         log_spectra=log_spectra,
     )
+    if log_spectra:
+        log_area_normalized_rollout_spectra(
+            writer,
+            epoch,
+            disp_t=np.asarray(t, dtype=float),
+            disp_true=np.asarray(y_true_norm, dtype=float),
+            disp_pred=np.asarray(rollout["y_norm"], dtype=float),
+            force_t=t_force_plot,
+            force_true=force_coeff_true,
+            force_pred=force_coeff_pred[:plot_len],
+            reduced_velocity=reduced_velocity_scalar,
+            force_baseline=None,
+            tag=f"{tag_prefix}_spectra",
+            step=step,
+            title_suffix=title_suffix,
+        )
     return metrics
 
 

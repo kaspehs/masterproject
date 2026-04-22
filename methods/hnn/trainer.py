@@ -1749,6 +1749,23 @@ def _log_td_correction_rollout_validation(
                 title_suffix=title_suffix,
                 log_spectra=log_spectra,
             )
+        if log_spectra:
+            log_area_normalized_rollout_spectra(
+                writer,
+                epoch,
+                disp_t=t_np,
+                disp_true=q_true_norm,
+                disp_pred=q_pred_norm,
+                force_t=force_t,
+                force_true=f_true_t[:, 0].detach().cpu().numpy()[:n_force],
+                force_pred=force_total_full[:n_force],
+                reduced_velocity=ur_val,
+                force_baseline=force_td_full[:n_force],
+                force_baseline_label="C_F (Vivana-TD)",
+                tag=f"{tag_prefix}_spectra",
+                step=step,
+                title_suffix=title_suffix,
+            )
         if log_plots and log_correction_on_data:
             output_label = "Correction coefficient" if str(getattr(model, "force_output", "force")) == "coefficient" else "Correction force"
             log_correction_on_data_plot(
@@ -3857,7 +3874,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     traj_name = str(traj.get("name", "unnamed"))
                     _log_td_correction_rollout_validation(
                         writer=writer,
-                        epoch=epoch_idx + 1,
+                        epoch=epoch_idx,
                         model=model,
                         traj=traj,
                         dt=dt,
@@ -3879,6 +3896,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         log_plots=False,
                         log_spectra=True,
                         log_only_spectra=True,
+                        step=epoch_idx + 1,
                         title_suffix=f" [{traj_name}]",
                     )
         elapsed = float(time.perf_counter() - split_start)
@@ -4114,7 +4132,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     split_loader=val_seen_loader,
                     split_rollout_loader=val_seen_rollout_loader,
                     split_trajs=val_seen_trajs,
-                    log_rollout_plots=True,
+                    log_rollout_plots=False,
                     log_all_rollout_spectra=True,
                 )
             ckpt_path = _save_td_validation_checkpoint(epoch)
