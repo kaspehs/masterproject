@@ -3843,7 +3843,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     tag_prefix=f"{split_tag}/rollout",
                     log_metrics=False,
                     log_plots=True,
-                    log_spectra=False,
+                    log_spectra=True,
                 )
             if log_all_rollout_spectra:
                 def _safe_tag_component(raw: Any) -> str:
@@ -3877,8 +3877,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         tag_prefix=f"{split_tag}/rollout/{_safe_tag_component(traj_name)}",
                         log_metrics=False,
                         log_plots=False,
-                        log_spectra=False,
-                        log_only_spectra=False,
+                        log_spectra=True,
+                        log_only_spectra=True,
                         title_suffix=f" [{traj_name}]",
                     )
         elapsed = float(time.perf_counter() - split_start)
@@ -4261,7 +4261,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_correction_on_data=False,
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
-                log_spectra=False,
+                log_spectra=True,
             )
             filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
             if filtered_plot_metrics:

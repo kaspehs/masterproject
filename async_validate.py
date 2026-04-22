@@ -59,7 +59,8 @@ from HNN_helper import (
 from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
     _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
-    _td_correction_rollout_loss_from_batch,
+    _normalize_rollout_disp_spectral_loss_mode,
+    _td_correction_rollout_losses_from_batch,
     _td_step_with_corrections,
     _td_state_mse_loss,
     _td_state_propagated_nll_loss,
@@ -709,6 +710,24 @@ def _run_hnn_td_correction_validation(
         raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
+    rollout_disp_spectral_weight_raw = getattr(loss_cfg, "rollout_disp_spectral_weight", None)
+    if rollout_disp_spectral_weight_raw is None:
+        rollout_disp_spectral_weight = float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
+    else:
+        rollout_disp_spectral_weight = float(rollout_disp_spectral_weight_raw)
+    rollout_disp_spectral_loss = _normalize_rollout_disp_spectral_loss_mode(
+        getattr(loss_cfg, "rollout_disp_spectral_loss", "psd")
+    )
+    rollout_disp_psd_peak_rel_bandwidth = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
+    rollout_disp_psd_use_hann_window = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
+    rollout_det_amplitude_normalized_mse = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
+    rollout_disp_std_normalize_raw = getattr(loss_cfg, "rollout_disp_std_normalize_by_true", None)
+    rollout_disp_std_normalize_by_true = (
+        rollout_det_amplitude_normalized_mse
+        if rollout_disp_std_normalize_raw is None
+        else bool(rollout_disp_std_normalize_raw)
+    )
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_batch_size = int(cfg.training.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
@@ -889,15 +908,21 @@ def _run_hnn_td_correction_validation(
                 name: float((value / val_denom).detach().cpu()) for name, value in val_sums.items()
             }
             rollout_loss_avg = 0.0
+            rollout_std_loss_avg = 0.0
+            rollout_spectral_loss_avg = 0.0
 
-            if rollout_loader is not None and rollout_det_weight > 0.0:
+            if rollout_loader is not None and (
+                rollout_det_weight > 0.0
+                or rollout_disp_std_weight > 0.0
+                or rollout_disp_spectral_weight > 0.0
+            ):
                 rollout_loss_sum = torch.zeros((), device=device)
+                rollout_std_loss_sum = torch.zeros((), device=device)
+                rollout_spectral_loss_sum = torch.zeros((), device=device)
                 rollout_count = 0
                 with torch.no_grad():
                     for rollout_batch in rollout_loader:
-                        if len(rollout_batch) != 8:
-                            raise ValueError("Unexpected TD correction rollout batch format.")
-                        rollout_loss_sum += _td_correction_rollout_loss_from_batch(
+                        rollout_losses = _td_correction_rollout_losses_from_batch(
                             model=model,
                             batch=rollout_batch,
                             device=device,
@@ -913,11 +938,29 @@ def _run_hnn_td_correction_validation(
                             rollout_loss_mode=rollout_loss_mode,
                             rollout_stochastic_samples=rollout_stochastic_samples,
                             rollout_noise_scale=rollout_noise_scale,
-                        ).detach()
+                            amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
+                            compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
+                            disp_std_normalize_by_true=rollout_disp_std_normalize_by_true,
+                            compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
+                            disp_spectral_loss_mode=rollout_disp_spectral_loss,
+                            disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
+                            disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
+                        )
+                        rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
+                        rollout_std_loss_sum += rollout_losses["disp_std_loss"].detach()
+                        rollout_spectral_loss_sum += rollout_losses["disp_spectral_loss"].detach()
                         rollout_count += 1
                 rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                rollout_std_loss_avg = float((rollout_std_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                rollout_spectral_loss_avg = float(
+                    (rollout_spectral_loss_sum / float(max(1, rollout_count))).detach().cpu()
+                )
                 writer.add_scalar(f"{split_tag}/loss_rollout_det", rollout_loss_avg, tb_step)
-                num_loss_scalars_written += 1
+                writer.add_scalar(f"{split_tag}/loss_rollout_disp_std", rollout_std_loss_avg, tb_step)
+                writer.add_scalar(f"{split_tag}/loss_rollout_spectral", rollout_spectral_loss_avg, tb_step)
+                num_loss_scalars_written += 3
+            val_metrics["loss_rollout_disp_std"] = rollout_std_loss_avg
+            val_metrics["loss_rollout_spectral"] = rollout_spectral_loss_avg
             val_metrics["loss_total"] = (
                 val_metrics["loss_state"]
                 + float(force_data_weight) * val_metrics["loss_data"]
@@ -925,6 +968,8 @@ def _run_hnn_td_correction_validation(
                 + float(sigma_reg) * val_metrics["loss_reg_sigma"]
                 + float(fhat_reg) * val_metrics["loss_reg_fhat"]
                 + float(rollout_det_weight) * rollout_loss_avg
+                + float(rollout_disp_std_weight) * rollout_std_loss_avg
+                + float(rollout_disp_spectral_weight) * rollout_spectral_loss_avg
             )
             for name, value in val_metrics.items():
                 writer.add_scalar(f"{split_tag}/{name}", value, tb_step)
@@ -1017,6 +1062,7 @@ def _run_hnn_td_correction_validation(
                 rollout_seed=rollout_seed,
                 log_metrics=False,
                 log_plots=True,
+                log_spectra=True,
                 tag_prefix=f"{split_tag}/rollout",
             )
 
