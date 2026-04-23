@@ -372,6 +372,25 @@ def _td_state_for_model_scaling(
     return torch.cat([z[..., 0:1], p_model], dim=-1)
 
 
+def _td_rollout_state_scale(
+    model: PHVIV,
+    *,
+    z_like: torch.Tensor,
+    reduced_velocity: torch.Tensor,
+    structural_mass: torch.Tensor | float,
+    stiffness: torch.Tensor | float,
+) -> torch.Tensor:
+    q_scale = torch.full_like(z_like[..., 0:1], float(model.D))
+    p_scale = _td_p_scale_tensor(
+        model,
+        reduced_velocity=reduced_velocity,
+        structural_mass=structural_mass,
+        stiffness=stiffness,
+        like=z_like[..., :1],
+    )
+    return torch.cat([q_scale, p_scale], dim=-1)
+
+
 def _td_optional_hidden_inputs_for_model(
     model: PHVIV,
     *,
@@ -1031,9 +1050,11 @@ def _displacement_std_error_torch(
     pred_centered = pred_signal - torch.mean(pred_signal, dim=1, keepdim=True)
     true_std = torch.sqrt(torch.mean(true_centered * true_centered, dim=1))
     pred_std = torch.sqrt(torch.mean(pred_centered * pred_centered, dim=1))
-    loss = torch.abs(pred_std - true_std)
+    diff = pred_std - true_std
+    loss = diff * diff
     if bool(normalize_by_true):
-        loss = loss / true_std.clamp_min(float(eps))
+        denom = true_std.clamp_min(float(eps))
+        loss = loss / (denom * denom)
     return torch.mean(loss)
 
 
@@ -1097,6 +1118,13 @@ def _td_correction_rollout_losses_from_batch(
     dt_values = dt_roll[:, 0]
     disp_std_loss = z_traj.new_zeros(())
     disp_spectral_loss = z_traj.new_zeros(())
+    z_scale = _td_rollout_state_scale(
+        model,
+        z_like=z_traj,
+        reduced_velocity=ur0,
+        structural_mass=mass0,
+        stiffness=stiffness0,
+    )
     if mode_key == "deterministic" or not sigma_active:
         z_pred, _force_seq, _corr_seq, _sigma_seq, _delta_fhat_seq = _td_correction_state_rollout(
             model=model,
@@ -1117,12 +1145,10 @@ def _td_correction_rollout_losses_from_batch(
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
+        err = (z_pred - z_traj) / z_scale
         if amplitude_normalized_mse:
-            z_scale = _target_centered_rms_scale_torch(z_traj, time_dim=1)
-            err = (z_pred - z_traj) / z_scale
-            trajectory_loss = torch.mean(torch.sum(err * err, dim=2))
-        else:
-            trajectory_loss = torch.mean(torch.sum((z_pred - z_traj) ** 2, dim=2))
+            err = err / _target_centered_rms_scale_torch(z_traj, time_dim=1)
+        trajectory_loss = torch.mean(torch.sum(err * err, dim=2))
         if compute_disp_std_loss:
             disp_std_loss = _displacement_std_error_torch(
                 true_signal=z_traj[:, :, 0],
@@ -1186,16 +1212,18 @@ def _td_correction_rollout_losses_from_batch(
     z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
     if mode_key == "stochastic_mse":
         err = z_pred - z_traj.unsqueeze(0)
+        err = err / z_scale.unsqueeze(0)
         if amplitude_normalized_mse:
-            z_scale = _target_centered_rms_scale_torch(z_traj, time_dim=1).unsqueeze(0)
-            err = err / z_scale
+            err = err / _target_centered_rms_scale_torch(z_traj, time_dim=1).unsqueeze(0)
         per_samples = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
         trajectory_loss = torch.mean(torch.mean(per_samples, dim=0))
     else:
-        mu = torch.mean(z_pred, dim=0)
-        var = torch.mean((z_pred - mu.unsqueeze(0)) ** 2, dim=0)
+        z_pred_scaled = z_pred / z_scale.unsqueeze(0)
+        z_true_scaled = z_traj.unsqueeze(0) / z_scale.unsqueeze(0)
+        mu = torch.mean(z_pred_scaled, dim=0)
+        var = torch.mean((z_pred_scaled - mu.unsqueeze(0)) ** 2, dim=0)
         var = torch.clamp(var, min=1e-6)
-        nll = 0.5 * (((z_traj - mu) ** 2) / var + torch.log(var))
+        nll = 0.5 * (((z_true_scaled - mu) ** 2) / var + torch.log(var))
         per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
         trajectory_loss = torch.mean(per)
     if compute_disp_std_loss:

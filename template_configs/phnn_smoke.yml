@@ -94,7 +94,8 @@ loss:
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
   rollout_det_batch_size: 256
-  # If true, divide rollout state MSE by the target signal's centered RMS per state channel.
+  # If true, additionally divide the fixed-normalized rollout state MSE by the
+  # target signal's centered RMS per state channel.
   rollout_det_amplitude_normalized_mse: false
   # Auxiliary rollout displacement-std loss weight.
   rollout_disp_std_weight: 0.0

@@ -2,7 +2,7 @@ import importlib
 import math
 import warnings
 import yaml
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -320,7 +320,7 @@ class LossConfig:
     rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
-    rollout_det_amplitude_normalized_mse: bool = False
+    rollout_det_amplitude_normalized_mse: bool = False  # additionally RMS-normalize the fixed-normalized rollout MSE
     rollout_disp_std_weight: float = 0.0
     rollout_disp_std_normalize_by_true: bool | None = None  # None -> reuse rollout_det_amplitude_normalized_mse
     rollout_disp_spectral_weight: float | None = None  # preferred name; falls back to rollout_disp_psd_weight when unset
@@ -414,22 +414,38 @@ _PHNN_HISTORY_MODEL_KEYS = (
 )
 
 
-def parse_config(raw: dict[str, Any]) -> Config:
-    method = raw.get("method", "hnn")
-    data_cfg = raw.get("data", {}) or {}
-    model_cfg = raw.get("model", {}) or {}
-    architecture_cfg = dict(raw.get("architecture", {}) or {})
-    training_cfg = dict(raw.get("training", {}) or {})
-    optim_cfg = dict(raw.get("optim", {}) or {})
-    loss_cfg = dict(raw.get("loss", {}) or {})
-    runtime_cfg = dict(raw.get("runtime", {}) or {})
-    precision_cfg = dict(raw.get("precision", {}) or {})
-    compile_cfg = dict(raw.get("compile", {}) or {})
-    monitoring_cfg = dict(raw.get("monitoring", raw.get("train_logging", {})) or {})
-    logging_cfg = raw.get("logging", {}) or {}
-    hnn_block = dict(raw.get("hnn", {}) or {})
-    pinn_block = dict(raw.get("pinn", {}) or {})
-    vpinn_block = dict(raw.get("vpinn", {}) or {})
+def _coerce_config_dict(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if hasattr(raw, "__dict__"):
+        return dict(raw.__dict__)
+    raise TypeError(f"Unsupported config type: {type(raw)}")
+
+
+def _filter_dataclass_kwargs(cls: type[Any], raw_cfg: dict[str, Any]) -> dict[str, Any]:
+    allowed = {field_info.name for field_info in fields(cls)}
+    return {key: value for key, value in raw_cfg.items() if key in allowed}
+
+
+def parse_config(raw: dict[str, Any] | Any) -> Config:
+    raw_cfg = _coerce_config_dict(raw)
+    method = raw_cfg.get("method", "hnn")
+    data_cfg = dict(raw_cfg.get("data", {}) or {})
+    model_cfg = dict(raw_cfg.get("model", {}) or {})
+    architecture_cfg = dict(raw_cfg.get("architecture", {}) or {})
+    training_cfg = dict(raw_cfg.get("training", {}) or {})
+    optim_cfg = dict(raw_cfg.get("optim", {}) or {})
+    loss_cfg = dict(raw_cfg.get("loss", {}) or {})
+    runtime_cfg = dict(raw_cfg.get("runtime", {}) or {})
+    precision_cfg = dict(raw_cfg.get("precision", {}) or {})
+    compile_cfg = dict(raw_cfg.get("compile", {}) or {})
+    monitoring_cfg = dict(raw_cfg.get("monitoring", raw_cfg.get("train_logging", {})) or {})
+    logging_cfg = dict(raw_cfg.get("logging", {}) or {})
+    hnn_block = dict(raw_cfg.get("hnn", {}) or {})
+    pinn_block = dict(raw_cfg.get("pinn", {}) or {})
+    vpinn_block = dict(raw_cfg.get("vpinn", {}) or {})
 
     method_key = str(method).strip().lower()
     if method_key in {"hnn", "phnn"}:
@@ -571,22 +587,25 @@ def parse_config(raw: dict[str, Any]) -> Config:
 
     training_cfg = {k: v for k, v in training_cfg.items() if k in {"batch_size", "max_grad_norm", "epochs"}}
 
-    data = DataConfig(**data_cfg)
-    model = ModelConfig(**model_cfg)
-    architecture = ArchitectureConfig(**architecture_cfg)
-    training = TrainingConfig(**training_cfg)
+    if "input_scaling_mode" in model_cfg:
+        model_cfg["input_scaling_mode"] = resolve_phnn_input_scaling_mode(model_cfg["input_scaling_mode"])
+
+    data = DataConfig(**_filter_dataclass_kwargs(DataConfig, data_cfg))
+    model = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_cfg))
+    architecture = ArchitectureConfig(**_filter_dataclass_kwargs(ArchitectureConfig, architecture_cfg))
+    training = TrainingConfig(**_filter_dataclass_kwargs(TrainingConfig, training_cfg))
 
     scheduler_dict = optim_cfg.get("scheduler", {}) or {}
-    scheduler = SchedulerConfig(**scheduler_dict)
-    optim_fields = {k: v for k, v in optim_cfg.items() if k != "scheduler"}
+    scheduler = SchedulerConfig(**_filter_dataclass_kwargs(SchedulerConfig, dict(scheduler_dict)))
+    optim_fields = _filter_dataclass_kwargs(OptimConfig, {k: v for k, v in optim_cfg.items() if k != "scheduler"})
     optim = OptimConfig(**optim_fields, scheduler=scheduler)
     if "sigma_reg" not in loss_cfg and "force_reg" in loss_cfg:
         loss_cfg["sigma_reg"] = loss_cfg["force_reg"]
     loss_cfg.pop("force_reg", None)
-    loss = LossConfig(**loss_cfg)
-    runtime = RuntimeConfig(**runtime_cfg)
-    precision = PrecisionConfig(**precision_cfg)
-    compile_cfg_obj = CompileConfig(**compile_cfg)
+    loss = LossConfig(**_filter_dataclass_kwargs(LossConfig, loss_cfg))
+    runtime = RuntimeConfig(**_filter_dataclass_kwargs(RuntimeConfig, runtime_cfg))
+    precision = PrecisionConfig(**_filter_dataclass_kwargs(PrecisionConfig, precision_cfg))
+    compile_cfg_obj = CompileConfig(**_filter_dataclass_kwargs(CompileConfig, compile_cfg))
     monitoring_cfg.pop("rollout_every_epoch", None)
     monitoring_cfg.pop("rollout_every_epochs", None)
     monitoring_cfg.pop("rollout_max_trajectories", None)
@@ -600,8 +619,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
     # Removed monitoring toggles: keep old configs loadable by ignoring stale keys.
     monitoring_cfg.pop("rollout_include_disp_nrmse", None)
     monitoring_cfg.pop("rollout_include_force_nrmse", None)
-    monitoring = MonitoringConfig(**monitoring_cfg)
-    logging = LoggingConfig(**logging_cfg)
+    monitoring = MonitoringConfig(**_filter_dataclass_kwargs(MonitoringConfig, monitoring_cfg))
+    logging = LoggingConfig(**_filter_dataclass_kwargs(LoggingConfig, logging_cfg))
     return Config(
         method=str(method),
         data=data,
