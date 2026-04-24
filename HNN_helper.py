@@ -4862,14 +4862,17 @@ def _broadcast_td_hidden_param_torch(
 ) -> torch.Tensor:
     tensor = value if torch.is_tensor(value) else torch.as_tensor(value, device=like.device, dtype=like.dtype)
     tensor = tensor.to(device=like.device, dtype=like.dtype)
-    if tensor.ndim == 0:
-        tensor = tensor.view(1, 1)
-    elif tensor.ndim == like.ndim - 1:
+    while tensor.ndim < like.ndim:
         tensor = tensor.unsqueeze(-1)
     if tensor.ndim != like.ndim or tensor.shape[-1] != 1:
         raise ValueError(f"{name} must be broadcastable to shape {tuple(like.shape)}, got {tuple(tensor.shape)}.")
     if tensor.shape[:-1] != like.shape[:-1]:
-        tensor = tensor.expand(like.shape[:-1] + (1,))
+        try:
+            tensor = tensor.expand(like.shape[:-1] + (1,))
+        except RuntimeError as exc:
+            raise ValueError(
+                f"{name} must be broadcastable to shape {tuple(like.shape)}, got {tuple(tensor.shape)}."
+            ) from exc
     return tensor
 
 

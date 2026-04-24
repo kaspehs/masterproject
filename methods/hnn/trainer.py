@@ -83,6 +83,7 @@ from HNN_helper import (
     resolve_cut_start_seconds,
     sample_indices_per_ur,
     sample_one_index_per_ur,
+    _broadcast_td_hidden_param_torch,
     td_hidden_inputs_from_context_torch,
 )
 
@@ -294,19 +295,8 @@ def _td_output_scale_tensor(
     stiffness: torch.Tensor | float,
     like: torch.Tensor,
 ) -> torch.Tensor:
-    mass_t = torch.as_tensor(structural_mass, device=like.device, dtype=like.dtype)
-    stiffness_t = torch.as_tensor(stiffness, device=like.device, dtype=like.dtype)
-    if mass_t.ndim == 0:
-        mass_t = mass_t.view(1, 1)
-    elif mass_t.ndim == 1:
-        mass_t = mass_t.view(-1, 1)
-    if stiffness_t.ndim == 0:
-        stiffness_t = stiffness_t.view(1, 1)
-    elif stiffness_t.ndim == 1:
-        stiffness_t = stiffness_t.view(-1, 1)
-    shape = like.shape[:-1] + (1,)
-    mass_t = mass_t.expand(shape)
-    stiffness_t = stiffness_t.expand(shape)
+    mass_t = _broadcast_td_hidden_param_torch(structural_mass, like=like, name="structural_mass")
+    stiffness_t = _broadcast_td_hidden_param_torch(stiffness, like=like, name="stiffness")
     if getattr(model, "force_output", "force") == "coefficient":
         rv_raw = model._prepare_reduced_velocity_raw(reduced_velocity, like=like)
         if rv_raw is None:
@@ -330,19 +320,8 @@ def _td_p_scale_tensor(
     stiffness: torch.Tensor | float,
     like: torch.Tensor,
 ) -> torch.Tensor:
-    mass_t = torch.as_tensor(structural_mass, device=like.device, dtype=like.dtype)
-    stiffness_t = torch.as_tensor(stiffness, device=like.device, dtype=like.dtype)
-    if mass_t.ndim == 0:
-        mass_t = mass_t.view(1, 1)
-    elif mass_t.ndim == 1:
-        mass_t = mass_t.view(-1, 1)
-    if stiffness_t.ndim == 0:
-        stiffness_t = stiffness_t.view(1, 1)
-    elif stiffness_t.ndim == 1:
-        stiffness_t = stiffness_t.view(-1, 1)
-    shape = like.shape[:-1] + (1,)
-    mass_t = mass_t.expand(shape)
-    stiffness_t = stiffness_t.expand(shape)
+    mass_t = _broadcast_td_hidden_param_torch(structural_mass, like=like, name="structural_mass")
+    stiffness_t = _broadcast_td_hidden_param_torch(stiffness, like=like, name="stiffness")
     if getattr(model, "input_scaling_mode", "current") == "convective":
         rv_raw = model._prepare_reduced_velocity_raw(reduced_velocity, like=like)
         if rv_raw is None:
