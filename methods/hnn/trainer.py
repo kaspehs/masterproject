@@ -793,13 +793,14 @@ def _spectral_band_mask_from_true_peak_torch(
     return band_mask
 
 
-def _area_normalized_psd_error_common_dt_torch(
+def _psd_error_common_dt_torch(
     *,
     true_signal: torch.Tensor,
     pred_signal: torch.Tensor,
     dt: float,
     peak_rel_bandwidth: float = 0.0,
     use_hann_window: bool = True,
+    relative: bool = False,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     spec = _rollout_disp_spectra_common_dt_torch(
@@ -820,27 +821,25 @@ def _area_normalized_psd_error_common_dt_torch(
     mask_f = band_mask.to(dtype=true_psd.dtype)
     p_true = torch.clamp(true_psd, min=0.0) * mask_f
     p_pred = torch.clamp(pred_psd, min=0.0) * mask_f
-    freq_grid = freqs.view(1, -1).expand(int(true_psd.shape[0]), -1).to(dtype=true_psd.dtype)
-    area_true = torch.trapz(p_true, freq_grid, dim=1)
-    area_pred = torch.trapz(p_pred, freq_grid, dim=1)
-    valid = (area_true > float(eps)) & (area_pred > float(eps)) & (band_mask.sum(dim=1) >= 2)
+    valid = band_mask.sum(dim=1) >= 1
     if not torch.any(valid):
         return true_signal.new_zeros(())
+    loss = torch.sum(((p_pred - p_true) ** 2) * mask_f, dim=1)
+    if bool(relative):
+        denom = torch.sum((p_true * p_true) * mask_f, dim=1) + float(eps)
+        loss = loss / denom
+    loss = torch.where(valid, loss, torch.zeros_like(loss))
+    return torch.sum(loss) / torch.clamp(valid.to(dtype=loss.dtype).sum(), min=1.0)
 
-    p_true_norm = p_true / area_true.clamp_min(float(eps)).view(-1, 1)
-    p_pred_norm = p_pred / area_pred.clamp_min(float(eps)).view(-1, 1)
-    tv = 0.5 * torch.trapz(torch.abs(p_pred_norm - p_true_norm), freq_grid, dim=1)
-    tv = torch.where(valid, tv, torch.zeros_like(tv))
-    return torch.sum(tv) / torch.clamp(valid.to(dtype=tv.dtype).sum(), min=1.0)
 
-
-def _area_normalized_psd_error_torch(
+def _psd_error_torch(
     *,
     true_signal: torch.Tensor,
     pred_signal: torch.Tensor,
     dt: float | torch.Tensor,
     peak_rel_bandwidth: float = 0.0,
     use_hann_window: bool = True,
+    relative: bool = False,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     if true_signal.ndim != 2 or pred_signal.ndim != 2:
@@ -852,12 +851,13 @@ def _area_normalized_psd_error_torch(
         return true_signal.new_zeros(())
     dt_values = _normalize_psd_dt_values(dt, batch_size=batch_size)
     if _dt_values_effectively_constant(dt_values):
-        return _area_normalized_psd_error_common_dt_torch(
+        return _psd_error_common_dt_torch(
             true_signal=true_signal,
             pred_signal=pred_signal,
             dt=float(torch.mean(dt_values).item()),
             peak_rel_bandwidth=peak_rel_bandwidth,
             use_hann_window=use_hann_window,
+            relative=relative,
             eps=eps,
         )
 
@@ -866,12 +866,13 @@ def _area_normalized_psd_error_torch(
     weights: list[float] = []
     for group_dt, group_indices in grouped:
         losses.append(
-            _area_normalized_psd_error_common_dt_torch(
+            _psd_error_common_dt_torch(
                 true_signal=true_signal.index_select(0, group_indices),
                 pred_signal=pred_signal.index_select(0, group_indices),
                 dt=group_dt,
                 peak_rel_bandwidth=peak_rel_bandwidth,
                 use_hann_window=use_hann_window,
+                relative=relative,
                 eps=eps,
             )
         )
@@ -888,7 +889,7 @@ def _soft_dominant_frequency_from_psd_torch(
     psd: torch.Tensor,
     freqs: torch.Tensor,
     band_mask: torch.Tensor,
-    sharpness: float = 12.0,
+    alpha: float = 12.0,
     eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     mask_f = band_mask.to(dtype=psd.dtype)
@@ -896,7 +897,7 @@ def _soft_dominant_frequency_from_psd_torch(
     peak_power = torch.amax(p_masked, dim=1, keepdim=True)
     valid = (peak_power[:, 0] > float(eps)) & (band_mask.sum(dim=1) >= 1)
     scaled = p_masked / peak_power.clamp_min(float(eps))
-    weights = torch.pow(torch.clamp(scaled, min=0.0), float(sharpness)) * mask_f
+    weights = torch.pow(torch.clamp(scaled, min=0.0), float(alpha)) * mask_f
     weight_sum = torch.sum(weights, dim=1, keepdim=True)
     freq_grid = freqs.view(1, -1).to(dtype=psd.dtype)
     dominant = torch.sum(weights * freq_grid, dim=1) / weight_sum.clamp_min(float(eps)).view(-1)
@@ -911,6 +912,9 @@ def _dominant_frequency_error_common_dt_torch(
     dt: float,
     peak_rel_bandwidth: float = 0.0,
     use_hann_window: bool = True,
+    relative: bool = True,
+    power: float = 1.0,
+    alpha: float = 12.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     spec = _rollout_disp_spectra_common_dt_torch(
@@ -932,20 +936,25 @@ def _dominant_frequency_error_common_dt_torch(
         psd=true_psd,
         freqs=freqs,
         band_mask=band_mask,
+        alpha=alpha,
         eps=eps,
     )
     pred_dom, pred_valid = _soft_dominant_frequency_from_psd_torch(
         psd=pred_psd,
         freqs=freqs,
         band_mask=band_mask,
+        alpha=alpha,
         eps=eps,
     )
-    valid = true_valid & pred_valid & (true_dom > float(eps))
+    valid = true_valid & pred_valid
     if not torch.any(valid):
         return true_signal.new_zeros(())
-    rel = torch.abs(pred_dom - true_dom) / true_dom.clamp_min(float(eps))
-    rel = torch.where(valid, rel, torch.zeros_like(rel))
-    return torch.sum(rel) / torch.clamp(valid.to(dtype=rel.dtype).sum(), min=1.0)
+    loss = torch.pow(torch.abs(pred_dom - true_dom), float(power))
+    if bool(relative):
+        denom = torch.pow(torch.abs(true_dom), float(power)) + float(eps)
+        loss = loss / denom
+    loss = torch.where(valid, loss, torch.zeros_like(loss))
+    return torch.sum(loss) / torch.clamp(valid.to(dtype=loss.dtype).sum(), min=1.0)
 
 
 def _dominant_frequency_error_torch(
@@ -955,6 +964,9 @@ def _dominant_frequency_error_torch(
     dt: float | torch.Tensor,
     peak_rel_bandwidth: float = 0.0,
     use_hann_window: bool = True,
+    relative: bool = True,
+    power: float = 1.0,
+    alpha: float = 12.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     if true_signal.ndim != 2 or pred_signal.ndim != 2:
@@ -972,6 +984,9 @@ def _dominant_frequency_error_torch(
             dt=float(torch.mean(dt_values).item()),
             peak_rel_bandwidth=peak_rel_bandwidth,
             use_hann_window=use_hann_window,
+            relative=relative,
+            power=power,
+            alpha=alpha,
             eps=eps,
         )
 
@@ -986,6 +1001,9 @@ def _dominant_frequency_error_torch(
                 dt=group_dt,
                 peak_rel_bandwidth=peak_rel_bandwidth,
                 use_hann_window=use_hann_window,
+                relative=relative,
+                power=power,
+                alpha=alpha,
                 eps=eps,
             )
         )
@@ -1012,7 +1030,8 @@ def _displacement_std_error_torch(
     *,
     true_signal: torch.Tensor,
     pred_signal: torch.Tensor,
-    normalize_by_true: bool = False,
+    relative: bool = False,
+    power: float = 2.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     if true_signal.ndim != 2 or pred_signal.ndim != 2:
@@ -1029,12 +1048,77 @@ def _displacement_std_error_torch(
     pred_centered = pred_signal - torch.mean(pred_signal, dim=1, keepdim=True)
     true_std = torch.sqrt(torch.mean(true_centered * true_centered, dim=1))
     pred_std = torch.sqrt(torch.mean(pred_centered * pred_centered, dim=1))
-    diff = pred_std - true_std
-    loss = diff * diff
-    if bool(normalize_by_true):
-        denom = true_std.clamp_min(float(eps))
-        loss = loss / (denom * denom)
+    loss = torch.pow(torch.abs(pred_std - true_std), float(power))
+    if bool(relative):
+        denom = torch.pow(torch.abs(true_std) + float(eps), float(power))
+        loss = loss / denom
     return torch.mean(loss)
+
+
+def _trajectory_rollout_mse_torch(
+    *,
+    true_traj: torch.Tensor,
+    pred_traj: torch.Tensor,
+    z_scale: torch.Tensor,
+    relative: bool = False,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    if true_traj.ndim != 3 or pred_traj.ndim != 3 or z_scale.ndim != 3:
+        raise ValueError("Rollout trajectory MSE expects [batch, time, state] tensors.")
+    if true_traj.shape != pred_traj.shape or true_traj.shape != z_scale.shape:
+        raise ValueError("Rollout trajectory MSE requires matching true, predicted, and scale shapes.")
+    if int(true_traj.shape[0]) < 1 or int(true_traj.shape[1]) < 1:
+        return true_traj.new_zeros(())
+    err = (pred_traj - true_traj) / z_scale
+    loss = torch.mean(torch.sum(err * err, dim=2), dim=1)
+    if bool(relative):
+        true_norm = true_traj / z_scale
+        denom = torch.mean(torch.sum(true_norm * true_norm, dim=2), dim=1).clamp_min(float(eps))
+        loss = loss / denom
+    return torch.mean(loss)
+
+
+def _resolve_td_rollout_loss_settings(loss_cfg: Any) -> dict[str, Any]:
+    relative_raw = getattr(loss_cfg, "rollout_relative_losses", None)
+    legacy_traj_relative = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
+    legacy_std_relative_raw = getattr(loss_cfg, "rollout_disp_std_normalize_by_true", None)
+    if relative_raw is None:
+        rollout_relative_losses = None
+        trajectory_relative = legacy_traj_relative
+        disp_std_relative = (
+            legacy_traj_relative if legacy_std_relative_raw is None else bool(legacy_std_relative_raw)
+        )
+        disp_psd_relative = False
+        disp_freq_relative = True
+        relative_source = "legacy"
+    else:
+        rollout_relative_losses = bool(relative_raw)
+        trajectory_relative = rollout_relative_losses
+        disp_std_relative = rollout_relative_losses
+        disp_psd_relative = rollout_relative_losses
+        disp_freq_relative = rollout_relative_losses
+        relative_source = "global"
+
+    disp_std_p = float(getattr(loss_cfg, "rollout_disp_std_p", 2.0))
+    disp_freq_p = float(getattr(loss_cfg, "rollout_disp_freq_p", 1.0))
+    disp_freq_alpha = float(getattr(loss_cfg, "rollout_disp_freq_alpha", 12.0))
+    if not np.isfinite(disp_std_p) or disp_std_p < 1.0 or disp_std_p > 2.0:
+        raise ValueError("loss.rollout_disp_std_p must be finite and in [1, 2].")
+    if not np.isfinite(disp_freq_p) or disp_freq_p < 1.0 or disp_freq_p > 2.0:
+        raise ValueError("loss.rollout_disp_freq_p must be finite and in [1, 2].")
+    if not np.isfinite(disp_freq_alpha) or disp_freq_alpha < 1.0:
+        raise ValueError("loss.rollout_disp_freq_alpha must be finite and >= 1.")
+    return {
+        "rollout_relative_losses": rollout_relative_losses,
+        "trajectory_relative": trajectory_relative,
+        "disp_std_relative": disp_std_relative,
+        "disp_psd_relative": disp_psd_relative,
+        "disp_freq_relative": disp_freq_relative,
+        "disp_std_p": disp_std_p,
+        "disp_freq_p": disp_freq_p,
+        "disp_freq_alpha": disp_freq_alpha,
+        "relative_source": relative_source,
+    }
 
 
 def _normalize_rollout_disp_spectral_loss_mode(raw_mode: Any) -> str:
@@ -1065,11 +1149,16 @@ def _td_correction_rollout_losses_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
-    amplitude_normalized_mse: bool = False,
+    trajectory_relative: bool = False,
     compute_disp_std_loss: bool = False,
-    disp_std_normalize_by_true: bool = False,
+    disp_std_relative: bool = False,
+    disp_std_power: float = 2.0,
     compute_disp_spectral_loss: bool = False,
     disp_spectral_loss_mode: str = "psd",
+    disp_freq_relative: bool = True,
+    disp_freq_power: float = 1.0,
+    disp_freq_alpha: float = 12.0,
+    disp_psd_relative: bool = False,
     disp_psd_peak_rel_bandwidth: float = 0.0,
     disp_psd_use_hann_window: bool = True,
 ) -> dict[str, torch.Tensor]:
@@ -1104,6 +1193,8 @@ def _td_correction_rollout_losses_from_batch(
         structural_mass=mass0,
         stiffness=stiffness0,
     )
+    z_traj_horizon = z_traj[:, 1:, :]
+    z_scale_horizon = z_scale[:, 1:, :]
     if mode_key == "deterministic" or not sigma_active:
         z_pred, _force_seq, _corr_seq, _sigma_seq, _delta_fhat_seq = _td_correction_state_rollout(
             model=model,
@@ -1124,32 +1215,40 @@ def _td_correction_rollout_losses_from_batch(
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
         )
-        err = (z_pred - z_traj) / z_scale
-        if amplitude_normalized_mse:
-            err = err / _target_centered_rms_scale_torch(z_traj, time_dim=1)
-        trajectory_loss = torch.mean(torch.sum(err * err, dim=2))
+        z_pred_horizon = z_pred[:, 1:, :]
+        trajectory_loss = _trajectory_rollout_mse_torch(
+            true_traj=z_traj_horizon,
+            pred_traj=z_pred_horizon,
+            z_scale=z_scale_horizon,
+            relative=trajectory_relative,
+        )
         if compute_disp_std_loss:
             disp_std_loss = _displacement_std_error_torch(
-                true_signal=z_traj[:, :, 0],
-                pred_signal=z_pred[:, :, 0],
-                normalize_by_true=disp_std_normalize_by_true,
+                true_signal=z_traj_horizon[:, :, 0],
+                pred_signal=z_pred_horizon[:, :, 0],
+                relative=disp_std_relative,
+                power=disp_std_power,
             )
         if compute_disp_spectral_loss:
             if disp_spectral_loss_mode == "dominant_frequency":
                 disp_spectral_loss = _dominant_frequency_error_torch(
-                    true_signal=z_traj[:, :, 0],
-                    pred_signal=z_pred[:, :, 0],
+                    true_signal=z_traj_horizon[:, :, 0],
+                    pred_signal=z_pred_horizon[:, :, 0],
                     dt=dt_values,
                     peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
                     use_hann_window=disp_psd_use_hann_window,
+                    relative=disp_freq_relative,
+                    power=disp_freq_power,
+                    alpha=disp_freq_alpha,
                 )
             else:
-                disp_spectral_loss = _area_normalized_psd_error_torch(
-                    true_signal=z_traj[:, :, 0],
-                    pred_signal=z_pred[:, :, 0],
+                disp_spectral_loss = _psd_error_torch(
+                    true_signal=z_traj_horizon[:, :, 0],
+                    pred_signal=z_pred_horizon[:, :, 0],
                     dt=dt_values,
                     peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
                     use_hann_window=disp_psd_use_hann_window,
+                    relative=disp_psd_relative,
                 )
         return {
             "trajectory_loss": trajectory_loss,
@@ -1189,16 +1288,18 @@ def _td_correction_rollout_losses_from_batch(
         rollout_noise_scale=rollout_noise_scale,
     )
     z_pred = z_pred.reshape(samples, batch_size, *z_pred.shape[1:])
+    z_pred_horizon = z_pred[:, :, 1:, :]
     if mode_key == "stochastic_mse":
-        err = z_pred - z_traj.unsqueeze(0)
-        err = err / z_scale.unsqueeze(0)
-        if amplitude_normalized_mse:
-            err = err / _target_centered_rms_scale_torch(z_traj, time_dim=1).unsqueeze(0)
-        per_samples = torch.mean(err[..., 0] * err[..., 0], dim=2) + torch.mean(err[..., 1] * err[..., 1], dim=2)
+        err = (z_pred_horizon - z_traj_horizon.unsqueeze(0)) / z_scale_horizon.unsqueeze(0)
+        per_samples = torch.mean(torch.sum(err * err, dim=3), dim=2)
+        if bool(trajectory_relative):
+            true_norm = z_traj_horizon / z_scale_horizon
+            denom = torch.mean(torch.sum(true_norm * true_norm, dim=2), dim=1).clamp_min(1e-12)
+            per_samples = per_samples / denom.unsqueeze(0)
         trajectory_loss = torch.mean(torch.mean(per_samples, dim=0))
     else:
-        z_pred_scaled = z_pred / z_scale.unsqueeze(0)
-        z_true_scaled = z_traj.unsqueeze(0) / z_scale.unsqueeze(0)
+        z_pred_scaled = z_pred_horizon / z_scale_horizon.unsqueeze(0)
+        z_true_scaled = z_traj_horizon.unsqueeze(0) / z_scale_horizon.unsqueeze(0)
         mu = torch.mean(z_pred_scaled, dim=0)
         var = torch.mean((z_pred_scaled - mu.unsqueeze(0)) ** 2, dim=0)
         var = torch.clamp(var, min=1e-6)
@@ -1206,29 +1307,34 @@ def _td_correction_rollout_losses_from_batch(
         per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
         trajectory_loss = torch.mean(per)
     if compute_disp_std_loss:
-        z_for_std = torch.mean(z_pred, dim=0)
+        z_for_std = torch.mean(z_pred_horizon, dim=0)
         disp_std_loss = _displacement_std_error_torch(
-            true_signal=z_traj[:, :, 0],
+            true_signal=z_traj_horizon[:, :, 0],
             pred_signal=z_for_std[:, :, 0],
-            normalize_by_true=disp_std_normalize_by_true,
+            relative=disp_std_relative,
+            power=disp_std_power,
         )
     if compute_disp_spectral_loss:
-        z_for_psd = torch.mean(z_pred, dim=0)
+        z_for_psd = torch.mean(z_pred_horizon, dim=0)
         if disp_spectral_loss_mode == "dominant_frequency":
             disp_spectral_loss = _dominant_frequency_error_torch(
-                true_signal=z_traj[:, :, 0],
+                true_signal=z_traj_horizon[:, :, 0],
                 pred_signal=z_for_psd[:, :, 0],
                 dt=dt_values,
                 peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
                 use_hann_window=disp_psd_use_hann_window,
+                relative=disp_freq_relative,
+                power=disp_freq_power,
+                alpha=disp_freq_alpha,
             )
         else:
-            disp_spectral_loss = _area_normalized_psd_error_torch(
-                true_signal=z_traj[:, :, 0],
+            disp_spectral_loss = _psd_error_torch(
+                true_signal=z_traj_horizon[:, :, 0],
                 pred_signal=z_for_psd[:, :, 0],
                 dt=dt_values,
                 peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
                 use_hann_window=disp_psd_use_hann_window,
+                relative=disp_psd_relative,
             )
     return {
         "trajectory_loss": trajectory_loss,
@@ -1254,7 +1360,7 @@ def _td_correction_rollout_loss_from_batch(
     rollout_loss_mode: str,
     rollout_stochastic_samples: int,
     rollout_noise_scale: float,
-    amplitude_normalized_mse: bool = False,
+    trajectory_relative: bool = False,
 ) -> torch.Tensor:
     return _td_correction_rollout_losses_from_batch(
         model=model,
@@ -1272,11 +1378,16 @@ def _td_correction_rollout_loss_from_batch(
         rollout_loss_mode=rollout_loss_mode,
         rollout_stochastic_samples=rollout_stochastic_samples,
         rollout_noise_scale=rollout_noise_scale,
-        amplitude_normalized_mse=amplitude_normalized_mse,
+        trajectory_relative=trajectory_relative,
         compute_disp_std_loss=False,
-        disp_std_normalize_by_true=False,
+        disp_std_relative=False,
+        disp_std_power=2.0,
         compute_disp_spectral_loss=False,
         disp_spectral_loss_mode="psd",
+        disp_freq_relative=True,
+        disp_freq_power=1.0,
+        disp_freq_alpha=12.0,
+        disp_psd_relative=False,
         disp_psd_peak_rel_bandwidth=0.0,
     )["trajectory_loss"]
 
@@ -3256,13 +3367,16 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     )
     rollout_disp_psd_peak_rel_bandwidth = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
     rollout_disp_psd_use_hann_window = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
-    rollout_det_amplitude_normalized_mse = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
-    rollout_disp_std_normalize_raw = getattr(loss_cfg, "rollout_disp_std_normalize_by_true", None)
-    rollout_disp_std_normalize_by_true = (
-        rollout_det_amplitude_normalized_mse
-        if rollout_disp_std_normalize_raw is None
-        else bool(rollout_disp_std_normalize_raw)
-    )
+    rollout_loss_settings = _resolve_td_rollout_loss_settings(loss_cfg)
+    rollout_relative_losses = rollout_loss_settings["rollout_relative_losses"]
+    rollout_det_relative = rollout_loss_settings["trajectory_relative"]
+    rollout_disp_std_relative = rollout_loss_settings["disp_std_relative"]
+    rollout_disp_psd_relative = rollout_loss_settings["disp_psd_relative"]
+    rollout_disp_freq_relative = rollout_loss_settings["disp_freq_relative"]
+    rollout_disp_std_p = rollout_loss_settings["disp_std_p"]
+    rollout_disp_freq_p = rollout_loss_settings["disp_freq_p"]
+    rollout_disp_freq_alpha = rollout_loss_settings["disp_freq_alpha"]
+    rollout_relative_source = rollout_loss_settings["relative_source"]
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_loss_mode = str(getattr(loss_cfg, "rollout_loss_mode", "deterministic")).strip().lower()
     rollout_stochastic_samples = int(getattr(loss_cfg, "rollout_stochastic_samples", 1))
@@ -3610,8 +3724,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             rollout_mode_msg = f"{rollout_loss_mode} (K={rollout_stochastic_samples})"
         startup_lines.append(
             f"Rollout loss mode: {rollout_mode_msg}, state_loss_mode={state_loss_mode}, "
-            f"amplitude_normalized_mse={rollout_det_amplitude_normalized_mse}, "
-            f"disp_std_normalize_by_true={rollout_disp_std_normalize_by_true}, "
+            f"relative_losses={rollout_relative_losses!r} ({rollout_relative_source}), "
+            f"trajectory_relative={rollout_det_relative}, "
+            f"disp_std_relative={rollout_disp_std_relative}, "
+            f"disp_psd_relative={rollout_disp_psd_relative}, "
+            f"disp_freq_relative={rollout_disp_freq_relative}, "
+            f"disp_std_p={rollout_disp_std_p:g}, "
+            f"disp_freq_p={rollout_disp_freq_p:g}, "
+            f"disp_freq_alpha={rollout_disp_freq_alpha:g}, "
             f"disp_spectral_loss={rollout_disp_spectral_loss}, "
             f"disp_psd_peak_rel_bandwidth={rollout_disp_psd_peak_rel_bandwidth:g}, "
             f"disp_psd_use_hann_window={rollout_disp_psd_use_hann_window}"
@@ -3744,11 +3864,16 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
-                        amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
+                        trajectory_relative=rollout_det_relative,
                         compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
-                        disp_std_normalize_by_true=rollout_disp_std_normalize_by_true,
+                        disp_std_relative=rollout_disp_std_relative,
+                        disp_std_power=rollout_disp_std_p,
                         compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
                         disp_spectral_loss_mode=rollout_disp_spectral_loss,
+                        disp_freq_relative=rollout_disp_freq_relative,
+                        disp_freq_power=rollout_disp_freq_p,
+                        disp_freq_alpha=rollout_disp_freq_alpha,
+                        disp_psd_relative=rollout_disp_psd_relative,
                         disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
                         disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                     )
@@ -4013,11 +4138,16 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_loss_mode=rollout_loss_mode,
                         rollout_stochastic_samples=rollout_stochastic_samples,
                         rollout_noise_scale=rollout_noise_scale,
-                        amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
+                        trajectory_relative=rollout_det_relative,
                         compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
-                        disp_std_normalize_by_true=rollout_disp_std_normalize_by_true,
+                        disp_std_relative=rollout_disp_std_relative,
+                        disp_std_power=rollout_disp_std_p,
                         compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
                         disp_spectral_loss_mode=rollout_disp_spectral_loss,
+                        disp_freq_relative=rollout_disp_freq_relative,
+                        disp_freq_power=rollout_disp_freq_p,
+                        disp_freq_alpha=rollout_disp_freq_alpha,
+                        disp_psd_relative=rollout_disp_psd_relative,
                         disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
                         disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                     )

@@ -60,6 +60,7 @@ from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
     _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
     _normalize_rollout_disp_spectral_loss_mode,
+    _resolve_td_rollout_loss_settings,
     _td_correction_rollout_losses_from_batch,
     _td_step_with_corrections,
     _td_state_mse_loss,
@@ -721,13 +722,14 @@ def _run_hnn_td_correction_validation(
     )
     rollout_disp_psd_peak_rel_bandwidth = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
     rollout_disp_psd_use_hann_window = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
-    rollout_det_amplitude_normalized_mse = bool(getattr(loss_cfg, "rollout_det_amplitude_normalized_mse", False))
-    rollout_disp_std_normalize_raw = getattr(loss_cfg, "rollout_disp_std_normalize_by_true", None)
-    rollout_disp_std_normalize_by_true = (
-        rollout_det_amplitude_normalized_mse
-        if rollout_disp_std_normalize_raw is None
-        else bool(rollout_disp_std_normalize_raw)
-    )
+    rollout_loss_settings = _resolve_td_rollout_loss_settings(loss_cfg)
+    rollout_det_relative = rollout_loss_settings["trajectory_relative"]
+    rollout_disp_std_relative = rollout_loss_settings["disp_std_relative"]
+    rollout_disp_psd_relative = rollout_loss_settings["disp_psd_relative"]
+    rollout_disp_freq_relative = rollout_loss_settings["disp_freq_relative"]
+    rollout_disp_std_p = rollout_loss_settings["disp_std_p"]
+    rollout_disp_freq_p = rollout_loss_settings["disp_freq_p"]
+    rollout_disp_freq_alpha = rollout_loss_settings["disp_freq_alpha"]
     rollout_det_steps = int(getattr(loss_cfg, "rollout_det_steps", 0))
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_batch_size = int(cfg.training.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
@@ -938,11 +940,16 @@ def _run_hnn_td_correction_validation(
                             rollout_loss_mode=rollout_loss_mode,
                             rollout_stochastic_samples=rollout_stochastic_samples,
                             rollout_noise_scale=rollout_noise_scale,
-                            amplitude_normalized_mse=rollout_det_amplitude_normalized_mse,
+                            trajectory_relative=rollout_det_relative,
                             compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
-                            disp_std_normalize_by_true=rollout_disp_std_normalize_by_true,
+                            disp_std_relative=rollout_disp_std_relative,
+                            disp_std_power=rollout_disp_std_p,
                             compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
                             disp_spectral_loss_mode=rollout_disp_spectral_loss,
+                            disp_freq_relative=rollout_disp_freq_relative,
+                            disp_freq_power=rollout_disp_freq_p,
+                            disp_freq_alpha=rollout_disp_freq_alpha,
+                            disp_psd_relative=rollout_disp_psd_relative,
                             disp_psd_peak_rel_bandwidth=rollout_disp_psd_peak_rel_bandwidth,
                             disp_psd_use_hann_window=rollout_disp_psd_use_hann_window,
                         )

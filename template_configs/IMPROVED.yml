@@ -89,13 +89,17 @@ loss:
   rollout_det_steps_final: 0
   rollout_det_steps_warmup_epochs: 0
   rollout_det_batch_size: 256
-  # If true, additionally divide the fixed-normalized rollout state MSE by the
-  # target signal's centered RMS per state channel.
+  # Legacy fallback when rollout_relative_losses is null.
   rollout_det_amplitude_normalized_mse: false
+  # If set, apply the same absolute/relative choice to rollout MSE, std, PSD,
+  # and dominant-frequency losses. If null, legacy per-loss defaults are used.
+  rollout_relative_losses: true
   # Auxiliary rollout displacement-std loss weight.
   rollout_disp_std_weight: 0.0
-  # If null, reuse rollout_det_amplitude_normalized_mse for std-loss normalization.
+  # Legacy fallback when rollout_relative_losses is null.
   rollout_disp_std_normalize_by_true: null
+  # Exponent p in |std(pred)-std(true)|^p.
+  rollout_disp_std_p: 2.0
   # Auxiliary rollout displacement spectral loss weight. If left null, legacy rollout_disp_psd_weight is used.
   rollout_disp_spectral_weight: 1.0
   # Spectral loss mode: psd | dominant_frequency
@@ -107,6 +111,10 @@ loss:
   rollout_disp_psd_peak_rel_bandwidth: 0.3
   # If true, apply a Hann window before the FFT in the rollout displacement PSD loss.
   rollout_disp_psd_use_hann_window: true
+  # Exponent p in |f_pred-f_true|^p.
+  rollout_disp_freq_p: 1.0
+  # Peak-concentration exponent alpha in the PSD-weighted dominant-frequency estimate.
+  rollout_disp_freq_alpha: 12.0
 
   # Data / symmetry losses
   use_force_data_loss: false

@@ -321,13 +321,17 @@ class LossConfig:
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
     rollout_det_amplitude_normalized_mse: bool = False  # additionally RMS-normalize the fixed-normalized rollout MSE
+    rollout_relative_losses: bool | None = None  # None -> preserve legacy per-loss relative/absolute defaults
     rollout_disp_std_weight: float = 0.0
     rollout_disp_std_normalize_by_true: bool | None = None  # None -> reuse rollout_det_amplitude_normalized_mse
+    rollout_disp_std_p: float = 2.0
     rollout_disp_spectral_weight: float | None = None  # preferred name; falls back to rollout_disp_psd_weight when unset
     rollout_disp_spectral_loss: str = "psd"  # "psd" | "dominant_frequency"
     rollout_disp_psd_weight: float = 0.0
     rollout_disp_psd_peak_rel_bandwidth: float = 0.0  # <=0 disables narrowbanding
     rollout_disp_psd_use_hann_window: bool = True
+    rollout_disp_freq_p: float = 1.0
+    rollout_disp_freq_alpha: float = 12.0
     use_gradnorm: bool = False
     gradnorm_alpha: float = 0.9
     gradnorm_eps: float = 1e-8
@@ -540,13 +544,17 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
         "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
         "rollout_det_amplitude_normalized_mse",
+        "rollout_relative_losses",
         "rollout_disp_std_weight",
         "rollout_disp_std_normalize_by_true",
+        "rollout_disp_std_p",
         "rollout_disp_spectral_weight",
         "rollout_disp_spectral_loss",
         "rollout_disp_psd_weight",
         "rollout_disp_psd_peak_rel_bandwidth",
         "rollout_disp_psd_use_hann_window",
+        "rollout_disp_freq_p",
+        "rollout_disp_freq_alpha",
         "use_gradnorm",
         "gradnorm_alpha",
         "gradnorm_eps",
