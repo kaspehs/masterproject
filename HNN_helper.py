@@ -216,6 +216,16 @@ def td_bounded_delta_fhat_torch(
     bounded = torch.where(raw_delta_fhat >= 0.0, torch.tanh(raw_delta_fhat) * room_up, torch.tanh(raw_delta_fhat) * room_down)
     return bounded, fhat_td + bounded
 
+
+def tanh_bounded_output_torch(raw: torch.Tensor, bound: float | None) -> torch.Tensor:
+    if bound is None:
+        return raw
+    bound_value = float(bound)
+    if not np.isfinite(bound_value) or bound_value <= 0.0:
+        raise ValueError(f"bound must be finite and positive, got {bound!r}.")
+    bound_t = torch.as_tensor(bound_value, device=raw.device, dtype=raw.dtype)
+    return bound_t * torch.tanh(raw / bound_t)
+
 @dataclass
 class DataConfig:
     # Cut away the first N seconds from each time series (relative to the series start).
@@ -237,6 +247,7 @@ class ModelConfig:
     k: float = 1218.0
     damping_c: float = 1e-4
     force_output: str = "force"  # "force" or "coefficient"
+    coefficient_output_bound: float | None = None
     use_reduced_velocity: bool = True
     use_td_force_input: bool | str = False
     use_td_fhat_input: bool = False
@@ -1995,6 +2006,7 @@ class PHVIV(nn.Module):
         p_scale=10.0,
         damping_c: float | None = None,
         force_output: str = "force",
+        coefficient_output_bound: float | None = None,
         use_fourier_features: bool = False,
         fourier_features: int = 64,
         fourier_sigma: float = 1.0,
@@ -2027,6 +2039,16 @@ class PHVIV(nn.Module):
         if force_output not in {"force", "coefficient"}:
             raise ValueError("force_output must be one of: force, coefficient")
         self.force_output = force_output
+        if coefficient_output_bound is None:
+            self.coefficient_output_bound = None
+        else:
+            coefficient_output_bound_val = float(coefficient_output_bound)
+            if not np.isfinite(coefficient_output_bound_val) or coefficient_output_bound_val <= 0.0:
+                raise ValueError(
+                    "coefficient_output_bound must be finite and positive when provided, "
+                    f"got {coefficient_output_bound!r}."
+                )
+            self.coefficient_output_bound = coefficient_output_bound_val
         self.input_scaling_mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
         self.use_reduced_velocity = bool(use_reduced_velocity)
         self.use_td_force_input = bool(use_td_force_input)
@@ -2181,6 +2203,11 @@ class PHVIV(nn.Module):
         self.register_buffer("G", torch.tensor([[0.0],
                                                 [1.0]]))
 
+    def _apply_coefficient_output_bound(self, raw: torch.Tensor) -> torch.Tensor:
+        if self.force_output != "coefficient":
+            return raw
+        return tanh_bounded_output_torch(raw, self.coefficient_output_bound)
+
     @classmethod
     def from_config(
         cls,
@@ -2196,6 +2223,8 @@ class PHVIV(nn.Module):
         damping_c = float(cfg.get("damping_c", 1e-4))
         structural_mass = float(cfg.get("structural_mass", 16.79))
         force_output = str(cfg.get("force_output", "force")).strip().lower()
+        coefficient_output_bound_raw = cfg.get("coefficient_output_bound", None)
+        coefficient_output_bound = None if coefficient_output_bound_raw is None else float(coefficient_output_bound_raw)
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
         td_force_input_source = resolve_td_force_input_source(cfg.get("use_td_force_input", False))
         use_td_force_input = td_force_input_source != "none"
@@ -2245,6 +2274,7 @@ class PHVIV(nn.Module):
             p_scale=p_scale,
             damping_c=damping_c,
             force_output=force_output,
+            coefficient_output_bound=coefficient_output_bound,
             use_fourier_features=use_fourier_features,
             fourier_features=fourier_features,
             fourier_sigma=fourier_sigma,
@@ -2609,6 +2639,7 @@ class PHVIV(nn.Module):
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
         )
+        raw = self._apply_coefficient_output_bound(raw)
         if self.force_output == "coefficient":
             return raw
         f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
@@ -2633,6 +2664,7 @@ class PHVIV(nn.Module):
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
         )
+        raw = self._apply_coefficient_output_bound(raw)
         if self.force_output == "coefficient":
             f0 = self._force_scale_from_reduced_velocity(reduced_velocity, like=raw, state=x)
             return raw * f0
@@ -5929,7 +5961,7 @@ def _force_component_coefficients(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     base_features = model._force_features(state, reduced_velocity=reduced_velocity)
     features = model.force_embed(base_features) if model.force_embed is not None else base_features
-    base_raw = model.u_base_net(features)
+    base_raw = model._apply_coefficient_output_bound(model.u_base_net(features))
     delta_raw = torch.zeros_like(base_raw)
 
     force_scale = model._force_scale_from_reduced_velocity(reduced_velocity, like=base_raw, state=state)

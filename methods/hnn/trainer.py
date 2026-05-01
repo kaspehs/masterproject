@@ -445,6 +445,7 @@ def _td_predict_outputs(
             sigma_inputs=sigma_inputs,
             td_force_scale=output_scale,
         )
+    raw_force = model._apply_coefficient_output_bound(raw_force)
     corr_mu = raw_force * output_scale
     if sigma_active:
         if force_zero_output:
@@ -3710,6 +3711,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         f"rollout_det={rollout_det_weight:g}, rollout_disp_std={rollout_disp_std_weight:g}, "
         f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
     )
+    if getattr(model, "force_output", "force") == "coefficient" and getattr(model, "coefficient_output_bound", None) is not None:
+        startup_lines.append(
+            "Coefficient output bound: "
+            f"tanh cap at +/-{float(getattr(model, 'coefficient_output_bound')):g}"
+        )
     sigma_identified_by_rollout = (
         rollout_det_weight > 0.0 and rollout_loss_mode in {"stochastic_nll", "stochastic_mse"}
     )

@@ -20,6 +20,8 @@ model:
   k: 1218.0
   damping_c: 1e-4
   force_output: coefficient
+  # Optional tanh cap on coefficient-mode network output. In TD-correction mode this bounds the correction coefficient.
+  coefficient_output_bound: 2.0
   sigma_min: 1.0e-6
   ur_scale: 10.0
 
