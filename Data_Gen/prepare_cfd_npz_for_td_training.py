@@ -68,13 +68,16 @@ DATA_DIR = THIS_DIR if (THIS_DIR / "npz_exports").exists() else THIS_DIR.parent 
 
 INPUT_NPZS: list[Path] | None = None
 INPUT_NPZ_GLOB = str(DATA_DIR / "npz_exports" / "*.npz")
-OUTPUT_DIR = DATA_DIR / "npz_exports_td_burnin_trimmed"
+OUTPUT_DIR = DATA_DIR / "npz_exports_multi_theta0_modified"
 METADATA_PATH = DATA_DIR / "analysis" / "CFD_metadata.csv"
 OVERWRITE = True
 SKIP_NO_CONVERGENCE = True
 FORCE_REL_STD_THRESHOLD = 1.0e-2
 PERSISTENCE_SECONDS = 1.0
 EXPORT_THETA0 = 0.0
+# Optional training augmentation: emit one replay-consistent TD hidden-state variant per theta0.
+# Leave as None for the legacy single export, or set e.g. np.linspace(-np.pi, np.pi, 4, endpoint=False).
+EXPORT_THETA0_VALUES: list[float] | tuple[float, ...] | np.ndarray | None = np.linspace(-np.pi, np.pi, 4, endpoint=False)
 SHOW_PROGRESS = True
 MIN_OUTPUT_SAMPLES = 2
 _METADATA_CACHE: dict[str, dict[str, str]] | None = None
@@ -104,6 +107,35 @@ def _progress(iterable, *, total: int | None = None, desc: str = ""):
     if SHOW_PROGRESS and tqdm is not None:
         return tqdm(iterable, total=total, desc=desc, leave=False)
     return iterable
+
+
+def _resolve_export_theta0_values() -> list[float]:
+    raw_values = EXPORT_THETA0_VALUES
+    if raw_values is None:
+        return [float(EXPORT_THETA0)]
+    values = np.asarray(raw_values, dtype=float).reshape(-1)
+    if values.size == 0:
+        raise ValueError("EXPORT_THETA0_VALUES must contain at least one finite value when set.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("EXPORT_THETA0_VALUES must contain only finite numeric values.")
+    return [float(value) for value in values.tolist()]
+
+
+def _use_full_timeseries_multi_theta0_mode() -> bool:
+    return EXPORT_THETA0_VALUES is not None
+
+
+def _format_td_params(params: dict[str, float]) -> str:
+    ordered_keys = ("Cv", "Cd", "Ca", "C", "fhat_min", "fhat0", "fhat_max")
+    return ", ".join(f"{key}={float(params[key]):.6g}" for key in ordered_keys)
+
+
+def _theta0_output_stem(npz_path: Path, *, theta0_export: float, num_variants: int) -> str:
+    if int(num_variants) <= 1:
+        return str(npz_path.stem)
+    token = f"{float(theta0_export):+.6f}"
+    token = token.replace("+", "p").replace("-", "m").replace(".", "p")
+    return f"{npz_path.stem}__theta0_{token}"
 
 
 def _td_memory_config() -> dict[str, object]:
@@ -421,23 +453,14 @@ def _build_case_td_replay_inputs(
     _override_scalar("rho_kg_m3", ("python_rho_kg_m3", "rho_kg_m3"))
     _override_scalar("diameter_m", ("python_diameter_m", "diameter_m"))
 
+    # Keep the TD replay coefficients tied to the active burn-in config.
+    # The source CFD payload may still carry older embedded `python_*` TD
+    # parameters, but those should not override the current burn-in defaults.
     params = dict(fallback_params)
-    for param_key, payload_keys in (
-        ("Cv", ("python_cv",)),
-        ("Cd", ("python_cd",)),
-        ("Ca", ("python_ca",)),
-        ("C", ("python_damping_c", "damping_c")),
-        ("fhat_min", ("python_fhat_min",)),
-        ("fhat0", ("python_fhat0",)),
-        ("fhat_max", ("python_fhat_max",)),
-    ):
-        value = _preferred_scalar(replay_payload, payload_keys, default=None)
-        if value is not None:
-            params[param_key] = float(value)
 
     if not (params["fhat_min"] <= params["fhat0"] <= params["fhat_max"]):
         raise ValueError(
-            "Invalid TD replay parameter set after metadata overrides: "
+            "Invalid TD replay parameter set from burn-in config: "
             f"{params['fhat_min']} <= {params['fhat0']} <= {params['fhat_max']} is required."
         )
 
@@ -539,6 +562,7 @@ def _preferred_scalar(
 def _manifest_row_base(npz_path: Path, payload: dict[str, np.ndarray], td_paramset_id: str) -> dict[str, object]:
     return {
         "case_name": npz_path.stem,
+        "source_case_name": npz_path.stem,
         "source_npz": str(npz_path),
         "output_npz": "",
         "status": "",
@@ -552,7 +576,16 @@ def _manifest_row_base(npz_path: Path, payload: dict[str, np.ndarray], td_params
         "force_rel_std_at_cut": None,
         "force_std_ref": None,
         "td_paramset_id": td_paramset_id,
-        "theta0_export": float(EXPORT_THETA0),
+        "td_Cv": None,
+        "td_Cd": None,
+        "td_Ca": None,
+        "td_C": None,
+        "td_fhat_min": None,
+        "td_fhat0": None,
+        "td_fhat_max": None,
+        "theta0_export": None,
+        "theta0_export_index": None,
+        "num_theta0_export_variants": int(len(_resolve_export_theta0_values())),
         "num_theta0": int(np.asarray(burnin_config.THETA0_VALUES, dtype=float).size),
         "flow_speed_m_s": _preferred_scalar(
             payload,
@@ -593,6 +626,7 @@ def _write_manifest(rows: list[dict[str, object]], out_dir: Path) -> None:
     csv_path = out_dir / "burnin_manifest.csv"
     fieldnames = [
         "case_name",
+        "source_case_name",
         "source_npz",
         "output_npz",
         "status",
@@ -606,7 +640,16 @@ def _write_manifest(rows: list[dict[str, object]], out_dir: Path) -> None:
         "force_rel_std_at_cut",
         "force_std_ref",
         "td_paramset_id",
+        "td_Cv",
+        "td_Cd",
+        "td_Ca",
+        "td_C",
+        "td_fhat_min",
+        "td_fhat0",
+        "td_fhat_max",
         "theta0_export",
+        "theta0_export_index",
+        "num_theta0_export_variants",
         "num_theta0",
         "flow_speed_m_s",
         "dt_dim",
@@ -694,11 +737,16 @@ def _prepare_output_payload(
     representative: dict[str, np.ndarray],
     force_total_rel_std: np.ndarray,
     *,
+    source_case_name: str,
+    output_case_name: str,
     burnin_start_idx: int,
     burnin_start_time_dim: float,
     burnin_seconds_removed: float,
     force_std_ref: float,
     detection_status: str,
+    theta0_export: float,
+    theta0_export_index: int,
+    num_theta0_export_variants: int,
 ) -> dict[str, np.ndarray]:
     trimmed = _trim_payload_arrays(payload, burnin_start_idx)
     trimmed["phi_vy_td"] = np.asarray(representative["phi_vy"][burnin_start_idx:], dtype=float)
@@ -736,13 +784,17 @@ def _prepare_output_payload(
     trimmed["burnin_seconds_removed"] = np.asarray(float(burnin_seconds_removed), dtype=float)
     trimmed["burnin_force_rel_std_threshold"] = np.asarray(float(FORCE_REL_STD_THRESHOLD), dtype=float)
     trimmed["burnin_persistence_seconds"] = np.asarray(float(PERSISTENCE_SECONDS), dtype=float)
-    trimmed["burnin_theta0_export"] = np.asarray(float(EXPORT_THETA0), dtype=float)
+    trimmed["burnin_theta0_export"] = np.asarray(float(theta0_export), dtype=float)
+    trimmed["burnin_theta0_export_index"] = np.asarray(int(theta0_export_index), dtype=int)
+    trimmed["burnin_theta0_export_count"] = np.asarray(int(num_theta0_export_variants), dtype=int)
     trimmed["burnin_num_theta0"] = np.asarray(
         int(np.asarray(burnin_config.THETA0_VALUES, dtype=float).size),
         dtype=int,
     )
     trimmed["burnin_force_std_ref"] = np.asarray(float(force_std_ref), dtype=float)
     trimmed["burnin_detection_status"] = np.asarray(str(detection_status))
+    trimmed["source_case_name"] = np.asarray(str(source_case_name))
+    trimmed["output_case_name"] = np.asarray(str(output_case_name))
     trimmed["damping_c"] = np.asarray(
         _preferred_scalar(
             payload,
@@ -779,94 +831,144 @@ def _prepare_output_payload(
     return trimmed
 
 
-def _process_single_file(npz_path: Path, *, params: dict[str, float]) -> dict[str, object]:
+def _process_single_file(npz_path: Path, *, params: dict[str, float]) -> list[dict[str, object]]:
     raw_payload = _inject_python_metadata(_load_npz_payload(npz_path), case_name=npz_path.stem)
     payload = _sanitize_payload(raw_payload, case_name=npz_path.stem)
     replay_payload, replay_params, replay_n_memory, replay_tau_seconds = _build_case_td_replay_inputs(
         payload,
         fallback_params=params,
     )
+    export_theta0_values = _resolve_export_theta0_values()
+    skip_burnin_trim = _use_full_timeseries_multi_theta0_mode()
     replay_paramset_id = paramset_id(replay_params)
     row = _manifest_row_base(npz_path, payload, replay_paramset_id)
     row["td_n_memory_resolved"] = float(replay_n_memory)
     row["td_tau_s_resolved"] = float(replay_tau_seconds)
+    row["td_Cv"] = float(replay_params["Cv"])
+    row["td_Cd"] = float(replay_params["Cd"])
+    row["td_Ca"] = float(replay_params["Ca"])
+    row["td_C"] = float(replay_params["C"])
+    row["td_fhat_min"] = float(replay_params["fhat_min"])
+    row["td_fhat0"] = float(replay_params["fhat0"])
+    row["td_fhat_max"] = float(replay_params["fhat_max"])
 
-    spread = compute_force_spread_history(
-        case_payload=replay_payload,
-        params=replay_params,
-        theta0_values=np.asarray(burnin_config.THETA0_VALUES, dtype=float),
-        sigma_init_mode=str(SIGMA_INIT_MODE),
-        sigma_init_window_seconds=float(replay_tau_seconds),
-        n_memory=int(replay_n_memory),
-        progress=_progress if SHOW_PROGRESS else None,
-        progress_desc=f"{npz_path.stem} theta0",
-        return_force_stack=_should_write_diagnostic_plot(npz_path.stem),
+    print(
+        f"{npz_path.stem}: using Vivana-TD replay params "
+        f"{_format_td_params(replay_params)} | "
+        f"memory_mode={TD_MEMORY_MODE}, n_memory={int(replay_n_memory)}, tau_s={float(replay_tau_seconds):.6g}, "
+        f"burnin_trim={'disabled' if skip_burnin_trim else 'enabled'}"
     )
-    force_total_rel_std = np.asarray(spread["force_total_rel_std"], dtype=float)
-    burnin_start_idx = detect_burnin_start_index(
-        np.asarray(payload["time_dim"], dtype=float),
-        force_total_rel_std,
-        threshold=float(FORCE_REL_STD_THRESHOLD),
-        persistence_seconds=float(PERSISTENCE_SECONDS),
-    )
-    row["force_std_ref"] = float(spread["force_std_ref"])
-
-    if burnin_start_idx is None:
-        row["status"] = "no_convergence"
-        if SKIP_NO_CONVERGENCE:
-            return row
-        raise RuntimeError(f"No valid burn-in cut found for {npz_path.name}.")
 
     time_dim = np.asarray(payload["time_dim"], dtype=float)
-    burnin_start_time_dim = float(time_dim[burnin_start_idx])
-    burnin_seconds_removed = float(burnin_start_time_dim - float(time_dim[0]))
-    row["burnin_start_idx"] = int(burnin_start_idx)
-    row["burnin_start_time_dim"] = burnin_start_time_dim
-    row["burnin_seconds_removed"] = burnin_seconds_removed
-    row["force_rel_std_at_cut"] = float(force_total_rel_std[burnin_start_idx])
-
-    if _should_write_diagnostic_plot(npz_path.stem):
-        _save_burnin_diagnostic_plot(
-            case_name=npz_path.stem,
-            payload=replay_payload,
-            spread=spread,
-            burnin_start_time_dim=burnin_start_time_dim,
-            replay_tau_seconds=float(replay_tau_seconds),
-            replay_n_memory=int(replay_n_memory),
+    if skip_burnin_trim:
+        force_total_rel_std = np.full(time_dim.shape, np.nan, dtype=float)
+        force_std_ref = float("nan")
+        burnin_start_idx = 0
+        burnin_start_time_dim = float(time_dim[0])
+        burnin_seconds_removed = 0.0
+        detection_status = "skipped_multi_theta0_export"
+        row["force_std_ref"] = force_std_ref
+        row["burnin_start_idx"] = int(burnin_start_idx)
+        row["burnin_start_time_dim"] = burnin_start_time_dim
+        row["burnin_seconds_removed"] = burnin_seconds_removed
+        row["force_rel_std_at_cut"] = None
+    else:
+        spread = compute_force_spread_history(
+            case_payload=replay_payload,
+            params=replay_params,
+            theta0_values=np.asarray(burnin_config.THETA0_VALUES, dtype=float),
+            sigma_init_mode=str(SIGMA_INIT_MODE),
+            sigma_init_window_seconds=float(replay_tau_seconds),
+            n_memory=int(replay_n_memory),
+            progress=_progress if SHOW_PROGRESS else None,
+            progress_desc=f"{npz_path.stem} theta0",
+            return_force_stack=_should_write_diagnostic_plot(npz_path.stem),
         )
+        force_total_rel_std = np.asarray(spread["force_total_rel_std"], dtype=float)
+        burnin_start_idx = detect_burnin_start_index(
+            np.asarray(payload["time_dim"], dtype=float),
+            force_total_rel_std,
+            threshold=float(FORCE_REL_STD_THRESHOLD),
+            persistence_seconds=float(PERSISTENCE_SECONDS),
+        )
+        force_std_ref = float(spread["force_std_ref"])
+        row["force_std_ref"] = force_std_ref
+
+        if burnin_start_idx is None:
+            row["status"] = "no_convergence"
+            if SKIP_NO_CONVERGENCE:
+                return [row]
+            raise RuntimeError(f"No valid burn-in cut found for {npz_path.name}.")
+
+        burnin_start_time_dim = float(time_dim[burnin_start_idx])
+        burnin_seconds_removed = float(burnin_start_time_dim - float(time_dim[0]))
+        detection_status = "ok"
+        row["burnin_start_idx"] = int(burnin_start_idx)
+        row["burnin_start_time_dim"] = burnin_start_time_dim
+        row["burnin_seconds_removed"] = burnin_seconds_removed
+        row["force_rel_std_at_cut"] = float(force_total_rel_std[burnin_start_idx])
+
+        if _should_write_diagnostic_plot(npz_path.stem):
+            _save_burnin_diagnostic_plot(
+                case_name=npz_path.stem,
+                payload=replay_payload,
+                spread=spread,
+                burnin_start_time_dim=burnin_start_time_dim,
+                replay_tau_seconds=float(replay_tau_seconds),
+                replay_n_memory=int(replay_n_memory),
+            )
 
     if int(time_dim.size - burnin_start_idx) < int(MIN_OUTPUT_SAMPLES):
         row["status"] = "too_short_after_trim"
-        return row
+        return [row]
 
-    representative = _representative_replay(
-        replay_payload,
-        params=replay_params,
-        theta0_export=float(EXPORT_THETA0),
-        n_memory=int(replay_n_memory),
-        tau_seconds=float(replay_tau_seconds),
-    )
-    output_payload = _prepare_output_payload(
-        payload,
-        representative,
-        force_total_rel_std,
-        burnin_start_idx=int(burnin_start_idx),
-        burnin_start_time_dim=burnin_start_time_dim,
-        burnin_seconds_removed=burnin_seconds_removed,
-        force_std_ref=float(spread["force_std_ref"]),
-        detection_status="ok",
-    )
+    output_rows: list[dict[str, object]] = []
+    for theta0_export_index, theta0_export in enumerate(export_theta0_values):
+        representative = _representative_replay(
+            replay_payload,
+            params=replay_params,
+            theta0_export=float(theta0_export),
+            n_memory=int(replay_n_memory),
+            tau_seconds=float(replay_tau_seconds),
+        )
+        output_case_name = _theta0_output_stem(
+            npz_path,
+            theta0_export=float(theta0_export),
+            num_variants=len(export_theta0_values),
+        )
+        output_payload = _prepare_output_payload(
+            payload,
+            representative,
+            force_total_rel_std,
+            source_case_name=str(npz_path.stem),
+            output_case_name=output_case_name,
+            burnin_start_idx=int(burnin_start_idx),
+            burnin_start_time_dim=burnin_start_time_dim,
+            burnin_seconds_removed=burnin_seconds_removed,
+            force_std_ref=float(force_std_ref),
+            detection_status=detection_status,
+            theta0_export=float(theta0_export),
+            theta0_export_index=int(theta0_export_index),
+            num_theta0_export_variants=int(len(export_theta0_values)),
+        )
 
-    output_path = OUTPUT_DIR.resolve() / npz_path.name
-    if output_path.exists() and not bool(OVERWRITE):
-        raise FileExistsError(f"Output file already exists: {output_path}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output_path, **output_payload)
+        output_path = OUTPUT_DIR.resolve() / f"{output_case_name}.npz"
+        if output_path.exists() and not bool(OVERWRITE):
+            raise FileExistsError(f"Output file already exists: {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(output_path, **output_payload)
 
-    row["status"] = "ok"
-    row["output_npz"] = str(output_path)
-    row["num_output_samples"] = int(np.asarray(output_payload["time_dim"]).reshape(-1).size)
-    return row
+        output_row = dict(row)
+        output_row["case_name"] = output_case_name
+        output_row["source_case_name"] = str(npz_path.stem)
+        output_row["status"] = "ok"
+        output_row["output_npz"] = str(output_path)
+        output_row["num_output_samples"] = int(np.asarray(output_payload["time_dim"]).reshape(-1).size)
+        output_row["theta0_export"] = float(theta0_export)
+        output_row["theta0_export_index"] = int(theta0_export_index)
+        output_row["num_theta0_export_variants"] = int(len(export_theta0_values))
+        output_rows.append(output_row)
+    return output_rows
 
 
 def main() -> None:
@@ -875,12 +977,20 @@ def main() -> None:
     rows: list[dict[str, object]] = []
     input_npzs = _resolve_input_npzs()
 
+    print(
+        "Default Vivana-TD replay params from burn-in config: "
+        f"{_format_td_params(params)} | "
+        f"memory_mode={TD_MEMORY_MODE}, export_theta0_values={_resolve_export_theta0_values()}, "
+        f"burnin_trim={'disabled' if _use_full_timeseries_multi_theta0_mode() else 'enabled'}"
+    )
+
     for npz_path in _progress(input_npzs, total=len(input_npzs), desc="TD preprocess"):
         try:
-            row = _process_single_file(npz_path, params=params)
+            file_rows = _process_single_file(npz_path, params=params)
         except Exception as exc:
-            row = {
+            file_rows = [{
                 "case_name": npz_path.stem,
+                "source_case_name": npz_path.stem,
                 "source_npz": str(npz_path),
                 "output_npz": "",
                 "status": "invalid_input",
@@ -894,14 +1004,23 @@ def main() -> None:
                 "force_rel_std_at_cut": None,
                 "force_std_ref": None,
                 "td_paramset_id": td_paramset_id,
-                "theta0_export": float(EXPORT_THETA0),
+                "td_Cv": None,
+                "td_Cd": None,
+                "td_Ca": None,
+                "td_C": None,
+                "td_fhat_min": None,
+                "td_fhat0": None,
+                "td_fhat_max": None,
+                "theta0_export": None,
+                "theta0_export_index": None,
+                "num_theta0_export_variants": int(len(_resolve_export_theta0_values())),
                 "num_theta0": int(np.asarray(burnin_config.THETA0_VALUES, dtype=float).size),
                 "flow_speed_m_s": None,
                 "dt_dim": None,
                 "error": str(exc),
-            }
+            }]
             print(f"Skipping {npz_path.name}: {exc}")
-        rows.append(row)
+        rows.extend(file_rows)
 
     _write_manifest(rows, OUTPUT_DIR.resolve())
     _print_trim_summary_table(rows)

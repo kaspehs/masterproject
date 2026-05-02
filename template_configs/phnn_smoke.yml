@@ -239,5 +239,9 @@ hnn:
   rollout_stochastic: false
   rollout_noise_scale: 1.0
   rollout_seed: null
+  # If null, validation/final rollouts use the stored initial phi/theta from each .npz file.
+  # If set, validation/final rollout logging also runs one rollout per listed theta0 value,
+  # overriding only the initial phase and logging theta-sweep mean/std/max metrics.
+  validation_theta0_values: null
 
 pinn: {}

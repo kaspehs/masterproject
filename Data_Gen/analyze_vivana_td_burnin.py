@@ -218,6 +218,32 @@ def _circular_std(values: np.ndarray) -> float:
     return float(np.sqrt(-2.0 * np.log(resultant)))
 
 
+def _circular_mean(values: np.ndarray, axis: int | None = None) -> np.ndarray | float:
+    angles = np.asarray(values, dtype=float)
+    valid = np.isfinite(angles)
+    unit_vectors = np.where(valid, np.exp(1j * angles), 0.0 + 0.0j)
+    counts = np.sum(valid, axis=axis)
+    vector_sum = np.sum(unit_vectors, axis=axis)
+
+    if axis is None:
+        if int(counts) <= 0:
+            return float("nan")
+        mean_vector = vector_sum / float(counts)
+        if np.abs(mean_vector) <= 1.0e-12:
+            return float("nan")
+        return float(np.angle(mean_vector))
+
+    counts_arr = np.asarray(counts)
+    mean_angles = np.full(counts_arr.shape, np.nan, dtype=float)
+    nonzero_mask = counts_arr > 0
+    if np.any(nonzero_mask):
+        mean_vector = np.zeros(counts_arr.shape, dtype=complex)
+        mean_vector[nonzero_mask] = vector_sum[nonzero_mask] / counts_arr[nonzero_mask]
+        stable_mask = nonzero_mask & (np.abs(mean_vector) > 1.0e-12)
+        mean_angles[stable_mask] = np.angle(mean_vector[stable_mask])
+    return mean_angles
+
+
 def _load_case(npz_path: Path) -> dict[str, np.ndarray | float | str]:
     if not npz_path.exists():
         raise FileNotFoundError(f"Input CFD case '{npz_path}' not found.")
@@ -809,6 +835,7 @@ def _plot_theta_trajectories_all_cases(
         burnin_time = _estimate_burnin_time_from_summary(summary)
         stored_ur = _stored_ur_display_value(summary)
         time_arr = np.asarray(time_from_start_s, dtype=float)
+        theta_arr = np.asarray(theta_stack, dtype=float)
         if COMBINED_THETA_MAX_SECONDS is None:
             mask = np.ones_like(time_arr, dtype=bool)
         else:
@@ -816,10 +843,21 @@ def _plot_theta_trajectories_all_cases(
         for idx, theta0 in enumerate(np.asarray(theta0_values, dtype=float).reshape(-1)):
             ax.plot(
                 time_arr[mask],
-                np.asarray(theta_stack[idx], dtype=float)[mask],
+                theta_arr[idx][mask],
                 linewidth=0.9,
                 alpha=0.9,
                 label=rf"$\theta_0={theta0:.3f}$",
+            )
+        if theta_arr.ndim == 2 and theta_arr.shape[1] == time_arr.size:
+            theta_mean = _circular_mean(theta_arr[:, mask], axis=0)
+            ax.plot(
+                time_arr[mask],
+                np.asarray(theta_mean, dtype=float),
+                color="black",
+                linewidth=2.0,
+                alpha=0.95,
+                label="Circular mean" if ax is axes[0] else "_nolegend_",
+                zorder=3,
             )
         if np.isfinite(burnin_time):
             ax.axvline(float(burnin_time), color="black", linestyle="--", linewidth=1.0, alpha=0.9)

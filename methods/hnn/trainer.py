@@ -272,6 +272,46 @@ def _td_context_with_theta_zero_torch(
     return _td_context_with_phase_torch(td_context, phi=_td_phi_dy_from_context_torch(td_context=td_context, velocity=velocity))
 
 
+def _wrap_phase_numpy(values: np.ndarray | float) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    return np.arctan2(np.sin(arr), np.cos(arr))
+
+
+def _td_phi_dy_from_context_numpy(
+    *,
+    td_context: np.ndarray,
+    velocity: float,
+) -> float:
+    ctx = np.asarray(td_context, dtype=float).reshape(-1)
+    if ctx.size < 5:
+        raise ValueError("td_context must contain at least [ddy, phi, sig_dy, sig_ddy, flow_speed].")
+    ddy = float(ctx[0])
+    sig_dy = max(float(ctx[2]), 1.0e-12)
+    sig_ddy = max(float(ctx[3]), 1.0e-12)
+    flow_speed = float(ctx[4])
+    speed_mag = float(np.sqrt(max(flow_speed * flow_speed + float(velocity) * float(velocity), 1.0e-12)))
+    projection = flow_speed / max(speed_mag, 1.0e-12)
+    dy_r = float(velocity) * projection
+    ddy_r = ddy * projection
+    cos_phi_dy = dy_r / sig_dy
+    sin_phi_dy = -ddy_r / sig_ddy
+    return float(np.arctan2(sin_phi_dy, cos_phi_dy))
+
+
+def _td_context_with_theta_numpy(
+    td_context: np.ndarray,
+    *,
+    velocity: float,
+    theta0: float,
+) -> np.ndarray:
+    out = np.asarray(td_context, dtype=float).reshape(-1).copy()
+    if out.size < 5:
+        raise ValueError("td_context must contain at least [ddy, phi, sig_dy, sig_ddy, flow_speed].")
+    phi_dy = _td_phi_dy_from_context_numpy(td_context=out, velocity=float(velocity))
+    out[1] = float(_wrap_phase_numpy(np.asarray([phi_dy - float(theta0)], dtype=float))[0])
+    return out
+
+
 def _apply_td_correction_head_init(
     model: PHVIV,
     *,
@@ -1760,74 +1800,52 @@ def _log_td_correction_rollout_validation(
     title_suffix: str = "",
     log_spectra: bool = False,
     log_only_spectra: bool = False,
+    validation_theta0_values: list[float] | None = None,
 ) -> dict[str, float]:
-    mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
-    mass_value = float(np.asarray(traj[mass_key]).reshape(()))
-    damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
-    stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
-    y_true_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1).to(device)
-    v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
-    z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
-    f_true_t = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1).to(device)
-    td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
-    ur_t = torch.from_numpy(
-        np.ascontiguousarray(
-            _td_flow_feature_from_traj(
-                traj,
-                input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
-                diameter=float(model.D),
+    def _run_rollout_validation_case(
+        *,
+        initial_td_context0: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        mass_key = "dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "effective_mass_kg"
+        mass_value = float(np.asarray(traj[mass_key]).reshape(()))
+        damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
+        stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+        y_true_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1).to(device)
+        v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
+        z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
+        f_true_t = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1).to(device)
+        ur_t = torch.from_numpy(
+            np.ascontiguousarray(
+                _td_flow_feature_from_traj(
+                    traj,
+                    input_scaling_mode=str(getattr(model, "input_scaling_mode", "current")),
+                    diameter=float(model.D),
+                )
             )
-        )
-    ).float().unsqueeze(1).to(device)
-    td_context_t = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float().to(device)
-    t_np = np.asarray(traj["t"], dtype=float).reshape(-1)
-    if z_true_t.shape[0] < 2:
-        return {}
-    traj_dt = float(t_np[1] - t_np[0])
+        ).float().unsqueeze(1).to(device)
+        td_context_np = np.asarray(traj["td_context"], dtype=float)
+        if initial_td_context0 is not None:
+            td_context_np = np.asarray(td_context_np, dtype=float).copy()
+            td_context_np[0, :5] = np.asarray(initial_td_context0, dtype=float).reshape(-1)[:5]
+        td_context_t = torch.from_numpy(np.ascontiguousarray(td_context_np)).float().to(device)
+        t_np = np.asarray(traj["t"], dtype=float).reshape(-1)
+        if z_true_t.shape[0] < 2:
+            return {}
+        traj_dt = float(t_np[1] - t_np[0])
 
-    mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
-    damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
-    stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
-    z_pred, total_force_seq, corr_mu_seq, sigma_roll_seq, delta_fhat_seq = _td_correction_state_rollout(
-        model=model,
-        z0=z_true_t[0:1],
-        ur0=ur_t[0:1],
-        td_context0=td_context_t[0:1],
-        steps=int(z_true_t.shape[0] - 1),
-        dt=traj_dt,
-        structural_mass=mass_t,
-        damping_c=damping_t,
-        stiffness=stiffness_t,
-        td_params=td_params,
-        td_memory_cfg=td_memory_cfg,
-        mean_active=mean_active,
-        sigma_active=predict_sigma,
-        fhat_active=fhat_active,
-        td_force_input_source=td_force_input_source,
-        fhat_bound_multiplier=fhat_bound_multiplier,
-        force_zero_output=force_zero_output,
-        rollout_stochastic=rollout_stochastic,
-        rollout_noise_scale=rollout_noise_scale,
-        rollout_seed=rollout_seed,
-    )
-    y_pred = z_pred[0, :, 0].detach().cpu().numpy()
-    v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
-    force_roll = total_force_seq[0, :, 0].detach().cpu().numpy()
-    corr_roll = corr_mu_seq[0, :, 0].detach().cpu().numpy()
-    sigma_roll = sigma_roll_seq[0, :, 0].detach().cpu().numpy()
-    delta_fhat_roll = delta_fhat_seq[0, :, 0].detach().cpu().numpy()
-    td_roll = force_roll - corr_roll
-
-    with torch.no_grad():
-        step_on_data = _td_step_with_corrections(
+        mass_t = torch.full((1, 1), mass_value, dtype=z_true_t.dtype, device=device)
+        damping_t = torch.full((1, 1), damping_value, dtype=z_true_t.dtype, device=device)
+        stiffness_t = torch.full((1, 1), stiffness_value, dtype=z_true_t.dtype, device=device)
+        z_pred, total_force_seq, corr_mu_seq, sigma_roll_seq, delta_fhat_seq = _td_correction_state_rollout(
             model=model,
-            z=z_true_t[:-1],
-            reduced_velocity=ur_t[:-1],
-            td_context=td_context_t[:-1],
+            z0=z_true_t[0:1],
+            ur0=ur_t[0:1],
+            td_context0=td_context_t[0:1],
+            steps=int(z_true_t.shape[0] - 1),
             dt=traj_dt,
-            structural_mass=torch.full((z_true_t.shape[0] - 1, 1), mass_value, dtype=z_true_t.dtype, device=device),
-            damping_c=torch.full((z_true_t.shape[0] - 1, 1), damping_value, dtype=z_true_t.dtype, device=device),
-            stiffness=torch.full((z_true_t.shape[0] - 1, 1), stiffness_value, dtype=z_true_t.dtype, device=device),
+            structural_mass=mass_t,
+            damping_c=damping_t,
+            stiffness=stiffness_t,
             td_params=td_params,
             td_memory_cfg=td_memory_cfg,
             mean_active=mean_active,
@@ -1836,61 +1854,255 @@ def _log_td_correction_rollout_validation(
             td_force_input_source=td_force_input_source,
             fhat_bound_multiplier=fhat_bound_multiplier,
             force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
         )
-        corr_on_data = step_on_data["corr_mu"]
-        sigma_on_data = step_on_data["sigma_corr"]
-        td_force_on_data = step_on_data["td_force_next"]
-        total_force_on_data = step_on_data["total_force_next"]
-        delta_fhat_on_data = step_on_data["delta_fhat"]
-    force_total_full = np.concatenate(
-        [np.asarray([float(total_force_on_data[0, 0].detach().cpu())]), force_roll],
-        axis=0,
-    )
-    force_td_full = np.concatenate([td_force_on_data[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
+        y_pred = z_pred[0, :, 0].detach().cpu().numpy()
+        v_pred = (z_pred[0, :, 1] / mass_value).detach().cpu().numpy()
+        force_roll = total_force_seq[0, :, 0].detach().cpu().numpy()
+        corr_roll = corr_mu_seq[0, :, 0].detach().cpu().numpy()
+        sigma_roll = sigma_roll_seq[0, :, 0].detach().cpu().numpy()
+        delta_fhat_roll = delta_fhat_seq[0, :, 0].detach().cpu().numpy()
+        td_roll = force_roll - corr_roll
 
-    metrics = compute_validation_metrics(
-        model=model,
-        y_data_t=y_true_t[:, 0],
-        val_vel=v_true_t[:, 0],
-        reduced_velocity=ur_t[:, 0],
-        m_eff=mass_value,
-        dt=traj_dt,
-        t=t_np,
-        y_data_raw=y_true_t[:, 0].detach().cpu().numpy(),
-        force_data=f_true_t[:, 0].detach().cpu().numpy(),
-        D=float(model.D),
-        k=stiffness_value,
-        device=device,
-        rollout={
-            "y_norm": y_pred / float(model.D),
-            "p_norm": v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D)),
-            "force_total": force_total_full,
-        },
-    )
-    force_true = f_true_t[1:, 0].detach().cpu().numpy()
-    force_model_on_data = total_force_on_data[:, 0].detach().cpu().numpy()
-    force_std = float(np.std(force_true))
-    if force_std <= 0.0:
-        force_std = 1.0
-    metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((force_model_on_data - force_true) ** 2))) / force_std
-    if fhat_active:
-        metrics["Delta fhat mean abs"] = float(torch.mean(torch.abs(delta_fhat_on_data)).detach().cpu())
-        metrics["Delta fhat mean"] = float(torch.mean(delta_fhat_on_data).detach().cpu())
+        with torch.no_grad():
+            step_on_data = _td_step_with_corrections(
+                model=model,
+                z=z_true_t[:-1],
+                reduced_velocity=ur_t[:-1],
+                td_context=td_context_t[:-1],
+                dt=traj_dt,
+                structural_mass=torch.full((z_true_t.shape[0] - 1, 1), mass_value, dtype=z_true_t.dtype, device=device),
+                damping_c=torch.full((z_true_t.shape[0] - 1, 1), damping_value, dtype=z_true_t.dtype, device=device),
+                stiffness=torch.full((z_true_t.shape[0] - 1, 1), stiffness_value, dtype=z_true_t.dtype, device=device),
+                td_params=td_params,
+                td_memory_cfg=td_memory_cfg,
+                mean_active=mean_active,
+                sigma_active=predict_sigma,
+                fhat_active=fhat_active,
+                td_force_input_source=td_force_input_source,
+                fhat_bound_multiplier=fhat_bound_multiplier,
+                force_zero_output=force_zero_output,
+            )
+            corr_on_data = step_on_data["corr_mu"]
+            sigma_on_data = step_on_data["sigma_corr"]
+            td_force_on_data = step_on_data["td_force_next"]
+            total_force_on_data = step_on_data["total_force_next"]
+            delta_fhat_on_data = step_on_data["delta_fhat"]
+        force_total_full = np.concatenate(
+            [np.asarray([float(total_force_on_data[0, 0].detach().cpu())]), force_roll],
+            axis=0,
+        )
+        force_td_full = np.concatenate([td_force_on_data[:1, 0].detach().cpu().numpy(), td_roll], axis=0)
+
+        metrics = compute_validation_metrics(
+            model=model,
+            y_data_t=y_true_t[:, 0],
+            val_vel=v_true_t[:, 0],
+            reduced_velocity=ur_t[:, 0],
+            m_eff=mass_value,
+            dt=traj_dt,
+            t=t_np,
+            y_data_raw=y_true_t[:, 0].detach().cpu().numpy(),
+            force_data=f_true_t[:, 0].detach().cpu().numpy(),
+            D=float(model.D),
+            k=stiffness_value,
+            device=device,
+            rollout={
+                "y_norm": y_pred / float(model.D),
+                "p_norm": v_pred / (float(np.sqrt(stiffness_value / mass_value)) * float(model.D)),
+                "force_total": force_total_full,
+            },
+        )
+        force_true = f_true_t[1:, 0].detach().cpu().numpy()
+        force_model_on_data = total_force_on_data[:, 0].detach().cpu().numpy()
+        force_std = float(np.std(force_true))
+        if force_std <= 0.0:
+            force_std = 1.0
+        metrics[FORCE_MAPPING_NRMSE_KEY] = float(np.sqrt(np.mean((force_model_on_data - force_true) ** 2))) / force_std
+        if fhat_active:
+            metrics["Delta fhat mean abs"] = float(torch.mean(torch.abs(delta_fhat_on_data)).detach().cpu())
+            metrics["Delta fhat mean"] = float(torch.mean(delta_fhat_on_data).detach().cpu())
+
+        omega = float(np.sqrt(stiffness_value / mass_value))
+        q_true_norm = y_true_t[:, 0].detach().cpu().numpy() / float(model.D)
+        p_true_norm = v_true_t[:, 0].detach().cpu().numpy() / (omega * float(model.D))
+        q_pred_norm = y_pred / float(model.D)
+        p_pred_norm = v_pred / (omega * float(model.D))
+        return {
+            "metrics": metrics,
+            "t_np": t_np,
+            "traj_dt": traj_dt,
+            "ur_val": float(ur_t[0, 0].detach().cpu().item()),
+            "q_true_norm": q_true_norm,
+            "p_true_norm": p_true_norm,
+            "q_pred_norm": q_pred_norm,
+            "p_pred_norm": p_pred_norm,
+            "force_true_full": f_true_t[:, 0].detach().cpu().numpy(),
+            "force_total_full": force_total_full,
+            "force_td_full": force_td_full,
+            "corr_roll": corr_roll,
+            "sigma_roll": sigma_roll,
+            "delta_fhat_roll": delta_fhat_roll,
+            "td_force_on_data": td_force_on_data[:, 0].detach().cpu().numpy(),
+            "corr_on_data": corr_on_data[:, 0].detach().cpu().numpy(),
+            "sigma_on_data": sigma_on_data[:, 0].detach().cpu().numpy(),
+            "delta_fhat_on_data": delta_fhat_on_data[:, 0].detach().cpu().numpy(),
+        }
+
+    def _aggregate_theta_sweep_metrics(
+        theta0_values_local: list[float],
+        sweep_results: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        aggregated: dict[str, float] = {}
+        metric_keys = sorted(
+            {
+                key
+                for result in sweep_results
+                for key in result.get("metrics", {})
+                if key != ROLLOUT_DIVERGED_KEY
+            }
+        )
+        for key in metric_keys:
+            values = np.asarray(
+                [
+                    float(result["metrics"][key])
+                    for result in sweep_results
+                    if key in result.get("metrics", {}) and np.isfinite(float(result["metrics"][key]))
+                ],
+                dtype=float,
+            )
+            if values.size == 0:
+                continue
+            aggregated[f"{key} theta-sweep mean"] = float(np.mean(values))
+            aggregated[f"{key} theta-sweep std"] = float(np.std(values))
+            aggregated[f"{key} theta-sweep max"] = float(np.max(values))
+        diverged_flags = np.asarray(
+            [float(result.get("metrics", {}).get(ROLLOUT_DIVERGED_KEY, 0.0)) for result in sweep_results],
+            dtype=float,
+        )
+        diverged_flags = diverged_flags[np.isfinite(diverged_flags)]
+        if diverged_flags.size > 0:
+            aggregated["Theta-sweep diverged count"] = float(np.sum(diverged_flags > 0.5))
+            aggregated["Theta-sweep diverged fraction"] = float(np.mean(diverged_flags > 0.5))
+            aggregated[ROLLOUT_DIVERGED_KEY] = 1.0 if np.any(diverged_flags > 0.5) else 0.0
+        aggregated["Theta-sweep sample count"] = float(len(theta0_values_local))
+        return aggregated
+
+    def _log_theta_sweep_plot(
+        *,
+        theta0_values_local: list[float],
+        base_result: dict[str, Any],
+        sweep_results: list[dict[str, Any]],
+    ) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ModuleNotFoundError:
+            return
+        if not sweep_results:
+            return
+        t_np = np.asarray(base_result["t_np"], dtype=float)
+        q_true_norm = np.asarray(base_result["q_true_norm"], dtype=float)
+        force_true_full = np.asarray(base_result["force_true_full"], dtype=float)
+        q_pred_stack = np.stack([np.asarray(result["q_pred_norm"], dtype=float) for result in sweep_results], axis=0)
+        force_pred_stack = np.stack([np.asarray(result["force_total_full"], dtype=float) for result in sweep_results], axis=0)
+        q_mean = np.mean(q_pred_stack, axis=0)
+        force_mean = np.mean(force_pred_stack, axis=0)
+        q_rmse = np.sqrt(np.mean((q_pred_stack - q_true_norm[None, :]) ** 2, axis=1))
+
+        fig, axes = plt.subplots(3, 1, figsize=(11, 11), sharex=False)
+        axes[0].plot(t_np, q_true_norm, color="black", linewidth=2.0, label="CFD")
+        for theta0_value, result in zip(theta0_values_local, sweep_results):
+            axes[0].plot(
+                t_np,
+                np.asarray(result["q_pred_norm"], dtype=float),
+                linewidth=1.1,
+                alpha=0.85,
+                label=rf"$\theta_0={theta0_value:.2f}$",
+            )
+        axes[0].plot(t_np, q_mean, color="#d35400", linewidth=2.0, linestyle="--", label="Sweep mean")
+        axes[0].set_title(f"Validation rollout displacement sweep | $U_r$={float(base_result['ur_val']):.3f}{title_suffix}")
+        axes[0].set_ylabel("y / D [-]")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+
+        axes[1].plot(t_np, force_true_full, color="black", linewidth=2.0, label="CFD")
+        for theta0_value, result in zip(theta0_values_local, sweep_results):
+            axes[1].plot(
+                t_np,
+                np.asarray(result["force_total_full"], dtype=float),
+                linewidth=1.1,
+                alpha=0.85,
+                label=rf"$\theta_0={theta0_value:.2f}$",
+            )
+        axes[1].plot(t_np, force_mean, color="#d35400", linewidth=2.0, linestyle="--", label="Sweep mean")
+        axes[1].set_ylabel("Force [N/m]")
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(np.asarray(theta0_values_local, dtype=float), q_rmse, marker="o", linewidth=1.5, color="#1f77b4")
+        axes[2].set_xlabel(r"Initial $\theta_0$ [rad]")
+        axes[2].set_ylabel(r"Rollout RMSE of $y/D$ [-]")
+        axes[2].set_title("Rollout sensitivity to initial theta")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].text(
+            0.02,
+            0.98,
+            f"mean={float(np.mean(q_rmse)):.3e}\nstd={float(np.std(q_rmse)):.3e}\nmax={float(np.max(q_rmse)):.3e}",
+            transform=axes[2].transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+        )
+        fig.tight_layout()
+        writer.add_figure(f"{tag_prefix}_theta_sweep", fig, epoch + 1 if step is None else step)
+        plt.close(fig)
+
+    base_result = _run_rollout_validation_case()
+    if not base_result:
+        return {}
+    metrics = dict(base_result["metrics"])
+    theta_sweep_results: list[dict[str, Any]] = []
+    if validation_theta0_values is not None:
+        velocity0 = float(np.asarray(traj["dy"], dtype=float).reshape(-1)[0])
+        td_context0 = np.asarray(traj["td_context"], dtype=float)[0]
+        for theta0_value in validation_theta0_values:
+            override_context0 = _td_context_with_theta_numpy(
+                td_context0,
+                velocity=velocity0,
+                theta0=float(theta0_value),
+            )
+            theta_sweep_results.append(
+                _run_rollout_validation_case(initial_td_context0=override_context0)
+            )
+        metrics.update(_aggregate_theta_sweep_metrics(validation_theta0_values, theta_sweep_results))
 
     if log_metrics:
         for name, value in metrics.items():
             if np.isfinite(float(value)):
                 writer.add_scalar(f"val/{name}", float(value), epoch)
 
+    t_np = np.asarray(base_result["t_np"], dtype=float)
+    ur_val = float(base_result["ur_val"])
+    q_true_norm = np.asarray(base_result["q_true_norm"], dtype=float)
+    p_true_norm = np.asarray(base_result["p_true_norm"], dtype=float)
+    q_pred_norm = np.asarray(base_result["q_pred_norm"], dtype=float)
+    p_pred_norm = np.asarray(base_result["p_pred_norm"], dtype=float)
+    force_true_full = np.asarray(base_result["force_true_full"], dtype=float)
+    force_total_full = np.asarray(base_result["force_total_full"], dtype=float)
+    force_td_full = np.asarray(base_result["force_td_full"], dtype=float)
+    corr_roll = np.asarray(base_result["corr_roll"], dtype=float)
+    sigma_roll = np.asarray(base_result["sigma_roll"], dtype=float)
+    delta_fhat_roll = np.asarray(base_result["delta_fhat_roll"], dtype=float)
+    td_force_on_data = np.asarray(base_result["td_force_on_data"], dtype=float)
+    corr_on_data = np.asarray(base_result["corr_on_data"], dtype=float)
+    sigma_on_data = np.asarray(base_result["sigma_on_data"], dtype=float)
+    delta_fhat_on_data = np.asarray(base_result["delta_fhat_on_data"], dtype=float)
+
     if log_plots or (log_only_spectra and log_spectra):
         zoom_mask = create_zoom_mask(t_np)
-        ur_val = float(ur_t[0, 0].detach().cpu().item())
-        omega = float(np.sqrt(stiffness_value / mass_value))
-        q_true_norm = y_true_t[:, 0].detach().cpu().numpy() / float(model.D)
-        p_true_norm = v_true_t[:, 0].detach().cpu().numpy() / (omega * float(model.D))
-        q_pred_norm = y_pred / float(model.D)
-        p_pred_norm = v_pred / (omega * float(model.D))
-        n_force = min(len(t_np), len(force_total_full), len(force_true), len(force_td_full))
+        n_force = min(len(t_np), len(force_total_full), len(force_true_full), len(force_td_full))
         force_t = t_np[:n_force]
         if log_plots:
             log_displacement_plots(
@@ -1912,7 +2124,7 @@ def _log_td_correction_rollout_validation(
                 epoch,
                 force_t,
                 force_total_full[:n_force],
-                f_true_t[:, 0].detach().cpu().numpy()[:n_force],
+                force_true_full[:n_force],
                 create_zoom_mask(force_t),
                 reduced_velocity=ur_val,
                 force_coeff_baseline=force_td_full[:n_force],
@@ -1934,7 +2146,7 @@ def _log_td_correction_rollout_validation(
                 disp_true=q_true_norm,
                 disp_pred=q_pred_norm,
                 force_t=force_t,
-                force_true=f_true_t[:, 0].detach().cpu().numpy()[:n_force],
+                force_true=force_true_full[:n_force],
                 force_pred=force_total_full[:n_force],
                 reduced_velocity=ur_val,
                 force_baseline=force_td_full[:n_force],
@@ -1949,10 +2161,10 @@ def _log_td_correction_rollout_validation(
                 writer,
                 epoch,
                 t=t_np[1:],
-                corr_true=(f_true_t[1:, 0] - td_force_on_data[:, 0]).detach().cpu().numpy(),
-                corr_pred=corr_on_data[:, 0].detach().cpu().numpy(),
+                corr_true=force_true_full[1:] - td_force_on_data,
+                corr_pred=corr_on_data,
                 sigma=(
-                    sigma_on_data[:, 0].detach().cpu().numpy()
+                    sigma_on_data
                     if predict_sigma
                     else None
                 ),
@@ -2001,6 +2213,12 @@ def _log_td_correction_rollout_validation(
                 tag="final_val/phase_rollout_outputs",
                 step=step,
                 title_suffix=title_suffix,
+            )
+        if validation_theta0_values is not None and theta_sweep_results and log_plots and not log_only_spectra:
+            _log_theta_sweep_plot(
+                theta0_values_local=validation_theta0_values,
+                base_result=base_result,
+                sweep_results=theta_sweep_results,
             )
     return metrics
 
@@ -3469,6 +3687,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("hnn.rollout_noise_scale must be finite and non-negative.")
     rollout_seed_raw = hnn_cfg.get("rollout_seed", None)
     rollout_seed = None if rollout_seed_raw is None else int(rollout_seed_raw)
+    validation_theta0_values = _as_float_list(
+        hnn_cfg.get("validation_theta0_values"),
+        key="hnn.validation_theta0_values",
+    )
+    if validation_theta0_values is not None and len(validation_theta0_values) == 0:
+        raise ValueError("hnn.validation_theta0_values must be null or contain at least one theta0 value.")
 
     if rollout_loss_mode == "stochastic":
         rollout_loss_mode = "stochastic_nll"
@@ -3780,6 +4004,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         f"rollout_det={rollout_det_weight:g}, rollout_disp_std={rollout_disp_std_weight:g}, "
         f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
     )
+    if validation_theta0_values is not None:
+        startup_lines.append(
+            f"Validation theta sweep: {len(validation_theta0_values)} initial theta0 values {validation_theta0_values}"
+        )
     if random_phase_training:
         startup_lines.append(
             "Phase augmentation: one-step loss uses random phi_vy; rollouts start from phi_vy=phi_dy (theta=0)."
@@ -3850,6 +4078,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         split_trajs: list[dict[str, np.ndarray]],
         log_rollout_plots: bool,
         log_all_rollout_spectra: bool = False,
+        validation_theta0_values_for_split: list[float] | None = None,
     ) -> None:
         if split_loader is None:
             return
@@ -4027,6 +4256,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     tag_prefix=f"{split_tag}/rollout",
                     log_metrics=False,
                     log_plots=False,
+                    validation_theta0_values=validation_theta0_values_for_split,
                 )
                 diverged_flag = float(metrics_roll.get(ROLLOUT_DIVERGED_KEY, 0.0))
                 if np.isfinite(diverged_flag) and diverged_flag > 0.5:
@@ -4078,6 +4308,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     log_metrics=False,
                     log_plots=True,
                     log_spectra=True,
+                    validation_theta0_values=validation_theta0_values_for_split,
                 )
             if log_all_rollout_spectra:
                 def _safe_tag_component(raw: Any) -> str:
@@ -4115,6 +4346,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         log_only_spectra=True,
                         step=epoch_idx + 1,
                         title_suffix=f" [{traj_name}]",
+                        validation_theta0_values=validation_theta0_values_for_split,
                     )
         elapsed = float(time.perf_counter() - split_start)
         writer.add_scalar(f"{split_tag}/validation_wall_time_s", elapsed, epoch_idx + 1)
@@ -4347,6 +4579,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 split_rollout_loader=rollout_loader,
                 split_trajs=val_trajs,
                 log_rollout_plots=True,
+                validation_theta0_values_for_split=validation_theta0_values,
             )
             if val_seen_loader is not None:
                 _run_td_validation_for_split(
@@ -4358,6 +4591,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     split_trajs=val_seen_trajs,
                     log_rollout_plots=False,
                     log_all_rollout_spectra=True,
+                    validation_theta0_values_for_split=validation_theta0_values,
                 )
             ckpt_path = _save_td_validation_checkpoint(epoch)
             print(f"Saved validation checkpoint to {ckpt_path}")
@@ -4403,6 +4637,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_plots=False,
                 log_correction_on_data=False,
                 log_phase_map=False,
+                validation_theta0_values=validation_theta0_values,
             )
             filtered = {
                 name: float(value)
@@ -4489,6 +4724,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 log_phase_map=True,
                 title_suffix=f" [final {idx}/{len(plot_trajs)}]",
                 log_spectra=True,
+                validation_theta0_values=validation_theta0_values,
             )
             filtered_plot_metrics = {name: float(value) for name, value in plot_metrics.items() if np.isfinite(float(value))}
             if filtered_plot_metrics:
