@@ -4031,7 +4031,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_seed=rollout_seed,
                         tag_prefix=f"{split_tag}/rollout/{_safe_tag_component(traj_name)}",
                         log_metrics=False,
-                        log_plots=False,
+                        log_plots=True,
                         log_spectra=True,
                         log_only_spectra=True,
                         step=epoch_idx + 1,
