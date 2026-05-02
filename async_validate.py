@@ -60,6 +60,7 @@ from methods.hnn.trainer import (
     _build_td_correction_hnn_loaders,
     _log_td_correction_rollout_validation as _hnn_td_rollout_validation,
     _normalize_rollout_disp_spectral_loss_mode,
+    _td_context_with_random_phi_torch,
     _resolve_td_rollout_loss_settings,
     _td_correction_rollout_losses_from_batch,
     _td_step_with_corrections,
@@ -701,6 +702,12 @@ def _run_hnn_td_correction_validation(
         hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
     )
     use_phi_input = phase_input_source != "none"
+    random_phase_training = bool(hnn_cfg.get("random_phase_training", False))
+    if random_phase_training and phase_input_source not in {"phi_vy", "both"}:
+        raise ValueError(
+            "hnn.random_phase_training=true requires hnn.use_phi_input / hnn.phi_input_source "
+            "to include phi_vy (use 'phi_vy' or 'both')."
+        )
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     input_scaling_mode = resolve_phnn_input_scaling_mode(getattr(cfg.model, "input_scaling_mode", "current"))
     fhat_bound_multiplier = float(ckpt.get("fhat_bound_multiplier", hnn_cfg.get("fhat_bound_multiplier", 1.5)))
@@ -789,6 +796,7 @@ def _run_hnn_td_correction_validation(
     setattr(model, "td_force_input_source", td_force_input_source)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
     setattr(model, "force_zero_output", force_zero_output)
+    setattr(model, "random_phase_training", random_phase_training)
     _load_state(model, ckpt["model_state"])
     model.eval()
 
@@ -835,6 +843,8 @@ def _run_hnn_td_correction_validation(
                     mass_i = mass_i.to(device, non_blocking=(device.type == "cuda"))
                     damping_i = damping_i.to(device, non_blocking=(device.type == "cuda"))
                     stiffness_i = stiffness_i.to(device, non_blocking=(device.type == "cuda"))
+                    if random_phase_training:
+                        td_context_i = _td_context_with_random_phi_torch(td_context_i)
                     dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
                     step = _td_step_with_corrections(
                         model=model,

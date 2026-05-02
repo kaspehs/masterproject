@@ -219,6 +219,59 @@ def _model_phase_input_source(model: PHVIV) -> str:
     return resolve_td_phase_input_source(raw_value)
 
 
+def _phase_input_source_includes_phi(phase_input_source: Any) -> bool:
+    return resolve_td_phase_input_source(phase_input_source) in {"phi_vy", "both"}
+
+
+def _random_phase_training_enabled(model: PHVIV) -> bool:
+    base = getattr(model, "_orig_mod", model)
+    return bool(getattr(base, "random_phase_training", False))
+
+
+def _wrap_phase_torch(values: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(values), torch.cos(values))
+
+
+def _td_phi_dy_from_context_torch(
+    *,
+    td_context: torch.Tensor,
+    velocity: torch.Tensor,
+) -> torch.Tensor:
+    if td_context.ndim < 2 or int(td_context.shape[-1]) < 5:
+        raise ValueError("td_context must have shape (..., 5) with [ddy, phi, sig_dy, sig_ddy, flow_speed].")
+    ddy = td_context[..., 0:1]
+    sig_dy = td_context[..., 2:3]
+    sig_ddy = td_context[..., 3:4]
+    flow_speed = td_context[..., 4:5]
+    speed_mag = torch.sqrt(torch.clamp(flow_speed * flow_speed + velocity * velocity, min=1.0e-12))
+    projection = flow_speed / torch.clamp(speed_mag, min=1.0e-12)
+    dy_r = velocity * projection
+    ddy_r = ddy * projection
+    cos_phi_dy = dy_r / torch.clamp(sig_dy, min=1.0e-12)
+    sin_phi_dy = -ddy_r / torch.clamp(sig_ddy, min=1.0e-12)
+    return torch.atan2(sin_phi_dy, cos_phi_dy)
+
+
+def _td_context_with_phase_torch(td_context: torch.Tensor, *, phi: torch.Tensor) -> torch.Tensor:
+    phi_wrapped = _wrap_phase_torch(phi.to(device=td_context.device, dtype=td_context.dtype))
+    out = td_context.clone()
+    out[..., 1:2] = phi_wrapped
+    return out
+
+
+def _td_context_with_random_phi_torch(td_context: torch.Tensor) -> torch.Tensor:
+    phi = (2.0 * math.pi) * torch.rand_like(td_context[..., 1:2]) - math.pi
+    return _td_context_with_phase_torch(td_context, phi=phi)
+
+
+def _td_context_with_theta_zero_torch(
+    td_context: torch.Tensor,
+    *,
+    velocity: torch.Tensor,
+) -> torch.Tensor:
+    return _td_context_with_phase_torch(td_context, phi=_td_phi_dy_from_context_torch(td_context=td_context, velocity=velocity))
+
+
 def _apply_td_correction_head_init(
     model: PHVIV,
     *,
@@ -1418,6 +1471,11 @@ def _td_correction_state_rollout(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     z = z0
     td_context = td_context0
+    if _random_phase_training_enabled(model):
+        td_context = _td_context_with_theta_zero_torch(
+            td_context,
+            velocity=z0[:, 1:2] / structural_mass,
+        )
     z_hist = [z0]
     total_force_hist: list[torch.Tensor] = []
     corr_mu_hist: list[torch.Tensor] = []
@@ -3336,6 +3394,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         hnn_cfg.get("phi_input_source", hnn_cfg.get("use_phi_input", False))
     )
     use_phi_input = phase_input_source != "none"
+    random_phase_training = bool(hnn_cfg.get("random_phase_training", False))
+    if random_phase_training and not _phase_input_source_includes_phi(phase_input_source):
+        raise ValueError(
+            "hnn.random_phase_training=true requires hnn.use_phi_input / hnn.phi_input_source "
+            "to include phi_vy (use 'phi_vy' or 'both')."
+        )
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     use_acceleration_input = bool(hnn_cfg.get("use_acceleration_input", False))
     fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
@@ -3462,6 +3526,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
     setattr(model, "force_zero_output", force_zero_output)
+    setattr(model, "random_phase_training", random_phase_training)
     if init_from_checkpoint is not None:
         _load_model_checkpoint_for_training(model, init_from_checkpoint)
     else:
@@ -3711,6 +3776,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         f"rollout_det={rollout_det_weight:g}, rollout_disp_std={rollout_disp_std_weight:g}, "
         f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
     )
+    if random_phase_training:
+        startup_lines.append(
+            "Phase augmentation: one-step loss uses random phi_vy; rollouts start from phi_vy=phi_dy (theta=0)."
+        )
     if getattr(model, "force_output", "force") == "coefficient" and getattr(model, "coefficient_output_bound", None) is not None:
         startup_lines.append(
             "Coefficient output bound: "
@@ -3801,6 +3870,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 mass_i = mass_i.to(device, non_blocking=non_blocking)
                 damping_i = damping_i.to(device, non_blocking=non_blocking)
                 stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
+                if random_phase_training:
+                    td_context_i = _td_context_with_random_phi_torch(td_context_i)
                 with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                     dt_i = torch.clamp(t_next - t_i, min=1.0e-12)
                     state_loss, step = _state_loss(
@@ -4093,6 +4164,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             mass_i = mass_i.to(device, non_blocking=non_blocking)
             damping_i = damping_i.to(device, non_blocking=non_blocking)
             stiffness_i = stiffness_i.to(device, non_blocking=non_blocking)
+            if random_phase_training:
+                td_context_i = _td_context_with_random_phi_torch(td_context_i)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 dt_i = torch.clamp(t_next - t_i, min=1.0e-12)

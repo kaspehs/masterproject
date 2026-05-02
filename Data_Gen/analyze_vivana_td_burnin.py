@@ -68,7 +68,7 @@ OVERWRITE = True
 MULTI_CASE_ONLY_SPREAD_PLOT = False  # If True, only generate the phase spread vs burn-in plot for multiple cases, skip single-case endpoint mismatch and trajectory overlay plots.
 SKIP_INVALID_CASES = True
 SHOW_PROGRESS = True
-
+'''
 # TD parameter sweep
 CV_VALUES = [1.2]
 CD_VALUES = [1.1]
@@ -77,6 +77,15 @@ CA_VALUES = [1.0]
 FHAT_MIN_VALUES = [0.11]
 FHAT0_VALUES = [0.18]
 FHAT_MAX_VALUES = [0.26]
+'''
+
+CV_VALUES = [1.03]
+CD_VALUES = [1.02]
+CA_VALUES = [1.95]
+
+FHAT_MIN_VALUES = [0.142]
+FHAT0_VALUES = [0.142]
+FHAT_MAX_VALUES = [0.173]
 
 DAMPING_C_VALUES = [0.0]
 N_MEMORY = 500
