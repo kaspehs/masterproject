@@ -687,6 +687,7 @@ def _run_hnn_td_correction_validation(
     train_series_root = Path(data_cfg.train_series_dir)
     td_params = resolve_td_correction_params(hnn_cfg)
     td_memory_cfg = resolve_td_memory_config(hnn_cfg)
+    recompute_td_observables_from_phi = bool(hnn_cfg.get("recompute_td_observables_from_phi", False))
     correction_mode = str(ckpt.get("correction_mode", resolve_td_correction_mode(hnn_cfg))).strip().lower()
     mode_flags = td_correction_mode_flags(correction_mode)
     mean_active = bool(mode_flags["mean_active"])
@@ -768,6 +769,7 @@ def _run_hnn_td_correction_validation(
             ur_source=td_mass_source,
             td_params=td_params,
             td_memory_cfg=td_memory_cfg,
+            recompute_td_observables_from_phi=recompute_td_observables_from_phi,
         )
 
     val_trajs_np = split_trajs_map.get(ASYNC_VAL_SPLIT_TAG, [])

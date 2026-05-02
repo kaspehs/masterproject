@@ -4831,6 +4831,65 @@ def _recompute_td_baseline_on_grid(
     }
 
 
+def _recompute_td_observables_from_fixed_phi(
+    *,
+    dy: np.ndarray,
+    ddy: np.ndarray,
+    phi_td: np.ndarray,
+    sig_dy_td: np.ndarray,
+    sig_ddy_td: np.ndarray,
+    flow_speed: np.ndarray,
+    rho: float,
+    diameter: float,
+    td_params: dict[str, float],
+) -> dict[str, np.ndarray]:
+    dy_arr = np.asarray(dy, dtype=float).reshape(-1)
+    ddy_arr = np.asarray(ddy, dtype=float).reshape(-1)
+    phi_arr = np.asarray(phi_td, dtype=float).reshape(-1)
+    sig_dy_arr = np.asarray(sig_dy_td, dtype=float).reshape(-1)
+    sig_ddy_arr = np.asarray(sig_ddy_td, dtype=float).reshape(-1)
+    flow_arr = np.asarray(flow_speed, dtype=float).reshape(-1)
+    n = min(dy_arr.size, ddy_arr.size, phi_arr.size, sig_dy_arr.size, sig_ddy_arr.size, flow_arr.size)
+    if n < 1:
+        raise ValueError("Need at least one sample to recompute TD observables from fixed phi.")
+    dy_arr = dy_arr[:n]
+    ddy_arr = ddy_arr[:n]
+    phi_arr = phi_arr[:n]
+    sig_dy_arr = sig_dy_arr[:n]
+    sig_ddy_arr = sig_ddy_arr[:n]
+    flow_arr = flow_arr[:n]
+    diameter_value = float(diameter)
+    if not np.isfinite(diameter_value) or diameter_value <= 0.0:
+        raise ValueError(f"diameter must be finite and positive, got {diameter!r}.")
+    speed_mag = np.sqrt(np.clip(flow_arr * flow_arr + dy_arr * dy_arr, 1.0e-12, None))
+    projection = flow_arr / np.clip(speed_mag, 1.0e-12, None)
+    dy_r = dy_arr * projection
+    ddy_r = ddy_arr * projection
+    cos_phi_dy = dy_r / np.clip(sig_dy_arr, 1.0e-12, None)
+    sin_phi_dy = -ddy_r / np.clip(sig_ddy_arr, 1.0e-12, None)
+    phi_dy = np.arctan2(sin_phi_dy, cos_phi_dy)
+    theta_td = np.arctan2(np.sin(phi_dy - phi_arr), np.cos(phi_dy - phi_arr))
+    fhat_td = np.where(
+        theta_td <= 0.0,
+        float(td_params["fhat0"]) + (float(td_params["fhat0"]) - float(td_params["fhat_min"])) * np.sin(theta_td),
+        float(td_params["fhat0"]) + (float(td_params["fhat_max"]) - float(td_params["fhat0"])) * np.sin(theta_td),
+    )
+    omega_vy_td = 2.0 * np.pi * fhat_td * speed_mag / diameter_value
+    force_dy = -0.5 * float(rho) * diameter_value * float(td_params["Cd"]) * speed_mag * dy_arr
+    force_cv = 0.5 * float(rho) * diameter_value * float(td_params["Cv"]) * speed_mag * flow_arr * np.cos(phi_arr)
+    force_ca = -0.25 * float(rho) * float(td_params["Ca"]) * np.pi * (diameter_value ** 2) * ddy_arr
+    force_td = force_ca + force_cv + force_dy
+    return {
+        "force_td": np.asarray(force_td, dtype=float),
+        "force_cv": np.asarray(force_cv, dtype=float),
+        "force_dy": np.asarray(force_dy, dtype=float),
+        "force_ca": np.asarray(force_ca, dtype=float),
+        "theta_td": np.asarray(theta_td, dtype=float),
+        "fhat_td": np.asarray(fhat_td, dtype=float),
+        "omega_vy_td": np.asarray(omega_vy_td, dtype=float),
+    }
+
+
 def td_phase_input_dim(phase_input_source: Any) -> int:
     resolved = resolve_td_phase_input_source(phase_input_source)
     if resolved == "none":
@@ -5010,6 +5069,7 @@ def load_td_correction_trajectories(
     ur_source: str = "stored",
     td_params: dict[str, float] | None = None,
     td_memory_cfg: dict[str, Any] | None = None,
+    recompute_td_observables_from_phi: bool = False,
 ) -> list[dict[str, np.ndarray]]:
     trajectories: list[dict[str, np.ndarray]] = []
     for path in paths:
@@ -5345,6 +5405,48 @@ def load_td_correction_trajectories(
                     sig_ddy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_ddy_norm"]
                     sig_dy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_dy_norm"]
                     sig_ddy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_ddy_norm"]
+            if bool(recompute_td_observables_from_phi) and td_params is not None:
+                fixed_phi_td = _recompute_td_observables_from_fixed_phi(
+                    dy=dy_reduced,
+                    ddy=ddy_reduced,
+                    phi_td=phi_td_reduced,
+                    sig_dy_td=sig_dy_td_reduced,
+                    sig_ddy_td=sig_ddy_td_reduced,
+                    flow_speed=flow_speed_reduced,
+                    rho=float(rho_kg_m3),
+                    diameter=float(diameter_m),
+                    td_params=td_params,
+                )
+                force_td_per_m_reduced = fixed_phi_td["force_td"]
+                theta_td_reduced = fixed_phi_td["theta_td"]
+                fhat_td_reduced = fixed_phi_td["fhat_td"]
+                omega_vy_td_reduced = fixed_phi_td["omega_vy_td"]
+                hidden_inputs_dry_reduced = _td_hidden_inputs_from_arrays_numpy(
+                    phi_td=phi_td_reduced,
+                    sig_dy_td=sig_dy_td_reduced,
+                    sig_ddy_td=sig_ddy_td_reduced,
+                    theta_td=theta_td_reduced,
+                    structural_mass=dry_mass_kg,
+                    stiffness=stiffness_n_m,
+                    diameter=diameter_m,
+                )
+                hidden_inputs_effective_reduced = _td_hidden_inputs_from_arrays_numpy(
+                    phi_td=phi_td_reduced,
+                    sig_dy_td=sig_dy_td_reduced,
+                    sig_ddy_td=sig_ddy_td_reduced,
+                    theta_td=theta_td_reduced,
+                    structural_mass=effective_mass_kg,
+                    stiffness=stiffness_n_m,
+                    diameter=diameter_m,
+                )
+                phi_sin_td_reduced = hidden_inputs_dry_reduced["phi_sin"]
+                phi_cos_td_reduced = hidden_inputs_dry_reduced["phi_cos"]
+                theta_sin_td_reduced = hidden_inputs_dry_reduced["theta_sin"]
+                theta_cos_td_reduced = hidden_inputs_dry_reduced["theta_cos"]
+                sig_dy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_dy_norm"]
+                sig_ddy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_ddy_norm"]
+                sig_dy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_dy_norm"]
+                sig_ddy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_ddy_norm"]
             td_context = np.stack(
                 [ddy_reduced, phi_td_reduced, sig_dy_td_reduced, sig_ddy_td_reduced, flow_speed_reduced],
                 axis=1,

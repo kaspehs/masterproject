@@ -3331,6 +3331,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("hnn.td_mass_source must be one of: dry, effective.")
     td_params = resolve_td_correction_params(hnn_cfg)
     td_memory_cfg = resolve_td_memory_config(hnn_cfg)
+    recompute_td_observables_from_phi = bool(hnn_cfg.get("recompute_td_observables_from_phi", False))
     train_cut = resolve_cut_start_seconds(data_cfg, "train")
     val_cut = resolve_cut_start_seconds(data_cfg, "val")
     reduce_time_enabled = bool(getattr(data_cfg, "reduce_time", False))
@@ -3352,6 +3353,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         ur_source=td_mass_source,
         td_params=td_params,
         td_memory_cfg=td_memory_cfg,
+        recompute_td_observables_from_phi=recompute_td_observables_from_phi,
     )
     val_trajs = (
         load_td_correction_trajectories(
@@ -3363,6 +3365,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             ur_source=td_mass_source,
             td_params=td_params,
             td_memory_cfg=td_memory_cfg,
+            recompute_td_observables_from_phi=recompute_td_observables_from_phi,
         )
         if val_paths
         else []
@@ -3377,6 +3380,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             ur_source=td_mass_source,
             td_params=td_params,
             td_memory_cfg=td_memory_cfg,
+            recompute_td_observables_from_phi=recompute_td_observables_from_phi,
         )
         if val_seen_paths
         else []
@@ -3779,6 +3783,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     if random_phase_training:
         startup_lines.append(
             "Phase augmentation: one-step loss uses random phi_vy; rollouts start from phi_vy=phi_dy (theta=0)."
+        )
+    if recompute_td_observables_from_phi:
+        startup_lines.append(
+            "TD observables: stored phi_vy/sigmas kept, but theta/fhat/omega/force_td are recomputed in-memory from config TD params."
         )
     if getattr(model, "force_output", "force") == "coefficient" and getattr(model, "coefficient_output_bound", None) is not None:
         startup_lines.append(

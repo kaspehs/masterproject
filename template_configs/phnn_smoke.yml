@@ -201,6 +201,9 @@ hnn:
   # If true, train the one-step loss with random phi_vy while forcing rollout starts to phi_vy=phi_dy (theta=0).
   # Requires use_phi_input: phi_vy or both.
   random_phase_training: false
+  # If true, keep stored phi_vy/sigma channels as estimates but recompute theta/fhat/omega/force_td
+  # in memory from the current config TD parameters.
+  recompute_td_observables_from_phi: false
   # If true, append both normalized TD sigma states:
   # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).
   use_sigma_inputs: false
