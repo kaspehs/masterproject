@@ -1119,7 +1119,7 @@ def compute_model_grad_norm(model: "PHVIV") -> float:
 
 
 class GradNormBalancer:
-    """Balance multiple loss terms by equalizing their gradient norms."""
+    """Balance multiple loss terms by matching auxiliary gradients to an anchor loss."""
 
     def __init__(
         self,
@@ -1134,6 +1134,8 @@ class GradNormBalancer:
             raise ValueError("GradNormBalancer requires at least one loss name")
         self.model = model
         self.names = tuple(names)
+        anchor_priority = ("residual", "state", "weak")
+        self.anchor_name = next((name for name in anchor_priority if name in self.names), self.names[0])
         self.alpha = float(alpha)
         self.eps = float(eps)
         self.min_weight = float(min_weight)
@@ -1181,11 +1183,13 @@ class GradNormBalancer:
                 self.g_ema[name] = self.alpha * self.g_ema[name] + (1.0 - self.alpha) * torch.clamp(
                     grad_norms[name], min=self.eps
                 )
-            inv = {name: 1.0 / torch.clamp(self.g_ema[name], min=self.eps) for name in self.names}
-            total_inv = sum(inv.values())
-            count = float(len(self.names))
+            anchor_grad = torch.clamp(self.g_ema[self.anchor_name], min=self.eps)
             for name in self.names:
-                weight = inv[name] * (count / total_inv)
+                if name == self.anchor_name:
+                    weight = anchor_grad.new_tensor(1.0)
+                else:
+                    denom = torch.clamp(self.g_ema[name], min=self.eps)
+                    weight = anchor_grad / denom
                 self.weights[name] = torch.clamp(weight, self.min_weight, self.max_weight)
             return {name: self.weights[name].detach() for name in self.names}
 
