@@ -4699,7 +4699,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             y_true_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1).to(device)
             v_true_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1).to(device)
             z_true_t = torch.cat([y_true_t, v_true_t * mass_value], dim=1)
-            td_force_t = torch.from_numpy(np.ascontiguousarray(traj["force_td_per_m"])).float().unsqueeze(1).to(device)
+            t_traj = torch.from_numpy(np.ascontiguousarray(traj["t"])).float().to(device)
+            dt_traj = torch.clamp((t_traj[1:] - t_traj[:-1]).unsqueeze(1), min=1.0e-12)
             ur_t = torch.from_numpy(
                 np.ascontiguousarray(
                     _td_flow_feature_from_traj(
@@ -4715,7 +4716,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     z=z_true_t[:-1],
                     reduced_velocity=ur_t[:-1],
                     td_context=torch.from_numpy(np.ascontiguousarray(traj["td_context"][:-1])).float().to(device),
-                    dt=dt,
+                    dt=dt_traj,
                     structural_mass=torch.full((z_true_t.shape[0] - 1, 1), mass_value, dtype=z_true_t.dtype, device=device),
                     damping_c=torch.full((z_true_t.shape[0] - 1, 1), float(np.asarray(traj["damping_c"]).reshape(())), dtype=z_true_t.dtype, device=device),
                     stiffness=torch.full((z_true_t.shape[0] - 1, 1), stiffness_value, dtype=z_true_t.dtype, device=device),

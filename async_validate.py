@@ -729,6 +729,9 @@ def _run_hnn_td_correction_validation(
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
     if state_loss_mode not in {"mse", "propagated_nll"}:
         raise ValueError("hnn.state_loss_mode must be one of: mse, propagated_nll.")
+    state_loss_weight = float(getattr(loss_cfg, "state_weight", 1.0))
+    if state_loss_weight < 0.0:
+        raise ValueError("loss.state_weight must be non-negative.")
     force_zero_output = bool(hnn_cfg.get("force_zero_output", False))
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
@@ -819,7 +822,7 @@ def _run_hnn_td_correction_validation(
 
     def _run_split(split_tag: str, split_trajs_np: list[dict[str, Any]]) -> dict[str, Any]:
         split_start = time.perf_counter()
-        _train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
+        _train_loader, val_loader, _train_rollout_loader, rollout_loader = _build_td_correction_hnn_loaders(
             train_trajs=split_trajs_np,
             val_trajs=split_trajs_np,
             mass_source=td_mass_source,
@@ -831,6 +834,8 @@ def _run_hnn_td_correction_validation(
             num_workers=int(num_workers),
             pin_memory=(device.type == "cuda"),
         )
+        del _train_loader
+        del _train_rollout_loader
 
         num_loss_scalars_written = 0
         num_rollout_scalars_written = 0
@@ -916,7 +921,7 @@ def _run_hnn_td_correction_validation(
                     sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                     fhat_reg_loss = _reg(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                     total_loss = (
-                        state_loss
+                        float(state_loss_weight) * state_loss
                         + float(force_data_weight) * data_loss
                         + float(mean_reg) * mean_reg_loss
                         + float(sigma_reg) * sigma_reg_loss
@@ -993,7 +998,7 @@ def _run_hnn_td_correction_validation(
             val_metrics["loss_rollout_disp_std"] = rollout_std_loss_avg
             val_metrics["loss_rollout_spectral"] = rollout_spectral_loss_avg
             val_metrics["loss_total"] = (
-                val_metrics["loss_state"]
+                float(state_loss_weight) * val_metrics["loss_state"]
                 + float(force_data_weight) * val_metrics["loss_data"]
                 + float(mean_reg) * val_metrics["loss_reg_mean"]
                 + float(sigma_reg) * val_metrics["loss_reg_sigma"]
