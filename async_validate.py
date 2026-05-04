@@ -286,6 +286,18 @@ def _load_state(model: torch.nn.Module, state: dict[str, Any]) -> None:
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     if any(k.startswith("module.") for k in state):
         state = {k.removeprefix("module."): v for k, v in state.items()}
+    shared_trunk_enabled = bool(getattr(model, "shared_td_correction_trunk", False))
+    has_shared_trunk_weights = any(str(key).startswith("td_corr_shared_trunk.") for key in state)
+    if shared_trunk_enabled and not has_shared_trunk_weights:
+        raise ValueError(
+            "Checkpoint state does not contain shared TD-correction trunk weights, "
+            "but the validation model was built with architecture.shared_td_correction_trunk=true."
+        )
+    if not shared_trunk_enabled and has_shared_trunk_weights:
+        raise ValueError(
+            "Checkpoint state contains shared TD-correction trunk weights, "
+            "but the validation model was built with architecture.shared_td_correction_trunk=false."
+        )
     model.load_state_dict(state, strict=False)
 
 

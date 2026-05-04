@@ -272,12 +272,32 @@ def _default_mlp_kwargs() -> dict[str, Any]:
 class ArchitectureConfig:
     force_net_type: str = "residual"
     hard_force_symmetry: bool = False
+    shared_td_correction_trunk: bool = False
     use_fourier_features: bool = False
     fourier_features: int = 64
     fourier_sigma: float = 1.0
     residual_kwargs: dict[str, Any] = field(default_factory=_default_residual_kwargs)
     mlp_kwargs: dict[str, Any] = field(default_factory=_default_mlp_kwargs)
     pirate_force_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+class _ODEPirateFeatureTrunk(nn.Module):
+    """Expose PirateNet's hidden state so TD correction heads can share one trunk."""
+
+    def __init__(self, input_size: int, pirate_args: dict[str, Any]):
+        super().__init__()
+        self.net = ODEPirateNet(input_size=int(input_size), output_size=1, **dict(pirate_args))
+        self.output_dim = 2 * int(pirate_args.get("fourier_features", 64))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        phi = self.net.ff(x)
+        u_lin = self.net.w1(phi)
+        u_feat = self.net.sine(self.net.w0_embed * u_lin) if self.net.use_sine_embed else self.net.act(u_lin)
+        v_feat = self.net.act(self.net.w2(phi))
+        hidden = phi
+        for block in self.net.blocks:
+            hidden = block(hidden, u_feat, v_feat)
+        return hidden
 
 @dataclass
 class SchedulerConfig:
@@ -2027,6 +2047,7 @@ class PHVIV(nn.Module):
         input_scaling_mode: str = "current",
         force_net_type: str | None = None,
         hard_force_symmetry: bool = False,
+        shared_td_correction_trunk: bool = False,
         arch_pirate_force_kwargs: dict[str, Any] | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
@@ -2140,6 +2161,7 @@ class PHVIV(nn.Module):
             raise ValueError(f"force_net_type must be one of {valid_types}, got '{force_net_type}'.")
         self.use_pirate_force = net_type == "pirate"
         self.residual_net = net_type == "residual"
+        self.shared_td_correction_trunk = bool(shared_td_correction_trunk)
         if self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
@@ -2185,16 +2207,41 @@ class PHVIV(nn.Module):
             mlp_layers.append(nn.Linear(self.mlp_hidden, 1))
             return nn.Sequential(*mlp_layers)
 
-        self.u_base_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
+        def _build_shared_trunk(input_features: int) -> tuple[nn.Module, int]:
+            if self.use_pirate_force:
+                pirate_args = _build_pirate_args(input_features)
+                trunk = _ODEPirateFeatureTrunk(input_size=input_features, pirate_args=pirate_args)
+                return trunk, int(trunk.output_dim)
+            if self.residual_net:
+                layers = [nn.Linear(int(input_features), self.residual_hidden)]
+                for _ in range(self.residual_layers):
+                    layers.append(Residual(self.residual_hidden, activation=self.residual_activation))
+                return nn.Sequential(*layers), int(self.residual_hidden)
+            mlp_layers: list[nn.Module] = []
+            in_features = int(input_features)
+            mlp_act_cls = _activation_factory(self.mlp_activation)
+            for _ in range(self.mlp_layers):
+                mlp_layers.append(nn.Linear(in_features, self.mlp_hidden))
+                mlp_layers.append(mlp_act_cls())
+                in_features = self.mlp_hidden
+            return nn.Sequential(*mlp_layers), int(self.mlp_hidden)
+
+        if self.shared_td_correction_trunk:
+            self.td_corr_shared_trunk, td_corr_head_dim = _build_shared_trunk(force_in_features)
+            self.u_base_net = nn.Linear(td_corr_head_dim, 1)
+            self.fhat_net = nn.Linear(td_corr_head_dim, 1)
+            self.sigma_net = nn.Linear(td_corr_head_dim, 1) if self.use_stochastic_process_noise else None
+        else:
+            self.td_corr_shared_trunk = None
+            self.u_base_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
+            self.fhat_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
+            self.sigma_net = (
+                _build_scalar_net(force_in_features, use_selected_backbone=True)
+                if self.use_stochastic_process_noise
+                else None
+            )
         # Backward-compatible alias used throughout the codebase.
         self.u_net = self.u_base_net
-        self.fhat_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
-
-        self.sigma_net = (
-            _build_scalar_net(force_in_features, use_selected_backbone=True)
-            if self.use_stochastic_process_noise
-            else None
-        )
 
         if damping_c is None:
             raise ValueError("damping_c must be provided for PHVIV.")
@@ -2245,6 +2292,10 @@ class PHVIV(nn.Module):
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         input_scaling_mode = resolve_phnn_input_scaling_mode(cfg.get("input_scaling_mode", "current"))
         arch_cfg = arch_cfg or {}
+        correction_mode_raw = cfg.get("correction_mode")
+        shared_td_correction_trunk = bool(arch_cfg.get("shared_td_correction_trunk", False))
+        if correction_mode_raw is None or str(correction_mode_raw).strip() == "":
+            shared_td_correction_trunk = False
         force_net_type = arch_cfg.get("force_net_type")
         hard_force_symmetry = bool(arch_cfg.get("hard_force_symmetry", False))
         use_fourier_features = bool(arch_cfg.get("use_fourier_features", False))
@@ -2295,6 +2346,7 @@ class PHVIV(nn.Module):
             input_scaling_mode=input_scaling_mode,
             force_net_type=force_net_type,
             hard_force_symmetry=hard_force_symmetry,
+            shared_td_correction_trunk=shared_td_correction_trunk,
             arch_pirate_force_kwargs=pirate_arch_kwargs,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
@@ -2503,6 +2555,12 @@ class PHVIV(nn.Module):
             base_features = torch.cat([base_features, sigma_feat], dim=-1)
         return base_features
 
+    def _td_correction_head_features(self, base_features: torch.Tensor) -> torch.Tensor:
+        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        if self.td_corr_shared_trunk is None:
+            return features
+        return self.td_corr_shared_trunk(features)
+
     def _force_net_raw(
         self,
         x,
@@ -2524,7 +2582,7 @@ class PHVIV(nn.Module):
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
-        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        features = self._td_correction_head_features(base_features)
         if not self.hard_force_symmetry:
             return self.u_base_net(features)
         neg_base_features = self._force_features(
@@ -2537,7 +2595,7 @@ class PHVIV(nn.Module):
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
-        neg_features = self.force_embed(neg_base_features) if self.force_embed is not None else neg_base_features
+        neg_features = self._td_correction_head_features(neg_base_features)
         return 0.5 * (self.u_base_net(features) - self.u_base_net(neg_features))
 
     def _sigma_net_raw(
@@ -2564,7 +2622,7 @@ class PHVIV(nn.Module):
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
-        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        features = self._td_correction_head_features(base_features)
         if self.sigma_net is None:
             like = x[..., :1]
             return torch.zeros_like(like)
@@ -2591,7 +2649,7 @@ class PHVIV(nn.Module):
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
         )
-        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        features = self._td_correction_head_features(base_features)
         return self.fhat_net(features)
 
     def sigma_theta(
@@ -6065,9 +6123,7 @@ def _force_component_coefficients(
     state: torch.Tensor,
     reduced_velocity: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    base_features = model._force_features(state, reduced_velocity=reduced_velocity)
-    features = model.force_embed(base_features) if model.force_embed is not None else base_features
-    base_raw = model._apply_coefficient_output_bound(model.u_base_net(features))
+    base_raw = model._apply_coefficient_output_bound(model._force_net_raw(state, reduced_velocity=reduced_velocity))
     delta_raw = torch.zeros_like(base_raw)
 
     force_scale = model._force_scale_from_reduced_velocity(reduced_velocity, like=base_raw, state=state)

@@ -29,6 +29,9 @@ architecture:
   # If true, enforce odd force symmetry by construction: f(-state, U_r) = -f(state, U_r).
   # Requires hnn.use_td_force_input: false and hnn.use_td_fhat_input: false.
   hard_force_symmetry: false
+  # If true, TD correction modes use one shared feature trunk with separate mean/fhat/sigma heads.
+  # Most useful for combined correction modes such as mean_fhat_only or mean_sigma_fhat.
+  shared_td_correction_trunk: true
   use_fourier_features: false
   fourier_features: 64
   fourier_sigma: 1.0

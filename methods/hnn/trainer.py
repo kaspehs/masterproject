@@ -179,7 +179,20 @@ def _load_model_checkpoint_for_training(model: nn.Module, checkpoint_path: Path)
         raise ValueError(
             f"Checkpoint '{checkpoint_path}' does not contain a 'model_state' or 'state_dict' mapping."
         )
-    load_result = model.load_state_dict(_normalize_state_dict_keys(state), strict=False)
+    normalized_state = _normalize_state_dict_keys(state)
+    shared_trunk_enabled = bool(getattr(model, "shared_td_correction_trunk", False))
+    has_shared_trunk_weights = any(str(key).startswith("td_corr_shared_trunk.") for key in normalized_state)
+    if shared_trunk_enabled and not has_shared_trunk_weights:
+        raise ValueError(
+            f"Checkpoint '{checkpoint_path}' was saved without shared TD-correction trunk weights, "
+            "but the current model expects architecture.shared_td_correction_trunk=true."
+        )
+    if not shared_trunk_enabled and has_shared_trunk_weights:
+        raise ValueError(
+            f"Checkpoint '{checkpoint_path}' contains shared TD-correction trunk weights, "
+            "but the current model has architecture.shared_td_correction_trunk=false."
+        )
+    load_result = model.load_state_dict(normalized_state, strict=False)
     missing_keys = sorted(str(k) for k in getattr(load_result, "missing_keys", ()))
     unexpected_keys = sorted(str(k) for k in getattr(load_result, "unexpected_keys", ()))
     print(f"Loaded pretrained model state from {checkpoint_path}")
@@ -3755,6 +3768,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
     setattr(model, "force_zero_output", force_zero_output)
     setattr(model, "random_phase_training", random_phase_training)
+    shared_td_correction_trunk = bool(getattr(model, "shared_td_correction_trunk", False))
+    if shared_td_correction_trunk and (freeze_mean_net or freeze_fhat_net or freeze_sigma_net):
+        raise ValueError(
+            "Freezing individual TD correction heads is not supported when "
+            "architecture.shared_td_correction_trunk=true because the heads share one trainable trunk."
+        )
     if init_from_checkpoint is not None:
         _load_model_checkpoint_for_training(model, init_from_checkpoint)
     else:
@@ -3878,6 +3897,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 "use_phi_input": use_phi_input,
                 "phi_input_source": (None if not use_phi_input else phase_input_source),
                 "use_sigma_inputs": use_sigma_inputs,
+                "shared_td_correction_trunk": shared_td_correction_trunk,
                 "fhat_bound_multiplier": float(fhat_bound_multiplier),
                 "fhat_reg": float(fhat_reg),
                 "fhat_reg_norm": str(fhat_reg_norm),
@@ -4804,6 +4824,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "use_phi_input": use_phi_input,
             "phi_input_source": (None if not use_phi_input else phase_input_source),
             "use_sigma_inputs": use_sigma_inputs,
+            "shared_td_correction_trunk": shared_td_correction_trunk,
             "fhat_bound_multiplier": float(fhat_bound_multiplier),
             "fhat_reg": float(fhat_reg),
             "fhat_reg_norm": str(fhat_reg_norm),
