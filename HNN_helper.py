@@ -286,8 +286,11 @@ class _ODEPirateFeatureTrunk(nn.Module):
 
     def __init__(self, input_size: int, pirate_args: dict[str, Any]):
         super().__init__()
-        self.net = ODEPirateNet(input_size=int(input_size), output_size=1, **dict(pirate_args))
-        self.output_dim = 2 * int(pirate_args.get("fourier_features", 64))
+        args = dict(pirate_args)
+        args["input_size"] = int(input_size)
+        args["output_size"] = 1
+        self.net = ODEPirateNet(**args)
+        self.output_dim = 2 * int(args.get("fourier_features", 64))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         phi = self.net.ff(x)
