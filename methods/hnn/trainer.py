@@ -1643,7 +1643,7 @@ def _build_td_correction_hnn_loaders(
     rollout_steps: int,
     num_workers: int,
     pin_memory: bool,
-) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+) -> tuple[DataLoader, DataLoader | None, DataLoader | None, DataLoader | None]:
     # These datasets are fully materialized in CPU tensors, so worker processes add
     # little value and can crash on CUDA clusters due to forked worker initialization.
     loader_num_workers = 0
@@ -1755,7 +1755,8 @@ def _build_td_correction_hnn_loaders(
     if train_dataset is None:
         raise ValueError("No TD correction training samples were built.")
     val_dataset = _one_step_dataset(val_trajs)
-    rollout_dataset = _rollout_dataset(val_trajs if val_trajs else train_trajs)
+    train_rollout_dataset = _rollout_dataset(train_trajs)
+    val_rollout_dataset = _rollout_dataset(val_trajs)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -1772,16 +1773,25 @@ def _build_td_correction_hnn_loaders(
             num_workers=loader_num_workers,
             pin_memory=pin_memory,
         )
-    rollout_loader = None
-    if rollout_dataset is not None:
-        rollout_loader = DataLoader(
-            rollout_dataset,
+    train_rollout_loader = None
+    if train_rollout_dataset is not None:
+        train_rollout_loader = DataLoader(
+            train_rollout_dataset,
             batch_size=rollout_batch_size,
             shuffle=False,
             num_workers=loader_num_workers,
             pin_memory=pin_memory,
         )
-    return train_loader, val_loader, rollout_loader
+    val_rollout_loader = None
+    if val_rollout_dataset is not None:
+        val_rollout_loader = DataLoader(
+            val_rollout_dataset,
+            batch_size=rollout_batch_size,
+            shuffle=False,
+            num_workers=loader_num_workers,
+            pin_memory=pin_memory,
+        )
+    return train_loader, val_loader, train_rollout_loader, val_rollout_loader
 
 
 def _log_td_correction_rollout_validation(
@@ -3798,7 +3808,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         warmup_epochs=rollout_det_steps_warmup_epochs,
     )
 
-    train_loader, val_loader, rollout_loader = _build_td_correction_hnn_loaders(
+    train_loader, val_loader, train_rollout_loader, val_rollout_loader = _build_td_correction_hnn_loaders(
         train_trajs=train_trajs,
         val_trajs=val_trajs,
         mass_source=td_mass_source,
@@ -3814,7 +3824,12 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     val_seen_loader = None
     val_seen_rollout_loader = None
     if val_seen_trajs:
-        _seen_train_loader_unused, val_seen_loader, val_seen_rollout_loader = _build_td_correction_hnn_loaders(
+        (
+            _seen_train_loader_unused,
+            val_seen_loader,
+            _seen_train_rollout_loader_unused,
+            val_seen_rollout_loader,
+        ) = _build_td_correction_hnn_loaders(
             train_trajs=train_trajs,
             val_trajs=val_seen_trajs,
             mass_source=td_mass_source,
@@ -3826,6 +3841,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             num_workers=int(runtime_cfg.num_workers),
             pin_memory=(device.type == "cuda"),
         )
+        del _seen_train_rollout_loader_unused
         del _seen_train_loader_unused
 
     state_loss_active = state_loss_weight > 0.0
@@ -3984,8 +4000,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     train_steps_per_epoch = len(train_loader)
     val_instances = len(val_loader.dataset) if val_loader is not None else 0
     val_steps_per_epoch = len(val_loader) if val_loader is not None else 0
-    train_rollout_instances = len(rollout_loader.dataset) if rollout_loader is not None else 0
-    train_rollout_steps_per_epoch = len(rollout_loader) if rollout_loader is not None else 0
+    train_rollout_instances = len(train_rollout_loader.dataset) if train_rollout_loader is not None else 0
+    train_rollout_steps_per_epoch = len(train_rollout_loader) if train_rollout_loader is not None else 0
+    val_rollout_instances = len(val_rollout_loader.dataset) if val_rollout_loader is not None else 0
+    val_rollout_steps_per_epoch = len(val_rollout_loader) if val_rollout_loader is not None else 0
 
     startup_lines = [
         f"Run name: {run_name}",
@@ -4003,7 +4021,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"Rollout setup: det_weight={rollout_det_weight:g}, std_weight={rollout_disp_std_weight:g}, "
             f"spectral_weight={rollout_disp_spectral_weight:g}, "
             f"steps={current_rollout_det_steps}, "
-            f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}"
+            f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}, "
+            f"val_rollout_windows={val_rollout_instances}, val_rollout_steps={val_rollout_steps_per_epoch}"
         ),
         (
             f"Runtime: device={device}, num_workers={int(runtime_cfg.num_workers)} "
@@ -4072,7 +4091,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     def _rebuild_td_rollout_loader(steps: int, *, split_trajs: list[dict[str, np.ndarray]]) -> Any | None:
         if steps <= 0 or not rollout_loss_active:
             return None
-        _train_loader_tmp, _val_loader_tmp, rollout_loader_tmp = _build_td_correction_hnn_loaders(
+        _train_loader_tmp, _val_loader_tmp, _train_rollout_loader_tmp, rollout_loader_tmp = _build_td_correction_hnn_loaders(
             train_trajs=train_trajs,
             val_trajs=split_trajs,
             mass_source=td_mass_source,
@@ -4086,6 +4105,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         )
         del _train_loader_tmp
         del _val_loader_tmp
+        del _train_rollout_loader_tmp
         return rollout_loader_tmp
 
     def _run_td_validation_for_split(
@@ -4381,7 +4401,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         )
         if scheduled_rollout_det_steps != current_rollout_det_steps:
             current_rollout_det_steps = scheduled_rollout_det_steps
-            rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps, split_trajs=val_trajs)
+            train_rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps, split_trajs=train_trajs)
+            val_rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps, split_trajs=val_trajs)
             if val_seen_trajs:
                 val_seen_rollout_loader = _rebuild_td_rollout_loader(current_rollout_det_steps, split_trajs=val_seen_trajs)
         model.train()
@@ -4411,7 +4432,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         )
         gradnorm_count = 0
         batch_count = 0
-        rollout_iter = iter(rollout_loader) if rollout_loader is not None and rollout_loss_active else None
+        rollout_iter = iter(train_rollout_loader) if train_rollout_loader is not None and rollout_loss_active else None
         for batch in train_loader:
             z_i, t_i, z_next, t_next, ur_i, force_true_next, td_context_i, mass_i, damping_i, stiffness_i = _parse_td_train_batch(batch)
             z_i = z_i.to(device, non_blocking=non_blocking)
@@ -4459,7 +4480,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     try:
                         rollout_batch = next(rollout_iter)
                     except StopIteration:
-                        rollout_iter = iter(rollout_loader)
+                        rollout_iter = iter(train_rollout_loader)
                         rollout_batch = next(rollout_iter)
                     rollout_losses = _td_correction_rollout_losses_from_batch(
                         model=model,
@@ -4596,7 +4617,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 split_tag="val_unseen",
                 split_name="val_unseen",
                 split_loader=val_loader,
-                split_rollout_loader=rollout_loader,
+                split_rollout_loader=val_rollout_loader,
                 split_trajs=val_trajs,
                 log_rollout_plots=True,
                 validation_theta0_values_for_split=validation_theta0_values,

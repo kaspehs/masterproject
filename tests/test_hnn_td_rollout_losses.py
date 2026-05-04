@@ -10,6 +10,7 @@ try:
     import torch
     from HNN_helper import parse_config
     from methods.hnn.trainer import (
+        _build_td_correction_hnn_loaders,
         _displacement_std_error_torch,
         _dominant_frequency_error_torch,
         _psd_error_torch,
@@ -19,6 +20,7 @@ try:
 except ModuleNotFoundError:
     torch = None
     parse_config = None
+    _build_td_correction_hnn_loaders = None
     _displacement_std_error_torch = None
     _dominant_frequency_error_torch = None
     _psd_error_torch = None
@@ -49,6 +51,26 @@ def _rollout_return_tuple(z_pred: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     aux_shape = (batch_size, max(steps - 1, 0), 1)
     zeros = torch.zeros(aux_shape, dtype=z_pred.dtype, device=z_pred.device)
     return z_pred, zeros, zeros, zeros, zeros
+
+
+def _make_td_traj(length: int, *, ur: float) -> dict[str, np.ndarray]:
+    t = np.arange(length, dtype=np.float32)
+    y = np.linspace(0.0, 1.0, length, dtype=np.float32)
+    dy = np.linspace(0.1, 0.2, length, dtype=np.float32)
+    td_context = np.zeros((length, 5), dtype=np.float32)
+    td_context[:, 4] = np.float32(ur)
+    return {
+        "y": y,
+        "dy": dy,
+        "t": t,
+        "ur": np.full((length,), ur, dtype=np.float32),
+        "force_per_m": np.linspace(0.0, 0.5, length, dtype=np.float32),
+        "td_context": td_context,
+        "dry_mass_kg": np.asarray(1.0, dtype=np.float32),
+        "effective_mass_kg": np.asarray(1.5, dtype=np.float32),
+        "damping_c": np.asarray(0.1, dtype=np.float32),
+        "stiffness_n_m": np.asarray(2.0, dtype=np.float32),
+    }
 
 
 def _manual_band_mask(freqs: np.ndarray, true_psd: np.ndarray, peak_rel_bandwidth: float) -> np.ndarray:
@@ -126,6 +148,7 @@ def _manual_dominant_frequency_loss(
 @unittest.skipUnless(
     torch is not None
     and parse_config is not None
+    and _build_td_correction_hnn_loaders is not None
     and _resolve_td_rollout_loss_settings is not None
     and _td_correction_rollout_losses_from_batch is not None,
     "torch-backed PHNN rollout helpers are required",
@@ -210,6 +233,28 @@ class HnnTdRolloutLossTests(unittest.TestCase):
         expected_l2_rel = (diff**2) / ((abs(true_std) + 1.0e-6) ** 2)
         self.assertAlmostEqual(float(loss_l1.item()), expected_l1, places=8)
         self.assertAlmostEqual(float(loss_l2_rel.item()), expected_l2_rel, places=8)
+
+    def test_td_correction_rollout_loaders_keep_train_and_val_splits_separate(self) -> None:
+        train_trajs = [_make_td_traj(5, ur=7.0)]
+        val_trajs = [_make_td_traj(4, ur=8.0)]
+
+        train_loader, val_loader, train_rollout_loader, val_rollout_loader = _build_td_correction_hnn_loaders(
+            train_trajs=train_trajs,
+            val_trajs=val_trajs,
+            mass_source="effective",
+            input_scaling_mode="current",
+            diameter=1.0,
+            batch_size=2,
+            rollout_batch_size=2,
+            rollout_steps=2,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+        self.assertEqual(len(train_loader.dataset), 4)
+        self.assertEqual(len(val_loader.dataset), 3)
+        self.assertEqual(len(train_rollout_loader.dataset), 3)
+        self.assertEqual(len(val_rollout_loader.dataset), 2)
 
     def test_psd_loss_supports_absolute_relative_and_narrowband_modes(self) -> None:
         dt = 0.05
