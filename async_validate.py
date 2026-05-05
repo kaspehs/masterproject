@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from HNN_helper import (
+    AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
     FORCE_MAPPING_NRMSE_KEY,
     PHVIV,
     ROLLOUT_DIVERGED_COUNT_KEY,
@@ -1058,9 +1059,12 @@ def _run_hnn_td_correction_validation(
                     metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
                     metrics_count[name] = metrics_count.get(name, 0) + 1
             for name, total in metrics_sum.items():
-                writer.add_scalar(f"{split_tag}/{name}", total / float(max(1, metrics_count.get(name, 0))), tb_step)
+                value_f = total / float(max(1, metrics_count.get(name, 0)))
+                writer.add_scalar(f"{split_tag}/{name}", value_f, tb_step)
+                val_metrics[name] = float(value_f)
                 num_rollout_scalars_written += 1
             writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
+            val_metrics[ROLLOUT_DIVERGED_COUNT_KEY] = float(diverged_count)
             num_rollout_scalars_written += 1
 
             rollout_idx = _rollout_index(
@@ -1125,6 +1129,8 @@ def _run_hnn_td_correction_validation(
         "val_metrics": unseen_result.get("val_metrics", {}),
         "split_results": split_results,
     }
+    summary["best_metric_name"] = AGGREGATE_FORCE_VALIDATION_ERROR_KEY
+    summary["best_metric_value"] = summary["val_metrics"].get(AGGREGATE_FORCE_VALIDATION_ERROR_KEY)
     if "val_seen" in split_results:
         summary["val_seen_loss_total"] = split_results["val_seen"].get("loss_total")
     return summary
@@ -1682,8 +1688,11 @@ def _run_vpinn_td_correction_validation(
                 metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
                 metrics_count[name] = metrics_count.get(name, 0) + 1
         for name, total in metrics_sum.items():
-            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", total / float(max(1, metrics_count.get(name, 0))), tb_step)
+            value_f = total / float(max(1, metrics_count.get(name, 0)))
+            writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{name}", value_f, tb_step)
+            val_metrics[name] = float(value_f)
         writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
+        val_metrics[ROLLOUT_DIVERGED_COUNT_KEY] = float(diverged_count)
 
         rollout_idx = _rollout_index(
             len(val_trajs_plot),
@@ -1727,6 +1736,8 @@ def _run_vpinn_td_correction_validation(
     return {
         "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
         "val_metrics": val_metrics,
+        "best_metric_name": AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
+        "best_metric_value": val_metrics.get(AGGREGATE_FORCE_VALIDATION_ERROR_KEY),
     }
 
 

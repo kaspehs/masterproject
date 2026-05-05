@@ -31,6 +31,7 @@ from core.runtime import (
     setup_amp,
 )
 from HNN_helper import (
+    AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
     Config,
     FORCE_MAPPING_NRMSE_KEY,
     GradNormBalancer,
@@ -3085,11 +3086,25 @@ def _reap_async_processes(
             if best_state is not None and summary_path.exists() and run_name:
                 try:
                     payload = json.loads(summary_path.read_text(encoding="utf-8"))
-                    loss_total = payload.get("loss_total", None)
-                    if loss_total is not None and np.isfinite(float(loss_total)):
-                        loss_total_f = float(loss_total)
-                        prev_best = float(best_state.get("loss_total", float("inf")))
-                        if loss_total_f < prev_best:
+                    val_metrics = payload.get("val_metrics", {})
+                    if not isinstance(val_metrics, dict):
+                        val_metrics = {}
+                    best_metric_name = AGGREGATE_FORCE_VALIDATION_ERROR_KEY
+                    best_metric_value = val_metrics.get(best_metric_name, payload.get(best_metric_name, None))
+                    if best_metric_value is None or not np.isfinite(float(best_metric_value)):
+                        best_metric_name = "loss_total"
+                        best_metric_value = payload.get("loss_total", None)
+                    if best_metric_value is not None and np.isfinite(float(best_metric_value)):
+                        best_metric_f = float(best_metric_value)
+                        loss_total = payload.get("loss_total", None)
+                        loss_total_f = float(loss_total) if loss_total is not None and np.isfinite(float(loss_total)) else None
+                        prev_metric_name = str(best_state.get("best_metric_name", best_metric_name))
+                        prev_best = (
+                            float("inf")
+                            if prev_metric_name != best_metric_name
+                            else float(best_state.get("best_metric_value", float("inf")))
+                        )
+                        if best_metric_f < prev_best:
                             models_dir = Path("models")
                             models_dir.mkdir(parents=True, exist_ok=True)
                             best_model_path = models_dir / f"{run_name}_best_val.pt"
@@ -3097,6 +3112,8 @@ def _reap_async_processes(
                             shutil.copy2(ckpt_path, best_model_path)
                             best_meta = {
                                 "epoch": epoch,
+                                "best_metric_name": best_metric_name,
+                                "best_metric_value": best_metric_f,
                                 "loss_total": loss_total_f,
                                 "run_name": run_name,
                                 "source_checkpoint": str(ckpt_path),
@@ -3106,12 +3123,14 @@ def _reap_async_processes(
                             best_state.update(
                                 {
                                     "epoch": epoch,
+                                    "best_metric_name": best_metric_name,
+                                    "best_metric_value": best_metric_f,
                                     "loss_total": loss_total_f,
                                     "best_model_path": str(best_model_path),
                                 }
                             )
                             print(
-                                f"[async-val] epoch {epoch}: new best val_unseen/loss_total={loss_total_f:.6e}; "
+                                f"[async-val] epoch {epoch}: new best val_unseen/{best_metric_name}={best_metric_f:.6e}; "
                                 f"kept {best_model_path}"
                             )
                 except Exception as exc:
@@ -5180,7 +5199,11 @@ def train(config: Config, config_name: str) -> None:
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
     async_processes: list[dict[str, Any]] = []
-    async_best_state: dict[str, Any] = {"loss_total": float("inf")}
+    async_best_state: dict[str, Any] = {
+        "best_metric_name": AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
+        "best_metric_value": float("inf"),
+        "loss_total": float("inf"),
+    }
     async_dir = Path(writer.log_dir) / "async_validation"
     if async_validation:
         async_dir.mkdir(parents=True, exist_ok=True)

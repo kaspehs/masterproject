@@ -31,6 +31,8 @@ DISP_SPECTRAL_REL_ERROR_KEY = "Displacement spectral relative error"
 DISP_STD_REL_ERROR_KEY = "Displacement std relative error"
 FORCE_DOMINANT_FREQ_REL_ERROR_KEY = "Force dominant frequency relative error"
 FORCE_STD_REL_ERROR_KEY = "Force std relative error"
+AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY = "Aggregate displacement error"
+AGGREGATE_FORCE_VALIDATION_ERROR_KEY = "Aggregate force error"
 AGGREGATE_VALIDATION_ERROR_KEY = "Aggregate validation error"
 # Backward-compat: VPINN still imports this legacy key name.
 MEAN_DISP_AMP_REL_ERROR_KEY = DISP_STD_REL_ERROR_KEY
@@ -49,6 +51,14 @@ ROLLOUT_DIVERGENCE_REL_Y_NORM_MULTIPLIER = 20.0
 AGGREGATE_VALIDATION_ERROR_COMPONENT_KEYS = (
     DOMINANT_FREQ_REL_ERROR_KEY,
     DISP_STD_REL_ERROR_KEY,
+    FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
+    FORCE_STD_REL_ERROR_KEY,
+)
+AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_COMPONENT_KEYS = (
+    DOMINANT_FREQ_REL_ERROR_KEY,
+    DISP_STD_REL_ERROR_KEY,
+)
+AGGREGATE_FORCE_VALIDATION_ERROR_COMPONENT_KEYS = (
     FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
     FORCE_STD_REL_ERROR_KEY,
 )
@@ -1114,19 +1124,29 @@ def compute_validation_metrics(
             force_std_rel = relative_error(pred_force_std, true_force_std)
             if np.isfinite(force_std_rel):
                 metrics[FORCE_STD_REL_ERROR_KEY] = abs(float(force_std_rel))
-    aggregate_values: list[float] = []
-    for key in AGGREGATE_VALIDATION_ERROR_COMPONENT_KEYS:
-        value = metrics.get(key)
-        if value is None:
-            aggregate_values = []
-            break
-        value = float(value)
-        if not np.isfinite(value):
-            aggregate_values = []
-            break
-        aggregate_values.append(value)
-    if aggregate_values:
-        metrics[AGGREGATE_VALIDATION_ERROR_KEY] = float(np.mean(aggregate_values))
+    def _aggregate_metric(component_keys: Sequence[str]) -> float | None:
+        values: list[float] = []
+        for key in component_keys:
+            value = metrics.get(key)
+            if value is None:
+                return None
+            value_f = float(value)
+            if not np.isfinite(value_f):
+                return None
+            values.append(value_f)
+        return float(np.mean(values)) if values else None
+
+    disp_aggregate = _aggregate_metric(AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_COMPONENT_KEYS)
+    if disp_aggregate is not None:
+        metrics[AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY] = disp_aggregate
+
+    force_aggregate = _aggregate_metric(AGGREGATE_FORCE_VALIDATION_ERROR_COMPONENT_KEYS)
+    if force_aggregate is not None:
+        metrics[AGGREGATE_FORCE_VALIDATION_ERROR_KEY] = force_aggregate
+
+    aggregate = _aggregate_metric(AGGREGATE_VALIDATION_ERROR_COMPONENT_KEYS)
+    if aggregate is not None:
+        metrics[AGGREGATE_VALIDATION_ERROR_KEY] = aggregate
     return metrics
 
 
@@ -4249,8 +4269,10 @@ def log_final_rollout_errors_vs_ur(
         (FORCE_MAPPING_NRMSE_KEY, FORCE_MAPPING_NRMSE_KEY),
         (DOMINANT_FREQ_REL_ERROR_KEY, DOMINANT_FREQ_REL_ERROR_KEY),
         (DISP_STD_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
+        (AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY, AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY),
         (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, FORCE_DOMINANT_FREQ_REL_ERROR_KEY),
         (FORCE_STD_REL_ERROR_KEY, FORCE_STD_REL_ERROR_KEY),
+        (AGGREGATE_FORCE_VALIDATION_ERROR_KEY, AGGREGATE_FORCE_VALIDATION_ERROR_KEY),
         (AGGREGATE_VALIDATION_ERROR_KEY, AGGREGATE_VALIDATION_ERROR_KEY),
     ]
     grouped_errors: dict[str, dict[float, list[float]]] = {key: {} for key, _ in series}
