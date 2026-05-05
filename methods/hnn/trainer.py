@@ -524,7 +524,7 @@ def _td_predict_outputs(
     sigma_active: bool,
     fhat_active: bool,
     force_zero_output: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     z_model = _td_state_for_model_scaling(
         model,
         z=z,
@@ -585,7 +585,7 @@ def _td_predict_outputs(
             sigma_inputs=sigma_inputs,
             td_force_scale=output_scale,
         )
-    return corr_mu, sigma, raw_delta_fhat
+    return corr_mu, sigma, raw_delta_fhat, raw_force
 
 
 def _td_force_input_tensor_from_source(
@@ -652,7 +652,7 @@ def _td_step_with_corrections(
         structural_mass=structural_mass,
         stiffness=stiffness,
     )
-    corr_mu, sigma_corr, raw_delta_fhat = _td_predict_outputs(
+    corr_mu, sigma_corr, raw_delta_fhat, raw_corr_mu = _td_predict_outputs(
         model,
         z=z,
         reduced_velocity=reduced_velocity,
@@ -720,6 +720,7 @@ def _td_step_with_corrections(
         "td_force_next": td_force_next,
         "total_force_next": total_force_next,
         "corr_mu": corr_mu,
+        "raw_corr_mu": raw_corr_mu,
         "corr_force": corr_force,
         "sigma_corr": sigma_corr,
         "raw_delta_fhat": raw_delta_fhat,
@@ -4182,6 +4183,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         stiffness_i=stiffness_i,
                     )
                     corr_mu = step["corr_mu"]
+                    raw_corr_mu = step["raw_corr_mu"]
                     sigma_corr = step["sigma_corr"]
                     if use_force_data_loss:
                         if predict_sigma:
@@ -4191,7 +4193,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                             data_loss = torch.mean((force_true_next - step["total_force_next"]) ** 2)
                     else:
                         data_loss = state_loss.new_tensor(0.0)
-                    mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
+                    mean_reg_loss = _regularizer(raw_corr_mu, mean_reg_norm)
                     sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                     fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                     total_loss = (
@@ -4481,6 +4483,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     stiffness_i=stiffness_i,
                 )
                 corr_mu = step["corr_mu"]
+                raw_corr_mu = step["raw_corr_mu"]
                 sigma_corr = step["sigma_corr"]
                 if use_force_data_loss:
                     if predict_sigma:
@@ -4490,7 +4493,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         data_loss = torch.mean((force_true_next - step["total_force_next"]) ** 2)
                 else:
                     data_loss = state_loss.new_tensor(0.0)
-                mean_reg_loss = _regularizer(corr_mu, mean_reg_norm)
+                mean_reg_loss = _regularizer(raw_corr_mu, mean_reg_norm)
                 sigma_reg_loss = _regularizer(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                 fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                 rollout_det_loss = state_loss.new_tensor(0.0)

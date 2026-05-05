@@ -885,6 +885,7 @@ def _run_hnn_td_correction_validation(
                         force_zero_output=force_zero_output,
                     )
                     corr_mu = step["corr_mu"]
+                    raw_corr_mu = step["raw_corr_mu"]
                     sigma_corr = step["sigma_corr"]
                     total_force_next = step["total_force_next"]
                     if predict_sigma and state_loss_mode == "propagated_nll":
@@ -918,7 +919,7 @@ def _run_hnn_td_correction_validation(
                             data_loss = torch.mean((force_true_next - total_force_next) ** 2)
                     else:
                         data_loss = state_loss.new_tensor(0.0)
-                    mean_reg_loss = _reg(corr_mu, mean_reg_norm)
+                    mean_reg_loss = _reg(raw_corr_mu, mean_reg_norm)
                     sigma_reg_loss = _reg(sigma_corr, sigma_reg_norm) if predict_sigma else state_loss.new_tensor(0.0)
                     fhat_reg_loss = _reg(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                     total_loss = (
