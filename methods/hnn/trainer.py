@@ -926,14 +926,15 @@ def _psd_error_common_dt_torch(
         peak_rel_bandwidth=peak_rel_bandwidth,
     )
     mask_f = band_mask.to(dtype=true_psd.dtype)
-    p_true = torch.clamp(true_psd, min=0.0) * mask_f
-    p_pred = torch.clamp(pred_psd, min=0.0) * mask_f
+    amp_true = torch.sqrt(torch.clamp(true_psd, min=0.0) + float(eps)) * mask_f
+    amp_pred = torch.sqrt(torch.clamp(pred_psd, min=0.0) + float(eps)) * mask_f
     valid = band_mask.sum(dim=1) >= 1
     if not torch.any(valid):
         return true_signal.new_zeros(())
-    loss = torch.sum(((p_pred - p_true) ** 2) * mask_f, dim=1)
+    num_bins = torch.clamp(mask_f.sum(dim=1), min=1.0)
+    loss = torch.sum(((amp_pred - amp_true) ** 2) * mask_f, dim=1) / num_bins
     if bool(relative):
-        denom = torch.sum((p_true * p_true) * mask_f, dim=1) + float(eps)
+        denom = torch.sum((amp_true * amp_true) * mask_f, dim=1) / num_bins + float(eps)
         loss = loss / denom
     loss = torch.where(valid, loss, torch.zeros_like(loss))
     return torch.sum(loss) / torch.clamp(valid.to(dtype=loss.dtype).sum(), min=1.0)

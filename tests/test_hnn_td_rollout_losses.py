@@ -113,9 +113,11 @@ def _manual_psd_loss(
     freqs, true_psd = _manual_spectrum(true_signal, dt=dt, use_hann_window=use_hann_window)
     _freqs_pred, pred_psd = _manual_spectrum(pred_signal, dt=dt, use_hann_window=use_hann_window)
     band_mask = _manual_band_mask(freqs, true_psd, peak_rel_bandwidth)
-    loss = float(np.sum((pred_psd[band_mask] - true_psd[band_mask]) ** 2))
+    true_amp = np.sqrt(np.clip(true_psd[band_mask], a_min=0.0, a_max=None) + eps)
+    pred_amp = np.sqrt(np.clip(pred_psd[band_mask], a_min=0.0, a_max=None) + eps)
+    loss = float(np.mean((pred_amp - true_amp) ** 2))
     if relative:
-        loss /= float(np.sum(true_psd[band_mask] ** 2) + eps)
+        loss /= float(np.mean(true_amp ** 2) + eps)
     return loss
 
 
