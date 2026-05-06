@@ -950,10 +950,10 @@ def train(config: Config, config_name: str) -> None:
         epochs=int(training_cfg.epochs),
     )
     writer, run_name = setup_writer(
+        config.logging.run_dir_root,
         config_name,
-        run_dir_root=str(config.logging.run_dir_root),
-        append_timestamp=bool(config.logging.append_timestamp),
         run_name_override=getattr(config.logging, "run_name", None),
+        append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
     writer.add_text("latent_rnn/config", json.dumps(lrnn_cfg, indent=2, sort_keys=True), 0)
     writer.add_text(
