@@ -1394,6 +1394,7 @@ def train(config: Config, config_name: str) -> None:
                 split_loader: DataLoader | None,
                 split_trajs: list[dict[str, np.ndarray]],
                 log_rollout_plots: bool,
+                log_all_rollout_plots: bool,
                 log_force_plot: bool,
             ) -> tuple[dict[str, float], float]:
                 if split_loader is None:
@@ -1447,11 +1448,20 @@ def train(config: Config, config_name: str) -> None:
                         writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
 
                     if log_rollout_plots:
-                        selected_indices = sample_one_index_per_ur(ur_for_sampling, seed=0)
-                        if not selected_indices:
-                            selected_indices = [0]
-                        rollout_idx = int(selected_indices[0])
-                        if 0 <= rollout_idx < len(split_trajs):
+                        if log_all_rollout_plots:
+                            plot_indices = list(range(len(split_trajs)))
+                        else:
+                            plot_indices = sample_one_index_per_ur(ur_for_sampling, seed=0)
+                            if not plot_indices:
+                                plot_indices = [0]
+                            plot_indices = plot_indices[:1]
+                        for rollout_idx_raw in plot_indices:
+                            rollout_idx = int(rollout_idx_raw)
+                            if not (0 <= rollout_idx < len(split_trajs)):
+                                continue
+                            tag_prefix = f"{split_tag}/rollout"
+                            if log_all_rollout_plots:
+                                tag_prefix = f"{split_tag}/rollout_{rollout_idx:03d}"
                             _log_latent_rollout_validation(
                                 writer=writer,
                                 epoch=epoch,
@@ -1463,7 +1473,7 @@ def train(config: Config, config_name: str) -> None:
                                 input_scaling_mode=input_scaling_mode,
                                 ur_scale=ur_scale,
                                 device=device,
-                                tag_prefix=f"{split_tag}/rollout",
+                                tag_prefix=tag_prefix,
                                 metric_prefix=split_tag,
                                 step=epoch + 1,
                                 log_metrics=False,
@@ -1483,6 +1493,7 @@ def train(config: Config, config_name: str) -> None:
                 split_loader=val_loader,
                 split_trajs=val_trajs,
                 log_rollout_plots=True,
+                log_all_rollout_plots=False,
                 log_force_plot=True,
             )
             if val_seen_loader is not None:
@@ -1491,6 +1502,7 @@ def train(config: Config, config_name: str) -> None:
                     split_loader=val_seen_loader,
                     split_trajs=val_seen_trajs,
                     log_rollout_plots=True,
+                    log_all_rollout_plots=True,
                     log_force_plot=False,
                 )
             ckpt_path = run_models_dir / f"{run_name}_epoch{epoch + 1:04d}.pt"
