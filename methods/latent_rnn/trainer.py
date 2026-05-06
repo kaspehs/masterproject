@@ -929,6 +929,7 @@ def _log_latent_rollout_validation(
     step: int | None = None,
     log_metrics: bool = True,
     log_plots: bool = True,
+    log_force_plot: bool = True,
     log_spectra: bool = False,
     title_suffix: str = "",
 ) -> dict[str, float]:
@@ -973,19 +974,20 @@ def _log_latent_rollout_validation(
         title_suffix=title_suffix,
         log_spectra=log_spectra,
     )
-    log_force_plots(
-        writer,
-        epoch,
-        t_plot,
-        np.asarray(result["force_pred_coeff"], dtype=float),
-        np.asarray(result["force_true_coeff"], dtype=float),
-        zoom_mask,
-        reduced_velocity=float(result["ur"]),
-        tag_prefix=tag_prefix,
-        step=step,
-        title_suffix=title_suffix,
-        log_spectra=log_spectra,
-    )
+    if log_force_plot:
+        log_force_plots(
+            writer,
+            epoch,
+            t_plot,
+            np.asarray(result["force_pred_coeff"], dtype=float),
+            np.asarray(result["force_true_coeff"], dtype=float),
+            zoom_mask,
+            reduced_velocity=float(result["ur"]),
+            tag_prefix=tag_prefix,
+            step=step,
+            title_suffix=title_suffix,
+            log_spectra=log_spectra,
+        )
     if log_spectra:
         log_area_normalized_rollout_spectra(
             writer,
@@ -1392,6 +1394,7 @@ def train(config: Config, config_name: str) -> None:
                 split_loader: DataLoader | None,
                 split_trajs: list[dict[str, np.ndarray]],
                 log_rollout_plots: bool,
+                log_force_plot: bool,
             ) -> tuple[dict[str, float], float]:
                 if split_loader is None:
                     return {}, float("inf")
@@ -1465,6 +1468,7 @@ def train(config: Config, config_name: str) -> None:
                                 step=epoch + 1,
                                 log_metrics=False,
                                 log_plots=True,
+                                log_force_plot=log_force_plot,
                                 log_spectra=False,
                             )
                 writer.add_scalar(
@@ -1479,13 +1483,15 @@ def train(config: Config, config_name: str) -> None:
                 split_loader=val_loader,
                 split_trajs=val_trajs,
                 log_rollout_plots=True,
+                log_force_plot=True,
             )
             if val_seen_loader is not None:
                 _validate_split(
                     split_tag="val_seen",
                     split_loader=val_seen_loader,
                     split_trajs=val_seen_trajs,
-                    log_rollout_plots=False,
+                    log_rollout_plots=True,
+                    log_force_plot=False,
                 )
             ckpt_path = run_models_dir / f"{run_name}_epoch{epoch + 1:04d}.pt"
             state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
