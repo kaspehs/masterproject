@@ -758,7 +758,15 @@ def _latent_losses_from_batch(
 
 
 def _trajectory_mass_key(mass_source: str) -> str:
-    return "dry_mass_kg" if str(mass_source).strip().lower() == "dry" else "effective_mass_kg"
+    key = {
+        "dry": "dry_mass_kg",
+        "effective": "effective_mass_kg",
+        "stored": "dry_mass_kg",
+        "label": "dry_mass_kg",
+    }.get(str(mass_source).strip().lower())
+    if key is None:
+        raise ValueError("latent_rnn.td_mass_source must be one of: dry, effective, stored, label.")
+    return key
 
 
 def _latent_force_scale_numpy(
@@ -810,10 +818,9 @@ def _latent_rollout_validation_case(
     y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
     dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
     z = torch.cat([y, dy * float(mass_value)], dim=1)
-    history_features = _history_features_from_traj(
+    history_features = _encoder_features_for_traj(
         traj,
-        mass=mass_value,
-        stiffness=stiffness_value,
+        mass_key=_trajectory_mass_key(mass_source),
         input_scaling_mode=input_scaling_mode,
         diameter=float(model.D),
         ur_scale=ur_scale,
