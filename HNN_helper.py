@@ -441,6 +441,7 @@ class Config:
     hnn: dict[str, Any] = field(default_factory=dict)
     pinn: dict[str, Any] = field(default_factory=dict)
     vpinn: dict[str, Any] = field(default_factory=dict)
+    latent_rnn: dict[str, Any] = field(default_factory=dict)
 
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
@@ -494,6 +495,7 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
     hnn_block = dict(raw_cfg.get("hnn", {}) or {})
     pinn_block = dict(raw_cfg.get("pinn", {}) or {})
     vpinn_block = dict(raw_cfg.get("vpinn", {}) or {})
+    latent_rnn_block = dict(raw_cfg.get("latent_rnn", {}) or {})
 
     method_key = str(method).strip().lower()
     if method_key in {"hnn", "phnn"}:
@@ -689,6 +691,7 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
         hnn=hnn_block,
         pinn=pinn_block,
         vpinn=vpinn_block,
+        latent_rnn=latent_rnn_block,
     )
 
 

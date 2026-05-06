@@ -9,6 +9,8 @@
 /old_logs
 /legacy_code
 /logs/*
+/figs
+/tests
 /Data_Gen/legacy_datasets
 /Data_Gen/const_Ur
 /Data_Gen/generated_series

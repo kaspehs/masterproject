@@ -21,4 +21,8 @@ def get_trainer(method: str) -> Trainer:
         from methods.vpinn.trainer import train as train_vpinn
 
         return train_vpinn
-    raise ValueError(f"Unknown method '{method}'. Expected 'hnn', 'pinn', or 'vpinn'.")
+    if key in {"latent_rnn", "scratch_latent_rnn"}:
+        from methods.latent_rnn.trainer import train as train_latent_rnn
+
+        return train_latent_rnn
+    raise ValueError(f"Unknown method '{method}'. Expected 'hnn', 'pinn', 'vpinn', or 'latent_rnn'.")

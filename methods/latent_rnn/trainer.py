@@ -1,0 +1,1126 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import shutil
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils as nn_utils
+from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
+
+from core.logging import setup_writer
+from core.optim import setup_optimizer_and_scheduler
+from core.runtime import (
+    configure_tf32,
+    maybe_compile_model,
+    select_device,
+    set_num_threads_from_slurm,
+    setup_amp,
+)
+from HNN_helper import (
+    Config,
+    ODEPirateNet,
+    Residual,
+    _activation_factory,
+    _default_mlp_kwargs,
+    _default_residual_kwargs,
+    resolve_cut_start_seconds,
+    resolve_phnn_input_scaling_mode,
+    structural_step_constant_force_torch,
+)
+from methods.hnn.trainer import (
+    _displacement_std_error_torch,
+    _dominant_frequency_error_torch,
+    _normalize_rollout_disp_spectral_loss_mode,
+    _psd_error_torch,
+    _resolve_td_rollout_loss_settings,
+    _trajectory_rollout_mse_torch,
+)
+
+
+def _first_present(data: np.lib.npyio.NpzFile, keys: Sequence[str], *, path: Path) -> Any:
+    for key in keys:
+        if key in data.files:
+            return data[key]
+    raise KeyError(f"{path} is missing required keys. Tried: {', '.join(keys)}")
+
+
+def _optional_present(data: np.lib.npyio.NpzFile, keys: Sequence[str]) -> Any | None:
+    for key in keys:
+        if key in data.files:
+            return data[key]
+    return None
+
+
+def _scalar_from_npz(data: np.lib.npyio.NpzFile, keys: Sequence[str], *, path: Path) -> float:
+    raw = _first_present(data, keys, path=path)
+    value = float(np.asarray(raw, dtype=float).reshape(-1)[0])
+    if not np.isfinite(value):
+        raise ValueError(f"{path} has non-finite scalar for keys {keys!r}.")
+    return value
+
+
+def _series_from_raw(raw: Any, n: int, *, name: str, path: Path) -> np.ndarray:
+    arr = np.asarray(raw, dtype=float)
+    if arr.ndim == 0:
+        return np.full((n,), float(arr), dtype=float)
+    out = arr.reshape(-1)
+    if out.shape[0] == 1:
+        return np.full((n,), float(out[0]), dtype=float)
+    if out.shape[0] != n:
+        raise ValueError(f"{path} {name} must be scalar or length {n}, got {out.shape[0]}.")
+    return out.astype(float, copy=False)
+
+
+def _force_per_m_from_npz(data: np.lib.npyio.NpzFile, *, path: Path, n: int) -> np.ndarray:
+    force_per_m_raw = _optional_present(data, ("y_force_per_m_dim", "force_per_m_dim"))
+    if force_per_m_raw is not None:
+        return _series_from_raw(force_per_m_raw, n, name="force_per_m", path=path)
+    force_total_raw = _optional_present(data, ("y_force_dim", "c", "F_total", "force_total", "force"))
+    if force_total_raw is None:
+        raise KeyError(f"{path} is missing CFD force channels.")
+    span_raw = _optional_present(data, ("physical_span_m", "raw_force_span_scale_applied", "span_m"))
+    span = 1.0 if span_raw is None else float(np.asarray(span_raw, dtype=float).reshape(-1)[0])
+    if not np.isfinite(span) or span <= 0.0:
+        raise ValueError(f"{path} has invalid force span scale {span!r}.")
+    return _series_from_raw(force_total_raw, n, name="force_total", path=path) / span
+
+
+def _prepare_ur_series(
+    *,
+    data: np.lib.npyio.NpzFile,
+    n: int,
+    path: Path,
+    mass_source: str,
+    flow_speed: np.ndarray,
+    dry_mass_kg: float,
+    effective_mass_kg: float,
+    stiffness_n_m: float,
+    diameter_m: float,
+) -> np.ndarray:
+    raw = _optional_present(data, ("U_r_computed_series", "U_r", "computed_ur", "label_ur"))
+    if raw is not None and str(mass_source).strip().lower() == "stored":
+        return _series_from_raw(raw, n, name="U_r", path=path)
+    if str(mass_source).strip().lower() == "label":
+        label_raw = _optional_present(data, ("U_r_label_series", "U_r_label_scalar", "label_ur"))
+        if label_raw is None:
+            raise ValueError(f"{path} does not contain U_r label values.")
+        return _series_from_raw(label_raw, n, name="U_r_label", path=path)
+    if str(mass_source).strip().lower() not in {"dry", "effective"}:
+        raise ValueError("latent_rnn.td_mass_source must be one of: dry, effective, stored, label.")
+    mass = dry_mass_kg if str(mass_source).strip().lower() == "dry" else effective_mass_kg
+    omega_n = math.sqrt(float(stiffness_n_m) / float(mass))
+    f_n = omega_n / (2.0 * math.pi)
+    return flow_speed / max(np.finfo(float).eps, f_n * float(diameter_m))
+
+
+def _maybe_reduce_arrays(
+    arrays: dict[str, np.ndarray],
+    *,
+    enabled: bool,
+    factor: int,
+    offset: int,
+) -> dict[str, np.ndarray]:
+    if not bool(enabled):
+        return arrays
+    rf = max(1, int(factor))
+    return {key: np.asarray(value)[int(offset) :: rf] for key, value in arrays.items()}
+
+
+def _load_latent_rnn_trajectories(
+    paths: Sequence[Path],
+    *,
+    cut_start_seconds: float,
+    reduce_time: bool,
+    reduction_factor: int,
+    stagger_reduced_time: bool,
+    mass_source: str,
+) -> list[dict[str, np.ndarray]]:
+    trajectories: list[dict[str, np.ndarray]] = []
+    offsets = list(range(max(1, int(reduction_factor)))) if bool(reduce_time and stagger_reduced_time) else [0]
+    for path in paths:
+        with np.load(path, allow_pickle=True) as data:
+            t = np.asarray(_first_present(data, ("time_dim", "time", "t"), path=path), dtype=float).reshape(-1)
+            y = np.asarray(_first_present(data, ("y_disp_dim", "y", "y_dim"), path=path), dtype=float).reshape(-1)
+            dy = np.asarray(_first_present(data, ("y_vel_dim", "dy", "dy_dim"), path=path), dtype=float).reshape(-1)
+            ddy = np.asarray(_first_present(data, ("y_acc_dim", "ddy", "ddy_dim"), path=path), dtype=float).reshape(-1)
+            n = int(t.shape[0])
+            if n < 3:
+                raise ValueError(f"{path} is too short for latent RNN training.")
+            force_per_m = _force_per_m_from_npz(data, path=path, n=n)
+            stiffness = _scalar_from_npz(data, ("python_stiffness_n_m", "stiffness_n_m"), path=path)
+            dry_mass = _scalar_from_npz(data, ("python_dry_mass_kg", "dry_mass_kg", "python_mass_kg"), path=path)
+            effective_mass = _scalar_from_npz(data, ("python_effective_mass_kg", "effective_mass_kg"), path=path)
+            damping_c = _scalar_from_npz(data, ("python_damping_c", "damping_c"), path=path)
+            rho = _scalar_from_npz(data, ("python_rho_kg_m3", "rho_kg_m3"), path=path)
+            diameter = _scalar_from_npz(data, ("python_diameter_m", "diameter_m"), path=path)
+            flow_raw = _first_present(data, ("python_flow_speed_m_s", "flow_speed_m_s"), path=path)
+            flow_speed = _series_from_raw(flow_raw, n, name="flow_speed_m_s", path=path)
+            ur = _prepare_ur_series(
+                data=data,
+                n=n,
+                path=path,
+                mass_source=mass_source,
+                flow_speed=flow_speed,
+                dry_mass_kg=dry_mass,
+                effective_mass_kg=effective_mass,
+                stiffness_n_m=stiffness,
+                diameter_m=diameter,
+            )
+        arrays = {
+            "t": t,
+            "y": y,
+            "dy": dy,
+            "ddy": ddy,
+            "force_per_m": force_per_m,
+            "flow_speed": flow_speed,
+            "ur": ur,
+        }
+        for offset in offsets:
+            reduced = _maybe_reduce_arrays(
+                arrays,
+                enabled=reduce_time,
+                factor=reduction_factor,
+                offset=offset,
+            )
+            if any(np.asarray(value).shape[0] < 3 for value in reduced.values()):
+                continue
+            t_reduced = np.asarray(reduced["t"], dtype=float)
+            if float(cut_start_seconds) > 0.0:
+                mask = t_reduced >= (float(t_reduced[0]) + float(cut_start_seconds))
+                if int(np.count_nonzero(mask)) < 3:
+                    continue
+                reduced = {key: np.asarray(value)[mask] for key, value in reduced.items()}
+                t_reduced = np.asarray(reduced["t"], dtype=float)
+            if not np.all(np.isfinite(t_reduced)) or np.any(np.diff(t_reduced) <= 0.0):
+                raise ValueError(f"{path} time vector must be strictly increasing after reduction.")
+            dt_values = np.diff(t_reduced)
+            if not np.allclose(dt_values, float(np.median(dt_values)), rtol=1e-5, atol=1e-9):
+                raise ValueError(f"{path} time vector is not uniform after reduction.")
+            suffix = ""
+            if bool(reduce_time and stagger_reduced_time) and len(offsets) > 1:
+                suffix = f"__rf{int(reduction_factor)}_offset{int(offset)}"
+            trajectories.append(
+                {
+                    "name": f"{path.stem}{suffix}{path.suffix}",
+                    "source_name": path.name,
+                    "t": np.asarray(reduced["t"], dtype=np.float32),
+                    "y": np.asarray(reduced["y"], dtype=np.float32),
+                    "dy": np.asarray(reduced["dy"], dtype=np.float32),
+                    "ddy": np.asarray(reduced["ddy"], dtype=np.float32),
+                    "force_per_m": np.asarray(reduced["force_per_m"], dtype=np.float32),
+                    "flow_speed": np.asarray(reduced["flow_speed"], dtype=np.float32),
+                    "ur": np.asarray(reduced["ur"], dtype=np.float32),
+                    "stiffness_n_m": np.asarray(stiffness, dtype=np.float32),
+                    "dry_mass_kg": np.asarray(dry_mass, dtype=np.float32),
+                    "effective_mass_kg": np.asarray(effective_mass, dtype=np.float32),
+                    "damping_c": np.asarray(damping_c, dtype=np.float32),
+                    "rho_kg_m3": np.asarray(rho, dtype=np.float32),
+                    "diameter_m": np.asarray(diameter, dtype=np.float32),
+                }
+            )
+    return trajectories
+
+
+def _last_linear(module: nn.Module) -> nn.Linear | None:
+    last: nn.Linear | None = None
+    for sub in module.modules():
+        if isinstance(sub, nn.Linear):
+            last = sub
+    return last
+
+
+def _build_backbone(
+    *,
+    input_dim: int,
+    output_dim: int,
+    architecture_cfg: Any,
+) -> nn.Module:
+    net_type = str(getattr(architecture_cfg, "force_net_type", "residual")).strip().lower()
+    if net_type == "pirate":
+        kwargs = dict(getattr(architecture_cfg, "pirate_force_kwargs", {}) or {})
+        return ODEPirateNet(
+            input_size=int(input_dim),
+            output_size=int(output_dim),
+            depth=int(kwargs.pop("depth", kwargs.pop("pirate_layers", 2))),
+            fourier_features=int(kwargs.pop("fourier_features", 64)),
+            sigma=float(kwargs.pop("sigma", 1.0)),
+            use_rwf=bool(kwargs.pop("use_rwf", False)),
+            activation=str(kwargs.pop("activation", "gelu")),
+            dtype=torch.float32,
+            **kwargs,
+        )
+    if net_type == "residual":
+        cfg = _default_residual_kwargs()
+        cfg.update(getattr(architecture_cfg, "residual_kwargs", {}) or {})
+        hidden = int(cfg.get("hidden", 128))
+        layers = max(1, int(cfg.get("layers", 2)))
+        modules: list[nn.Module] = [nn.Linear(int(input_dim), hidden)]
+        for _ in range(layers):
+            modules.append(Residual(hidden, activation=str(cfg.get("activation", "gelu"))))
+        modules.append(nn.Linear(hidden, int(output_dim)))
+        return nn.Sequential(*modules)
+    if net_type == "mlp":
+        cfg = _default_mlp_kwargs()
+        cfg.update(getattr(architecture_cfg, "mlp_kwargs", {}) or {})
+        hidden = int(cfg.get("hidden", 128))
+        layers = max(1, int(cfg.get("layers", 2)))
+        act_cls = _activation_factory(str(cfg.get("activation", "gelu")))
+        modules = []
+        in_features = int(input_dim)
+        for _ in range(layers):
+            modules.append(nn.Linear(in_features, hidden))
+            modules.append(act_cls())
+            in_features = hidden
+        modules.append(nn.Linear(in_features, int(output_dim)))
+        return nn.Sequential(*modules)
+    raise ValueError("architecture.force_net_type must be one of: residual, mlp, pirate.")
+
+
+class LatentRNNForceModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        latent_dim: int,
+        encoder_input_dim: int,
+        encoder_hidden: int,
+        encoder_layers: int,
+        encoder_dropout: float,
+        backbone_input_dim: int,
+        architecture_cfg: Any,
+        rho: float,
+        diameter: float,
+        force_output: str,
+        coefficient_output_bound: float | None,
+        input_scaling_mode: str,
+        ur_scale: float,
+        latent_time_scale: float,
+        corr_init_mode: str = "zero",
+    ) -> None:
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.encoder = nn.GRU(
+            input_size=int(encoder_input_dim),
+            hidden_size=int(encoder_hidden),
+            num_layers=int(encoder_layers),
+            batch_first=True,
+            dropout=float(encoder_dropout) if int(encoder_layers) > 1 else 0.0,
+        )
+        self.encoder_out = nn.Linear(int(encoder_hidden), int(latent_dim))
+        self.backbone = _build_backbone(
+            input_dim=int(backbone_input_dim),
+            output_dim=1 + int(latent_dim),
+            architecture_cfg=architecture_cfg,
+        )
+        self.rho = float(rho)
+        self.D = float(diameter)
+        self.force_output = str(force_output).strip().lower()
+        if self.force_output not in {"force", "coefficient"}:
+            raise ValueError("model.force_output must be one of: force, coefficient.")
+        self.coefficient_output_bound = (
+            None if coefficient_output_bound is None else float(coefficient_output_bound)
+        )
+        self.input_scaling_mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
+        self.ur_scale = float(ur_scale)
+        self.latent_time_scale = float(latent_time_scale)
+        if not np.isfinite(self.latent_time_scale) or self.latent_time_scale <= 0.0:
+            raise ValueError("latent_time_scale must resolve to a positive finite value.")
+        self._apply_final_init(corr_init_mode)
+
+    def _apply_final_init(self, mode: str) -> None:
+        key = str(mode).strip().lower()
+        if key == "standard":
+            return
+        last = _last_linear(self.backbone)
+        if last is None:
+            return
+        with torch.no_grad():
+            if key == "zero":
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+            elif key == "tiny":
+                nn.init.normal_(last.weight, mean=0.0, std=1.0e-4)
+                nn.init.zeros_(last.bias)
+            else:
+                raise ValueError("latent_rnn.corr_init_mode must be one of: zero, tiny, standard.")
+
+    def encode(self, history: torch.Tensor) -> torch.Tensor:
+        _out, hidden = self.encoder(history)
+        return self.encoder_out(hidden[-1])
+
+    def _flow_speed_from_ur(
+        self,
+        ur: torch.Tensor,
+        *,
+        mass: torch.Tensor,
+        stiffness: torch.Tensor,
+    ) -> torch.Tensor:
+        omega_n = torch.sqrt(torch.clamp(stiffness / torch.clamp(mass, min=1.0e-12), min=1.0e-12))
+        f_n = omega_n / (2.0 * math.pi)
+        return ur * f_n * float(self.D)
+
+    def _state_features(
+        self,
+        z: torch.Tensor,
+        *,
+        ur: torch.Tensor,
+        mass: torch.Tensor,
+        stiffness: torch.Tensor,
+        flow_speed: torch.Tensor,
+    ) -> torch.Tensor:
+        y = z[:, 0:1]
+        p = z[:, 1:2]
+        velocity = p / torch.clamp(mass, min=1.0e-12)
+        y_feat = y / float(self.D)
+        if self.input_scaling_mode == "convective":
+            u = torch.clamp(torch.abs(flow_speed), min=1.0e-12)
+            v_feat = velocity / u
+            ur_feat = flow_speed / float(self.D)
+        else:
+            p_scale = torch.sqrt(torch.clamp(mass * stiffness, min=1.0e-12)) * float(self.D)
+            v_feat = p / torch.clamp(p_scale, min=1.0e-12)
+            ur_feat = ur / float(self.ur_scale)
+        return torch.cat([y_feat, v_feat, ur_feat], dim=1)
+
+    def _force_scale(
+        self,
+        *,
+        raw_force: torch.Tensor,
+        ur: torch.Tensor,
+        mass: torch.Tensor,
+        stiffness: torch.Tensor,
+        flow_speed: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.force_output == "coefficient":
+            if self.input_scaling_mode == "convective":
+                u = flow_speed
+            else:
+                u = self._flow_speed_from_ur(ur, mass=mass, stiffness=stiffness)
+            return torch.clamp(0.5 * float(self.rho) * float(self.D) * (u * u), min=1.0e-12)
+        return torch.clamp(stiffness * float(self.D), min=1.0e-12).expand_as(raw_force)
+
+    def predict_step(
+        self,
+        *,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        ur: torch.Tensor,
+        mass: torch.Tensor,
+        damping_c: torch.Tensor,
+        stiffness: torch.Tensor,
+        flow_speed: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        features = self._state_features(
+            z,
+            ur=ur,
+            mass=mass,
+            stiffness=stiffness,
+            flow_speed=flow_speed,
+        )
+        raw = self.backbone(torch.cat([features, h], dim=1))
+        raw_force = raw[:, 0:1]
+        raw_dh = raw[:, 1:]
+        if self.force_output == "coefficient" and self.coefficient_output_bound is not None:
+            raw_force = float(self.coefficient_output_bound) * torch.tanh(raw_force / float(self.coefficient_output_bound))
+        force = raw_force * self._force_scale(
+            raw_force=raw_force,
+            ur=ur,
+            mass=mass,
+            stiffness=stiffness,
+            flow_speed=flow_speed,
+        )
+        h_next = h + (dt / float(self.latent_time_scale)) * raw_dh
+        y_next, v_next, a_next = structural_step_constant_force_torch(
+            y=z[:, 0:1],
+            velocity=z[:, 1:2] / torch.clamp(mass, min=1.0e-12),
+            force=force,
+            dt=dt,
+            mass=mass,
+            damping_c=damping_c,
+            stiffness=stiffness,
+        )
+        z_next = torch.cat([y_next, v_next * mass], dim=1)
+        return {
+            "z_next": z_next,
+            "h_next": h_next,
+            "force": force,
+            "raw_dh": raw_dh,
+            "acceleration_next": a_next,
+        }
+
+    def rollout(
+        self,
+        *,
+        history: torch.Tensor,
+        z0: torch.Tensor,
+        t_seq: torch.Tensor,
+        ur: torch.Tensor,
+        mass: torch.Tensor,
+        damping_c: torch.Tensor,
+        stiffness: torch.Tensor,
+        flow_speed: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        h = self.encode(history)
+        z = z0
+        z_hist = [z0]
+        force_hist: list[torch.Tensor] = []
+        h_hist = [h]
+        for idx in range(int(t_seq.shape[1]) - 1):
+            dt = torch.clamp((t_seq[:, idx + 1 : idx + 2] - t_seq[:, idx : idx + 1]), min=1.0e-12)
+            step = self.predict_step(
+                z=z,
+                h=h,
+                ur=ur,
+                mass=mass,
+                damping_c=damping_c,
+                stiffness=stiffness,
+                flow_speed=flow_speed,
+                dt=dt,
+            )
+            z = step["z_next"]
+            h = step["h_next"]
+            z_hist.append(z)
+            h_hist.append(h)
+            force_hist.append(step["force"])
+        return {
+            "z": torch.stack(z_hist, dim=1),
+            "h": torch.stack(h_hist, dim=1),
+            "force": (
+                torch.stack(force_hist, dim=1)
+                if force_hist
+                else z0.new_zeros((z0.shape[0], 0, 1))
+            ),
+        }
+
+
+def _trajectory_state_scale(
+    *,
+    z_like: torch.Tensor,
+    mass: torch.Tensor,
+    stiffness: torch.Tensor,
+    diameter: float,
+    input_scaling_mode: str,
+    flow_speed: torch.Tensor,
+) -> torch.Tensor:
+    q_scale = torch.full_like(z_like[..., 0:1], float(diameter))
+    if resolve_phnn_input_scaling_mode(input_scaling_mode) == "convective":
+        p_scale = mass.view(-1, 1, 1) * torch.clamp(torch.abs(flow_speed.view(-1, 1, 1)), min=1.0e-12)
+    else:
+        p_scale = torch.sqrt(torch.clamp(mass.view(-1, 1, 1) * stiffness.view(-1, 1, 1), min=1.0e-12)) * float(diameter)
+    return torch.cat([q_scale, p_scale.expand_as(q_scale)], dim=2)
+
+
+def _encoder_features_for_traj(
+    traj: dict[str, np.ndarray],
+    *,
+    mass_key: str,
+    input_scaling_mode: str,
+    diameter: float,
+    ur_scale: float,
+    include_acceleration: bool,
+) -> torch.Tensor:
+    y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
+    dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
+    ddy = torch.from_numpy(np.ascontiguousarray(traj["ddy"])).float().unsqueeze(1)
+    ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+    flow_speed = torch.from_numpy(np.ascontiguousarray(traj["flow_speed"])).float().unsqueeze(1)
+    mass = float(np.asarray(traj[mass_key]).reshape(()))
+    stiffness = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+    y_feat = y / float(diameter)
+    mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
+    if mode == "convective":
+        u = torch.clamp(torch.abs(flow_speed), min=1.0e-12)
+        v_feat = dy / u
+        ur_feat = flow_speed / float(diameter)
+        acc_feat = ddy * float(diameter) / torch.clamp(u * u, min=1.0e-12)
+    else:
+        p_scale = math.sqrt(max(mass * stiffness, 1.0e-12)) * float(diameter)
+        v_feat = (dy * mass) / max(p_scale, 1.0e-12)
+        ur_feat = ur / float(ur_scale)
+        omega_n = math.sqrt(max(stiffness / mass, 1.0e-12))
+        acc_feat = ddy / max((omega_n * omega_n) * float(diameter), 1.0e-12)
+    parts = [y_feat, v_feat, ur_feat]
+    if include_acceleration:
+        parts.append(acc_feat)
+    return torch.cat(parts, dim=1)
+
+
+def _build_latent_window_dataset(
+    trajs: list[dict[str, np.ndarray]],
+    *,
+    encoder_length: int,
+    rollout_steps: int,
+    mass_source: str,
+    input_scaling_mode: str,
+    diameter: float,
+    ur_scale: float,
+    include_acceleration: bool,
+) -> TensorDataset | ConcatDataset | None:
+    mass_key = {
+        "dry": "dry_mass_kg",
+        "effective": "effective_mass_kg",
+        "stored": "dry_mass_kg",
+        "label": "dry_mass_kg",
+    }.get(str(mass_source).strip().lower())
+    if mass_key is None:
+        raise ValueError("latent_rnn.td_mass_source must be one of: dry, effective, stored, label.")
+    items: list[TensorDataset] = []
+    enc_len = max(1, int(encoder_length))
+    steps = max(1, int(rollout_steps))
+    total = enc_len + steps
+    for traj in trajs:
+        t = torch.from_numpy(np.ascontiguousarray(traj["t"])).float()
+        y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float()
+        dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float()
+        force = torch.from_numpy(np.ascontiguousarray(traj["force_per_m"])).float().unsqueeze(1)
+        ur = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1)
+        flow = torch.from_numpy(np.ascontiguousarray(traj["flow_speed"])).float().unsqueeze(1)
+        mass_value = float(np.asarray(traj[mass_key]).reshape(()))
+        damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
+        stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+        z = torch.cat([y.unsqueeze(1), (dy * mass_value).unsqueeze(1)], dim=1)
+        history_features = _encoder_features_for_traj(
+            traj,
+            mass_key=mass_key,
+            input_scaling_mode=input_scaling_mode,
+            diameter=diameter,
+            ur_scale=ur_scale,
+            include_acceleration=include_acceleration,
+        )
+        if int(z.shape[0]) < total:
+            continue
+        histories = []
+        z0s = []
+        tseqs = []
+        ztrajs = []
+        urs = []
+        flows = []
+        force_seqs = []
+        masses = []
+        dampings = []
+        stiffnesses = []
+        for start in range(int(z.shape[0]) - total + 1):
+            context_end = start + enc_len - 1
+            end = context_end + steps + 1
+            histories.append(history_features[start : start + enc_len])
+            z0s.append(z[context_end])
+            tseqs.append(t[context_end:end])
+            ztrajs.append(z[context_end:end])
+            urs.append(ur[context_end])
+            flows.append(flow[context_end])
+            force_seqs.append(force[context_end + 1 : end])
+            masses.append(torch.tensor([mass_value], dtype=torch.float32))
+            dampings.append(torch.tensor([damping_value], dtype=torch.float32))
+            stiffnesses.append(torch.tensor([stiffness_value], dtype=torch.float32))
+        if histories:
+            items.append(
+                TensorDataset(
+                    torch.stack(histories, dim=0),
+                    torch.stack(z0s, dim=0),
+                    torch.stack(tseqs, dim=0),
+                    torch.stack(ztrajs, dim=0),
+                    torch.stack(urs, dim=0),
+                    torch.stack(flows, dim=0),
+                    torch.stack(force_seqs, dim=0),
+                    torch.stack(masses, dim=0),
+                    torch.stack(dampings, dim=0),
+                    torch.stack(stiffnesses, dim=0),
+                )
+            )
+    if not items:
+        return None
+    return items[0] if len(items) == 1 else ConcatDataset(items)
+
+
+def _unpack_batch(batch: Sequence[torch.Tensor], *, device: torch.device, non_blocking: bool) -> tuple[torch.Tensor, ...]:
+    if len(batch) != 10:
+        raise ValueError("Unexpected latent_rnn batch format.")
+    return tuple(t.to(device, non_blocking=non_blocking) for t in batch)
+
+
+def _latent_losses_from_batch(
+    *,
+    model: LatentRNNForceModel,
+    batch: Sequence[torch.Tensor],
+    device: torch.device,
+    non_blocking: bool,
+    trajectory_relative: bool,
+    compute_disp_std_loss: bool,
+    disp_std_relative: bool,
+    disp_std_power: float,
+    compute_disp_spectral_loss: bool,
+    disp_spectral_loss_mode: str,
+    disp_freq_relative: bool,
+    disp_freq_power: float,
+    disp_freq_alpha: float,
+    disp_psd_relative: bool,
+    disp_psd_peak_rel_bandwidth: float,
+    disp_psd_use_hann_window: bool,
+) -> dict[str, torch.Tensor]:
+    history, z0, t_seq, z_traj, ur, flow, force_true, mass, damping, stiffness = _unpack_batch(
+        batch,
+        device=device,
+        non_blocking=non_blocking,
+    )
+    rollout = model.rollout(
+        history=history,
+        z0=z0,
+        t_seq=t_seq,
+        ur=ur,
+        mass=mass,
+        damping_c=damping,
+        stiffness=stiffness,
+        flow_speed=flow,
+    )
+    z_pred = rollout["z"]
+    z_scale = _trajectory_state_scale(
+        z_like=z_traj,
+        mass=mass,
+        stiffness=stiffness,
+        diameter=float(model.D),
+        input_scaling_mode=str(model.input_scaling_mode),
+        flow_speed=flow,
+    )
+    state_loss = _trajectory_rollout_mse_torch(
+        true_traj=z_traj[:, 1:2, :],
+        pred_traj=z_pred[:, 1:2, :],
+        z_scale=z_scale[:, 1:2, :],
+        relative=False,
+    )
+    trajectory_loss = _trajectory_rollout_mse_torch(
+        true_traj=z_traj[:, 1:, :],
+        pred_traj=z_pred[:, 1:, :],
+        z_scale=z_scale[:, 1:, :],
+        relative=trajectory_relative,
+    )
+    disp_std_loss = z_traj.new_zeros(())
+    if compute_disp_std_loss:
+        disp_std_loss = _displacement_std_error_torch(
+            true_signal=z_traj[:, 1:, 0],
+            pred_signal=z_pred[:, 1:, 0],
+            relative=disp_std_relative,
+            power=disp_std_power,
+        )
+    disp_spectral_loss = z_traj.new_zeros(())
+    if compute_disp_spectral_loss:
+        dt_values = torch.clamp(t_seq[:, 1] - t_seq[:, 0], min=1.0e-12)
+        if disp_spectral_loss_mode == "dominant_frequency":
+            disp_spectral_loss = _dominant_frequency_error_torch(
+                true_signal=z_traj[:, 1:, 0],
+                pred_signal=z_pred[:, 1:, 0],
+                dt=dt_values,
+                peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                use_hann_window=disp_psd_use_hann_window,
+                relative=disp_freq_relative,
+                power=disp_freq_power,
+                alpha=disp_freq_alpha,
+            )
+        else:
+            disp_spectral_loss = _psd_error_torch(
+                true_signal=z_traj[:, 1:, 0],
+                pred_signal=z_pred[:, 1:, 0],
+                dt=dt_values,
+                peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
+                use_hann_window=disp_psd_use_hann_window,
+                relative=disp_psd_relative,
+            )
+    force_data_loss = torch.mean((rollout["force"] - force_true) ** 2)
+    return {
+        "state_loss": state_loss,
+        "trajectory_loss": trajectory_loss,
+        "disp_std_loss": disp_std_loss,
+        "disp_spectral_loss": disp_spectral_loss,
+        "force_data_loss": force_data_loss,
+        "z_pred": z_pred,
+        "force_pred": rollout["force"],
+    }
+
+
+def _resolve_latent_time_scale(raw: Any, *, train_trajs: list[dict[str, np.ndarray]]) -> float:
+    key = str(raw).strip().lower()
+    if key in {"", "auto", "median_dt"}:
+        dts: list[float] = []
+        for traj in train_trajs:
+            t = np.asarray(traj["t"], dtype=float).reshape(-1)
+            if t.size > 1:
+                dts.extend(np.diff(t).tolist())
+        if not dts:
+            raise ValueError("Cannot resolve latent_time_scale=auto without at least one dt.")
+        return float(np.median(np.asarray(dts, dtype=float)))
+    value = float(raw)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("latent_rnn.latent_time_scale must be auto or a positive finite value.")
+    return value
+
+
+def train(config: Config, config_name: str) -> None:
+    data_cfg = config.data
+    model_cfg = config.model
+    arch_cfg = config.architecture
+    training_cfg = config.training
+    optim_cfg = config.optim
+    loss_cfg = config.loss
+    runtime_cfg = config.runtime
+    precision_cfg = config.precision
+    compile_cfg = config.compile
+    monitoring_cfg = config.monitoring
+    lrnn_cfg = dict(config.latent_rnn or {})
+
+    device = select_device(os.getenv("TRAIN_DEVICE", str(runtime_cfg.device)))
+    print(f"Using device: {device}")
+    configure_tf32(device, bool(precision_cfg.use_tf32))
+    set_num_threads_from_slurm(default=1)
+    amp_enabled, amp_dtype, scaler = setup_amp(
+        device,
+        use_amp=bool(precision_cfg.use_amp),
+        amp_dtype=str(precision_cfg.amp_dtype),
+    )
+    non_blocking = device.type == "cuda"
+
+    train_series_root = Path(data_cfg.train_series_dir)
+    train_dir = train_series_root / "train"
+    val_unseen_dir = train_series_root / "val_unseen"
+    if not val_unseen_dir.exists():
+        val_unseen_dir = train_series_root / "val"
+    if not train_dir.exists() or not val_unseen_dir.exists():
+        raise FileNotFoundError(
+            "latent_rnn expects train/ and val_unseen/ under data.train_series_dir "
+            "(legacy val/ is supported as a fallback)."
+        )
+    train_paths = sorted(train_dir.glob("*.npz"))
+    val_paths = sorted(val_unseen_dir.glob("*.npz"))
+    if not train_paths:
+        raise FileNotFoundError("No latent_rnn training trajectories were found.")
+
+    mass_source = str(lrnn_cfg.get("td_mass_source", "dry")).strip().lower()
+    train_cut = resolve_cut_start_seconds(data_cfg, "train")
+    val_cut = resolve_cut_start_seconds(data_cfg, "val")
+    reduce_time_enabled = bool(getattr(data_cfg, "reduce_time", False))
+    reduction_factor = int(getattr(data_cfg, "reduction_factor", 1))
+    stagger_train_reduce = bool(
+        getattr(
+            data_cfg,
+            "stagger_reduced_time_train",
+            reduce_time_enabled and max(1, reduction_factor) > 1,
+        )
+    )
+    stagger_val_reduce = bool(getattr(data_cfg, "stagger_reduced_time_val", False))
+    train_trajs = _load_latent_rnn_trajectories(
+        train_paths,
+        cut_start_seconds=train_cut,
+        reduce_time=reduce_time_enabled,
+        reduction_factor=reduction_factor,
+        stagger_reduced_time=stagger_train_reduce,
+        mass_source=mass_source,
+    )
+    val_trajs = _load_latent_rnn_trajectories(
+        val_paths,
+        cut_start_seconds=val_cut,
+        reduce_time=reduce_time_enabled,
+        reduction_factor=reduction_factor,
+        stagger_reduced_time=stagger_val_reduce,
+        mass_source=mass_source,
+    )
+    if not train_trajs:
+        raise ValueError("No latent_rnn training trajectories remained after loading/reduction.")
+
+    latent_dim = int(lrnn_cfg.get("latent_dim", 3))
+    encoder_length = int(lrnn_cfg.get("encoder_length", 50))
+    if latent_dim < 1:
+        raise ValueError("latent_rnn.latent_dim must be >= 1.")
+    if encoder_length < 1:
+        raise ValueError("latent_rnn.encoder_length must be >= 1.")
+    encoder_type = str(lrnn_cfg.get("encoder_type", "gru")).strip().lower()
+    if encoder_type != "gru":
+        raise ValueError("latent_rnn.encoder_type currently supports only 'gru'.")
+    latent_update = str(lrnn_cfg.get("latent_update", "dt_scaled")).strip().lower()
+    if latent_update != "dt_scaled":
+        raise ValueError("latent_rnn.latent_update currently supports only 'dt_scaled'.")
+    include_acceleration = bool(lrnn_cfg.get("encoder_include_acceleration", True))
+    input_scaling_mode = resolve_phnn_input_scaling_mode(getattr(model_cfg, "input_scaling_mode", "current"))
+    ur_scale = 10.0 if getattr(model_cfg, "ur_scale", None) is None else float(model_cfg.ur_scale)
+    latent_time_scale = _resolve_latent_time_scale(lrnn_cfg.get("latent_time_scale", "auto"), train_trajs=train_trajs)
+    rollout_settings = _resolve_td_rollout_loss_settings(loss_cfg)
+    rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
+    spectral_weight_raw = getattr(loss_cfg, "rollout_disp_spectral_weight", None)
+    rollout_disp_spectral_weight = (
+        float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
+        if spectral_weight_raw is None
+        else float(spectral_weight_raw)
+    )
+    rollout_active = (
+        rollout_det_weight > 0.0
+        or rollout_disp_std_weight > 0.0
+        or rollout_disp_spectral_weight > 0.0
+    )
+    rollout_steps = int(getattr(loss_cfg, "rollout_det_steps", 1)) if rollout_active else 1
+    rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
+    rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
+    state_weight = float(getattr(loss_cfg, "state_weight", 1.0))
+    force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
+    spectral_mode = _normalize_rollout_disp_spectral_loss_mode(
+        getattr(loss_cfg, "rollout_disp_spectral_loss", "psd")
+    )
+    psd_peak_rel_bw = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
+    psd_use_hann = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
+
+    train_dataset = _build_latent_window_dataset(
+        train_trajs,
+        encoder_length=encoder_length,
+        rollout_steps=rollout_steps,
+        mass_source=mass_source,
+        input_scaling_mode=input_scaling_mode,
+        diameter=float(model_cfg.D),
+        ur_scale=ur_scale,
+        include_acceleration=include_acceleration,
+    )
+    if train_dataset is None:
+        raise ValueError("No latent_rnn training windows were built.")
+    val_dataset = _build_latent_window_dataset(
+        val_trajs,
+        encoder_length=encoder_length,
+        rollout_steps=rollout_steps,
+        mass_source=mass_source,
+        input_scaling_mode=input_scaling_mode,
+        diameter=float(model_cfg.D),
+        ur_scale=ur_scale,
+        include_acceleration=include_acceleration,
+    )
+    loader_workers = 0
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=rollout_batch_size,
+        shuffle=True,
+        num_workers=loader_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    val_loader = (
+        DataLoader(
+            val_dataset,
+            batch_size=rollout_batch_size,
+            shuffle=False,
+            num_workers=loader_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        if val_dataset is not None
+        else None
+    )
+
+    encoder_input_dim = 3 + (1 if include_acceleration else 0)
+    backbone_input_dim = 3 + latent_dim
+    first_traj = train_trajs[0]
+    model = LatentRNNForceModel(
+        latent_dim=latent_dim,
+        encoder_input_dim=encoder_input_dim,
+        encoder_hidden=int(lrnn_cfg.get("encoder_hidden", 128)),
+        encoder_layers=int(lrnn_cfg.get("encoder_layers", 1)),
+        encoder_dropout=float(lrnn_cfg.get("encoder_dropout", 0.0)),
+        backbone_input_dim=backbone_input_dim,
+        architecture_cfg=arch_cfg,
+        rho=float(np.asarray(first_traj["rho_kg_m3"]).reshape(())),
+        diameter=float(model_cfg.D),
+        force_output=str(model_cfg.force_output),
+        coefficient_output_bound=(
+            None
+            if getattr(model_cfg, "coefficient_output_bound", None) is None
+            else float(model_cfg.coefficient_output_bound)
+        ),
+        input_scaling_mode=input_scaling_mode,
+        ur_scale=ur_scale,
+        latent_time_scale=latent_time_scale,
+        corr_init_mode=str(lrnn_cfg.get("corr_init_mode", getattr(model_cfg, "corr_init_mode", "zero"))),
+    ).to(device)
+    model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
+
+    optimizer, scheduler = setup_optimizer_and_scheduler(
+        model,
+        optim_cfg=optim_cfg,
+        scheduler_cfg=optim_cfg.scheduler,
+        epochs=int(training_cfg.epochs),
+    )
+    writer, run_name = setup_writer(
+        config_name,
+        run_dir_root=str(config.logging.run_dir_root),
+        append_timestamp=bool(config.logging.append_timestamp),
+        run_name_override=getattr(config.logging, "run_name", None),
+    )
+    writer.add_text("latent_rnn/config", json.dumps(lrnn_cfg, indent=2, sort_keys=True), 0)
+    writer.add_text(
+        "latent_rnn/resolved",
+        json.dumps(
+            {
+                "latent_time_scale": latent_time_scale,
+                "rollout_steps": rollout_steps,
+                "encoder_input_dim": encoder_input_dim,
+                "backbone_input_dim": backbone_input_dim,
+                "train_windows": len(train_loader.dataset),
+                "val_windows": 0 if val_loader is None else len(val_loader.dataset),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        0,
+    )
+
+    print(
+        "\n".join(
+            [
+                f"Run name: {run_name}",
+                (
+                    f"Latent RNN setup: epochs={int(training_cfg.epochs)}, batch_size={rollout_batch_size}, "
+                    f"train_windows={len(train_loader.dataset)}, val_windows={0 if val_loader is None else len(val_loader.dataset)}"
+                ),
+                (
+                    f"Ablation: no Vivana-TD force/context/phase/sigma/fhat inputs are loaded into the model; "
+                    f"latent_dim={latent_dim}, encoder_length={encoder_length}, latent_time_scale={latent_time_scale:g}"
+                ),
+                (
+                    f"Loss weights: state={state_weight:g}, force_data="
+                    f"{force_data_weight if use_force_data_loss else 0.0:g}, rollout_det={rollout_det_weight:g}, "
+                    f"rollout_disp_std={rollout_disp_std_weight:g}, rollout_disp_spectral={rollout_disp_spectral_weight:g}"
+                ),
+            ]
+        )
+    )
+
+    def _run_epoch(loader: DataLoader, *, train_mode: bool) -> dict[str, float]:
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
+        sums: dict[str, torch.Tensor] = {}
+        count = 0
+        for batch in loader:
+            if train_mode:
+                optimizer.zero_grad(set_to_none=True)
+            with torch.set_grad_enabled(train_mode):
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    losses = _latent_losses_from_batch(
+                        model=model,
+                        batch=batch,
+                        device=device,
+                        non_blocking=non_blocking,
+                        trajectory_relative=bool(rollout_settings["trajectory_relative"]),
+                        compute_disp_std_loss=rollout_disp_std_weight > 0.0,
+                        disp_std_relative=bool(rollout_settings["disp_std_relative"]),
+                        disp_std_power=float(rollout_settings["disp_std_p"]),
+                        compute_disp_spectral_loss=rollout_disp_spectral_weight > 0.0,
+                        disp_spectral_loss_mode=spectral_mode,
+                        disp_freq_relative=bool(rollout_settings["disp_freq_relative"]),
+                        disp_freq_power=float(rollout_settings["disp_freq_p"]),
+                        disp_freq_alpha=float(rollout_settings["disp_freq_alpha"]),
+                        disp_psd_relative=bool(rollout_settings["disp_psd_relative"]),
+                        disp_psd_peak_rel_bandwidth=psd_peak_rel_bw,
+                        disp_psd_use_hann_window=psd_use_hann,
+                    )
+                    total_loss = (
+                        state_weight * losses["state_loss"]
+                        + rollout_det_weight * losses["trajectory_loss"]
+                        + rollout_disp_std_weight * losses["disp_std_loss"]
+                        + rollout_disp_spectral_weight * losses["disp_spectral_loss"]
+                    )
+                    if use_force_data_loss:
+                        total_loss = total_loss + force_data_weight * losses["force_data_loss"]
+                if train_mode:
+                    scaler.scale(total_loss).backward()
+                    if float(training_cfg.max_grad_norm) > 0.0:
+                        scaler.unscale_(optimizer)
+                        nn_utils.clip_grad_norm_(model.parameters(), float(training_cfg.max_grad_norm))
+                    scaler.step(optimizer)
+                    scaler.update()
+            batch_size = int(batch[0].shape[0])
+            count += batch_size
+            for name, value in {
+                "loss_total": total_loss,
+                "loss_state": losses["state_loss"],
+                "loss_rollout_det": losses["trajectory_loss"],
+                "loss_rollout_disp_std": losses["disp_std_loss"],
+                "loss_rollout_spectral": losses["disp_spectral_loss"],
+                "loss_force_data": losses["force_data_loss"],
+            }.items():
+                sums[name] = sums.get(name, value.detach().new_zeros(())) + value.detach() * batch_size
+        denom = float(max(1, count))
+        return {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
+
+    run_models_dir = Path("models") / run_name
+    run_models_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = run_models_dir / f"{run_name}_latest.pt"
+    best_val = float("inf")
+    epochs = int(training_cfg.epochs)
+    validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
+    print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
+    log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
+
+    for epoch in range(epochs):
+        if bool(optim_cfg.use_lr_scheduler):
+            lr = scheduler.get_lr(epoch + 1)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+        start = time.perf_counter()
+        train_metrics = _run_epoch(train_loader, train_mode=True)
+        elapsed = time.perf_counter() - start
+        if (epoch + 1) % log_every == 0:
+            for name, value in train_metrics.items():
+                writer.add_scalar(f"train/{name}", value, epoch + 1)
+            writer.add_scalar("train/lr", float(optimizer.param_groups[0]["lr"]), epoch + 1)
+            writer.add_scalar("train/epoch_wall_time_s", elapsed, epoch + 1)
+        if (epoch + 1) % print_every == 0 or epoch == 0:
+            print(
+                f"[latent_rnn] epoch {epoch + 1}/{epochs}: "
+                f"loss={train_metrics.get('loss_total', float('nan')):.4e}, "
+                f"state={train_metrics.get('loss_state', float('nan')):.4e}, "
+                f"roll={train_metrics.get('loss_rollout_det', float('nan')):.4e}, "
+                f"spectral={train_metrics.get('loss_rollout_spectral', float('nan')):.4e}"
+            )
+        if val_loader is not None and ((epoch + 1) % validate_every == 0 or epoch == epochs - 1):
+            val_metrics = _run_epoch(val_loader, train_mode=False)
+            for name, value in val_metrics.items():
+                writer.add_scalar(f"val_unseen/{name}", value, epoch + 1)
+            val_loss = val_metrics.get("loss_total", float("inf"))
+            ckpt_path = run_models_dir / f"{run_name}_epoch{epoch + 1:04d}.pt"
+            state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
+            payload = {
+                "model_state": state_source.state_dict(),
+                "config": asdict(config),
+                "run_name": run_name,
+                "method": "latent_rnn",
+                "latent_time_scale": latent_time_scale,
+                "epoch": epoch + 1,
+                "val_loss": val_loss,
+            }
+            torch.save(payload, ckpt_path)
+            shutil.copyfile(ckpt_path, latest_path)
+            if val_loss < best_val:
+                best_val = val_loss
+                shutil.copyfile(ckpt_path, run_models_dir / f"{run_name}_best_val.pt")
+            print(
+                f"[latent_rnn][val] epoch {epoch + 1}: "
+                f"loss={val_loss:.4e}, state={val_metrics.get('loss_state', float('nan')):.4e}"
+            )
+
+    state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
+    final_path = Path("models") / f"{run_name}.pt"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state": state_source.state_dict(),
+            "config": asdict(config),
+            "run_name": run_name,
+            "method": "latent_rnn",
+            "latent_time_scale": latent_time_scale,
+        },
+        final_path,
+    )
+    writer.close()
+    print(f"Saved final latent_rnn model to {final_path}")
