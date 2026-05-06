@@ -924,7 +924,8 @@ def _log_latent_rollout_validation(
     input_scaling_mode: str,
     ur_scale: float,
     device: torch.device,
-    tag_prefix: str = "val/rollout",
+    tag_prefix: str = "val_unseen/rollout",
+    metric_prefix: str = "val_unseen",
     step: int | None = None,
     log_metrics: bool = True,
     log_plots: bool = True,
@@ -951,7 +952,7 @@ def _log_latent_rollout_validation(
                 continue
             value_f = float(value)
             if np.isfinite(value_f):
-                writer.add_scalar(f"val/{name}", value_f, tensorboard_step)
+                writer.add_scalar(f"{metric_prefix}/{name}", value_f, tensorboard_step)
     if not log_plots:
         return metrics
     t_plot = np.asarray(result["t"], dtype=float).reshape(-1)
@@ -1050,6 +1051,7 @@ def train(config: Config, config_name: str) -> None:
     val_unseen_dir = train_series_root / "val_unseen"
     if not val_unseen_dir.exists():
         val_unseen_dir = train_series_root / "val"
+    val_seen_dir = train_series_root / "val_seen"
     if not train_dir.exists() or not val_unseen_dir.exists():
         raise FileNotFoundError(
             "latent_rnn expects train/ and val_unseen/ under data.train_series_dir "
@@ -1057,6 +1059,7 @@ def train(config: Config, config_name: str) -> None:
         )
     train_paths = sorted(train_dir.glob("*.npz"))
     val_paths = sorted(val_unseen_dir.glob("*.npz"))
+    val_seen_paths = sorted(val_seen_dir.glob("*.npz")) if val_seen_dir.exists() else []
     if not train_paths:
         raise FileNotFoundError("No latent_rnn training trajectories were found.")
 
@@ -1088,6 +1091,18 @@ def train(config: Config, config_name: str) -> None:
         reduction_factor=reduction_factor,
         stagger_reduced_time=stagger_val_reduce,
         mass_source=mass_source,
+    )
+    val_seen_trajs = (
+        _load_latent_rnn_trajectories(
+            val_seen_paths,
+            cut_start_seconds=val_cut,
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+            stagger_reduced_time=stagger_val_reduce,
+            mass_source=mass_source,
+        )
+        if val_seen_paths
+        else []
     )
     if not train_trajs:
         raise ValueError("No latent_rnn training trajectories remained after loading/reduction.")
@@ -1156,6 +1171,16 @@ def train(config: Config, config_name: str) -> None:
         ur_scale=ur_scale,
         include_acceleration=include_acceleration,
     )
+    val_seen_dataset = _build_latent_window_dataset(
+        val_seen_trajs,
+        encoder_length=encoder_length,
+        rollout_steps=rollout_steps,
+        mass_source=mass_source,
+        input_scaling_mode=input_scaling_mode,
+        diameter=float(model_cfg.D),
+        ur_scale=ur_scale,
+        include_acceleration=include_acceleration,
+    )
     loader_workers = 0
     train_loader = DataLoader(
         train_dataset,
@@ -1173,6 +1198,17 @@ def train(config: Config, config_name: str) -> None:
             pin_memory=(device.type == "cuda"),
         )
         if val_dataset is not None
+        else None
+    )
+    val_seen_loader = (
+        DataLoader(
+            val_seen_dataset,
+            batch_size=rollout_batch_size,
+            shuffle=False,
+            num_workers=loader_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        if val_seen_dataset is not None
         else None
     )
 
@@ -1224,7 +1260,8 @@ def train(config: Config, config_name: str) -> None:
                 "encoder_input_dim": encoder_input_dim,
                 "backbone_input_dim": backbone_input_dim,
                 "train_windows": len(train_loader.dataset),
-                "val_windows": 0 if val_loader is None else len(val_loader.dataset),
+                "val_unseen_windows": 0 if val_loader is None else len(val_loader.dataset),
+                "val_seen_windows": 0 if val_seen_loader is None else len(val_seen_loader.dataset),
             },
             indent=2,
             sort_keys=True,
@@ -1238,7 +1275,9 @@ def train(config: Config, config_name: str) -> None:
                 f"Run name: {run_name}",
                 (
                     f"Latent RNN setup: epochs={int(training_cfg.epochs)}, batch_size={rollout_batch_size}, "
-                    f"train_windows={len(train_loader.dataset)}, val_windows={0 if val_loader is None else len(val_loader.dataset)}"
+                    f"train_windows={len(train_loader.dataset)}, "
+                    f"val_unseen_windows={0 if val_loader is None else len(val_loader.dataset)}, "
+                    f"val_seen_windows={0 if val_seen_loader is None else len(val_seen_loader.dataset)}"
                 ),
                 (
                     f"Ablation: no Vivana-TD force/context/phase/sigma/fhat inputs are loaded into the model; "
@@ -1344,80 +1383,110 @@ def train(config: Config, config_name: str) -> None:
                 f"spectral={train_metrics.get('loss_rollout_spectral', float('nan')):.4e}"
             )
         if val_loader is not None and ((epoch + 1) % validate_every == 0 or epoch == epochs - 1):
-            validation_start = time.perf_counter()
-            val_metrics = _run_epoch(val_loader, train_mode=False)
-            for name, value in val_metrics.items():
-                writer.add_scalar(f"val/{name}", value, epoch + 1)
-            val_loss = val_metrics.get("loss_total", float("inf"))
             eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             eval_model.eval()
-            if val_trajs:
-                ur_for_sampling = [
-                    float(np.asarray(traj["ur"], dtype=float).reshape(-1)[0])
-                    for traj in val_trajs
-                    if np.asarray(traj["ur"], dtype=float).reshape(-1).size > 0
-                ]
-                sampled_indices = sample_indices_per_ur(
-                    ur_for_sampling,
-                    samples_per_ur=validation_samples_per_ur,
-                    seed=1,
-                )
-                metrics_sum: dict[str, float] = {}
-                metrics_count = 0
-                diverged_count = 0
-                for idx in sampled_indices:
-                    if idx >= len(val_trajs):
-                        continue
-                    rollout_metrics = _latent_rollout_validation_case(
-                        model=eval_model,
-                        traj=val_trajs[idx],
-                        encoder_length=encoder_length,
-                        include_acceleration=include_acceleration,
-                        mass_source=mass_source,
-                        input_scaling_mode=input_scaling_mode,
-                        ur_scale=ur_scale,
-                        device=device,
-                    ).get("metrics", {})
-                    if not rollout_metrics:
-                        continue
-                    diverged_flag = float(rollout_metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
-                    if np.isfinite(diverged_flag) and diverged_flag > 0.5:
-                        diverged_count += 1
-                    for name, value in rollout_metrics.items():
-                        if name == ROLLOUT_DIVERGED_KEY:
-                            continue
-                        value_f = float(value)
-                        if np.isfinite(value_f):
-                            metrics_sum[name] = metrics_sum.get(name, 0.0) + value_f
-                    metrics_count += 1
-                if metrics_count > 0:
-                    for name, total in metrics_sum.items():
-                        writer.add_scalar(f"val/{name}", total / float(metrics_count), epoch + 1)
-                    writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
 
-                selected_indices = sample_one_index_per_ur(ur_for_sampling, seed=0)
-                if not selected_indices:
-                    selected_indices = [0]
-                rollout_idx = int(selected_indices[0])
-                if 0 <= rollout_idx < len(val_trajs):
-                    _log_latent_rollout_validation(
-                        writer=writer,
-                        epoch=epoch,
-                        model=eval_model,
-                        traj=val_trajs[rollout_idx],
-                        encoder_length=encoder_length,
-                        include_acceleration=include_acceleration,
-                        mass_source=mass_source,
-                        input_scaling_mode=input_scaling_mode,
-                        ur_scale=ur_scale,
-                        device=device,
-                        tag_prefix="val/rollout",
-                        step=epoch + 1,
-                        log_metrics=False,
-                        log_plots=True,
-                        log_spectra=False,
+            def _validate_split(
+                *,
+                split_tag: str,
+                split_loader: DataLoader | None,
+                split_trajs: list[dict[str, np.ndarray]],
+                log_rollout_plots: bool,
+            ) -> tuple[dict[str, float], float]:
+                if split_loader is None:
+                    return {}, float("inf")
+                validation_start = time.perf_counter()
+                split_metrics = _run_epoch(split_loader, train_mode=False)
+                for name, value in split_metrics.items():
+                    writer.add_scalar(f"{split_tag}/{name}", value, epoch + 1)
+                if split_trajs:
+                    ur_for_sampling = [
+                        float(np.asarray(traj["ur"], dtype=float).reshape(-1)[0])
+                        for traj in split_trajs
+                        if np.asarray(traj["ur"], dtype=float).reshape(-1).size > 0
+                    ]
+                    sampled_indices = sample_indices_per_ur(
+                        ur_for_sampling,
+                        samples_per_ur=validation_samples_per_ur,
+                        seed=1,
                     )
-            writer.add_scalar("val/validation_wall_time_s", float(time.perf_counter() - validation_start), epoch + 1)
+                    metrics_sum: dict[str, float] = {}
+                    metrics_count = 0
+                    diverged_count = 0
+                    for idx in sampled_indices:
+                        if idx >= len(split_trajs):
+                            continue
+                        rollout_metrics = _latent_rollout_validation_case(
+                            model=eval_model,
+                            traj=split_trajs[idx],
+                            encoder_length=encoder_length,
+                            include_acceleration=include_acceleration,
+                            mass_source=mass_source,
+                            input_scaling_mode=input_scaling_mode,
+                            ur_scale=ur_scale,
+                            device=device,
+                        ).get("metrics", {})
+                        if not rollout_metrics:
+                            continue
+                        diverged_flag = float(rollout_metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+                        if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                            diverged_count += 1
+                        for name, value in rollout_metrics.items():
+                            if name == ROLLOUT_DIVERGED_KEY:
+                                continue
+                            value_f = float(value)
+                            if np.isfinite(value_f):
+                                metrics_sum[name] = metrics_sum.get(name, 0.0) + value_f
+                        metrics_count += 1
+                    if metrics_count > 0:
+                        for name, total in metrics_sum.items():
+                            writer.add_scalar(f"{split_tag}/{name}", total / float(metrics_count), epoch + 1)
+                        writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
+
+                    if log_rollout_plots:
+                        selected_indices = sample_one_index_per_ur(ur_for_sampling, seed=0)
+                        if not selected_indices:
+                            selected_indices = [0]
+                        rollout_idx = int(selected_indices[0])
+                        if 0 <= rollout_idx < len(split_trajs):
+                            _log_latent_rollout_validation(
+                                writer=writer,
+                                epoch=epoch,
+                                model=eval_model,
+                                traj=split_trajs[rollout_idx],
+                                encoder_length=encoder_length,
+                                include_acceleration=include_acceleration,
+                                mass_source=mass_source,
+                                input_scaling_mode=input_scaling_mode,
+                                ur_scale=ur_scale,
+                                device=device,
+                                tag_prefix=f"{split_tag}/rollout",
+                                metric_prefix=split_tag,
+                                step=epoch + 1,
+                                log_metrics=False,
+                                log_plots=True,
+                                log_spectra=False,
+                            )
+                writer.add_scalar(
+                    f"{split_tag}/validation_wall_time_s",
+                    float(time.perf_counter() - validation_start),
+                    epoch + 1,
+                )
+                return split_metrics, split_metrics.get("loss_total", float("inf"))
+
+            val_metrics, val_loss = _validate_split(
+                split_tag="val_unseen",
+                split_loader=val_loader,
+                split_trajs=val_trajs,
+                log_rollout_plots=True,
+            )
+            if val_seen_loader is not None:
+                _validate_split(
+                    split_tag="val_seen",
+                    split_loader=val_seen_loader,
+                    split_trajs=val_seen_trajs,
+                    log_rollout_plots=False,
+                )
             ckpt_path = run_models_dir / f"{run_name}_epoch{epoch + 1:04d}.pt"
             state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
             payload = {
@@ -1435,11 +1504,12 @@ def train(config: Config, config_name: str) -> None:
                 best_val = val_loss
                 shutil.copyfile(ckpt_path, run_models_dir / f"{run_name}_best_val.pt")
             print(
-                f"[latent_rnn][val] epoch {epoch + 1}: "
+                f"[latent_rnn][val_unseen] epoch {epoch + 1}: "
                 f"loss={val_loss:.4e}, state={val_metrics.get('loss_state', float('nan')):.4e}"
             )
 
-    if final_rollout_all_validation and val_trajs:
+    final_val_trajs = [*val_trajs, *val_seen_trajs]
+    if final_rollout_all_validation and final_val_trajs:
         print("Final latent_rnn validation rollout (all trajectories) started.")
         final_start = time.perf_counter()
         eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -1447,7 +1517,7 @@ def train(config: Config, config_name: str) -> None:
         avg_metrics: dict[str, float] = {}
         metrics_list: list[dict[str, float]] = []
         ur_values: list[float] = []
-        for traj in val_trajs:
+        for traj in final_val_trajs:
             result = _latent_rollout_validation_case(
                 model=eval_model,
                 traj=traj,
@@ -1476,7 +1546,12 @@ def train(config: Config, config_name: str) -> None:
                 values = [float(metrics[key]) for metrics in metrics_list if key in metrics and np.isfinite(float(metrics[key]))]
                 if values:
                     avg_metrics[key] = float(np.mean(values))
-            summary_lines = [f"Final rollout over {len(metrics_list)} validation trajectories:"]
+            summary_lines = [
+                (
+                    f"Final rollout over {len(metrics_list)} validation trajectories "
+                    f"(val_unseen={len(val_trajs)}, val_seen={len(val_seen_trajs)}):"
+                )
+            ]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
