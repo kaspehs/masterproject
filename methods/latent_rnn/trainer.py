@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
 
 from core.logging import setup_writer
 from core.optim import setup_optimizer_and_scheduler
@@ -26,14 +27,25 @@ from core.runtime import (
     setup_amp,
 )
 from HNN_helper import (
+    FORCE_MAPPING_NRMSE_KEY,
     Config,
+    ROLLOUT_DIVERGED_COUNT_KEY,
+    ROLLOUT_DIVERGED_KEY,
     ODEPirateNet,
     Residual,
     _activation_factory,
     _default_mlp_kwargs,
     _default_residual_kwargs,
+    compute_validation_metrics,
+    create_zoom_mask,
+    log_area_normalized_rollout_spectra,
+    log_displacement_plots,
+    log_final_rollout_errors_vs_ur,
+    log_force_plots,
     resolve_cut_start_seconds,
     resolve_phnn_input_scaling_mode,
+    sample_indices_per_ur,
+    sample_one_index_per_ur,
     structural_step_constant_force_torch,
 )
 from methods.hnn.trainer import (
@@ -745,6 +757,246 @@ def _latent_losses_from_batch(
     }
 
 
+def _trajectory_mass_key(mass_source: str) -> str:
+    return "dry_mass_kg" if str(mass_source).strip().lower() == "dry" else "effective_mass_kg"
+
+
+def _latent_force_scale_numpy(
+    *,
+    model: LatentRNNForceModel,
+    traj: dict[str, np.ndarray],
+    mass_value: float,
+    stiffness_value: float,
+    sl: slice,
+) -> np.ndarray:
+    n = int(np.asarray(traj["t"])[sl].reshape(-1).shape[0])
+    if n <= 0:
+        return np.asarray([], dtype=float)
+    if str(model.force_output) == "coefficient":
+        if str(model.input_scaling_mode) == "convective":
+            u = np.asarray(traj["flow_speed"], dtype=float).reshape(-1)[sl]
+        else:
+            omega_n = math.sqrt(float(stiffness_value) / max(float(mass_value), np.finfo(float).eps))
+            f_n = omega_n / (2.0 * math.pi)
+            ur = np.asarray(traj["ur"], dtype=float).reshape(-1)[sl]
+            u = ur * f_n * float(model.D)
+        return np.clip(0.5 * float(model.rho) * float(model.D) * (u * u), 1.0e-12, None)
+    return np.full((n,), max(1.0e-12, float(stiffness_value) * float(model.D)), dtype=float)
+
+
+def _latent_rollout_validation_case(
+    *,
+    model: LatentRNNForceModel,
+    traj: dict[str, np.ndarray],
+    encoder_length: int,
+    include_acceleration: bool,
+    mass_source: str,
+    input_scaling_mode: str,
+    ur_scale: float,
+    device: torch.device,
+) -> dict[str, Any]:
+    enc_len = int(encoder_length)
+    t_np = np.asarray(traj["t"], dtype=float).reshape(-1)
+    if t_np.shape[0] <= enc_len:
+        return {}
+    context_end = enc_len - 1
+    steps = int(t_np.shape[0] - enc_len)
+    if steps < 1:
+        return {}
+
+    mass_value = float(np.asarray(traj[_trajectory_mass_key(mass_source)]).reshape(()))
+    damping_value = float(np.asarray(traj["damping_c"]).reshape(()))
+    stiffness_value = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+    y = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().unsqueeze(1)
+    dy = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().unsqueeze(1)
+    z = torch.cat([y, dy * float(mass_value)], dim=1)
+    history_features = _history_features_from_traj(
+        traj,
+        mass=mass_value,
+        stiffness=stiffness_value,
+        input_scaling_mode=input_scaling_mode,
+        diameter=float(model.D),
+        ur_scale=ur_scale,
+        include_acceleration=include_acceleration,
+    )
+    history = history_features[:enc_len].unsqueeze(0).to(device)
+    z0 = z[context_end : context_end + 1].to(device)
+    t_seq = torch.from_numpy(np.ascontiguousarray(t_np[context_end:])).float().unsqueeze(0).to(device)
+    ur0 = torch.tensor([[float(np.asarray(traj["ur"], dtype=float).reshape(-1)[context_end])]], dtype=torch.float32, device=device)
+    flow0 = torch.tensor(
+        [[float(np.asarray(traj["flow_speed"], dtype=float).reshape(-1)[context_end])]],
+        dtype=torch.float32,
+        device=device,
+    )
+    mass_t = torch.tensor([[mass_value]], dtype=torch.float32, device=device)
+    damping_t = torch.tensor([[damping_value]], dtype=torch.float32, device=device)
+    stiffness_t = torch.tensor([[stiffness_value]], dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        rollout = model.rollout(
+            history=history,
+            z0=z0,
+            t_seq=t_seq,
+            ur=ur0,
+            mass=mass_t,
+            damping_c=damping_t,
+            stiffness=stiffness_t,
+            flow_speed=flow0,
+        )
+    z_pred = rollout["z"][0].detach().cpu()
+    force_pred = rollout["force"][0, :, 0].detach().cpu().numpy()
+    post_slice = slice(context_end + 1, None)
+    t_post = t_np[post_slice]
+    y_true_post = np.asarray(traj["y"], dtype=float).reshape(-1)[post_slice]
+    dy_true_post = np.asarray(traj["dy"], dtype=float).reshape(-1)[post_slice]
+    force_true_post = np.asarray(traj["force_per_m"], dtype=float).reshape(-1)[post_slice]
+    y_pred_post = z_pred[1:, 0].numpy()
+    v_pred_post = (z_pred[1:, 1] / float(mass_value)).numpy()
+    omega = math.sqrt(float(stiffness_value) / max(float(mass_value), np.finfo(float).eps))
+    rollout_for_metrics = {
+        "y_norm": y_pred_post / float(model.D),
+        "p_norm": v_pred_post / max(omega * float(model.D), 1.0e-12),
+        "force_total": force_pred,
+    }
+    dt_value = float(np.median(np.diff(t_post))) if t_post.shape[0] > 1 else float(np.median(np.diff(t_np)))
+    y_t = torch.from_numpy(np.ascontiguousarray(y_true_post)).float()
+    dy_t = torch.from_numpy(np.ascontiguousarray(dy_true_post)).float()
+    ur_post = torch.from_numpy(np.ascontiguousarray(np.asarray(traj["ur"], dtype=float).reshape(-1)[post_slice])).float()
+    metrics = compute_validation_metrics(
+        model=model,
+        y_data_t=y_t,
+        val_vel=dy_t,
+        reduced_velocity=ur_post,
+        m_eff=mass_value,
+        dt=dt_value,
+        t=t_post,
+        y_data_raw=y_true_post,
+        force_data=force_true_post,
+        D=float(model.D),
+        k=stiffness_value,
+        device=device,
+        rollout=rollout_for_metrics,
+    )
+    force_std = float(np.std(force_true_post))
+    if force_pred.size > 1 and force_true_post.size > 1 and np.isfinite(force_std) and force_std > 0.0:
+        n_force = min(int(force_pred.size), int(force_true_post.size))
+        metrics[FORCE_MAPPING_NRMSE_KEY] = float(
+            np.sqrt(np.mean((force_pred[:n_force] - force_true_post[:n_force]) ** 2)) / force_std
+        )
+
+    force_scale = _latent_force_scale_numpy(
+        model=model,
+        traj=traj,
+        mass_value=mass_value,
+        stiffness_value=stiffness_value,
+        sl=post_slice,
+    )
+    plot_len = int(min(t_post.size, y_true_post.size, y_pred_post.size, force_true_post.size, force_pred.size, force_scale.size))
+    return {
+        "metrics": metrics,
+        "t": t_post[:plot_len],
+        "dt": dt_value,
+        "ur": float(np.asarray(traj["ur"], dtype=float).reshape(-1)[context_end]),
+        "y_true_norm": y_true_post[:plot_len] / float(model.D),
+        "y_pred_norm": y_pred_post[:plot_len] / float(model.D),
+        "p_pred_norm": rollout_for_metrics["p_norm"][:plot_len],
+        "force_true_coeff": force_true_post[:plot_len] / force_scale[:plot_len],
+        "force_pred_coeff": force_pred[:plot_len] / force_scale[:plot_len],
+    }
+
+
+def _log_latent_rollout_validation(
+    *,
+    writer: SummaryWriter,
+    epoch: int,
+    model: LatentRNNForceModel,
+    traj: dict[str, np.ndarray],
+    encoder_length: int,
+    include_acceleration: bool,
+    mass_source: str,
+    input_scaling_mode: str,
+    ur_scale: float,
+    device: torch.device,
+    tag_prefix: str = "val/rollout",
+    step: int | None = None,
+    log_metrics: bool = True,
+    log_plots: bool = True,
+    log_spectra: bool = False,
+    title_suffix: str = "",
+) -> dict[str, float]:
+    result = _latent_rollout_validation_case(
+        model=model,
+        traj=traj,
+        encoder_length=encoder_length,
+        include_acceleration=include_acceleration,
+        mass_source=mass_source,
+        input_scaling_mode=input_scaling_mode,
+        ur_scale=ur_scale,
+        device=device,
+    )
+    if not result:
+        return {}
+    metrics = dict(result["metrics"])
+    tensorboard_step = epoch + 1 if step is None else step
+    if log_metrics:
+        for name, value in metrics.items():
+            if name == ROLLOUT_DIVERGED_KEY:
+                continue
+            value_f = float(value)
+            if np.isfinite(value_f):
+                writer.add_scalar(f"val/{name}", value_f, tensorboard_step)
+    if not log_plots:
+        return metrics
+    t_plot = np.asarray(result["t"], dtype=float).reshape(-1)
+    if t_plot.size < 2:
+        return metrics
+    zoom_mask = create_zoom_mask(t_plot)
+    log_displacement_plots(
+        writer,
+        epoch,
+        t_plot,
+        np.asarray(result["y_true_norm"], dtype=float),
+        np.asarray(result["y_pred_norm"], dtype=float),
+        np.asarray(result["p_pred_norm"], dtype=float),
+        zoom_mask,
+        reduced_velocity=float(result["ur"]),
+        tag_prefix=tag_prefix,
+        step=step,
+        title_suffix=title_suffix,
+        log_spectra=log_spectra,
+    )
+    log_force_plots(
+        writer,
+        epoch,
+        t_plot,
+        np.asarray(result["force_pred_coeff"], dtype=float),
+        np.asarray(result["force_true_coeff"], dtype=float),
+        zoom_mask,
+        reduced_velocity=float(result["ur"]),
+        tag_prefix=tag_prefix,
+        step=step,
+        title_suffix=title_suffix,
+        log_spectra=log_spectra,
+    )
+    if log_spectra:
+        log_area_normalized_rollout_spectra(
+            writer,
+            epoch,
+            disp_t=t_plot,
+            disp_true=np.asarray(result["y_true_norm"], dtype=float),
+            disp_pred=np.asarray(result["y_pred_norm"], dtype=float),
+            force_t=t_plot,
+            force_true=np.asarray(result["force_true_coeff"], dtype=float),
+            force_pred=np.asarray(result["force_pred_coeff"], dtype=float),
+            reduced_velocity=float(result["ur"]),
+            force_baseline=None,
+            tag=f"{tag_prefix}_spectra",
+            step=step,
+            title_suffix=title_suffix,
+        )
+    return metrics
+
+
 def _resolve_latent_time_scale(raw: Any, *, train_trajs: list[dict[str, np.ndarray]]) -> float:
     key = str(raw).strip().lower()
     if key in {"", "auto", "median_dt"}:
@@ -1047,7 +1299,6 @@ def train(config: Config, config_name: str) -> None:
                 "loss_rollout_det": losses["trajectory_loss"],
                 "loss_rollout_disp_std": losses["disp_std_loss"],
                 "loss_rollout_spectral": losses["disp_spectral_loss"],
-                "loss_force_data": losses["force_data_loss"],
             }.items():
                 sums[name] = sums.get(name, value.detach().new_zeros(())) + value.detach() * batch_size
         denom = float(max(1, count))
@@ -1061,6 +1312,8 @@ def train(config: Config, config_name: str) -> None:
     validate_every = max(1, int(getattr(monitoring_cfg, "validate_every_epochs", 1)))
     print_every = max(1, int(getattr(monitoring_cfg, "print_every_epochs", 1)))
     log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
+    validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+    final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
 
     for epoch in range(epochs):
         if bool(optim_cfg.use_lr_scheduler):
@@ -1084,10 +1337,80 @@ def train(config: Config, config_name: str) -> None:
                 f"spectral={train_metrics.get('loss_rollout_spectral', float('nan')):.4e}"
             )
         if val_loader is not None and ((epoch + 1) % validate_every == 0 or epoch == epochs - 1):
+            validation_start = time.perf_counter()
             val_metrics = _run_epoch(val_loader, train_mode=False)
             for name, value in val_metrics.items():
-                writer.add_scalar(f"val_unseen/{name}", value, epoch + 1)
+                writer.add_scalar(f"val/{name}", value, epoch + 1)
             val_loss = val_metrics.get("loss_total", float("inf"))
+            eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            eval_model.eval()
+            if val_trajs:
+                ur_for_sampling = [
+                    float(np.asarray(traj["ur"], dtype=float).reshape(-1)[0])
+                    for traj in val_trajs
+                    if np.asarray(traj["ur"], dtype=float).reshape(-1).size > 0
+                ]
+                sampled_indices = sample_indices_per_ur(
+                    ur_for_sampling,
+                    samples_per_ur=validation_samples_per_ur,
+                    seed=1,
+                )
+                metrics_sum: dict[str, float] = {}
+                metrics_count = 0
+                diverged_count = 0
+                for idx in sampled_indices:
+                    if idx >= len(val_trajs):
+                        continue
+                    rollout_metrics = _latent_rollout_validation_case(
+                        model=eval_model,
+                        traj=val_trajs[idx],
+                        encoder_length=encoder_length,
+                        include_acceleration=include_acceleration,
+                        mass_source=mass_source,
+                        input_scaling_mode=input_scaling_mode,
+                        ur_scale=ur_scale,
+                        device=device,
+                    ).get("metrics", {})
+                    if not rollout_metrics:
+                        continue
+                    diverged_flag = float(rollout_metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+                    if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                        diverged_count += 1
+                    for name, value in rollout_metrics.items():
+                        if name == ROLLOUT_DIVERGED_KEY:
+                            continue
+                        value_f = float(value)
+                        if np.isfinite(value_f):
+                            metrics_sum[name] = metrics_sum.get(name, 0.0) + value_f
+                    metrics_count += 1
+                if metrics_count > 0:
+                    for name, total in metrics_sum.items():
+                        writer.add_scalar(f"val/{name}", total / float(metrics_count), epoch + 1)
+                    writer.add_scalar(f"val/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
+
+                selected_indices = sample_one_index_per_ur(ur_for_sampling, seed=0)
+                if not selected_indices:
+                    selected_indices = [0]
+                rollout_idx = int(selected_indices[0])
+                if 0 <= rollout_idx < len(val_trajs):
+                    _log_latent_rollout_validation(
+                        writer=writer,
+                        epoch=epoch,
+                        model=eval_model,
+                        traj=val_trajs[rollout_idx],
+                        encoder_length=encoder_length,
+                        include_acceleration=include_acceleration,
+                        mass_source=mass_source,
+                        input_scaling_mode=input_scaling_mode,
+                        ur_scale=ur_scale,
+                        device=device,
+                        tag_prefix="val/rollout",
+                        step=epoch + 1,
+                        log_metrics=False,
+                        log_plots=True,
+                        log_spectra=False,
+                    )
+            writer.add_scalar("val/validation_wall_time_s", float(time.perf_counter() - validation_start), epoch + 1)
             ckpt_path = run_models_dir / f"{run_name}_epoch{epoch + 1:04d}.pt"
             state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
             payload = {
@@ -1108,6 +1431,57 @@ def train(config: Config, config_name: str) -> None:
                 f"[latent_rnn][val] epoch {epoch + 1}: "
                 f"loss={val_loss:.4e}, state={val_metrics.get('loss_state', float('nan')):.4e}"
             )
+
+    if final_rollout_all_validation and val_trajs:
+        print("Final latent_rnn validation rollout (all trajectories) started.")
+        final_start = time.perf_counter()
+        eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+        eval_model.eval()
+        avg_metrics: dict[str, float] = {}
+        metrics_list: list[dict[str, float]] = []
+        ur_values: list[float] = []
+        for traj in val_trajs:
+            result = _latent_rollout_validation_case(
+                model=eval_model,
+                traj=traj,
+                encoder_length=encoder_length,
+                include_acceleration=include_acceleration,
+                mass_source=mass_source,
+                input_scaling_mode=input_scaling_mode,
+                ur_scale=ur_scale,
+                device=device,
+            )
+            metrics = dict(result.get("metrics", {}))
+            if not metrics:
+                continue
+            metrics_list.append(metrics)
+            ur_values.append(float(result.get("ur", np.asarray(traj["ur"], dtype=float).reshape(-1)[0])))
+        if metrics_list:
+            metric_keys = sorted(
+                {
+                    key
+                    for metrics in metrics_list
+                    for key, value in metrics.items()
+                    if key != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+                }
+            )
+            for key in metric_keys:
+                values = [float(metrics[key]) for metrics in metrics_list if key in metrics and np.isfinite(float(metrics[key]))]
+                if values:
+                    avg_metrics[key] = float(np.mean(values))
+            summary_lines = [f"Final rollout over {len(metrics_list)} validation trajectories:"]
+            for name in sorted(avg_metrics):
+                summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
+                writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
+            writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
+            log_final_rollout_errors_vs_ur(
+                writer,
+                ur_values,
+                metrics_list,
+                epochs,
+            )
+        writer.add_scalar("final_val/rollout_wall_time_s", float(time.perf_counter() - final_start), epochs)
+        print(f"Final latent_rnn validation rollout finished in {time.perf_counter() - final_start:.2f}s.")
 
     state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
     final_path = Path("models") / f"{run_name}.pt"
