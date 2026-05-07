@@ -196,6 +196,84 @@ def resolve_td_force_input_source(
     )
 
 
+def td_uses_head_specific_input_configs(*, correction_mode: str, shared_td_correction_trunk: bool) -> bool:
+    flags = td_correction_mode_flags(correction_mode)
+    return bool(flags["mean_active"] and flags["fhat_active"] and not shared_td_correction_trunk)
+
+
+def _resolve_td_single_input_config(base_cfg: dict[str, Any], head_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = dict(base_cfg)
+    if head_cfg:
+        cfg.update(head_cfg)
+    if head_cfg and "use_td_force_input" in head_cfg and "td_force_input_source" not in head_cfg:
+        td_force_raw = head_cfg["use_td_force_input"]
+    else:
+        td_force_raw = cfg.get("td_force_input_source", cfg.get("use_td_force_input", False))
+    if head_cfg and "use_phi_input" in head_cfg and "phi_input_source" not in head_cfg and "phase_input_source" not in head_cfg:
+        phase_raw = head_cfg["use_phi_input"]
+    else:
+        phase_raw = cfg.get("phase_input_source", None)
+        if phase_raw is None:
+            phase_raw = cfg.get("phi_input_source", None)
+        if phase_raw is None:
+            phase_raw = cfg.get("use_phi_input", False)
+    td_force_input_source = resolve_td_force_input_source(td_force_raw)
+    phase_input_source = resolve_td_phase_input_source(phase_raw)
+    return {
+        "use_td_force_input": td_force_input_source != "none",
+        "td_force_input_source": td_force_input_source,
+        "use_td_fhat_input": bool(cfg.get("use_td_fhat_input", False)),
+        "use_acceleration_input": bool(cfg.get("use_acceleration_input", False)),
+        "use_phi_input": phase_input_source != "none",
+        "phase_input_source": phase_input_source,
+        "phi_input_source": None if phase_input_source == "none" else phase_input_source,
+        "use_sigma_inputs": bool(cfg.get("use_sigma_inputs", False)),
+    }
+
+
+def resolve_td_input_configs(
+    method_cfg: dict[str, Any],
+    *,
+    shared_td_correction_trunk: bool,
+) -> dict[str, dict[str, Any]]:
+    correction_mode = resolve_td_correction_mode(method_cfg)
+    base_cfg = {
+        "use_td_force_input": method_cfg.get("use_td_force_input", False),
+        "use_td_fhat_input": method_cfg.get("use_td_fhat_input", False),
+        "use_acceleration_input": method_cfg.get("use_acceleration_input", False),
+        "use_phi_input": method_cfg.get("use_phi_input", False),
+        "phi_input_source": method_cfg.get("phi_input_source", None),
+        "use_sigma_inputs": method_cfg.get("use_sigma_inputs", False),
+    }
+    base_resolved = _resolve_td_single_input_config(base_cfg)
+    resolved = {
+        "mean": dict(base_resolved),
+        "fhat": dict(base_resolved),
+        "sigma": dict(base_resolved),
+    }
+    if not td_uses_head_specific_input_configs(
+        correction_mode=correction_mode,
+        shared_td_correction_trunk=shared_td_correction_trunk,
+    ):
+        return resolved
+
+    raw_input_configs = method_cfg.get("input_configs", None)
+    if raw_input_configs is None:
+        return resolved
+    if not isinstance(raw_input_configs, dict):
+        raise ValueError("hnn.input_configs must be a mapping with optional 'mean' and 'fhat' entries.")
+    for head in ("mean", "fhat"):
+        raw_head = raw_input_configs.get(head, None)
+        if raw_head is None:
+            continue
+        if not isinstance(raw_head, dict):
+            raise ValueError(f"hnn.input_configs.{head} must be a mapping.")
+        resolved[head] = _resolve_td_single_input_config(base_cfg, dict(raw_head))
+    # Sigma is force-correction uncertainty; keep it aligned with the mean head.
+    resolved["sigma"] = dict(resolved["mean"])
+    return resolved
+
+
 def td_predict_sigma_from_mode(method_cfg: dict[str, Any]) -> bool:
     return bool(td_correction_mode_flags(resolve_td_correction_mode(method_cfg))["sigma_active"])
 
@@ -2074,6 +2152,7 @@ class PHVIV(nn.Module):
         force_net_type: str | None = None,
         hard_force_symmetry: bool = False,
         shared_td_correction_trunk: bool = False,
+        input_configs: dict[str, dict[str, Any]] | None = None,
         arch_pirate_force_kwargs: dict[str, Any] | None = None,
         residual_kwargs: dict[str, Any] | None = None,
         mlp_kwargs: dict[str, Any] | None = None,
@@ -2102,15 +2181,53 @@ class PHVIV(nn.Module):
             self.coefficient_output_bound = coefficient_output_bound_val
         self.input_scaling_mode = resolve_phnn_input_scaling_mode(input_scaling_mode)
         self.use_reduced_velocity = bool(use_reduced_velocity)
-        self.use_td_force_input = bool(use_td_force_input)
-        self.use_td_fhat_input = bool(use_td_fhat_input)
-        self.use_acceleration_input = bool(use_acceleration_input)
+        self.shared_td_correction_trunk = bool(shared_td_correction_trunk)
         resolved_phase_input_source = resolve_td_phase_input_source(
             use_phi_input if phi_input_source is None else phi_input_source
         )
-        self.use_phi_input = resolved_phase_input_source != "none"
-        self.phi_input_source = None if not self.use_phi_input else resolved_phase_input_source
-        self.use_sigma_inputs = bool(use_sigma_inputs)
+        legacy_input_cfg = {
+            "use_td_force_input": bool(use_td_force_input),
+            "use_td_fhat_input": bool(use_td_fhat_input),
+            "use_acceleration_input": bool(use_acceleration_input),
+            "use_phi_input": resolved_phase_input_source != "none",
+            "phi_input_source": None if resolved_phase_input_source == "none" else resolved_phase_input_source,
+            "use_sigma_inputs": bool(use_sigma_inputs),
+        }
+        if input_configs is None:
+            self.td_input_configs = {
+                "mean": dict(legacy_input_cfg),
+                "fhat": dict(legacy_input_cfg),
+                "sigma": dict(legacy_input_cfg),
+            }
+        else:
+            self.td_input_configs = {
+                "mean": dict(input_configs.get("mean", legacy_input_cfg)),
+                "fhat": dict(input_configs.get("fhat", legacy_input_cfg)),
+                "sigma": dict(input_configs.get("sigma", input_configs.get("mean", legacy_input_cfg))),
+            }
+        for head_cfg in self.td_input_configs.values():
+            force_raw = head_cfg.get("td_force_input_source", head_cfg.get("use_td_force_input", False))
+            phase_raw = head_cfg.get("phase_input_source", None)
+            if phase_raw is None:
+                phase_raw = head_cfg.get("phi_input_source", None)
+            if phase_raw is None:
+                phase_raw = head_cfg.get("use_phi_input", False)
+            force_source = resolve_td_force_input_source(force_raw)
+            phase_source = resolve_td_phase_input_source(phase_raw)
+            head_cfg["use_td_force_input"] = force_source != "none"
+            head_cfg["td_force_input_source"] = force_source
+            head_cfg["use_td_fhat_input"] = bool(head_cfg.get("use_td_fhat_input", False))
+            head_cfg["use_acceleration_input"] = bool(head_cfg.get("use_acceleration_input", False))
+            head_cfg["use_phi_input"] = phase_source != "none"
+            head_cfg["phase_input_source"] = phase_source
+            head_cfg["phi_input_source"] = None if phase_source == "none" else phase_source
+            head_cfg["use_sigma_inputs"] = bool(head_cfg.get("use_sigma_inputs", False))
+        self.use_td_force_input = any(bool(cfg["use_td_force_input"]) for cfg in self.td_input_configs.values())
+        self.use_td_fhat_input = any(bool(cfg["use_td_fhat_input"]) for cfg in self.td_input_configs.values())
+        self.use_acceleration_input = any(bool(cfg["use_acceleration_input"]) for cfg in self.td_input_configs.values())
+        self.use_phi_input = any(bool(cfg["use_phi_input"]) for cfg in self.td_input_configs.values())
+        self.phi_input_source = self.td_input_configs["mean"]["phi_input_source"]
+        self.use_sigma_inputs = any(bool(cfg["use_sigma_inputs"]) for cfg in self.td_input_configs.values())
         self.hard_force_symmetry = bool(hard_force_symmetry)
         if self.hard_force_symmetry and (
             self.use_td_force_input
@@ -2134,18 +2251,22 @@ class PHVIV(nn.Module):
             raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
         self.register_buffer("ur_scale", torch.tensor(ur_scale_val, dtype=torch.float32))
         self.base_feature_dim = 2
-        self.force_input_dim = (
-            self.base_feature_dim
-            + (1 if self.use_reduced_velocity else 0)
-            + (1 if self.use_td_force_input else 0)
-            + (1 if self.use_td_fhat_input else 0)
-            + _td_hidden_input_dim(
-                use_phi_input=self.use_phi_input,
-                use_sigma_inputs=self.use_sigma_inputs,
-                use_acceleration_input=self.use_acceleration_input,
-                phase_input_source=(self.phi_input_source if self.use_phi_input else False),
+        self.force_input_dim_by_head = {
+            head: (
+                self.base_feature_dim
+                + (1 if self.use_reduced_velocity else 0)
+                + (1 if bool(head_cfg["use_td_force_input"]) else 0)
+                + (1 if bool(head_cfg["use_td_fhat_input"]) else 0)
+                + _td_hidden_input_dim(
+                    use_phi_input=bool(head_cfg["use_phi_input"]),
+                    use_sigma_inputs=bool(head_cfg["use_sigma_inputs"]),
+                    use_acceleration_input=bool(head_cfg["use_acceleration_input"]),
+                    phase_input_source=(head_cfg["phase_input_source"] if bool(head_cfg["use_phi_input"]) else False),
+                )
             )
-        )
+            for head, head_cfg in self.td_input_configs.items()
+        }
+        self.force_input_dim = int(self.force_input_dim_by_head["mean"])
 
         residual_cfg = _default_residual_kwargs()
         if residual_kwargs:
@@ -2178,7 +2299,9 @@ class PHVIV(nn.Module):
         self.fourier_features = int(fourier_features)
         self.fourier_sigma = float(fourier_sigma)
         self.force_embed = None
+        self.force_embeds = nn.ModuleDict()
         base_force_dim = self.force_input_dim
+        force_in_features_by_head = {head: int(dim) for head, dim in self.force_input_dim_by_head.items()}
         force_in_features = base_force_dim
         selected_net = force_net_type if force_net_type not in (None, "") else "residual"
         net_type = str(selected_net).lower()
@@ -2187,18 +2310,27 @@ class PHVIV(nn.Module):
             raise ValueError(f"force_net_type must be one of {valid_types}, got '{force_net_type}'.")
         self.use_pirate_force = net_type == "pirate"
         self.residual_net = net_type == "residual"
-        self.shared_td_correction_trunk = bool(shared_td_correction_trunk)
         if self.use_fourier_features:
             if self.fourier_features < 1:
                 raise ValueError("fourier_features must be >= 1 when use_fourier_features is True")
             if not self.use_pirate_force:
-                self.force_embed = FourierFeatures(
-                    in_dim=base_force_dim,
-                    out_features=self.fourier_features,
-                    sigma=self.fourier_sigma,
-                    dtype=torch.float32,
-                )
-                force_in_features = 2 * self.fourier_features
+                if self.shared_td_correction_trunk:
+                    self.force_embed = FourierFeatures(
+                        in_dim=base_force_dim,
+                        out_features=self.fourier_features,
+                        sigma=self.fourier_sigma,
+                        dtype=torch.float32,
+                    )
+                    force_in_features = 2 * self.fourier_features
+                else:
+                    for head, input_dim in force_in_features_by_head.items():
+                        self.force_embeds[head] = FourierFeatures(
+                            in_dim=input_dim,
+                            out_features=self.fourier_features,
+                            sigma=self.fourier_sigma,
+                            dtype=torch.float32,
+                        )
+                        force_in_features_by_head[head] = 2 * self.fourier_features
 
         def _build_pirate_args(input_size: int) -> dict[str, Any]:
             pirate_cfg = dict(arch_pirate_force_kwargs or {})
@@ -2259,10 +2391,10 @@ class PHVIV(nn.Module):
             self.sigma_net = nn.Linear(td_corr_head_dim, 1) if self.use_stochastic_process_noise else None
         else:
             self.td_corr_shared_trunk = None
-            self.u_base_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
-            self.fhat_net = _build_scalar_net(force_in_features, use_selected_backbone=True)
+            self.u_base_net = _build_scalar_net(force_in_features_by_head["mean"], use_selected_backbone=True)
+            self.fhat_net = _build_scalar_net(force_in_features_by_head["fhat"], use_selected_backbone=True)
             self.sigma_net = (
-                _build_scalar_net(force_in_features, use_selected_backbone=True)
+                _build_scalar_net(force_in_features_by_head["sigma"], use_selected_backbone=True)
                 if self.use_stochastic_process_noise
                 else None
             )
@@ -2322,6 +2454,10 @@ class PHVIV(nn.Module):
         shared_td_correction_trunk = bool(arch_cfg.get("shared_td_correction_trunk", False))
         if correction_mode_raw is None or str(correction_mode_raw).strip() == "":
             shared_td_correction_trunk = False
+        input_configs = resolve_td_input_configs(
+            dict(cfg),
+            shared_td_correction_trunk=shared_td_correction_trunk,
+        )
         force_net_type = arch_cfg.get("force_net_type")
         hard_force_symmetry = bool(arch_cfg.get("hard_force_symmetry", False))
         use_fourier_features = bool(arch_cfg.get("use_fourier_features", False))
@@ -2373,6 +2509,7 @@ class PHVIV(nn.Module):
             force_net_type=force_net_type,
             hard_force_symmetry=hard_force_symmetry,
             shared_td_correction_trunk=shared_td_correction_trunk,
+            input_configs=input_configs,
             arch_pirate_force_kwargs=pirate_arch_kwargs,
             residual_kwargs=residual_kwargs,
             mlp_kwargs=mlp_kwargs,
@@ -2494,14 +2631,19 @@ class PHVIV(nn.Module):
         phi_input: torch.Tensor | np.ndarray | None = None,
         sigma_inputs: torch.Tensor | np.ndarray | None = None,
         td_force_scale: torch.Tensor | None = None,
+        head: str = "mean",
     ):
+        head_key = str(head)
+        if head_key not in self.td_input_configs:
+            head_key = "mean"
+        input_cfg = self.td_input_configs[head_key]
         base_features = self._base_features(x)
         if self.use_reduced_velocity:
             rv = self._prepare_reduced_velocity(reduced_velocity, like=base_features)
             base_features = torch.cat([base_features, rv], dim=-1)
-        if self.use_td_force_input:
+        if bool(input_cfg["use_td_force_input"]):
             if td_force_input is None:
-                raise ValueError("td_force_input is required when model.use_td_force_input is enabled.")
+                raise ValueError(f"td_force_input is required when {head_key} head use_td_force_input is enabled.")
             if torch.is_tensor(td_force_input):
                 td_force = td_force_input.to(device=base_features.device, dtype=base_features.dtype)
             else:
@@ -2522,9 +2664,9 @@ class PHVIV(nn.Module):
                 min=1e-12,
             )
             base_features = torch.cat([base_features, td_force_feat], dim=-1)
-        if self.use_td_fhat_input:
+        if bool(input_cfg["use_td_fhat_input"]):
             if td_fhat_input is None:
-                raise ValueError("td_fhat_input is required when model.use_td_fhat_input is enabled.")
+                raise ValueError(f"td_fhat_input is required when {head_key} head use_td_fhat_input is enabled.")
             if torch.is_tensor(td_fhat_input):
                 td_fhat = td_fhat_input.to(device=base_features.device, dtype=base_features.dtype)
             else:
@@ -2536,9 +2678,9 @@ class PHVIV(nn.Module):
             if td_fhat.shape[:-1] != base_features.shape[:-1]:
                 td_fhat = td_fhat.expand(base_features.shape[:-1] + (1,))
             base_features = torch.cat([base_features, td_fhat], dim=-1)
-        if self.use_acceleration_input:
+        if bool(input_cfg["use_acceleration_input"]):
             if acceleration_input is None:
-                raise ValueError("acceleration_input is required when model.use_acceleration_input is enabled.")
+                raise ValueError(f"acceleration_input is required when {head_key} head use_acceleration_input is enabled.")
             accel_feat = (
                 acceleration_input
                 if torch.is_tensor(acceleration_input)
@@ -2552,12 +2694,12 @@ class PHVIV(nn.Module):
             if accel_feat.shape[:-1] != base_features.shape[:-1]:
                 accel_feat = accel_feat.expand(base_features.shape[:-1] + (1,))
             base_features = torch.cat([base_features, accel_feat], dim=-1)
-        if self.use_phi_input:
+        if bool(input_cfg["use_phi_input"]):
             if phi_input is None:
-                raise ValueError("phi_input is required when model.use_phi_input is enabled.")
+                raise ValueError(f"phi_input is required when {head_key} head use_phi_input is enabled.")
             phi_feat = phi_input if torch.is_tensor(phi_input) else torch.as_tensor(phi_input, device=base_features.device, dtype=base_features.dtype)
             phi_feat = phi_feat.to(device=base_features.device, dtype=base_features.dtype)
-            expected_phi_dim = td_phase_input_dim(self.phi_input_source if self.use_phi_input else False)
+            expected_phi_dim = td_phase_input_dim(input_cfg["phase_input_source"])
             if phi_feat.ndim == 1 and base_features.ndim == 2 and phi_feat.shape[0] == expected_phi_dim:
                 phi_feat = phi_feat.view(1, expected_phi_dim)
             if phi_feat.ndim != base_features.ndim or phi_feat.shape[-1] != expected_phi_dim:
@@ -2567,9 +2709,9 @@ class PHVIV(nn.Module):
             if phi_feat.shape[:-1] != base_features.shape[:-1]:
                 phi_feat = phi_feat.expand(base_features.shape[:-1] + (expected_phi_dim,))
             base_features = torch.cat([base_features, phi_feat], dim=-1)
-        if self.use_sigma_inputs:
+        if bool(input_cfg["use_sigma_inputs"]):
             if sigma_inputs is None:
-                raise ValueError("sigma_inputs is required when model.use_sigma_inputs is enabled.")
+                raise ValueError(f"sigma_inputs is required when {head_key} head use_sigma_inputs is enabled.")
             sigma_feat = sigma_inputs if torch.is_tensor(sigma_inputs) else torch.as_tensor(sigma_inputs, device=base_features.device, dtype=base_features.dtype)
             sigma_feat = sigma_feat.to(device=base_features.device, dtype=base_features.dtype)
             if sigma_feat.ndim == 1 and base_features.ndim == 2 and sigma_feat.shape[0] == 2:
@@ -2581,8 +2723,12 @@ class PHVIV(nn.Module):
             base_features = torch.cat([base_features, sigma_feat], dim=-1)
         return base_features
 
-    def _td_correction_head_features(self, base_features: torch.Tensor) -> torch.Tensor:
-        features = self.force_embed(base_features) if self.force_embed is not None else base_features
+    def _td_correction_head_features(self, base_features: torch.Tensor, *, head: str = "mean") -> torch.Tensor:
+        if self.shared_td_correction_trunk:
+            features = self.force_embed(base_features) if self.force_embed is not None else base_features
+        else:
+            embed = self.force_embeds[head] if head in self.force_embeds else None
+            features = embed(base_features) if embed is not None else base_features
         if self.td_corr_shared_trunk is None:
             return features
         return self.td_corr_shared_trunk(features)
@@ -2607,8 +2753,9 @@ class PHVIV(nn.Module):
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
+            head="mean",
         )
-        features = self._td_correction_head_features(base_features)
+        features = self._td_correction_head_features(base_features, head="mean")
         if not self.hard_force_symmetry:
             return self.u_base_net(features)
         neg_base_features = self._force_features(
@@ -2620,8 +2767,9 @@ class PHVIV(nn.Module):
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
+            head="mean",
         )
-        neg_features = self._td_correction_head_features(neg_base_features)
+        neg_features = self._td_correction_head_features(neg_base_features, head="mean")
         return 0.5 * (self.u_base_net(features) - self.u_base_net(neg_features))
 
     def _sigma_net_raw(
@@ -2647,8 +2795,9 @@ class PHVIV(nn.Module):
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
+            head="sigma",
         )
-        features = self._td_correction_head_features(base_features)
+        features = self._td_correction_head_features(base_features, head="sigma")
         if self.sigma_net is None:
             like = x[..., :1]
             return torch.zeros_like(like)
@@ -2674,8 +2823,9 @@ class PHVIV(nn.Module):
             phi_input=phi_input,
             sigma_inputs=sigma_inputs,
             td_force_scale=td_force_scale,
+            head="fhat",
         )
-        features = self._td_correction_head_features(base_features)
+        features = self._td_correction_head_features(base_features, head="fhat")
         return self.fhat_net(features)
 
     def sigma_theta(

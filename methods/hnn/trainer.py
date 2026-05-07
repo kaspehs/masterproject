@@ -70,6 +70,7 @@ from HNN_helper import (
     resolve_td_force_input_source,
     resolve_td_memory_config,
     resolve_td_n_memory_torch,
+    resolve_td_input_configs,
     resolve_phnn_input_scaling_mode,
     rollout_model,
     resolve_td_phase_input_source,
@@ -78,6 +79,7 @@ from HNN_helper import (
     td_bounded_delta_fhat_torch,
     td_baseline_step_torch,
     td_correction_mode_flags,
+    td_uses_head_specific_input_configs,
     td_fhat_active_from_mode,
     td_mean_active_from_mode,
     td_predict_sigma_from_mode,
@@ -484,28 +486,54 @@ def _td_optional_hidden_inputs_for_model(
     velocity: torch.Tensor,
     structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    if not (
-        bool(getattr(model, "use_phi_input", False))
-        or bool(getattr(model, "use_sigma_inputs", False))
-        or bool(getattr(model, "use_acceleration_input", False))
-    ):
-        return None, None, None
-    phase_input_source = _model_phase_input_source(model)
-    phi_input, sigma_inputs, acceleration_input = td_hidden_inputs_from_context_torch(
-        td_context=td_context,
-        structural_mass=structural_mass,
-        stiffness=stiffness,
-        diameter=float(model.D),
-        velocity=velocity,
-        phase_input_source=phase_input_source,
-        input_scaling_mode=getattr(model, "input_scaling_mode", "current"),
-    )
-    return (
-        phi_input if bool(getattr(model, "use_phi_input", False)) else None,
-        sigma_inputs if bool(getattr(model, "use_sigma_inputs", False)) else None,
-        acceleration_input if bool(getattr(model, "use_acceleration_input", False)) else None,
-    )
+) -> dict[str, dict[str, torch.Tensor | None]]:
+    input_configs = getattr(model, "td_input_configs", None)
+    if not isinstance(input_configs, dict):
+        phase_input_source = _model_phase_input_source(model)
+        input_configs = {
+            "mean": {
+                "use_phi_input": bool(getattr(model, "use_phi_input", False)),
+                "phase_input_source": phase_input_source,
+                "use_sigma_inputs": bool(getattr(model, "use_sigma_inputs", False)),
+                "use_acceleration_input": bool(getattr(model, "use_acceleration_input", False)),
+            }
+        }
+    hidden_by_head: dict[str, dict[str, torch.Tensor | None]] = {}
+    cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    for head in ("mean", "fhat", "sigma"):
+        cfg = input_configs.get(head, input_configs.get("mean", {}))
+        uses_phi = bool(cfg.get("use_phi_input", False))
+        uses_sigma = bool(cfg.get("use_sigma_inputs", False))
+        uses_accel = bool(cfg.get("use_acceleration_input", False))
+        if not (uses_phi or uses_sigma or uses_accel):
+            hidden_by_head[head] = {
+                "phi_input": None,
+                "sigma_inputs": None,
+                "acceleration_input": None,
+            }
+            continue
+        phase_input_source = resolve_td_phase_input_source(
+            cfg.get("phase_input_source", cfg.get("phi_input_source", False))
+            if uses_phi
+            else "phi_vy"
+        )
+        if phase_input_source not in cache:
+            cache[phase_input_source] = td_hidden_inputs_from_context_torch(
+                td_context=td_context,
+                structural_mass=structural_mass,
+                stiffness=stiffness,
+                diameter=float(model.D),
+                velocity=velocity,
+                phase_input_source=phase_input_source,
+                input_scaling_mode=getattr(model, "input_scaling_mode", "current"),
+            )
+        phi_input, sigma_inputs, acceleration_input = cache[phase_input_source]
+        hidden_by_head[head] = {
+            "phi_input": phi_input if uses_phi else None,
+            "sigma_inputs": sigma_inputs if uses_sigma else None,
+            "acceleration_input": acceleration_input if uses_accel else None,
+        }
+    return hidden_by_head
 
 
 def _td_predict_outputs(
@@ -513,11 +541,7 @@ def _td_predict_outputs(
     *,
     z: torch.Tensor,
     reduced_velocity: torch.Tensor,
-    td_force_input: torch.Tensor | None,
-    td_fhat_input: torch.Tensor | None,
-    acceleration_input: torch.Tensor | None,
-    phi_input: torch.Tensor | None,
-    sigma_inputs: torch.Tensor | None,
+    head_inputs: dict[str, dict[str, torch.Tensor | None]],
     structural_mass: torch.Tensor | float,
     stiffness: torch.Tensor | float,
     mean_active: bool,
@@ -545,11 +569,11 @@ def _td_predict_outputs(
         raw_force = model._force_net_raw(
             z_model,
             reduced_velocity=reduced_velocity,
-            td_force_input=td_force_input,
-            td_fhat_input=td_fhat_input,
-            acceleration_input=acceleration_input,
-            phi_input=phi_input,
-            sigma_inputs=sigma_inputs,
+            td_force_input=head_inputs["mean"].get("td_force_input"),
+            td_fhat_input=head_inputs["mean"].get("td_fhat_input"),
+            acceleration_input=head_inputs["mean"].get("acceleration_input"),
+            phi_input=head_inputs["mean"].get("phi_input"),
+            sigma_inputs=head_inputs["mean"].get("sigma_inputs"),
             td_force_scale=output_scale,
         )
     raw_force = model._apply_coefficient_output_bound(raw_force)
@@ -561,11 +585,11 @@ def _td_predict_outputs(
             raw_sigma = model._sigma_net_raw(
                 z_model,
                 reduced_velocity=reduced_velocity,
-                td_force_input=td_force_input,
-                td_fhat_input=td_fhat_input,
-                acceleration_input=acceleration_input,
-                phi_input=phi_input,
-                sigma_inputs=sigma_inputs,
+                td_force_input=head_inputs["sigma"].get("td_force_input"),
+                td_fhat_input=head_inputs["sigma"].get("td_fhat_input"),
+                acceleration_input=head_inputs["sigma"].get("acceleration_input"),
+                phi_input=head_inputs["sigma"].get("phi_input"),
+                sigma_inputs=head_inputs["sigma"].get("sigma_inputs"),
                 td_force_scale=output_scale,
             )
             sigma = model.sigma_min.to(device=raw_sigma.device, dtype=raw_sigma.dtype) + F.softplus(raw_sigma)
@@ -578,11 +602,11 @@ def _td_predict_outputs(
         raw_delta_fhat = model._fhat_net_raw(
             z_model,
             reduced_velocity=reduced_velocity,
-            td_force_input=td_force_input,
-            td_fhat_input=td_fhat_input,
-            acceleration_input=acceleration_input,
-            phi_input=phi_input,
-            sigma_inputs=sigma_inputs,
+            td_force_input=head_inputs["fhat"].get("td_force_input"),
+            td_fhat_input=head_inputs["fhat"].get("td_fhat_input"),
+            acceleration_input=head_inputs["fhat"].get("acceleration_input"),
+            phi_input=head_inputs["fhat"].get("phi_input"),
+            sigma_inputs=head_inputs["fhat"].get("sigma_inputs"),
             td_force_scale=output_scale,
         )
     return corr_mu, sigma, raw_delta_fhat, raw_force
@@ -645,26 +669,49 @@ def _td_step_with_corrections(
         params=step_params,
         return_diagnostics=True,
     )
-    phi_input, sigma_inputs, acceleration_input = _td_optional_hidden_inputs_for_model(
+    hidden_inputs_by_head = _td_optional_hidden_inputs_for_model(
         model,
         td_context=td_context,
         velocity=velocity,
         structural_mass=structural_mass,
         stiffness=stiffness,
     )
+    input_configs = getattr(model, "td_input_configs", None)
+    if not isinstance(input_configs, dict):
+        input_configs = {
+            "mean": {
+                "use_td_force_input": td_force_input_source != "none",
+                "td_force_input_source": td_force_input_source,
+                "use_td_fhat_input": bool(getattr(model, "use_td_fhat_input", False)),
+            }
+        }
+        input_configs["fhat"] = dict(input_configs["mean"])
+        input_configs["sigma"] = dict(input_configs["mean"])
+    head_inputs: dict[str, dict[str, torch.Tensor | None]] = {}
+    for head in ("mean", "fhat", "sigma"):
+        cfg = input_configs.get(head, input_configs.get("mean", {}))
+        hidden = hidden_inputs_by_head.get(head, hidden_inputs_by_head.get("mean", {}))
+        force_source = str(cfg.get("td_force_input_source", "none"))
+        head_inputs[head] = {
+            "td_force_input": (
+                _td_force_input_tensor_from_source(
+                    source=force_source,
+                    baseline_force_next=baseline_force_next,
+                    baseline_diag=baseline_diag,
+                )
+                if bool(cfg.get("use_td_force_input", False))
+                else None
+            ),
+            "td_fhat_input": baseline_diag["fhat_td"] if bool(cfg.get("use_td_fhat_input", False)) else None,
+            "acceleration_input": hidden.get("acceleration_input"),
+            "phi_input": hidden.get("phi_input"),
+            "sigma_inputs": hidden.get("sigma_inputs"),
+        }
     corr_mu, sigma_corr, raw_delta_fhat, raw_corr_mu = _td_predict_outputs(
         model,
         z=z,
         reduced_velocity=reduced_velocity,
-        td_force_input=_td_force_input_tensor_from_source(
-            source=td_force_input_source,
-            baseline_force_next=baseline_force_next,
-            baseline_diag=baseline_diag,
-        ),
-        td_fhat_input=(baseline_diag["fhat_td"] if bool(getattr(model, "use_td_fhat_input", False)) else None),
-        acceleration_input=acceleration_input,
-        phi_input=phi_input,
-        sigma_inputs=sigma_inputs,
+        head_inputs=head_inputs,
         structural_mass=structural_mass,
         stiffness=stiffness,
         mean_active=mean_active,
@@ -3653,6 +3700,16 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     mean_active = bool(mode_flags["mean_active"])
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
+    arch_dict = asdict(config.architecture)
+    shared_td_correction_trunk_cfg = bool(arch_dict.get("shared_td_correction_trunk", False))
+    td_input_configs = resolve_td_input_configs(
+        hnn_cfg,
+        shared_td_correction_trunk=shared_td_correction_trunk_cfg,
+    )
+    head_specific_input_configs_active = td_uses_head_specific_input_configs(
+        correction_mode=correction_mode,
+        shared_td_correction_trunk=shared_td_correction_trunk_cfg,
+    )
     td_force_input_source = resolve_td_force_input_source(hnn_cfg.get("use_td_force_input", False))
     use_td_force_input = td_force_input_source != "none"
     use_td_fhat_input = bool(hnn_cfg.get("use_td_fhat_input", False))
@@ -3661,7 +3718,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     )
     use_phi_input = phase_input_source != "none"
     random_phase_training = bool(hnn_cfg.get("random_phase_training", False))
-    if random_phase_training and not _phase_input_source_includes_phi(phase_input_source):
+    effective_phase_sources = [
+        cfg.get("phase_input_source", "none")
+        for cfg in td_input_configs.values()
+        if bool(cfg.get("use_phi_input", False))
+    ]
+    if random_phase_training and (
+        not effective_phase_sources
+        or any(not _phase_input_source_includes_phi(source) for source in effective_phase_sources)
+    ):
         raise ValueError(
             "hnn.random_phase_training=true requires hnn.use_phi_input / hnn.phi_input_source "
             "to include phi_vy (use 'phi_vy' or 'both')."
@@ -3677,7 +3742,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         raise ValueError("hnn.fhat_bound_multiplier must be finite and positive.")
     if init_from_checkpoint is not None and not init_from_checkpoint.exists():
         raise FileNotFoundError(f"hnn.init_from_checkpoint does not exist: '{init_from_checkpoint}'.")
-    if use_td_force_input and fhat_active and correction_mode != "fhat_only":
+    if use_td_force_input and fhat_active and correction_mode != "fhat_only" and not head_specific_input_configs_active:
         raise ValueError(
             "hnn.use_td_force_input with total/fcv input is only supported for correction_mode='fhat_only' among the modes that include fhat correction."
         )
@@ -3793,9 +3858,10 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
     model_dict["use_sigma_inputs"] = use_sigma_inputs
     model_dict["correction_mode"] = correction_mode
-    arch_dict = asdict(config.architecture)
+    model_dict["input_configs"] = td_input_configs
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
     setattr(model, "correction_mode", correction_mode)
+    setattr(model, "td_force_input_source", td_force_input_source)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
     setattr(model, "force_zero_output", force_zero_output)
     setattr(model, "random_phase_training", random_phase_training)
@@ -3931,6 +3997,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 "use_td_force_input": use_td_force_input,
                 "td_force_input_source": td_force_input_source,
                 "use_td_fhat_input": use_td_fhat_input,
+                "input_configs": td_input_configs,
                 "use_phi_input": use_phi_input,
                 "phi_input_source": (None if not use_phi_input else phase_input_source),
                 "use_sigma_inputs": use_sigma_inputs,
@@ -4865,6 +4932,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "use_td_force_input": use_td_force_input,
             "td_force_input_source": td_force_input_source,
             "use_td_fhat_input": use_td_fhat_input,
+            "input_configs": td_input_configs,
             "use_acceleration_input": use_acceleration_input,
             "use_phi_input": use_phi_input,
             "phi_input_source": (None if not use_phi_input else phase_input_source),

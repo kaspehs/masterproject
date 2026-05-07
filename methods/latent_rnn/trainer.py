@@ -1532,10 +1532,15 @@ def train(config: Config, config_name: str) -> None:
         final_start = time.perf_counter()
         eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         eval_model.eval()
-        avg_metrics: dict[str, float] = {}
+        metrics_sum: dict[str, float] = {}
+        metrics_count: dict[str, int] = {}
         metrics_list: list[dict[str, float]] = []
-        ur_values: list[float] = []
-        for traj in final_val_trajs:
+        plot_ur_values: list[float] = []
+        plot_metrics_list: list[dict[str, float]] = []
+        metric_trajs = list(final_val_trajs)
+        plot_trajs = list(final_val_trajs)
+        plot_trajs.sort(key=lambda traj: round(float(np.asarray(traj["ur"]).reshape(-1)[0]), 6))
+        for traj in metric_trajs:
             result = _latent_rollout_validation_case(
                 model=eval_model,
                 traj=traj,
@@ -1546,39 +1551,75 @@ def train(config: Config, config_name: str) -> None:
                 ur_scale=ur_scale,
                 device=device,
             )
-            metrics = dict(result.get("metrics", {}))
-            if not metrics:
+            filtered_metrics = {
+                name: float(value)
+                for name, value in dict(result.get("metrics", {})).items()
+                if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+            }
+            if not filtered_metrics:
                 continue
-            metrics_list.append(metrics)
-            ur_values.append(float(result.get("ur", np.asarray(traj["ur"], dtype=float).reshape(-1)[0])))
-        if metrics_list:
-            metric_keys = sorted(
-                {
-                    key
-                    for metrics in metrics_list
-                    for key, value in metrics.items()
-                    if key != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
-                }
+            metrics_list.append(filtered_metrics)
+            for name, value in filtered_metrics.items():
+                metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                metrics_count[name] = metrics_count.get(name, 0) + 1
+        for idx, traj in enumerate(plot_trajs, start=1):
+            plot_metrics = _log_latent_rollout_validation(
+                writer=writer,
+                epoch=max(0, epochs - 1),
+                model=eval_model,
+                traj=traj,
+                encoder_length=encoder_length,
+                include_acceleration=include_acceleration,
+                mass_source=mass_source,
+                input_scaling_mode=input_scaling_mode,
+                ur_scale=ur_scale,
+                device=device,
+                tag_prefix="final_val/rollout",
+                metric_prefix="final_val",
+                step=idx,
+                log_metrics=False,
+                log_plots=True,
+                log_force_plot=True,
+                log_spectra=True,
+                title_suffix=f" [final {idx}/{len(plot_trajs)}]",
             )
-            for key in metric_keys:
-                values = [float(metrics[key]) for metrics in metrics_list if key in metrics and np.isfinite(float(metrics[key]))]
-                if values:
-                    avg_metrics[key] = float(np.mean(values))
+            filtered_plot_metrics = {
+                name: float(value)
+                for name, value in plot_metrics.items()
+                if name != ROLLOUT_DIVERGED_KEY and np.isfinite(float(value))
+            }
+            if filtered_plot_metrics:
+                plot_ur_values.append(float(np.asarray(traj["ur"], dtype=float).reshape(-1)[0]))
+                plot_metrics_list.append(filtered_plot_metrics)
+        if metrics_list:
+            avg_metrics = {
+                name: metrics_sum[name] / float(metrics_count[name])
+                for name in metrics_sum
+                if metrics_count.get(name, 0) > 0
+            }
             summary_lines = [
+                "Final rollout over all validation trajectories:",
                 (
-                    f"Final rollout over {len(metrics_list)} validation trajectories "
-                    f"(val_unseen={len(val_trajs)}, val_seen={len(val_seen_trajs)}):"
-                )
+                    f"val_unseen={len(val_trajs)}, val_seen={len(val_seen_trajs)}, "
+                    f"total={len(metric_trajs)}, metric_count={len(metrics_list)}, plot_count={len(plot_metrics_list)}"
+                ),
             ]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")
                 writer.add_scalar(f"final_val/avg/{name}", avg_metrics[name], epochs)
             writer.add_text("final_val/summary", "\n".join(summary_lines), epochs)
+        if plot_ur_values and plot_metrics_list:
+            reference_ur_values = [
+                float(np.asarray(traj["ur"]).reshape(-1)[0])
+                for traj in final_val_trajs
+                if np.asarray(traj["ur"]).reshape(-1).size > 0
+            ]
             log_final_rollout_errors_vs_ur(
                 writer,
-                ur_values,
-                metrics_list,
+                plot_ur_values,
+                plot_metrics_list,
                 epochs,
+                reference_ur_values=reference_ur_values,
             )
         writer.add_scalar("final_val/rollout_wall_time_s", float(time.perf_counter() - final_start), epochs)
         print(f"Final latent_rnn validation rollout finished in {time.perf_counter() - final_start:.2f}s.")

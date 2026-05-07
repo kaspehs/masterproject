@@ -53,6 +53,7 @@ from HNN_helper import (
     resolve_td_correction_params,
     resolve_td_correction_mode,
     resolve_td_force_input_source,
+    resolve_td_input_configs,
     resolve_td_phase_input_source,
     resolve_td_memory_config,
     td_correction_mode_flags,
@@ -706,6 +707,18 @@ def _run_hnn_td_correction_validation(
     mean_active = bool(mode_flags["mean_active"])
     predict_sigma = bool(mode_flags["sigma_active"])
     fhat_active = bool(mode_flags["fhat_active"])
+    arch_dict = asdict(cfg.architecture)
+    shared_td_correction_trunk_cfg = bool(
+        ckpt.get("shared_td_correction_trunk", arch_dict.get("shared_td_correction_trunk", False))
+    )
+    input_config_source = dict(hnn_cfg)
+    if "input_configs" in ckpt:
+        input_config_source["input_configs"] = ckpt["input_configs"]
+    input_config_source["correction_mode"] = correction_mode
+    td_input_configs = resolve_td_input_configs(
+        input_config_source,
+        shared_td_correction_trunk=shared_td_correction_trunk_cfg,
+    )
     td_force_input_source = resolve_td_force_input_source(
         ckpt.get("td_force_input_source", hnn_cfg.get("use_td_force_input", False))
     )
@@ -717,7 +730,15 @@ def _run_hnn_td_correction_validation(
     )
     use_phi_input = phase_input_source != "none"
     random_phase_training = bool(hnn_cfg.get("random_phase_training", False))
-    if random_phase_training and phase_input_source not in {"phi_vy", "both"}:
+    effective_phase_sources = [
+        config.get("phase_input_source", "none")
+        for config in td_input_configs.values()
+        if bool(config.get("use_phi_input", False))
+    ]
+    if random_phase_training and (
+        not effective_phase_sources
+        or any(resolve_td_phase_input_source(source) not in {"phi_vy", "both"} for source in effective_phase_sources)
+    ):
         raise ValueError(
             "hnn.random_phase_training=true requires hnn.use_phi_input / hnn.phi_input_source "
             "to include phi_vy (use 'phi_vy' or 'both')."
@@ -808,7 +829,7 @@ def _run_hnn_td_correction_validation(
     model_dict["phi_input_source"] = None if not use_phi_input else phase_input_source
     model_dict["use_sigma_inputs"] = use_sigma_inputs
     model_dict["correction_mode"] = correction_mode
-    arch_dict = asdict(cfg.architecture)
+    model_dict["input_configs"] = td_input_configs
     model, _derived = PHVIV.from_config(dt=dt, cfg=model_dict, arch_cfg=arch_dict, device=device)
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "td_force_input_source", td_force_input_source)
