@@ -1212,6 +1212,35 @@ def _displacement_std_error_torch(
     return torch.mean(loss)
 
 
+def _displacement_mean_error_torch(
+    *,
+    true_signal: torch.Tensor,
+    pred_signal: torch.Tensor,
+    relative: bool = False,
+    power: float = 2.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if true_signal.ndim != 2 or pred_signal.ndim != 2:
+        raise ValueError("Mean rollout loss expects [batch, time] tensors.")
+    if true_signal.shape != pred_signal.shape:
+        raise ValueError("Mean rollout loss requires true and predicted signals with matching shapes.")
+    compute_dtype = torch.float32 if true_signal.dtype in {torch.float16, torch.bfloat16} else true_signal.dtype
+    true_signal = true_signal.to(dtype=compute_dtype)
+    pred_signal = pred_signal.to(dtype=compute_dtype)
+    if int(true_signal.shape[0]) < 1 or int(true_signal.shape[1]) < 1:
+        return true_signal.new_zeros(())
+
+    true_mean = torch.mean(true_signal, dim=1)
+    pred_mean = torch.mean(pred_signal, dim=1)
+    loss = torch.pow(torch.abs(pred_mean - true_mean), float(power))
+    if bool(relative):
+        true_centered = true_signal - true_mean.view(-1, 1)
+        true_std = torch.sqrt(torch.mean(true_centered * true_centered, dim=1))
+        denom = torch.pow(torch.abs(true_std) + float(eps), float(power))
+        loss = loss / denom
+    return torch.mean(loss)
+
+
 def _trajectory_rollout_mse_torch(
     *,
     true_traj: torch.Tensor,
@@ -1308,6 +1337,7 @@ def _td_correction_rollout_losses_from_batch(
     rollout_noise_scale: float,
     trajectory_relative: bool = False,
     compute_disp_std_loss: bool = False,
+    compute_disp_mean_loss: bool = False,
     disp_std_relative: bool = False,
     disp_std_power: float = 2.0,
     compute_disp_spectral_loss: bool = False,
@@ -1342,6 +1372,7 @@ def _td_correction_rollout_losses_from_batch(
     dt_roll = torch.clamp((t_seq[:, 1] - t_seq[:, 0]).unsqueeze(1), min=1.0e-12)
     dt_values = dt_roll[:, 0]
     disp_std_loss = z_traj.new_zeros(())
+    disp_mean_loss = z_traj.new_zeros(())
     disp_spectral_loss = z_traj.new_zeros(())
     z_scale = _td_rollout_state_scale(
         model,
@@ -1386,6 +1417,13 @@ def _td_correction_rollout_losses_from_batch(
                 relative=disp_std_relative,
                 power=disp_std_power,
             )
+        if compute_disp_mean_loss:
+            disp_mean_loss = _displacement_mean_error_torch(
+                true_signal=z_traj_horizon[:, :, 0],
+                pred_signal=z_pred_horizon[:, :, 0],
+                relative=disp_std_relative,
+                power=disp_std_power,
+            )
         if compute_disp_spectral_loss:
             if disp_spectral_loss_mode == "dominant_frequency":
                 disp_spectral_loss = _dominant_frequency_error_torch(
@@ -1410,6 +1448,7 @@ def _td_correction_rollout_losses_from_batch(
         return {
             "trajectory_loss": trajectory_loss,
             "disp_std_loss": disp_std_loss,
+            "disp_mean_loss": disp_mean_loss,
             "disp_spectral_loss": disp_spectral_loss,
         }
 
@@ -1471,6 +1510,14 @@ def _td_correction_rollout_losses_from_batch(
             relative=disp_std_relative,
             power=disp_std_power,
         )
+    if compute_disp_mean_loss:
+        z_for_mean = torch.mean(z_pred_horizon, dim=0)
+        disp_mean_loss = _displacement_mean_error_torch(
+            true_signal=z_traj_horizon[:, :, 0],
+            pred_signal=z_for_mean[:, :, 0],
+            relative=disp_std_relative,
+            power=disp_std_power,
+        )
     if compute_disp_spectral_loss:
         z_for_psd = torch.mean(z_pred_horizon, dim=0)
         if disp_spectral_loss_mode == "dominant_frequency":
@@ -1496,6 +1543,7 @@ def _td_correction_rollout_losses_from_batch(
     return {
         "trajectory_loss": trajectory_loss,
         "disp_std_loss": disp_std_loss,
+        "disp_mean_loss": disp_mean_loss,
         "disp_spectral_loss": disp_spectral_loss,
     }
 
@@ -1537,6 +1585,7 @@ def _td_correction_rollout_loss_from_batch(
         rollout_noise_scale=rollout_noise_scale,
         trajectory_relative=trajectory_relative,
         compute_disp_std_loss=False,
+        compute_disp_mean_loss=False,
         disp_std_relative=False,
         disp_std_power=2.0,
         compute_disp_spectral_loss=False,
@@ -3121,9 +3170,6 @@ def _reap_async_processes(
             print(
                 f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s"
             )
-            if writer is not None:
-                writer.add_scalar("val_unseen/validation_wall_time_s", float(elapsed), int(epoch) + 1)
-                writer.flush()
         else:
             print(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
@@ -3137,7 +3183,7 @@ def _reap_async_processes(
                     val_metrics = payload.get("val_metrics", {})
                     if not isinstance(val_metrics, dict):
                         val_metrics = {}
-                    best_metric_name = AGGREGATE_FORCE_VALIDATION_ERROR_KEY
+                    best_metric_name = str(payload.get("best_metric_name", AGGREGATE_FORCE_VALIDATION_ERROR_KEY))
                     best_metric_value = val_metrics.get(best_metric_name, payload.get(best_metric_name, None))
                     if best_metric_value is None or not np.isfinite(float(best_metric_value)):
                         best_metric_name = "loss_total"
@@ -3178,7 +3224,7 @@ def _reap_async_processes(
                                 }
                             )
                             print(
-                                f"[async-val] epoch {epoch}: new best val_unseen/{best_metric_name}={best_metric_f:.6e}; "
+                                f"[async-val] epoch {epoch}: new best {best_metric_name}={best_metric_f:.6e}; "
                                 f"kept {best_model_path}"
                             )
                 except Exception as exc:
@@ -3753,6 +3799,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     corr_init_mode, corr_init_tiny_std = _resolve_td_correction_init_settings(hnn_cfg, model_cfg)
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
+    rollout_disp_mean_in_std_loss = bool(getattr(loss_cfg, "rollout_disp_mean_in_std_loss", True))
     rollout_disp_spectral_weight_raw = getattr(loss_cfg, "rollout_disp_spectral_weight", None)
     if rollout_disp_spectral_weight_raw is None:
         rollout_disp_spectral_weight = float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
@@ -4107,6 +4154,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         ),
         (
             f"Rollout setup: det_weight={rollout_det_weight:g}, std_weight={rollout_disp_std_weight:g}, "
+            f"mean_in_std_loss={rollout_disp_mean_in_std_loss}, "
             f"spectral_weight={rollout_disp_spectral_weight:g}, "
             f"steps={current_rollout_det_steps}, "
             f"train_rollout_windows={train_rollout_instances}, train_rollout_steps={train_rollout_steps_per_epoch}, "
@@ -4129,6 +4177,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     startup_lines.append(
         f"Loss weights: state={state_loss_weight:g}, data={force_data_weight:g}, "
         f"rollout_det={rollout_det_weight:g}, rollout_disp_std={rollout_disp_std_weight:g}, "
+        f"rollout_disp_mean=same_as_std({rollout_disp_mean_in_std_loss}), "
         f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
     )
     if validation_theta0_values is not None:
@@ -4165,6 +4214,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"relative_losses={rollout_relative_losses!r} ({rollout_relative_source}), "
             f"trajectory_relative={rollout_det_relative}, "
             f"disp_std_relative={rollout_disp_std_relative}, "
+            f"disp_mean_in_std_loss={rollout_disp_mean_in_std_loss}, "
             f"disp_psd_relative={rollout_disp_psd_relative}, "
             f"disp_freq_relative={rollout_disp_freq_relative}, "
             f"disp_std_p={rollout_disp_std_p:g}, "
@@ -4283,11 +4333,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         }
         rollout_loss_avg = 0.0
         rollout_std_loss_avg = 0.0
+        rollout_mean_loss_avg = 0.0
         rollout_spectral_loss_avg = 0.0
         if split_rollout_loader is not None and rollout_loss_active:
             with torch.no_grad():
                 rollout_loss_sum = torch.zeros((), device=device)
                 rollout_std_loss_sum = torch.zeros((), device=device)
+                rollout_mean_loss_sum = torch.zeros((), device=device)
                 rollout_spectral_loss_sum = torch.zeros((), device=device)
                 rollout_count = 0
                 for rollout_batch in split_rollout_loader:
@@ -4309,6 +4361,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_noise_scale=rollout_noise_scale,
                         trajectory_relative=rollout_det_relative,
                         compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
+                        compute_disp_mean_loss=(
+                            rollout_disp_std_weight > 0.0 and rollout_disp_mean_in_std_loss
+                        ),
                         disp_std_relative=rollout_disp_std_relative,
                         disp_std_power=rollout_disp_std_p,
                         compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
@@ -4322,17 +4377,21 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     )
                     rollout_loss_sum += rollout_losses["trajectory_loss"].detach()
                     rollout_std_loss_sum += rollout_losses["disp_std_loss"].detach()
+                    rollout_mean_loss_sum += rollout_losses["disp_mean_loss"].detach()
                     rollout_spectral_loss_sum += rollout_losses["disp_spectral_loss"].detach()
                     rollout_count += 1
                 rollout_loss_avg = float((rollout_loss_sum / float(max(1, rollout_count))).detach().cpu())
                 rollout_std_loss_avg = float((rollout_std_loss_sum / float(max(1, rollout_count))).detach().cpu())
+                rollout_mean_loss_avg = float((rollout_mean_loss_sum / float(max(1, rollout_count))).detach().cpu())
                 rollout_spectral_loss_avg = float(
                     (rollout_spectral_loss_sum / float(max(1, rollout_count))).detach().cpu()
                 )
                 writer.add_scalar(f"{split_tag}/loss_rollout_det", rollout_loss_avg, epoch_idx + 1)
                 writer.add_scalar(f"{split_tag}/loss_rollout_disp_std", rollout_std_loss_avg, epoch_idx + 1)
+                writer.add_scalar(f"{split_tag}/loss_rollout_disp_mean", rollout_mean_loss_avg, epoch_idx + 1)
                 writer.add_scalar(f"{split_tag}/loss_rollout_spectral", rollout_spectral_loss_avg, epoch_idx + 1)
         val_metrics["loss_rollout_disp_std"] = rollout_std_loss_avg
+        val_metrics["loss_rollout_disp_mean"] = rollout_mean_loss_avg
         val_metrics["loss_rollout_spectral"] = rollout_spectral_loss_avg
         val_metrics["loss_total"] = (
             float(state_loss_weight) * val_metrics["loss_state"]
@@ -4341,7 +4400,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             + float(sigma_reg) * val_metrics["loss_reg_sigma"]
             + float(fhat_reg) * val_metrics["loss_reg_fhat"]
             + float(rollout_det_weight) * rollout_loss_avg
-            + float(rollout_disp_std_weight) * rollout_std_loss_avg
+            + float(rollout_disp_std_weight) * (rollout_std_loss_avg + rollout_mean_loss_avg)
             + float(rollout_disp_spectral_weight) * rollout_spectral_loss_avg
         )
         for name, value in val_metrics.items():
@@ -4507,6 +4566,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "loss_reg_fhat": torch.zeros((), device=device),
             "loss_rollout_det": torch.zeros((), device=device),
             "loss_rollout_disp_std": torch.zeros((), device=device),
+            "loss_rollout_disp_mean": torch.zeros((), device=device),
             "loss_rollout_spectral": torch.zeros((), device=device),
             "grad_norm": torch.zeros((), device=device),
         }
@@ -4565,6 +4625,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 fhat_reg_loss = _regularizer(step["delta_fhat"], fhat_reg_norm) if fhat_active else state_loss.new_tensor(0.0)
                 rollout_det_loss = state_loss.new_tensor(0.0)
                 rollout_std_loss = state_loss.new_tensor(0.0)
+                rollout_mean_loss = state_loss.new_tensor(0.0)
                 rollout_spectral_loss = state_loss.new_tensor(0.0)
                 if rollout_iter is not None:
                     try:
@@ -4590,6 +4651,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                         rollout_noise_scale=rollout_noise_scale,
                         trajectory_relative=rollout_det_relative,
                         compute_disp_std_loss=(rollout_disp_std_weight > 0.0),
+                        compute_disp_mean_loss=(
+                            rollout_disp_std_weight > 0.0 and rollout_disp_mean_in_std_loss
+                        ),
                         disp_std_relative=rollout_disp_std_relative,
                         disp_std_power=rollout_disp_std_p,
                         compute_disp_spectral_loss=(rollout_disp_spectral_weight > 0.0),
@@ -4603,10 +4667,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     )
                     rollout_det_loss = rollout_losses["trajectory_loss"]
                     rollout_std_loss = rollout_losses["disp_std_loss"]
+                    rollout_mean_loss = rollout_losses["disp_mean_loss"]
                     rollout_spectral_loss = rollout_losses["disp_spectral_loss"]
                 rollout_total_loss = (
                     float(rollout_det_weight) * rollout_det_loss
-                    + float(rollout_disp_std_weight) * rollout_std_loss
+                    + float(rollout_disp_std_weight) * (rollout_std_loss + rollout_mean_loss)
                     + float(rollout_disp_spectral_weight) * rollout_spectral_loss
                 )
                 if gradnorm_balancer is not None:
@@ -4670,6 +4735,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             sums["loss_reg_fhat"] += fhat_reg_loss.detach()
             sums["loss_rollout_det"] += rollout_det_loss.detach()
             sums["loss_rollout_disp_std"] += rollout_std_loss.detach()
+            sums["loss_rollout_disp_mean"] += rollout_mean_loss.detach()
             sums["loss_rollout_spectral"] += rollout_spectral_loss.detach()
             sums["grad_norm"] += grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
 
@@ -4698,6 +4764,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 f"Lstate={train_metrics['loss_state']:.4e}, Ldata={train_metrics['loss_data']:.4e}, "
                 f"Lroll={train_metrics['loss_rollout_det']:.4e}, "
                 f"Lstd={train_metrics['loss_rollout_disp_std']:.4e}, "
+                f"Lmean={train_metrics['loss_rollout_disp_mean']:.4e}, "
                 f"Lspec={train_metrics['loss_rollout_spectral']:.4e}, lr={train_metrics['lr']:.3e}"
             )
 

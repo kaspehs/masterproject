@@ -46,20 +46,18 @@ RUN_DIRS: list[str] = []
 # discovery/sorting. RUN_LABELS_BY_RUN can key by run path or default run label.
 RUN_LABELS: list[str] = []
 RUN_LABELS_BY_RUN: dict[str, str] = {
-    "mean_loss_ablation/ABLATION_onestep": "Residual loss only",
-    "mean_loss_ablation/ABLATION_mse": "+ MSE loss",
-    "mean_loss_ablation/ABLATION_std_final": "+ Std loss",
-    "mean_loss_ablation/ABLATION_freq_final": "+ Frequency loss",
-    "mean_loss_ablation/ABLATION_psd_final": "+ PSD loss",
-    "mean_loss_ablation/ABLATION_std_freq": "+ Std and Frequency loss",
-    "mean_loss_ablation/ABLATION_std_psd": "+ Std and PSD loss"
+    "fhat/loss_ablation/ABLATION_onestep": "Residual loss only",
+    "fhat/loss_ablation/ABLATION_mse": "+ MSE loss",
+    "fhat/loss_ablation/ABLATION_std": "+ Std loss",
+    "fhat/loss_ablation/ABLATION_std_freq": "+ Std and Frequency loss",
+    "fhat/loss_ablation/ABLATION_std_psd": "+ Std and PSD loss",
 }
 
 # Number of discovered runs to include. Set to None to use all discovered runs.
 NUM_RUNS: int | None = None
 
 # Used only when RUN_DIRS is empty.
-RUN_NAME_CONTAINS: str | None = None
+RUN_NAME_CONTAINS: str | None = "fhat/loss_ablation"
 SORT_RUNS_BY = "mtime_desc"  # "mtime_desc", "mtime_asc", or "name"
 
 OUTPUT_DIR = Path("figs/tensorboard_validation")

@@ -916,9 +916,6 @@ def _reap_async_processes(
 
         if return_code == 0:
             print(f"[async-val] epoch {epoch}: completed successfully in {elapsed:.2f}s")
-            if writer is not None:
-                writer.add_scalar("val_unseen/validation_wall_time_s", float(elapsed), int(epoch) + 1)
-                writer.flush()
         else:
             print(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
@@ -932,7 +929,7 @@ def _reap_async_processes(
                     val_metrics = payload.get("val_metrics", {})
                     if not isinstance(val_metrics, dict):
                         val_metrics = {}
-                    best_metric_name = AGGREGATE_FORCE_VALIDATION_ERROR_KEY
+                    best_metric_name = str(payload.get("best_metric_name", AGGREGATE_FORCE_VALIDATION_ERROR_KEY))
                     best_metric_value = val_metrics.get(best_metric_name, payload.get(best_metric_name, None))
                     if best_metric_value is None or not np.isfinite(float(best_metric_value)):
                         best_metric_name = "loss_total"
@@ -973,7 +970,7 @@ def _reap_async_processes(
                                 }
                             )
                             print(
-                                f"[async-val] epoch {epoch}: new best val_unseen/{best_metric_name}={best_metric_f:.6e}; "
+                                f"[async-val] epoch {epoch}: new best {best_metric_name}={best_metric_f:.6e}; "
                                 f"kept {best_model_path}"
                             )
                 except Exception as exc:

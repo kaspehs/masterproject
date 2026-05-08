@@ -49,6 +49,7 @@ from HNN_helper import (
     structural_step_constant_force_torch,
 )
 from methods.hnn.trainer import (
+    _displacement_mean_error_torch,
     _displacement_std_error_torch,
     _dominant_frequency_error_torch,
     _normalize_rollout_disp_spectral_loss_mode,
@@ -667,6 +668,7 @@ def _latent_losses_from_batch(
     non_blocking: bool,
     trajectory_relative: bool,
     compute_disp_std_loss: bool,
+    compute_disp_mean_loss: bool,
     disp_std_relative: bool,
     disp_std_power: float,
     compute_disp_spectral_loss: bool,
@@ -722,6 +724,14 @@ def _latent_losses_from_batch(
             relative=disp_std_relative,
             power=disp_std_power,
         )
+    disp_mean_loss = z_traj.new_zeros(())
+    if compute_disp_mean_loss:
+        disp_mean_loss = _displacement_mean_error_torch(
+            true_signal=z_traj[:, 1:, 0],
+            pred_signal=z_pred[:, 1:, 0],
+            relative=disp_std_relative,
+            power=disp_std_power,
+        )
     disp_spectral_loss = z_traj.new_zeros(())
     if compute_disp_spectral_loss:
         dt_values = torch.clamp(t_seq[:, 1] - t_seq[:, 0], min=1.0e-12)
@@ -750,6 +760,7 @@ def _latent_losses_from_batch(
         "state_loss": state_loss,
         "trajectory_loss": trajectory_loss,
         "disp_std_loss": disp_std_loss,
+        "disp_mean_loss": disp_mean_loss,
         "disp_spectral_loss": disp_spectral_loss,
         "force_data_loss": force_data_loss,
         "z_pred": z_pred,
@@ -1128,6 +1139,7 @@ def train(config: Config, config_name: str) -> None:
     rollout_settings = _resolve_td_rollout_loss_settings(loss_cfg)
     rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
     rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
+    rollout_disp_mean_in_std_loss = bool(getattr(loss_cfg, "rollout_disp_mean_in_std_loss", True))
     spectral_weight_raw = getattr(loss_cfg, "rollout_disp_spectral_weight", None)
     rollout_disp_spectral_weight = (
         float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
@@ -1288,7 +1300,9 @@ def train(config: Config, config_name: str) -> None:
                 (
                     f"Loss weights: state={state_weight:g}, force_data="
                     f"{force_data_weight if use_force_data_loss else 0.0:g}, rollout_det={rollout_det_weight:g}, "
-                    f"rollout_disp_std={rollout_disp_std_weight:g}, rollout_disp_spectral={rollout_disp_spectral_weight:g}"
+                    f"rollout_disp_std={rollout_disp_std_weight:g}, "
+                    f"rollout_disp_mean=same_as_std({rollout_disp_mean_in_std_loss}), "
+                    f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
                 ),
             ]
         )
@@ -1313,6 +1327,9 @@ def train(config: Config, config_name: str) -> None:
                         non_blocking=non_blocking,
                         trajectory_relative=bool(rollout_settings["trajectory_relative"]),
                         compute_disp_std_loss=rollout_disp_std_weight > 0.0,
+                        compute_disp_mean_loss=(
+                            rollout_disp_std_weight > 0.0 and rollout_disp_mean_in_std_loss
+                        ),
                         disp_std_relative=bool(rollout_settings["disp_std_relative"]),
                         disp_std_power=float(rollout_settings["disp_std_p"]),
                         compute_disp_spectral_loss=rollout_disp_spectral_weight > 0.0,
@@ -1327,7 +1344,7 @@ def train(config: Config, config_name: str) -> None:
                     total_loss = (
                         state_weight * losses["state_loss"]
                         + rollout_det_weight * losses["trajectory_loss"]
-                        + rollout_disp_std_weight * losses["disp_std_loss"]
+                        + rollout_disp_std_weight * (losses["disp_std_loss"] + losses["disp_mean_loss"])
                         + rollout_disp_spectral_weight * losses["disp_spectral_loss"]
                     )
                     if use_force_data_loss:
@@ -1346,6 +1363,7 @@ def train(config: Config, config_name: str) -> None:
                 "loss_state": losses["state_loss"],
                 "loss_rollout_det": losses["trajectory_loss"],
                 "loss_rollout_disp_std": losses["disp_std_loss"],
+                "loss_rollout_disp_mean": losses["disp_mean_loss"],
                 "loss_rollout_spectral": losses["disp_spectral_loss"],
             }.items():
                 sums[name] = sums.get(name, value.detach().new_zeros(())) + value.detach() * batch_size

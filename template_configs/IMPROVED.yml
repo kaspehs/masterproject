@@ -105,6 +105,9 @@ loss:
   rollout_disp_std_normalize_by_true: null
   # Exponent p in |std(pred)-std(true)|^p.
   rollout_disp_std_p: 2.0
+  # If true, also adds |mean(pred)-mean(true)|^p under rollout_disp_std_weight.
+  # Relative normalization uses the same true-displacement std scale as the std term.
+  rollout_disp_mean_in_std_loss: true
   # Auxiliary rollout displacement spectral loss weight. If left null, legacy rollout_disp_psd_weight is used.
   rollout_disp_spectral_weight: 1.0
   # Spectral loss mode: psd | dominant_frequency
@@ -158,6 +161,10 @@ monitoring:
   async_validation_num_workers: 0
   async_validation_num_threads: 1
   async_validation_max_concurrent: 6
+  surrogate_validation_enabled: true
+  surrogate_validation_npz: CFD_Data/analysis/surrogate_validation_points.npz
+  surrogate_validation_tag: val_surrogate
+  combined_validation_tag: val
 
 logging:
   run_dir_root: logs

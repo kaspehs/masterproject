@@ -86,6 +86,7 @@ loss:
   rollout_disp_std_weight: 0.0
   rollout_disp_std_normalize_by_true: null
   rollout_disp_std_p: 2.0
+  rollout_disp_mean_in_std_loss: true
   rollout_disp_spectral_weight: 1.0
   rollout_disp_spectral_loss: dominant_frequency
   rollout_disp_psd_weight: 0.0

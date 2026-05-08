@@ -26,8 +26,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from HNN_helper import (
+    AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY,
     AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
+    AGGREGATE_VALIDATION_ERROR_KEY,
+    DISP_STD_REL_ERROR_KEY,
+    DOMINANT_FREQ_REL_ERROR_KEY,
+    FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
     FORCE_MAPPING_NRMSE_KEY,
+    FORCE_STD_REL_ERROR_KEY,
     PHVIV,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
@@ -38,6 +44,7 @@ from HNN_helper import (
     build_dataloader_from_series,
     build_rollout_dataloader_from_series,
     compute_validation_metrics,
+    dominant_frequency,
     load_training_series,
     log_displacement_plots,
     log_force_plots,
@@ -56,6 +63,7 @@ from HNN_helper import (
     resolve_td_input_configs,
     resolve_td_phase_input_source,
     resolve_td_memory_config,
+    relative_error,
     td_correction_mode_flags,
 )
 from methods.hnn.trainer import (
@@ -65,6 +73,7 @@ from methods.hnn.trainer import (
     _td_context_with_random_phi_torch,
     _resolve_td_rollout_loss_settings,
     _td_correction_rollout_losses_from_batch,
+    _td_correction_state_rollout,
     _td_step_with_corrections,
     _td_state_mse_loss,
     _td_state_propagated_nll_loss,
@@ -273,6 +282,285 @@ def _rollout_loss_from_batch(
     if return_per_sample:
         return per
     return torch.mean(per)
+
+
+_SURROGATE_TARGET_KEYS = (
+    "disp_std",
+    "force_std",
+    "disp_dominant_frequency_hz",
+    "force_dominant_frequency_hz",
+)
+
+
+def _as_1d_npz_array(data: np.lib.npyio.NpzFile, key: str, *, path: Path) -> np.ndarray:
+    if key not in data:
+        raise KeyError(f"Surrogate validation file '{path}' is missing required array '{key}'.")
+    return np.asarray(data[key]).reshape(-1)
+
+
+def _finite_scalar_from_npz(data: np.lib.npyio.NpzFile, key: str, idx: int, *, path: Path) -> float:
+    arr = _as_1d_npz_array(data, key, path=path)
+    if idx >= arr.size:
+        raise ValueError(f"Surrogate validation array '{key}' in '{path}' is shorter than row {idx}.")
+    value = float(arr[idx])
+    if not np.isfinite(value):
+        raise ValueError(f"Surrogate validation row {idx} has non-finite '{key}'={value!r}.")
+    return value
+
+
+def _load_surrogate_validation_rows(path: Path, *, td_mass_source: str) -> list[dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Surrogate validation NPZ does not exist: {path}")
+    rows: list[dict[str, Any]] = []
+    with np.load(path, allow_pickle=True) as data:
+        ur_key = "ur_effective" if "ur_effective" in data else "ur"
+        ur = _as_1d_npz_array(data, ur_key, path=path).astype(float)
+        n = int(ur.size)
+        if n <= 0:
+            raise ValueError(f"Surrogate validation file '{path}' contains no rows.")
+        if "td_context0" not in data:
+            raise KeyError(f"Surrogate validation file '{path}' is missing required array 'td_context0'.")
+        td_context0 = np.asarray(data["td_context0"], dtype=float)
+        if td_context0.shape != (n, 5):
+            raise ValueError(f"Surrogate validation 'td_context0' must have shape ({n}, 5), got {td_context0.shape}.")
+        mass_key = "ic_dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "ic_effective_mass_kg"
+        required_scalar_keys = (
+            "ic_y0",
+            "ic_dy0",
+            "ic_dt",
+            "ic_stiffness_n_m",
+            "ic_effective_mass_kg",
+            "ic_dry_mass_kg",
+            "ic_damping_c",
+            "rollout_steps",
+            "eval_steps_after_discard",
+            "rollout_discard_seconds",
+            "ic_diameter_m",
+            *_SURROGATE_TARGET_KEYS,
+        )
+        for idx in range(n):
+            if not np.isfinite(float(ur[idx])):
+                raise ValueError(f"Surrogate validation row {idx} has non-finite '{ur_key}'={ur[idx]!r}.")
+            if not np.all(np.isfinite(td_context0[idx])):
+                raise ValueError(f"Surrogate validation row {idx} has non-finite td_context0={td_context0[idx]!r}.")
+            row = {
+                "index": idx,
+                "ur": float(ur[idx]),
+                "ur_label": (
+                    _finite_scalar_from_npz(data, "ur_label", idx, path=path)
+                    if "ur_label" in data
+                    else float("nan")
+                ),
+                "td_context0": td_context0[idx].astype(float),
+                "mass_key": mass_key,
+            }
+            for key in required_scalar_keys:
+                row[key] = _finite_scalar_from_npz(data, key, idx, path=path)
+            row["mass"] = _finite_scalar_from_npz(data, mass_key, idx, path=path)
+            rows.append(row)
+    return rows
+
+
+def _surrogate_relative_abs(pred: float, target: float) -> float:
+    value = relative_error(float(pred), float(target))
+    return abs(float(value)) if np.isfinite(value) else float("nan")
+
+
+def _surrogate_aggregate_metric(metrics: dict[str, float], keys: tuple[str, ...]) -> float:
+    values = [float(metrics[key]) for key in keys if key in metrics and np.isfinite(float(metrics[key]))]
+    return float(np.mean(values)) if len(values) == len(keys) else float("nan")
+
+
+def _safe_scalar_stats(prefix: str, values: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {}
+    return {
+        f"{prefix} mean": float(np.mean(arr)),
+        f"{prefix} mean abs": float(np.mean(np.abs(arr))),
+        f"{prefix} std": float(np.std(arr)),
+    }
+
+
+def _run_surrogate_td_validation(
+    *,
+    rows: list[dict[str, Any]],
+    writer: SummaryWriter,
+    tb_step: int,
+    tag: str,
+    model: PHVIV,
+    device: torch.device,
+    td_params: dict[str, float],
+    td_memory_cfg: dict[str, Any],
+    mean_active: bool,
+    predict_sigma: bool,
+    fhat_active: bool,
+    td_force_input_source: str,
+    fhat_bound_multiplier: float,
+    force_zero_output: bool,
+    rollout_stochastic: bool,
+    rollout_noise_scale: float,
+    rollout_seed: int | None,
+) -> dict[str, Any]:
+    metrics_sum: dict[str, float] = {}
+    metrics_count: dict[str, int] = {}
+    diverged_count = 0
+
+    def _add_metric(name: str, value: float) -> None:
+        value_f = float(value)
+        if not np.isfinite(value_f):
+            return
+        metrics_sum[name] = metrics_sum.get(name, 0.0) + value_f
+        metrics_count[name] = metrics_count.get(name, 0) + 1
+
+    for row in rows:
+        steps = int(round(float(row["rollout_steps"])))
+        eval_steps = int(round(float(row["eval_steps_after_discard"])))
+        if steps <= 1 or eval_steps <= 1 or eval_steps > steps:
+            raise ValueError(
+                f"Invalid surrogate rollout/eval steps for row {row['index']}: "
+                f"rollout_steps={steps}, eval_steps_after_discard={eval_steps}"
+            )
+        dt = float(row["ic_dt"])
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError(f"Surrogate row {row['index']} has invalid ic_dt={dt!r}.")
+        discard_steps = int(round(float(row["rollout_discard_seconds"]) / dt))
+        if discard_steps < 0 or discard_steps >= steps:
+            raise ValueError(
+                f"Invalid surrogate discard window for row {row['index']}: "
+                f"rollout_discard_seconds={row['rollout_discard_seconds']}, dt={dt}, rollout_steps={steps}"
+            )
+        if steps - discard_steps != eval_steps:
+            raise ValueError(
+                f"Surrogate row {row['index']} has inconsistent rollout window fields: "
+                f"rollout_steps={steps}, discard_steps={discard_steps}, "
+                f"eval_steps_after_discard={eval_steps}"
+            )
+        mass_value = float(row["mass"])
+        stiffness_value = float(row["ic_stiffness_n_m"])
+        damping_value = float(row["ic_damping_c"])
+        ur_value = float(row["ur"])
+        diameter_value = max(float(row.get("ic_diameter_m", float(model.D))), 1.0e-12)
+        z0 = torch.tensor([[float(row["ic_y0"]), float(row["ic_dy0"]) * mass_value]], dtype=torch.float32, device=device)
+        ur0 = torch.tensor([[ur_value]], dtype=torch.float32, device=device)
+        td_context0 = torch.from_numpy(np.asarray(row["td_context0"], dtype=np.float32).reshape(1, 5)).to(device)
+        mass_t = torch.full((1, 1), mass_value, dtype=torch.float32, device=device)
+        damping_t = torch.full((1, 1), damping_value, dtype=torch.float32, device=device)
+        stiffness_t = torch.full((1, 1), stiffness_value, dtype=torch.float32, device=device)
+        z_pred, force_seq, corr_seq, sigma_seq, delta_fhat_seq = _td_correction_state_rollout(
+            model=model,
+            z0=z0,
+            ur0=ur0,
+            td_context0=td_context0,
+            steps=steps,
+            dt=dt,
+            structural_mass=mass_t,
+            damping_c=damping_t,
+            stiffness=stiffness_t,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+            mean_active=mean_active,
+            sigma_active=predict_sigma,
+            fhat_active=fhat_active,
+            td_force_input_source=td_force_input_source,
+            fhat_bound_multiplier=fhat_bound_multiplier,
+            force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
+        )
+        y_pred = z_pred[0, :, 0].detach().cpu().numpy()
+        force_pred = force_seq[0, :, 0].detach().cpu().numpy()
+        corr_pred = corr_seq[0, :, 0].detach().cpu().numpy()
+        sigma_pred = sigma_seq[0, :, 0].detach().cpu().numpy()
+        delta_fhat_pred = delta_fhat_seq[0, :, 0].detach().cpu().numpy()
+        if not np.all(np.isfinite(y_pred)) or not np.all(np.isfinite(force_pred)):
+            diverged_count += 1
+            continue
+        y_eval = y_pred[discard_steps + 1 :]
+        force_eval = force_pred[discard_steps:]
+        corr_eval = corr_pred[discard_steps:]
+        sigma_eval = sigma_pred[discard_steps:]
+        delta_fhat_eval = delta_fhat_pred[discard_steps:]
+        if y_eval.size < 4 or force_eval.size < 4:
+            raise ValueError(f"Surrogate row {row['index']} evaluation window is too short after discard.")
+        fn = float(np.sqrt(stiffness_value / float(row["ic_effective_mass_kg"])) / (2.0 * np.pi))
+        if not np.isfinite(fn) or fn <= 0.0:
+            raise ValueError(f"Surrogate row {row['index']} has invalid effective natural frequency.")
+        with torch.no_grad():
+            f0 = float(
+                model._force_scale_from_reduced_velocity(
+                    torch.tensor([[ur_value]], dtype=torch.float32, device=device),
+                    like=torch.zeros((1, 1), dtype=torch.float32, device=device),
+                ).detach().cpu().reshape(-1)[0]
+            )
+        f0 = max(float(f0), 1.0e-12)
+        pred_disp_std = float(np.std(y_eval / diameter_value))
+        pred_force_std = float(np.std(force_eval / f0))
+        pred_disp_freq_ratio = float(dominant_frequency(y_eval, dt) / fn)
+        pred_force_freq_ratio = float(dominant_frequency(force_eval, dt) / fn)
+        target_disp_std = float(row["disp_std"])
+        target_force_std = float(row["force_std"])
+        target_disp_freq_ratio = float(row["disp_dominant_frequency_hz"] / fn)
+        target_force_freq_ratio = float(row["force_dominant_frequency_hz"] / fn)
+        row_metrics = {
+            DOMINANT_FREQ_REL_ERROR_KEY: _surrogate_relative_abs(pred_disp_freq_ratio, target_disp_freq_ratio),
+            DISP_STD_REL_ERROR_KEY: _surrogate_relative_abs(pred_disp_std, target_disp_std),
+            FORCE_DOMINANT_FREQ_REL_ERROR_KEY: _surrogate_relative_abs(pred_force_freq_ratio, target_force_freq_ratio),
+            FORCE_STD_REL_ERROR_KEY: _surrogate_relative_abs(pred_force_std, target_force_std),
+            "Predicted std(y/D)": pred_disp_std,
+            "Target std(y/D)": target_disp_std,
+            "Predicted std(F/F0)": pred_force_std,
+            "Target std(F/F0)": target_force_std,
+            "Predicted f_y/f_n": pred_disp_freq_ratio,
+            "Target f_y/f_n": target_disp_freq_ratio,
+            "Predicted f_F/f_n": pred_force_freq_ratio,
+            "Target f_F/f_n": target_force_freq_ratio,
+        }
+        row_metrics[AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY] = _surrogate_aggregate_metric(
+            row_metrics,
+            (DOMINANT_FREQ_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
+        )
+        row_metrics[AGGREGATE_FORCE_VALIDATION_ERROR_KEY] = _surrogate_aggregate_metric(
+            row_metrics,
+            (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, FORCE_STD_REL_ERROR_KEY),
+        )
+        row_metrics[AGGREGATE_VALIDATION_ERROR_KEY] = _surrogate_aggregate_metric(
+            row_metrics,
+            (
+                DOMINANT_FREQ_REL_ERROR_KEY,
+                DISP_STD_REL_ERROR_KEY,
+                FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
+                FORCE_STD_REL_ERROR_KEY,
+            ),
+        )
+        for name, value in row_metrics.items():
+            _add_metric(name, value)
+        for name, value in _safe_scalar_stats("Correction", corr_eval / f0).items():
+            _add_metric(name, value)
+        if predict_sigma:
+            for name, value in _safe_scalar_stats("Sigma correction", sigma_eval / f0).items():
+                _add_metric(name, value)
+        if fhat_active:
+            for name, value in _safe_scalar_stats("Delta fhat", delta_fhat_eval).items():
+                _add_metric(name, value)
+    averaged = {
+        name: total / float(max(1, metrics_count.get(name, 0)))
+        for name, total in metrics_sum.items()
+        if metrics_count.get(name, 0) > 0
+    }
+    averaged[ROLLOUT_DIVERGED_COUNT_KEY] = float(diverged_count)
+    averaged["sample_count"] = float(len(rows))
+    for name, value in averaged.items():
+        writer.add_scalar(f"{tag}/{name}", float(value), tb_step)
+    writer.flush()
+    return {
+        "loss_total": None,
+        "val_metrics": averaged,
+        "validation_wall_time_s": None,
+    }
 
 
 def _load_checkpoint(path: Path) -> tuple[dict[str, Any], Any, str]:
@@ -785,8 +1073,17 @@ def _run_hnn_td_correction_validation(
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", True))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+    surrogate_enabled = bool(getattr(monitoring_cfg, "surrogate_validation_enabled", True))
+    surrogate_tag = str(getattr(monitoring_cfg, "surrogate_validation_tag", "val_surrogate")).strip() or "val_surrogate"
+    combined_tag = str(getattr(monitoring_cfg, "combined_validation_tag", "val")).strip() or "val"
+    surrogate_rows: list[dict[str, Any]] = []
+    if surrogate_enabled:
+        surrogate_rows = _load_surrogate_validation_rows(
+            Path(getattr(monitoring_cfg, "surrogate_validation_npz", "CFD_Data/analysis/surrogate_validation_points.npz")),
+            td_mass_source=td_mass_source,
+        )
 
-    split_dirs: dict[str, Path] = {ASYNC_VAL_SPLIT_TAG: _resolve_val_unseen_dir(train_series_root)}
+    split_dirs: dict[str, Path] = {}
     val_seen_dir = _resolve_optional_val_split_dir(train_series_root, "val_seen")
     if val_seen_dir is not None:
         split_dirs["val_seen"] = val_seen_dir
@@ -795,8 +1092,6 @@ def _run_hnn_td_correction_validation(
     for split_tag, split_dir in split_dirs.items():
         split_paths = sorted(split_dir.glob("*.npz"))
         if not split_paths:
-            if split_tag == ASYNC_VAL_SPLIT_TAG:
-                raise FileNotFoundError(f"No '.npz' files found in '{split_dir}'.")
             continue
         split_trajs_map[split_tag] = load_td_correction_trajectories(
             paths=split_paths,
@@ -809,17 +1104,26 @@ def _run_hnn_td_correction_validation(
             recompute_td_observables_from_phi=recompute_td_observables_from_phi,
         )
 
-    val_trajs_np = split_trajs_map.get(ASYNC_VAL_SPLIT_TAG, [])
-    if not val_trajs_np:
-        raise FileNotFoundError("Async PHNN validation requires a non-empty val_unseen split.")
-    dt = float(val_trajs_np[0]["t"][1] - val_trajs_np[0]["t"][0])
+    first_split_trajs = next((trajs for trajs in split_trajs_map.values() if trajs), [])
+    if not first_split_trajs and not surrogate_rows:
+        raise FileNotFoundError("Async PHNN validation requires val_seen trajectories or surrogate validation rows.")
+    if first_split_trajs:
+        dt = float(first_split_trajs[0]["t"][1] - first_split_trajs[0]["t"][0])
+    else:
+        dt = float(surrogate_rows[0]["ic_dt"])
 
     model_dict = asdict(cfg.model)
-    first_val_traj = val_trajs_np[0]
     mass_key = "dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"
-    model_dict["structural_mass"] = float(np.asarray(first_val_traj[mass_key]).reshape(()))
-    model_dict["k"] = float(np.asarray(first_val_traj["stiffness_n_m"]).reshape(()))
-    model_dict["damping_c"] = float(np.asarray(first_val_traj["damping_c"]).reshape(()))
+    if first_split_trajs:
+        first_val_traj = first_split_trajs[0]
+        model_dict["structural_mass"] = float(np.asarray(first_val_traj[mass_key]).reshape(()))
+        model_dict["k"] = float(np.asarray(first_val_traj["stiffness_n_m"]).reshape(()))
+        model_dict["damping_c"] = float(np.asarray(first_val_traj["damping_c"]).reshape(()))
+    else:
+        first_surrogate = surrogate_rows[0]
+        model_dict["structural_mass"] = float(first_surrogate["mass"])
+        model_dict["k"] = float(first_surrogate["ic_stiffness_n_m"])
+        model_dict["damping_c"] = float(first_surrogate["ic_damping_c"])
     model_dict["Ca"] = 0.0
     model_dict["use_stochastic_process_noise"] = predict_sigma
     model_dict["use_td_force_input"] = use_td_force_input
@@ -1145,16 +1449,67 @@ def _run_hnn_td_correction_validation(
         for split_tag, split_trajs_np in split_trajs_map.items()
         if split_trajs_np
     }
-    unseen_result = split_results.get(ASYNC_VAL_SPLIT_TAG, {})
+    if surrogate_enabled and surrogate_rows and do_rollout:
+        surrogate_start = time.perf_counter()
+        surrogate_result = _run_surrogate_td_validation(
+            rows=surrogate_rows,
+            writer=writer,
+            tb_step=tb_step,
+            tag=surrogate_tag,
+            model=model,
+            device=device,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+            mean_active=mean_active,
+            predict_sigma=predict_sigma,
+            fhat_active=fhat_active,
+            td_force_input_source=td_force_input_source,
+            fhat_bound_multiplier=fhat_bound_multiplier,
+            force_zero_output=force_zero_output,
+            rollout_stochastic=rollout_stochastic,
+            rollout_noise_scale=rollout_noise_scale,
+            rollout_seed=rollout_seed,
+        )
+        surrogate_result["validation_wall_time_s"] = float(time.perf_counter() - surrogate_start)
+        writer.add_scalar(f"{surrogate_tag}/validation_wall_time_s", surrogate_result["validation_wall_time_s"], tb_step)
+        split_results[surrogate_tag] = surrogate_result
+
+    combined_metrics: dict[str, float] = {}
+    seen_metrics = split_results.get("val_seen", {}).get("val_metrics", {})
+    surrogate_metrics = split_results.get(surrogate_tag, {}).get("val_metrics", {})
+    if seen_metrics and surrogate_metrics:
+        shared_names = sorted(set(seen_metrics).intersection(surrogate_metrics))
+        for name in shared_names:
+            if str(name).startswith("loss_") or str(name) == "loss_total":
+                continue
+            seen_value = float(seen_metrics[name])
+            surrogate_value = float(surrogate_metrics[name])
+            if np.isfinite(seen_value) and np.isfinite(surrogate_value):
+                combined_value = 0.5 * seen_value + 0.5 * surrogate_value
+                combined_metrics[name] = float(combined_value)
+                writer.add_scalar(f"{combined_tag}/{name}", combined_value, tb_step)
+        if combined_metrics:
+            split_results[combined_tag] = {
+                "loss_total": None,
+                "val_metrics": combined_metrics,
+                "validation_wall_time_s": None,
+            }
+            writer.flush()
+
+    summary_metrics = combined_metrics or surrogate_metrics or seen_metrics
     summary: dict[str, Any] = {
-        "loss_total": unseen_result.get("loss_total"),
-        "val_metrics": unseen_result.get("val_metrics", {}),
+        "loss_total": None,
+        "val_metrics": summary_metrics,
         "split_results": split_results,
     }
-    summary["best_metric_name"] = AGGREGATE_FORCE_VALIDATION_ERROR_KEY
-    summary["best_metric_value"] = summary["val_metrics"].get(AGGREGATE_FORCE_VALIDATION_ERROR_KEY)
+    summary["best_metric_name"] = AGGREGATE_VALIDATION_ERROR_KEY
+    summary["best_metric_value"] = summary["val_metrics"].get(AGGREGATE_VALIDATION_ERROR_KEY)
     if "val_seen" in split_results:
         summary["val_seen_loss_total"] = split_results["val_seen"].get("loss_total")
+    if surrogate_tag in split_results:
+        summary["val_surrogate_aggregate"] = split_results[surrogate_tag].get("val_metrics", {}).get(
+            AGGREGATE_VALIDATION_ERROR_KEY
+        )
     return summary
 
 
@@ -2290,8 +2645,6 @@ def main() -> None:
         elapsed = time.perf_counter() - validation_start
         summary["status"] = "completed"
         summary["validation_wall_time_s"] = float(elapsed)
-        tb_step = int(args.epoch) + 1
-        writer.add_scalar(f"{ASYNC_VAL_SPLIT_TAG}/validation_wall_time_s", float(elapsed), tb_step)
         writer.flush()
         summary_path = _async_summary_path(args.log_dir, int(args.epoch))
         summary_path.parent.mkdir(parents=True, exist_ok=True)

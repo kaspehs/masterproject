@@ -447,6 +447,7 @@ class LossConfig:
     rollout_disp_std_weight: float = 0.0
     rollout_disp_std_normalize_by_true: bool | None = None  # None -> reuse rollout_det_amplitude_normalized_mse
     rollout_disp_std_p: float = 2.0
+    rollout_disp_mean_in_std_loss: bool = True  # add displacement-mean error under rollout_disp_std_weight
     rollout_disp_spectral_weight: float | None = None  # preferred name; falls back to rollout_disp_psd_weight when unset
     rollout_disp_spectral_loss: str = "psd"  # "psd" | "dominant_frequency"
     rollout_disp_psd_weight: float = 0.0
@@ -495,6 +496,10 @@ class MonitoringConfig:
     async_validation_num_workers: int = 0
     async_validation_num_threads: int = 4
     async_validation_max_concurrent: int = 1
+    surrogate_validation_enabled: bool = True
+    surrogate_validation_npz: str = "CFD_Data/analysis/surrogate_validation_points.npz"
+    surrogate_validation_tag: str = "val_surrogate"
+    combined_validation_tag: str = "val"
 
 @dataclass
 class LoggingConfig:
