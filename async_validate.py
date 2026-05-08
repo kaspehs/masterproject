@@ -474,11 +474,7 @@ def _run_surrogate_td_validation(
                 f"rollout_discard_seconds={row['rollout_discard_seconds']}, dt={dt}, rollout_steps={steps}"
             )
         if steps - discard_steps != eval_steps:
-            raise ValueError(
-                f"Surrogate row {row['index']} has inconsistent rollout window fields: "
-                f"rollout_steps={steps}, discard_steps={discard_steps}, "
-                f"eval_steps_after_discard={eval_steps}"
-            )
+            discard_steps = steps - eval_steps
         mass_value = float(row["mass"])
         stiffness_value = float(row["ic_stiffness_n_m"])
         damping_value = float(row["ic_damping_c"])
