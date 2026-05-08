@@ -363,6 +363,46 @@ def _load_surrogate_validation_rows(path: Path, *, td_mass_source: str) -> list[
     return rows
 
 
+def _maybe_reduce_surrogate_validation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    reduce_time: bool,
+    reduction_factor: int,
+) -> list[dict[str, Any]]:
+    rf = max(1, int(reduction_factor))
+    if not bool(reduce_time) or rf <= 1:
+        return rows
+    reduced_rows: list[dict[str, Any]] = []
+    for row in rows:
+        old_dt = float(row["ic_dt"])
+        if not np.isfinite(old_dt) or old_dt <= 0.0:
+            raise ValueError(f"Surrogate row {row['index']} has invalid ic_dt={old_dt!r}.")
+        old_eval_steps = int(round(float(row["eval_steps_after_discard"])))
+        old_rollout_steps = int(round(float(row["rollout_steps"])))
+        if old_eval_steps <= 1 or old_rollout_steps <= old_eval_steps:
+            raise ValueError(
+                f"Invalid surrogate rollout/eval steps for row {row['index']}: "
+                f"rollout_steps={old_rollout_steps}, eval_steps_after_discard={old_eval_steps}"
+            )
+        discard_seconds = float(row["rollout_discard_seconds"])
+        eval_seconds = float(old_eval_steps) * old_dt
+        new_dt = old_dt * float(rf)
+        new_discard_steps = int(np.ceil(discard_seconds / new_dt))
+        new_eval_steps = int(np.ceil(eval_seconds / new_dt))
+        new_rollout_steps = new_discard_steps + new_eval_steps
+        if new_discard_steps < 1 or new_eval_steps <= 1 or new_rollout_steps <= new_eval_steps:
+            raise ValueError(
+                f"Time reduction produced invalid surrogate rollout/eval steps for row {row['index']}: "
+                f"dt={new_dt}, rollout_steps={new_rollout_steps}, eval_steps_after_discard={new_eval_steps}"
+            )
+        reduced = dict(row)
+        reduced["ic_dt"] = float(new_dt)
+        reduced["rollout_steps"] = float(new_rollout_steps)
+        reduced["eval_steps_after_discard"] = float(new_eval_steps)
+        reduced_rows.append(reduced)
+    return reduced_rows
+
+
 def _surrogate_relative_abs(pred: float, target: float) -> float:
     value = relative_error(float(pred), float(target))
     return abs(float(value)) if np.isfinite(value) else float("nan")
@@ -1083,9 +1123,16 @@ def _run_hnn_td_correction_validation(
             Path(getattr(monitoring_cfg, "surrogate_validation_npz", "CFD_Data/analysis/surrogate_validation_points.npz")),
             td_mass_source=td_mass_source,
         )
+        surrogate_rows = _maybe_reduce_surrogate_validation_rows(
+            surrogate_rows,
+            reduce_time=bool(getattr(data_cfg, "reduce_time", False)),
+            reduction_factor=int(getattr(data_cfg, "reduction_factor", 1)),
+        )
+        surrogate_step_counts = [int(round(float(row["rollout_steps"]))) for row in surrogate_rows]
         print(
             f"[async-val][phnn] loaded {len(surrogate_rows)} surrogate validation row(s) "
-            f"from {getattr(monitoring_cfg, 'surrogate_validation_npz', 'CFD_Data/analysis/surrogate_validation_points.npz')}"
+            f"from {getattr(monitoring_cfg, 'surrogate_validation_npz', 'CFD_Data/analysis/surrogate_validation_points.npz')} "
+            f"(rollout_steps={surrogate_step_counts})"
         )
 
     split_dirs: dict[str, Path] = {}
