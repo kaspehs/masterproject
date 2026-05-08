@@ -32,6 +32,7 @@ from core.runtime import (
 )
 from HNN_helper import (
     AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
+    AGGREGATE_VALIDATION_ERROR_KEY,
     Config,
     FORCE_MAPPING_NRMSE_KEY,
     GradNormBalancer,
@@ -3665,18 +3666,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
 
     train_series_root = Path(data_cfg.train_series_dir)
     train_dir = train_series_root / "train"
-    val_unseen_dir = train_series_root / "val_unseen"
-    legacy_val_dir = train_series_root / "val"
-    if not val_unseen_dir.exists():
-        val_unseen_dir = legacy_val_dir
     val_seen_dir = train_series_root / "val_seen"
-    if not train_dir.exists() or not val_unseen_dir.exists():
-        raise FileNotFoundError(
-            "TD correction mode expects train/ and val_unseen/ under data.train_series_dir "
-            "(legacy val/ is still supported as a fallback)."
-        )
+    legacy_val_dir = train_series_root / "val"
+    if not val_seen_dir.exists() and legacy_val_dir.exists():
+        val_seen_dir = legacy_val_dir
+    if not train_dir.exists():
+        raise FileNotFoundError("TD correction mode expects train/ under data.train_series_dir.")
     train_paths = sorted(train_dir.glob("*.npz"))
-    val_paths = sorted(val_unseen_dir.glob("*.npz"))
     val_seen_paths = sorted(val_seen_dir.glob("*.npz")) if val_seen_dir.exists() else []
     if not train_paths:
         raise FileNotFoundError("No TD correction training trajectories were found.")
@@ -3710,21 +3706,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         td_memory_cfg=td_memory_cfg,
         recompute_td_observables_from_phi=recompute_td_observables_from_phi,
     )
-    val_trajs = (
-        load_td_correction_trajectories(
-            paths=val_paths,
-            cut_start_seconds=val_cut,
-            reduce_time=reduce_time_enabled,
-            reduction_factor=reduction_factor,
-            stagger_reduced_time=stagger_val_reduce,
-            ur_source=td_mass_source,
-            td_params=td_params,
-            td_memory_cfg=td_memory_cfg,
-            recompute_td_observables_from_phi=recompute_td_observables_from_phi,
-        )
-        if val_paths
-        else []
-    )
+    val_trajs: list[dict[str, np.ndarray]] = []
     val_seen_trajs = (
         load_td_correction_trajectories(
             paths=val_seen_paths,
@@ -4008,6 +3990,11 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     amp_enabled, amp_dtype, scaler = setup_amp(
         device, use_amp=bool(precision_cfg.use_amp), amp_dtype=str(precision_cfg.amp_dtype)
     )
+    async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
+    async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
+    async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
+    async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
+    async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
     writer, run_name = setup_writer(
         config.logging.run_dir_root,
         config_name,
@@ -4016,6 +4003,14 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     )
     writer.add_text("hnn/td_correction_config", json.dumps(hnn_cfg, indent=2, sort_keys=True), 0)
     writer.flush()
+    async_processes: list[dict[str, Any]] = []
+    async_best_state: dict[str, Any] = {
+        "best_metric_name": AGGREGATE_VALIDATION_ERROR_KEY,
+        "best_metric_value": float("inf"),
+        "loss_total": float("inf"),
+    }
+    if async_validation:
+        (Path(writer.log_dir) / "async_validation").mkdir(parents=True, exist_ok=True)
     run_models_dir = Path("models") / run_name
     run_models_dir.mkdir(parents=True, exist_ok=True)
     validation_models_dir = run_models_dir / "async_validation"
@@ -4135,6 +4130,8 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     train_steps_per_epoch = len(train_loader)
     val_instances = len(val_loader.dataset) if val_loader is not None else 0
     val_steps_per_epoch = len(val_loader) if val_loader is not None else 0
+    val_seen_instances = len(val_seen_loader.dataset) if val_seen_loader is not None else 0
+    val_seen_steps_per_epoch = len(val_seen_loader) if val_seen_loader is not None else 0
     train_rollout_instances = len(train_rollout_loader.dataset) if train_rollout_loader is not None else 0
     train_rollout_steps_per_epoch = len(train_rollout_loader) if train_rollout_loader is not None else 0
     val_rollout_instances = len(val_rollout_loader.dataset) if val_rollout_loader is not None else 0
@@ -4148,9 +4145,9 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             f"train_trajectories={len(train_trajs)}, correction_mode={correction_mode}"
         ),
         (
-            f"Validation setup: unseen_steps={val_steps_per_epoch}, unseen_instances={val_instances}, "
-            f"val_unseen_trajectories={len(val_trajs)}, val_seen_trajectories={len(val_seen_trajs)}, validate_every={validate_every}, "
-            f"val_samples_per_ur={validation_samples_per_ur}"
+            f"Validation setup: seen_steps={val_seen_steps_per_epoch}, seen_instances={val_seen_instances}, "
+            f"val_seen_trajectories={len(val_seen_trajs)}, validate_every={validate_every}, "
+            f"val_samples_per_ur={validation_samples_per_ur}, async_validation={async_validation}"
         ),
         (
             f"Rollout setup: det_weight={rollout_det_weight:g}, std_weight={rollout_disp_std_weight:g}, "
@@ -4768,18 +4765,32 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 f"Lspec={train_metrics['loss_rollout_spectral']:.4e}, lr={train_metrics['lr']:.3e}"
             )
 
-        if val_loader is not None and ((epoch % validate_every) == 0 or epoch == epochs - 1):
-            _run_td_validation_for_split(
-                epoch_idx=epoch,
-                split_tag="val_unseen",
-                split_name="val_unseen",
-                split_loader=val_loader,
-                split_rollout_loader=val_rollout_loader,
-                split_trajs=val_trajs,
-                log_rollout_plots=True,
-                validation_theta0_values_for_split=validation_theta0_values,
-            )
-            if val_seen_loader is not None:
+        should_validate = (epoch % validate_every) == 0 or epoch == epochs - 1
+        if should_validate:
+            if async_validation:
+                async_processes = _reap_async_processes(
+                    async_processes,
+                    writer=writer,
+                    best_state=async_best_state,
+                    wait=False,
+                )
+                ckpt_path = _save_td_validation_checkpoint(epoch)
+                print(f"Saved async validation checkpoint to {ckpt_path}")
+                async_processes = _launch_async_validation(
+                    processes=async_processes,
+                    max_concurrent=async_max_concurrent,
+                    checkpoint_path=ckpt_path,
+                    epoch=epoch,
+                    log_dir=Path(writer.log_dir),
+                    device=async_device,
+                    num_threads=async_num_threads,
+                    num_workers=async_num_workers,
+                    do_losses=True,
+                    do_rollout=True,
+                    writer=writer,
+                    best_state=async_best_state,
+                )
+            elif val_seen_loader is not None:
                 _run_td_validation_for_split(
                     epoch_idx=epoch,
                     split_tag="val_seen",
@@ -4787,14 +4798,23 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     split_loader=val_seen_loader,
                     split_rollout_loader=val_seen_rollout_loader,
                     split_trajs=val_seen_trajs,
-                    log_rollout_plots=False,
+                    log_rollout_plots=True,
                     log_all_rollout_spectra=True,
                     validation_theta0_values_for_split=validation_theta0_values,
                 )
-            ckpt_path = _save_td_validation_checkpoint(epoch)
-            print(f"Saved validation checkpoint to {ckpt_path}")
+                ckpt_path = _save_td_validation_checkpoint(epoch)
+                print(f"Saved validation checkpoint to {ckpt_path}")
 
-    final_val_trajs = [*val_trajs, *val_seen_trajs]
+    if async_validation and async_processes:
+        print(f"Waiting for {len(async_processes)} async validation job(s) to finish...")
+        async_processes = _reap_async_processes(
+            async_processes,
+            writer=writer,
+            best_state=async_best_state,
+            wait=True,
+        )
+
+    final_val_trajs = [*val_seen_trajs]
     if final_rollout_all_validation and final_val_trajs:
         print("Final validation rollout (all trajectories) started.")
         metrics_sum: dict[str, float] = {}
@@ -4937,7 +4957,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         if avg_metrics:
             summary_lines = [
                 "Final rollout over all validation trajectories:",
-                f"val_unseen={len(val_trajs)}, val_seen={len(val_seen_trajs)}, total={len(metric_trajs)}",
+                f"val_seen={len(val_seen_trajs)}, total={len(metric_trajs)}",
             ]
             for name in sorted(avg_metrics):
                 summary_lines.append(f"{name}: {avg_metrics[name]:.6f}")

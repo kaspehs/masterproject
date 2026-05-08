@@ -1085,6 +1085,8 @@ def _run_hnn_td_correction_validation(
 
     split_dirs: dict[str, Path] = {}
     val_seen_dir = _resolve_optional_val_split_dir(train_series_root, "val_seen")
+    if val_seen_dir is None:
+        val_seen_dir = _resolve_optional_val_split_dir(train_series_root, "val")
     if val_seen_dir is not None:
         split_dirs["val_seen"] = val_seen_dir
     cut_start_seconds = resolve_cut_start_seconds(data_cfg, "val")
