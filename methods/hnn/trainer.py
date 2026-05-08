@@ -4781,13 +4781,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                     max_concurrent=async_max_concurrent,
                     checkpoint_path=ckpt_path,
                     epoch=epoch,
-                    log_dir=Path(writer.log_dir),
-                    device=async_device,
-                    num_threads=async_num_threads,
-                    num_workers=async_num_workers,
+                    run_name=run_name,
+                    writer=writer,
+                    async_device=async_device,
+                    async_num_workers=async_num_workers,
+                    async_num_threads=async_num_threads,
                     do_losses=True,
                     do_rollout=True,
-                    writer=writer,
                     best_state=async_best_state,
                 )
             elif val_seen_loader is not None:
