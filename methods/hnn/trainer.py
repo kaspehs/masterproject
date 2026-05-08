@@ -3176,6 +3176,14 @@ def _reap_async_processes(
                 f"[async-val] epoch {epoch}: FAILED with exit code {return_code} "
                 f"after {elapsed:.2f}s"
             )
+            if summary_path.exists():
+                try:
+                    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+                    error_msg = str(payload.get("error", "")).strip()
+                    if error_msg:
+                        print(f"[async-val] epoch {epoch}: {error_msg}")
+                except Exception:
+                    pass
 
         if ckpt_path.exists() and return_code == 0:
             if best_state is not None and summary_path.exists() and run_name:
@@ -3995,6 +4003,15 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
     async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
     async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
+    if async_validation and bool(getattr(monitoring_cfg, "surrogate_validation_enabled", True)):
+        surrogate_validation_npz = Path(
+            getattr(monitoring_cfg, "surrogate_validation_npz", "CFD_Data/analysis/surrogate_validation_points.npz")
+        )
+        if not surrogate_validation_npz.exists():
+            raise FileNotFoundError(
+                "monitoring.surrogate_validation_npz does not exist: "
+                f"{surrogate_validation_npz}. Generate/copy this NPZ before starting async surrogate validation."
+            )
     writer, run_name = setup_writer(
         config.logging.run_dir_root,
         config_name,

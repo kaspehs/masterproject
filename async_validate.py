@@ -8,6 +8,7 @@ Intended to be spawned as a child process so training can continue.
 from __future__ import annotations
 
 import argparse
+import traceback
 import json
 import time
 from pathlib import Path
@@ -1082,6 +1083,10 @@ def _run_hnn_td_correction_validation(
             Path(getattr(monitoring_cfg, "surrogate_validation_npz", "CFD_Data/analysis/surrogate_validation_points.npz")),
             td_mass_source=td_mass_source,
         )
+        print(
+            f"[async-val][phnn] loaded {len(surrogate_rows)} surrogate validation row(s) "
+            f"from {getattr(monitoring_cfg, 'surrogate_validation_npz', 'CFD_Data/analysis/surrogate_validation_points.npz')}"
+        )
 
     split_dirs: dict[str, Path] = {}
     val_seen_dir = _resolve_optional_val_split_dir(train_series_root, "val_seen")
@@ -1452,6 +1457,7 @@ def _run_hnn_td_correction_validation(
         if split_trajs_np
     }
     if surrogate_enabled and surrogate_rows and do_rollout:
+        print(f"[async-val][phnn] running surrogate validation split '{surrogate_tag}'")
         surrogate_start = time.perf_counter()
         surrogate_result = _run_surrogate_td_validation(
             rows=surrogate_rows,
@@ -2651,6 +2657,14 @@ def main() -> None:
         summary_path = _async_summary_path(args.log_dir, int(args.epoch))
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        summary["traceback"] = traceback.format_exc()
+        summary_path = _async_summary_path(args.log_dir, int(args.epoch))
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        raise
     finally:
         writer.flush()
         writer.close()
