@@ -79,6 +79,19 @@ from methods.hnn.trainer import (
     _td_state_mse_loss,
     _td_state_propagated_nll_loss,
 )
+from methods.latent_rnn.trainer import (
+    LatentRNNForceModel,
+    _build_latent_window_dataset,
+    _build_surrogate_encoder_reference_groups,
+    _latent_losses_from_batch,
+    _latent_rollout_validation_case,
+    _load_latent_rnn_trajectories,
+    _load_surrogate_validation_rows as _load_latent_surrogate_validation_rows,
+    _log_latent_rollout_validation,
+    _maybe_reduce_surrogate_validation_rows as _maybe_reduce_latent_surrogate_validation_rows,
+    _resolve_latent_time_scale,
+    _run_latent_surrogate_validation,
+)
 from methods.vpinn.trainer import (
     _force_mapping_nrmse_over_trajs,
     ScaledForceWrapper,
@@ -1765,6 +1778,390 @@ def _run_vpinn_validation(
         )
 
 
+def _run_latent_rnn_validation(
+    *,
+    ckpt: dict[str, Any],
+    cfg: Any,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    do_losses: bool,
+    do_rollout: bool,
+    num_workers: int,
+) -> dict[str, Any]:
+    tb_step = int(epoch)
+    data_cfg = cfg.data
+    model_cfg = cfg.model
+    arch_cfg = cfg.architecture
+    loss_cfg = cfg.loss
+    monitoring_cfg = cfg.monitoring
+    lrnn_cfg = dict(cfg.latent_rnn or {})
+    non_blocking = device.type == "cuda"
+
+    train_series_root = Path(data_cfg.train_series_dir)
+    train_dir = train_series_root / "train"
+    if not train_dir.exists():
+        raise FileNotFoundError("latent_rnn async validation expects train/ under data.train_series_dir.")
+    train_paths = sorted(train_dir.glob("*.npz"))
+    if not train_paths:
+        raise FileNotFoundError(f"No '.npz' files found in '{train_dir}'.")
+
+    mass_source = str(lrnn_cfg.get("td_mass_source", "dry")).strip().lower()
+    reduce_time_enabled = bool(getattr(data_cfg, "reduce_time", False))
+    reduction_factor = int(getattr(data_cfg, "reduction_factor", 1))
+    stagger_train_reduce = bool(
+        getattr(
+            data_cfg,
+            "stagger_reduced_time_train",
+            reduce_time_enabled and max(1, reduction_factor) > 1,
+        )
+    )
+    stagger_val_reduce = bool(getattr(data_cfg, "stagger_reduced_time_val", False))
+    train_trajs = _load_latent_rnn_trajectories(
+        train_paths,
+        cut_start_seconds=resolve_cut_start_seconds(data_cfg, "train"),
+        reduce_time=reduce_time_enabled,
+        reduction_factor=reduction_factor,
+        stagger_reduced_time=stagger_train_reduce,
+        mass_source=mass_source,
+    )
+    if not train_trajs:
+        raise ValueError("No latent_rnn training trajectories remained after async loading/reduction.")
+
+    split_paths_map: dict[str, list[Path]] = {}
+    val_unseen_dir = train_series_root / ASYNC_VAL_SPLIT_TAG
+    legacy_val_dir = train_series_root / "val"
+    if val_unseen_dir.exists():
+        split_paths_map[ASYNC_VAL_SPLIT_TAG] = sorted(val_unseen_dir.glob("*.npz"))
+    elif legacy_val_dir.exists():
+        split_paths_map[ASYNC_VAL_SPLIT_TAG] = sorted(legacy_val_dir.glob("*.npz"))
+    val_seen_dir = train_series_root / "val_seen"
+    if val_seen_dir.exists():
+        split_paths_map["val_seen"] = sorted(val_seen_dir.glob("*.npz"))
+
+    split_trajs_map: dict[str, list[dict[str, Any]]] = {}
+    for split_tag, paths in split_paths_map.items():
+        if not paths:
+            continue
+        split_trajs_map[split_tag] = _load_latent_rnn_trajectories(
+            paths,
+            cut_start_seconds=resolve_cut_start_seconds(data_cfg, "val"),
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+            stagger_reduced_time=stagger_val_reduce,
+            mass_source=mass_source,
+        )
+
+    latent_dim = int(lrnn_cfg.get("latent_dim", 3))
+    encoder_length = int(lrnn_cfg.get("encoder_length", 50))
+    include_acceleration = bool(lrnn_cfg.get("encoder_include_acceleration", True))
+    input_scaling_mode = resolve_phnn_input_scaling_mode(getattr(model_cfg, "input_scaling_mode", "current"))
+    ur_scale = 10.0 if getattr(model_cfg, "ur_scale", None) is None else float(model_cfg.ur_scale)
+    latent_time_scale = float(
+        ckpt.get(
+            "latent_time_scale",
+            _resolve_latent_time_scale(lrnn_cfg.get("latent_time_scale", "auto"), train_trajs=train_trajs),
+        )
+    )
+    rollout_settings = _resolve_td_rollout_loss_settings(loss_cfg)
+    rollout_det_weight = float(getattr(loss_cfg, "rollout_det_weight", 0.0))
+    rollout_disp_std_weight = float(getattr(loss_cfg, "rollout_disp_std_weight", 0.0))
+    rollout_disp_mean_in_std_loss = bool(getattr(loss_cfg, "rollout_disp_mean_in_std_loss", True))
+    spectral_weight_raw = getattr(loss_cfg, "rollout_disp_spectral_weight", None)
+    rollout_disp_spectral_weight = (
+        float(getattr(loss_cfg, "rollout_disp_psd_weight", 0.0))
+        if spectral_weight_raw is None
+        else float(spectral_weight_raw)
+    )
+    rollout_active = (
+        rollout_det_weight > 0.0
+        or rollout_disp_std_weight > 0.0
+        or rollout_disp_spectral_weight > 0.0
+    )
+    rollout_steps = int(getattr(loss_cfg, "rollout_det_steps", 1)) if rollout_active else 1
+    rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
+    rollout_batch_size = int(cfg.training.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
+    state_weight = float(getattr(loss_cfg, "state_weight", 1.0))
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
+    use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
+    spectral_mode = _normalize_rollout_disp_spectral_loss_mode(
+        getattr(loss_cfg, "rollout_disp_spectral_loss", "psd")
+    )
+    psd_peak_rel_bw = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
+    psd_use_hann = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
+
+    first_traj = train_trajs[0]
+    model = LatentRNNForceModel(
+        latent_dim=latent_dim,
+        encoder_input_dim=3 + (1 if include_acceleration else 0),
+        encoder_hidden=int(lrnn_cfg.get("encoder_hidden", 128)),
+        encoder_layers=int(lrnn_cfg.get("encoder_layers", 1)),
+        encoder_dropout=float(lrnn_cfg.get("encoder_dropout", 0.0)),
+        backbone_input_dim=3 + latent_dim,
+        architecture_cfg=arch_cfg,
+        rho=float(np.asarray(first_traj["rho_kg_m3"]).reshape(())),
+        diameter=float(model_cfg.D),
+        force_output=str(model_cfg.force_output),
+        coefficient_output_bound=(
+            None
+            if getattr(model_cfg, "coefficient_output_bound", None) is None
+            else float(model_cfg.coefficient_output_bound)
+        ),
+        input_scaling_mode=input_scaling_mode,
+        ur_scale=ur_scale,
+        latent_time_scale=latent_time_scale,
+        corr_init_mode=str(lrnn_cfg.get("corr_init_mode", getattr(model_cfg, "corr_init_mode", "zero"))),
+    ).to(device)
+    _load_state(model, ckpt["model_state"])
+    model.eval()
+
+    surrogate_enabled = bool(getattr(monitoring_cfg, "surrogate_validation_enabled", True))
+    surrogate_tag = str(getattr(monitoring_cfg, "surrogate_validation_tag", "val_surrogate")).strip() or "val_surrogate"
+    combined_tag = str(getattr(monitoring_cfg, "combined_validation_tag", "val")).strip() or "val"
+    surrogate_rows: list[dict[str, Any]] = []
+    if surrogate_enabled:
+        surrogate_rows = _load_latent_surrogate_validation_rows(
+            Path(getattr(monitoring_cfg, "surrogate_validation_npz", "CFD_Data/analysis/surrogate_validation_points.npz")),
+            td_mass_source=mass_source,
+        )
+        surrogate_rows = _maybe_reduce_latent_surrogate_validation_rows(
+            surrogate_rows,
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+        )
+        surrogate_step_counts = [int(round(float(row["rollout_steps"]))) for row in surrogate_rows]
+        print(
+            f"[async-val][latent_rnn] loaded {len(surrogate_rows)} surrogate validation row(s) "
+            f"from {getattr(monitoring_cfg, 'surrogate_validation_npz', 'CFD_Data/analysis/surrogate_validation_points.npz')} "
+            f"(rollout_steps={surrogate_step_counts})"
+        )
+    if not any(split_trajs_map.values()) and not surrogate_rows:
+        raise FileNotFoundError("Async latent_rnn validation requires validation trajectories or surrogate rows.")
+    surrogate_encoder_references = _build_surrogate_encoder_reference_groups(
+        train_trajs,
+        encoder_length=encoder_length,
+        mass_source=mass_source,
+        input_scaling_mode=input_scaling_mode,
+        diameter=float(model_cfg.D),
+        ur_scale=ur_scale,
+        include_acceleration=include_acceleration,
+    )
+    if surrogate_enabled and surrogate_rows and not surrogate_encoder_references:
+        raise ValueError("Surrogate validation is enabled, but no latent encoder reference histories were available.")
+
+    def _run_loss_loader(loader: Any) -> dict[str, float]:
+        sums: dict[str, torch.Tensor] = {}
+        count = 0
+        with torch.no_grad():
+            for batch in loader:
+                losses = _latent_losses_from_batch(
+                    model=model,
+                    batch=batch,
+                    device=device,
+                    non_blocking=non_blocking,
+                    trajectory_relative=bool(rollout_settings["trajectory_relative"]),
+                    compute_disp_std_loss=rollout_disp_std_weight > 0.0,
+                    compute_disp_mean_loss=(rollout_disp_std_weight > 0.0 and rollout_disp_mean_in_std_loss),
+                    disp_std_relative=bool(rollout_settings["disp_std_relative"]),
+                    disp_std_power=float(rollout_settings["disp_std_p"]),
+                    compute_disp_spectral_loss=rollout_disp_spectral_weight > 0.0,
+                    disp_spectral_loss_mode=spectral_mode,
+                    disp_freq_relative=bool(rollout_settings["disp_freq_relative"]),
+                    disp_freq_power=float(rollout_settings["disp_freq_p"]),
+                    disp_freq_alpha=float(rollout_settings["disp_freq_alpha"]),
+                    disp_psd_relative=bool(rollout_settings["disp_psd_relative"]),
+                    disp_psd_peak_rel_bandwidth=psd_peak_rel_bw,
+                    disp_psd_use_hann_window=psd_use_hann,
+                    mean_reg_norm=mean_reg_norm,
+                )
+                rollout_total_loss = (
+                    rollout_det_weight * losses["trajectory_loss"]
+                    + rollout_disp_std_weight * (losses["disp_std_loss"] + losses["disp_mean_loss"])
+                    + rollout_disp_spectral_weight * losses["disp_spectral_loss"]
+                )
+                total_loss = state_weight * losses["state_loss"] + rollout_total_loss + mean_reg * losses["mean_reg_loss"]
+                if use_force_data_loss:
+                    total_loss = total_loss + force_data_weight * losses["force_data_loss"]
+                batch_metrics = {
+                    "loss_total": total_loss,
+                    "loss_state": losses["state_loss"],
+                    "loss_rollout_det": losses["trajectory_loss"],
+                    "loss_rollout_disp_std": losses["disp_std_loss"],
+                    "loss_rollout_disp_mean": losses["disp_mean_loss"],
+                    "loss_rollout_spectral": losses["disp_spectral_loss"],
+                    "loss_reg_mean": losses["mean_reg_loss"],
+                }
+                batch_size = int(batch[0].shape[0])
+                count += batch_size
+                for name, value in batch_metrics.items():
+                    sums[name] = sums.get(name, value.detach().new_zeros(())) + value.detach() * batch_size
+        denom = float(max(1, count))
+        return {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
+
+    def _run_split(split_tag: str, split_trajs: list[dict[str, Any]]) -> dict[str, Any]:
+        split_start = time.perf_counter()
+        val_metrics: dict[str, float] = {}
+        dataset = _build_latent_window_dataset(
+            split_trajs,
+            encoder_length=encoder_length,
+            rollout_steps=rollout_steps,
+            mass_source=mass_source,
+            input_scaling_mode=input_scaling_mode,
+            diameter=float(model_cfg.D),
+            ur_scale=ur_scale,
+            include_acceleration=include_acceleration,
+        )
+        if do_losses and dataset is not None:
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=rollout_batch_size,
+                shuffle=False,
+                num_workers=int(num_workers),
+                pin_memory=(device.type == "cuda"),
+            )
+            val_metrics.update(_run_loss_loader(loader))
+            for name, value in val_metrics.items():
+                writer.add_scalar(f"{split_tag}/{name}", value, tb_step)
+
+        if do_rollout and split_trajs:
+            validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
+            ur_values = [
+                float(np.asarray(traj["ur"], dtype=float).reshape(-1)[0])
+                for traj in split_trajs
+                if np.asarray(traj["ur"], dtype=float).reshape(-1).size > 0
+            ]
+            sampled_indices = sample_indices_per_ur(
+                ur_values,
+                samples_per_ur=validation_samples_per_ur,
+                seed=1,
+            )
+            sampled_names = [str(split_trajs[idx].get("name", f"traj_{idx}")) for idx in sampled_indices if idx < len(split_trajs)]
+            print(
+                f"[async-val][latent_rnn][{split_tag}] epoch {epoch}: sampled metric trajectories={sampled_names} "
+                f"(mass_source={mass_source})"
+            )
+            metrics_sum: dict[str, float] = {}
+            metrics_count: dict[str, int] = {}
+            diverged_count = 0
+            for idx in sampled_indices:
+                if idx >= len(split_trajs):
+                    continue
+                rollout_metrics = _latent_rollout_validation_case(
+                    model=model,
+                    traj=split_trajs[idx],
+                    encoder_length=encoder_length,
+                    include_acceleration=include_acceleration,
+                    mass_source=mass_source,
+                    input_scaling_mode=input_scaling_mode,
+                    ur_scale=ur_scale,
+                    device=device,
+                ).get("metrics", {})
+                diverged_flag = float(rollout_metrics.get(ROLLOUT_DIVERGED_KEY, 0.0))
+                if np.isfinite(diverged_flag) and diverged_flag > 0.5:
+                    diverged_count += 1
+                for name, value in rollout_metrics.items():
+                    if name == ROLLOUT_DIVERGED_KEY or not np.isfinite(float(value)):
+                        continue
+                    metrics_sum[name] = metrics_sum.get(name, 0.0) + float(value)
+                    metrics_count[name] = metrics_count.get(name, 0) + 1
+            for name, total in metrics_sum.items():
+                value_f = total / float(max(1, metrics_count.get(name, 0)))
+                writer.add_scalar(f"{split_tag}/{name}", value_f, tb_step)
+                val_metrics[name] = float(value_f)
+            writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), tb_step)
+            val_metrics[ROLLOUT_DIVERGED_COUNT_KEY] = float(diverged_count)
+
+            plot_indices = sample_one_index_per_ur(ur_values, seed=0) or [0]
+            plot_idx = int(plot_indices[0])
+            if 0 <= plot_idx < len(split_trajs):
+                _log_latent_rollout_validation(
+                    writer=writer,
+                    epoch=tb_step,
+                    model=model,
+                    traj=split_trajs[plot_idx],
+                    encoder_length=encoder_length,
+                    include_acceleration=include_acceleration,
+                    mass_source=mass_source,
+                    input_scaling_mode=input_scaling_mode,
+                    ur_scale=ur_scale,
+                    device=device,
+                    tag_prefix=f"{split_tag}/rollout",
+                    metric_prefix=split_tag,
+                    step=tb_step,
+                    log_metrics=False,
+                    log_plots=True,
+                    log_force_plot=(split_tag != "val_seen"),
+                    log_spectra=False,
+                )
+
+        split_elapsed = time.perf_counter() - split_start
+        writer.add_scalar(f"{split_tag}/validation_wall_time_s", float(split_elapsed), tb_step)
+        return {
+            "loss_total": (float(val_metrics["loss_total"]) if "loss_total" in val_metrics else None),
+            "val_metrics": val_metrics,
+            "validation_wall_time_s": float(split_elapsed),
+        }
+
+    split_results = {
+        split_tag: _run_split(split_tag, split_trajs)
+        for split_tag, split_trajs in split_trajs_map.items()
+        if split_trajs
+    }
+
+    if surrogate_enabled and surrogate_rows and do_rollout:
+        print(f"[async-val][latent_rnn] running surrogate validation split '{surrogate_tag}'")
+        surrogate_start = time.perf_counter()
+        surrogate_result = _run_latent_surrogate_validation(
+            rows=surrogate_rows,
+            writer=writer,
+            tb_step=tb_step,
+            tag=surrogate_tag,
+            model=model,
+            encoder_references=surrogate_encoder_references,
+            device=device,
+        )
+        surrogate_result["validation_wall_time_s"] = float(time.perf_counter() - surrogate_start)
+        writer.add_scalar(f"{surrogate_tag}/validation_wall_time_s", surrogate_result["validation_wall_time_s"], tb_step)
+        split_results[surrogate_tag] = surrogate_result
+
+    combined_metrics: dict[str, float] = {}
+    seen_metrics = split_results.get("val_seen", {}).get("val_metrics", {})
+    surrogate_metrics = split_results.get(surrogate_tag, {}).get("val_metrics", {})
+    if seen_metrics and surrogate_metrics:
+        shared_names = sorted(set(seen_metrics).intersection(surrogate_metrics))
+        for name in shared_names:
+            if str(name).startswith("loss_") or str(name) == "loss_total":
+                continue
+            seen_value = float(seen_metrics[name])
+            surrogate_value = float(surrogate_metrics[name])
+            if np.isfinite(seen_value) and np.isfinite(surrogate_value):
+                combined_value = 0.5 * seen_value + 0.5 * surrogate_value
+                combined_metrics[name] = float(combined_value)
+                writer.add_scalar(f"{combined_tag}/{name}", combined_value, tb_step)
+        if combined_metrics:
+            split_results[combined_tag] = {
+                "loss_total": None,
+                "val_metrics": combined_metrics,
+                "validation_wall_time_s": None,
+            }
+            writer.flush()
+
+    unseen_metrics = split_results.get(ASYNC_VAL_SPLIT_TAG, {}).get("val_metrics", {})
+    summary_metrics = combined_metrics or surrogate_metrics or seen_metrics or unseen_metrics
+    loss_total = split_results.get(ASYNC_VAL_SPLIT_TAG, {}).get("loss_total")
+    if loss_total is None:
+        loss_total = split_results.get("val_seen", {}).get("loss_total")
+    return {
+        "loss_total": loss_total,
+        "val_metrics": summary_metrics,
+        "split_results": split_results,
+        "best_metric_name": AGGREGATE_VALIDATION_ERROR_KEY,
+        "best_metric_value": summary_metrics.get(AGGREGATE_VALIDATION_ERROR_KEY),
+    }
+
+
 def _run_vpinn_td_correction_validation(
     *,
     ckpt: dict[str, Any],
@@ -2669,6 +3066,17 @@ def main() -> None:
             if not bool(ckpt.get("td_correction", False)):
                 raise ValueError("PHNN async validation now only supports TD-correction checkpoints.")
             summary.update(_run_hnn_td_correction_validation(
+                ckpt=ckpt,
+                cfg=cfg,
+                device=device,
+                writer=writer,
+                epoch=int(args.epoch),
+                do_losses=bool(int(args.do_losses)),
+                do_rollout=bool(int(args.do_rollout)),
+                num_workers=int(args.num_workers),
+            ))
+        elif method in {"latent_rnn", "scratch_latent_rnn"}:
+            summary.update(_run_latent_rnn_validation(
                 ckpt=ckpt,
                 cfg=cfg,
                 device=device,

@@ -62,8 +62,10 @@ from methods.hnn.trainer import (
     _displacement_mean_error_torch,
     _displacement_std_error_torch,
     _dominant_frequency_error_torch,
+    _launch_async_validation,
     _normalize_rollout_disp_spectral_loss_mode,
     _psd_error_torch,
+    _reap_async_processes,
     _resolve_td_rollout_loss_settings,
     _trajectory_rollout_mse_torch,
 )
@@ -1652,7 +1654,7 @@ def train(config: Config, config_name: str) -> None:
         ur_scale=ur_scale,
         include_acceleration=include_acceleration,
     )
-    loader_workers = 0
+    loader_workers = int(runtime_cfg.num_workers)
     train_loader = DataLoader(
         train_dataset,
         batch_size=rollout_batch_size,
@@ -1741,6 +1743,20 @@ def train(config: Config, config_name: str) -> None:
         run_name_override=getattr(config.logging, "run_name", None),
         append_timestamp=bool(getattr(config.logging, "append_timestamp", True)),
     )
+    async_validation = bool(getattr(monitoring_cfg, "async_validation", False))
+    async_device = str(getattr(monitoring_cfg, "async_validation_device", "cpu"))
+    async_num_workers = int(getattr(monitoring_cfg, "async_validation_num_workers", 0))
+    async_num_threads = int(getattr(monitoring_cfg, "async_validation_num_threads", 4))
+    async_max_concurrent = int(getattr(monitoring_cfg, "async_validation_max_concurrent", 1))
+    async_processes: list[dict[str, Any]] = []
+    async_best_state: dict[str, Any] = {
+        "best_metric_name": AGGREGATE_VALIDATION_ERROR_KEY,
+        "best_metric_value": float("inf"),
+        "loss_total": float("inf"),
+    }
+    async_dir = Path(writer.log_dir) / "async_validation"
+    if async_validation:
+        async_dir.mkdir(parents=True, exist_ok=True)
     writer.add_text("latent_rnn/config", json.dumps(lrnn_cfg, indent=2, sort_keys=True), 0)
     writer.add_text(
         "latent_rnn/resolved",
@@ -1772,7 +1788,8 @@ def train(config: Config, config_name: str) -> None:
                     f"val_unseen_windows={0 if val_loader is None else len(val_loader.dataset)}, "
                     f"val_seen_windows={0 if val_seen_loader is None else len(val_seen_loader.dataset)}, "
                     f"surrogate_rows={len(surrogate_rows)}, "
-                    f"surrogate_encoder_ref_groups={len(surrogate_encoder_references)}"
+                    f"surrogate_encoder_ref_groups={len(surrogate_encoder_references)}, "
+                    f"num_workers={loader_workers}, async_validation={async_validation}"
                 ),
                 (
                     f"Ablation: no Vivana-TD force/context/phase/sigma/fhat inputs are loaded into the model; "
@@ -1931,6 +1948,8 @@ def train(config: Config, config_name: str) -> None:
 
     run_models_dir = Path("models") / run_name
     run_models_dir.mkdir(parents=True, exist_ok=True)
+    validation_models_dir = run_models_dir / "async_validation"
+    validation_models_dir.mkdir(parents=True, exist_ok=True)
     latest_path = run_models_dir / f"{run_name}_latest.pt"
     best_val = float("inf")
     epochs = int(training_cfg.epochs)
@@ -1939,6 +1958,26 @@ def train(config: Config, config_name: str) -> None:
     log_every = max(1, int(getattr(monitoring_cfg, "log_every_epochs", 1)))
     validation_samples_per_ur = max(1, int(getattr(monitoring_cfg, "validation_samples_per_ur", 1)))
     final_rollout_all_validation = bool(getattr(monitoring_cfg, "final_rollout_all_validation", False))
+
+    def _save_latent_validation_checkpoint(epoch_idx: int) -> Path:
+        ckpt_path = validation_models_dir / f"model_epoch_{epoch_idx + 1:06d}.pt"
+        latest_validation_path = validation_models_dir / "model.pt"
+        state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
+        checkpoint_config = asdict(config)
+        checkpoint_config["loss"]["rollout_det_steps"] = int(rollout_steps)
+        torch.save(
+            {
+                "model_state": state_source.state_dict(),
+                "config": checkpoint_config,
+                "run_name": run_name,
+                "method": "latent_rnn",
+                "latent_time_scale": latent_time_scale,
+                "epoch": epoch_idx + 1,
+            },
+            ckpt_path,
+        )
+        shutil.copyfile(ckpt_path, latest_validation_path)
+        return ckpt_path
 
     for epoch in range(epochs):
         if bool(optim_cfg.use_lr_scheduler):
@@ -1963,6 +2002,29 @@ def train(config: Config, config_name: str) -> None:
             )
         validation_due = (epoch + 1) % validate_every == 0 or epoch == epochs - 1
         if validation_due and (val_loader is not None or val_seen_loader is not None or surrogate_rows):
+            if async_validation:
+                async_processes = _reap_async_processes(
+                    async_processes,
+                    writer=writer,
+                    best_state=async_best_state,
+                    wait=False,
+                )
+                ckpt_path = _save_latent_validation_checkpoint(epoch)
+                async_processes = _launch_async_validation(
+                    processes=async_processes,
+                    max_concurrent=async_max_concurrent,
+                    checkpoint_path=ckpt_path,
+                    epoch=epoch,
+                    run_name=run_name,
+                    writer=writer,
+                    async_device=async_device,
+                    async_num_workers=async_num_workers,
+                    async_num_threads=async_num_threads,
+                    do_losses=True,
+                    do_rollout=True,
+                    best_state=async_best_state,
+                )
+                continue
             eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             eval_model.eval()
 
@@ -2157,6 +2219,15 @@ def train(config: Config, config_name: str) -> None:
                 f"loss={val_loss:.4e}, state={val_metrics.get('loss_state', float('nan')):.4e}, "
                 f"selection={selection_value:.4e}"
             )
+
+    if async_validation and async_processes:
+        print("[async-val] waiting for latent_rnn validation jobs to finish...")
+        async_processes = _reap_async_processes(
+            async_processes,
+            writer=writer,
+            best_state=async_best_state,
+            wait=True,
+        )
 
     final_val_trajs = [*val_trajs, *val_seen_trajs]
     if final_rollout_all_validation and final_val_trajs:
