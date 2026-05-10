@@ -83,7 +83,7 @@ EXCLUDE_UR_ATOL = 1.0e-8
 
 MAKE_DIAGNOSTIC_PLOT = True
 SHOW_DIAGNOSTIC_PLOT = False
-PLOT_DPI = 220
+PLOT_DPI = 300
 
 
 METRIC_KEYS = (
@@ -876,18 +876,13 @@ def save_diagnostic_plot(
     interpolation_kind = str(np.asarray(points.get("interpolation_kind", INTERPOLATION_KIND)).reshape(()))
     smoothing_strength = float(np.asarray(points.get("smoothing_strength", SMOOTHING_STRENGTH)).reshape(()))
 
-    metric_titles = {
-        "disp_std": "Displacement std, nondimensional",
-        "force_std": "Force std, nondimensional",
-        "disp_dominant_frequency_hz": "Displacement frequency ratio",
-        "force_dominant_frequency_hz": "Force frequency ratio",
-    }
     metric_ylabels = {
-        "disp_std": r"$\sigma_{y/D}$",
-        "force_std": r"$\sigma_{F/F_0}$",
-        "disp_dominant_frequency_hz": r"$f_y/f_n$",
-        "force_dominant_frequency_hz": r"$f_F/f_n$",
+        "disp_std": r"$\sigma_y$",
+        "force_std": r"$\sigma_F$",
+        "disp_dominant_frequency_hz": r"$\omega_y/\omega_n$",
+        "force_dominant_frequency_hz": r"$\omega_F/\omega_n$",
     }
+    axis_label_fontsize = 12
 
     fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.5), sharex=True)
     axes_flat = axes.reshape(-1)
@@ -993,13 +988,12 @@ def save_diagnostic_plot(
                 zorder=4,
                 label="anchor rows in output",
             )
-        ax.set_title(metric_titles[key])
-        ax.set_ylabel(metric_ylabels[key])
+        ax.set_ylabel(metric_ylabels[key], fontsize=axis_label_fontsize)
         ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.25)
 
     for ax in axes[-1, :]:
-        ax.set_xlabel(r"Effective reduced velocity $U_r$ ($C_a=1$)")
+        ax.set_xlabel(r"Reduced velocity $U_r$", fontsize=axis_label_fontsize)
 
     handles, labels = axes_flat[0].get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
@@ -1009,10 +1003,9 @@ def save_diagnostic_plot(
         loc="upper center",
         ncol=min(4, max(1, len(by_label))),
         frameon=False,
-        bbox_to_anchor=(0.5, 1.01),
+        bbox_to_anchor=(0.5, 0.995),
     )
-    fig.suptitle("Surrogate validation metric targets", y=1.04)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.955))
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -3149,6 +3149,29 @@ def _reap_async_processes(
     best_state: dict[str, Any] | None = None,
     wait: bool = False,
 ) -> list[dict[str, Any]]:
+    def _mirror_async_summary_scalars(payload: dict[str, Any], step: int) -> None:
+        if writer is None:
+            return
+        split_results = payload.get("split_results", {})
+        if not isinstance(split_results, dict):
+            return
+        for split_tag, split_payload in split_results.items():
+            if not isinstance(split_payload, dict):
+                continue
+            metrics = split_payload.get("val_metrics", {})
+            if not isinstance(metrics, dict):
+                continue
+            for name, value in metrics.items():
+                if value is None:
+                    continue
+                try:
+                    value_f = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value_f):
+                    writer.add_scalar(f"{split_tag}/{name}", value_f, step)
+        writer.flush()
+
     active: list[dict[str, Any]] = []
     for job in processes:
         proc: subprocess.Popen = job["proc"]
@@ -3186,9 +3209,12 @@ def _reap_async_processes(
                     pass
 
         if ckpt_path.exists() and return_code == 0:
-            if best_state is not None and summary_path.exists() and run_name:
+            if summary_path.exists():
                 try:
                     payload = json.loads(summary_path.read_text(encoding="utf-8"))
+                    _mirror_async_summary_scalars(payload, epoch)
+                    if best_state is None or not run_name:
+                        raise StopIteration
                     val_metrics = payload.get("val_metrics", {})
                     if not isinstance(val_metrics, dict):
                         val_metrics = {}
@@ -3236,6 +3262,8 @@ def _reap_async_processes(
                                 f"[async-val] epoch {epoch}: new best {best_metric_name}={best_metric_f:.6e}; "
                                 f"kept {best_model_path}"
                             )
+                except StopIteration:
+                    pass
                 except Exception as exc:
                     print(f"[async-val] epoch {epoch}: failed to promote best checkpoint ({exc})")
             try:

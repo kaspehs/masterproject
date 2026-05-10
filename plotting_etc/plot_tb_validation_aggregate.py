@@ -43,14 +43,18 @@ LOG_ROOT = Path("logs")
 RUN_DIRS: list[str] = []
 
 # Optional legend labels. RUN_LABELS is applied in the selected run order after
-# discovery/sorting. RUN_LABELS_BY_RUN can key by run path or default run label.
+# discovery/sorting. When RUN_LABELS_BY_RUN is non-empty, it also acts as an
+# allowlist: only matching runs are included. Keys can be run paths or default
+# run labels.
 RUN_LABELS: list[str] = []
 RUN_LABELS_BY_RUN: dict[str, str] = {
-    "fhat/loss_ablation/ABLATION_onestep": "Residual loss only",
-    "fhat/loss_ablation/ABLATION_mse": "+ MSE loss",
-    "fhat/loss_ablation/ABLATION_std": "+ Std loss",
-    "fhat/loss_ablation/ABLATION_std_freq": "+ Std and Frequency loss",
-    "fhat/loss_ablation/ABLATION_std_psd": "+ Std and PSD loss",
+    "fhat/loss_ablation/ABLATION_onestep": r"Residual loss",
+    "fhat/loss_ablation/ABLATION_mse": r"+ MSE loss",
+    "fhat/loss_ablation/ABLATION_std": r"+ Std loss",
+    "fhat/loss_ablation/ABLATION_psd": r"+ PSD loss",
+    "fhat/loss_ablation/ABLATION_freq": r"+ Frequency loss",
+    "fhat/loss_ablation/ABLATION_std_freq": r"+ Std and Frequency losses",
+    "fhat/loss_ablation/ABLATION_std_psd": r"+ Std and PSD losses",
 }
 
 # Number of discovered runs to include. Set to None to use all discovered runs.
@@ -61,14 +65,14 @@ RUN_NAME_CONTAINS: str | None = "fhat/loss_ablation"
 SORT_RUNS_BY = "mtime_desc"  # "mtime_desc", "mtime_asc", or "name"
 
 OUTPUT_DIR = Path("figs/tensorboard_validation")
-OUTPUT_BASENAME = "aggregate_validation_seen_components"
+OUTPUT_BASENAME = "aggregate_validation_split_rows"
 DPI = 300
 
 PLOT_TITLE: str | None = None
 X_LABEL = "Epoch"
 X_LIMITS: tuple[float, float] | None = (0.0, 500.0)
 X_LIMIT_MARGIN = 5.0
-SHOW_SUBPLOT_TITLES = False
+SHOW_SUBPLOT_TITLES = True
 Y_LABEL_FONT_SIZE = 14.4
 Y_LABEL_ROTATION = 0
 Y_LABEL_PAD = 11
@@ -87,11 +91,20 @@ PLOT_ROLLING_STD_BANDS = False
 BAND_STD_MULTIPLIER = 1.0
 BAND_ALPHA = 0.10
 LINE_WIDTH = 1.8
+HIGHLIGHT_RUN_LABELS: set[str] = set()
+HIGHLIGHT_RUN_KEYS: set[str] = set()
+HIGHLIGHT_LINE_WIDTH = LINE_WIDTH
+HIGHLIGHT_COLOR = "black"
+HIGHLIGHT_MARKER_SIZE = 34
 PLOT_FINAL_MARKERS = True
 PLOT_FINAL_VALUE_LABELS = False
-FINAL_MARKER_STEPS_BY_RUN: dict[str, float] = {
-    "mean_loss_ablation/ABLATION_onestep": 161.0,
-}
+SELECTION_SPLIT_TAG_PREFIX = "val"
+SELECTION_SCALAR_NAME = "Aggregate validation error"
+# Optional manual checkpoint overrides. Leave empty to select the minimum
+# combined-validation aggregate error for each run.
+SELECTED_EPOCHS_BY_RUN: dict[str, float] = {}
+OMIT_INITIAL_BEST_RUNS_FROM_PLOT = True
+INITIAL_BEST_STEP_ATOL = 1e-9
 FINAL_MARKER_SIZE = 34
 FINAL_LABEL_FONT_SIZE = 8
 FINAL_LABEL_X_OFFSET_POINTS = 5
@@ -99,12 +112,16 @@ FINAL_LABEL_RIGHT_MARGIN_FRACTION = 0.08
 
 PLOT_BASELINE_LINES = True
 BASELINE_LABEL = "Baseline VIVANA-TD"
+BASELINE_COLOR = "0.35"
 BASELINE_LINE_WIDTH = 1.4
 PLOT_BASELINE_Y_TICKS = True
 BASELINE_ERRORS_BY_METRIC: dict[str, float] = {
-    "displacement": 0.752,
-    "force": 0.316,
     "combined": 0.534,
+}
+BASELINE_ERRORS_BY_SPLIT: dict[str, float | None] = {
+    "val_seen": 0.534,
+    "val_surrogate": 0.889,
+    "val": 0.712,
 }
 
 # Log-space aggregation is usually better for positive error metrics spanning
@@ -119,12 +136,16 @@ SAVE_LATEX_TABLE = True
 PRINT_LATEX_TABLE = True
 LATEX_TABLE_CAPTION = (
     "Ablation performance at the selected best-performing checkpoints. "
-    "The aggregate metric is the mean of the four component errors. "
+    "Displacement and force aggregates are means of their frequency and standard-deviation errors; "
+    "the total aggregate is the mean of all four component errors. "
     "Lower values indicate better performance."
 )
 LATEX_TABLE_LABEL = "tab:loss_ablation_performance"
 LATEX_BOLD_BEST_PER_METRIC = True
 LATEX_TABLE_COLSEP_PT = 3
+LATEX_INCLUDE_BASELINE_ROW = True
+LATEX_INCLUDE_BEST_EPOCH = True
+LATEX_BEST_EPOCH_HEADER = "Epoch"
 SHOW_FIGURE = False
 
 
@@ -144,30 +165,28 @@ class SplitConfig:
 
 
 @dataclass(frozen=True)
-class TableMetricConfig:
+class TableColumnConfig:
+    split_tag_prefix: str
     scalar_name: str
     label: str
     latex_header: str
 
 
+@dataclass(frozen=True)
+class SelectedCheckpoint:
+    step: float
+    value: float
+    is_initial: bool
+
+
 SPLITS: list[SplitConfig] = [
-    SplitConfig(tag_prefix="val_seen", label="seen", linestyle="-"),
+    SplitConfig(tag_prefix="val_seen", label="Seen training trajectories", linestyle="-"),
+    SplitConfig(tag_prefix="val_surrogate", label="Surrogate validation points", linestyle="-"),
+    SplitConfig(tag_prefix="val", label="Combined validation", linestyle="-"),
 ]
 
 
 METRICS: list[MetricConfig] = [
-    MetricConfig(
-        scalar_name="Aggregate displacement error",
-        label="displacement",
-        title="Displacement aggregate error",
-        y_label=r"$\bar{\varepsilon}_y$",
-    ),
-    MetricConfig(
-        scalar_name="Aggregate force error",
-        label="force",
-        title="Force aggregate error",
-        y_label=r"$\bar{\varepsilon}_F$",
-    ),
     MetricConfig(
         scalar_name="Aggregate validation error",
         label="combined",
@@ -176,33 +195,55 @@ METRICS: list[MetricConfig] = [
     ),
 ]
 
-TABLE_METRICS: list[TableMetricConfig] = [
-    TableMetricConfig(
-        scalar_name="Dominant frequency relative error",
-        label="disp_frequency",
-        latex_header=r"$\varepsilon_{f,y}$",
+TABLE_COLUMNS: list[TableColumnConfig] = [
+    TableColumnConfig(
+        split_tag_prefix="val_seen",
+        scalar_name="Aggregate displacement error",
+        label="seen_disp",
+        latex_header=r"Seen $\bar{\varepsilon}_y$",
     ),
-    TableMetricConfig(
-        scalar_name="Displacement std relative error",
-        label="disp_std",
-        latex_header=r"$\varepsilon_{\sigma,y}$",
+    TableColumnConfig(
+        split_tag_prefix="val_seen",
+        scalar_name="Aggregate force error",
+        label="seen_force",
+        latex_header=r"Seen $\bar{\varepsilon}_F$",
     ),
-    TableMetricConfig(
-        scalar_name="Force dominant frequency relative error",
-        label="force_frequency",
-        latex_header=r"$\varepsilon_{f,F}$",
+    TableColumnConfig(
+        split_tag_prefix="val_surrogate",
+        scalar_name="Aggregate displacement error",
+        label="surrogate_disp",
+        latex_header=r"Surr. $\bar{\varepsilon}_y$",
     ),
-    TableMetricConfig(
-        scalar_name="Force std relative error",
-        label="force_std",
-        latex_header=r"$\varepsilon_{\sigma,F}$",
+    TableColumnConfig(
+        split_tag_prefix="val_surrogate",
+        scalar_name="Aggregate force error",
+        label="surrogate_force",
+        latex_header=r"Surr. $\bar{\varepsilon}_F$",
     ),
-    TableMetricConfig(
+    TableColumnConfig(
+        split_tag_prefix="val_surrogate",
         scalar_name="Aggregate validation error",
-        label="combined",
-        latex_header=r"$\bar{\varepsilon}$",
+        label="surrogate_combined",
+        latex_header=r"Surr. $\bar{\varepsilon}$",
+    ),
+    TableColumnConfig(
+        split_tag_prefix="val",
+        scalar_name="Aggregate validation error",
+        label="total_combined",
+        latex_header=r"Total $\bar{\varepsilon}$",
     ),
 ]
+
+# Fill component baseline entries here if/when those baseline evaluations are available.
+# The aggregate baseline values below come from BASELINE_ERRORS_BY_SPLIT.
+BASELINE_TABLE_ERRORS: dict[tuple[str, str], float | None] = {
+    ("val_seen", "Aggregate displacement error"): 0.752,
+    ("val_seen", "Aggregate force error"): 0.316,
+    ("val_surrogate", "Aggregate displacement error"): 0.317,
+    ("val_surrogate", "Aggregate force error"): 1.46,
+    ("val_surrogate", "Aggregate validation error"): BASELINE_ERRORS_BY_SPLIT.get("val_surrogate"),
+    ("val", "Aggregate validation error"): BASELINE_ERRORS_BY_SPLIT.get("val"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +277,13 @@ def _run_label_order_key(run_dir: Path) -> tuple[int, int, str]:
     return (1, len(label_order), default_label)
 
 
+def _run_matches_label_config(run_dir: Path) -> bool:
+    if not RUN_LABELS_BY_RUN:
+        return True
+    default_label = default_run_label(run_dir)
+    return any(key in RUN_LABELS_BY_RUN for key in (str(run_dir), default_label))
+
+
 def discover_run_dirs() -> list[Path]:
     if RUN_DIRS:
         run_dirs = [Path(path).expanduser() for path in RUN_DIRS]
@@ -244,6 +292,8 @@ def discover_run_dirs() -> list[Path]:
     run_dirs = sorted({path.parent for path in LOG_ROOT.rglob("events.out.tfevents*")})
     if RUN_NAME_CONTAINS:
         run_dirs = [path for path in run_dirs if RUN_NAME_CONTAINS in str(path)]
+    if RUN_LABELS_BY_RUN:
+        run_dirs = [path for path in run_dirs if _run_matches_label_config(path)]
 
     if SORT_RUNS_BY == "mtime_desc":
         run_dirs.sort(key=_run_mtime, reverse=True)
@@ -404,42 +454,67 @@ def format_latex_value(value: float, *, bold: bool = False) -> str:
     return rf"$\mathbf{{{body}}}$" if bold else rf"${body}$"
 
 
+def format_latex_epoch(value: float | None) -> str:
+    if value is None or not np.isfinite(float(value)):
+        return "--"
+    if np.isclose(float(value), round(float(value)), rtol=0.0, atol=1e-9):
+        return str(int(round(float(value))))
+    return f"{float(value):.3g}"
+
+
 def make_latex_performance_table(
     table_values: dict[str, dict[str, tuple[float, float]]],
+    selected_epochs: dict[str, float] | None = None,
 ) -> str:
-    metric_headers = {metric.label: metric.latex_header for metric in TABLE_METRICS}
-    metric_order = [metric.label for metric in TABLE_METRICS]
+    column_headers = {column.label: column.latex_header for column in TABLE_COLUMNS}
+    column_order = [column.label for column in TABLE_COLUMNS]
+    selected_epochs = selected_epochs or {}
+    value_column_spec = " ".join("c" for _ in column_order)
+    if LATEX_INCLUDE_BEST_EPOCH:
+        column_spec = "c c" if not column_order else "c c | " + value_column_spec
+    else:
+        column_spec = "c" if not column_order else "c | " + value_column_spec
     best_by_metric: dict[str, float] = {}
     if LATEX_BOLD_BEST_PER_METRIC:
-        for metric_label in metric_order:
+        for column_label in column_order:
             values = [
-                metric_values[metric_label][1]
+                metric_values[column_label][1]
                 for metric_values in table_values.values()
-                if metric_label in metric_values
+                if column_label in metric_values and np.isfinite(metric_values[column_label][1])
             ]
             if values:
-                best_by_metric[metric_label] = min(values)
+                best_by_metric[column_label] = min(values)
 
     lines = [
         r"\begin{table}[H]",
         r"\centering",
         rf"\setlength{{\tabcolsep}}{{{LATEX_TABLE_COLSEP_PT}pt}}",
-        r"\begin{tabular}{c c c c c | c}",
+        rf"\begin{{tabular}}{{{column_spec}}}",
         r"\toprule",
-        "Variant & "
-        + " & ".join(metric_headers.get(metric_label, latex_escape(metric_label)) for metric_label in metric_order)
-        + r" \\",
+        (
+            "Variant"
+            + (f" & {LATEX_BEST_EPOCH_HEADER}" if LATEX_INCLUDE_BEST_EPOCH else "")
+            + (
+                " & "
+                + " & ".join(column_headers.get(column_label, latex_escape(column_label)) for column_label in column_order)
+                if column_order
+                else ""
+            )
+            + r" \\"
+        ),
         r"\midrule",
     ]
 
     for run_label, metric_values in table_values.items():
         row = [latex_escape(run_label)]
-        for metric_label in metric_order:
-            if metric_label not in metric_values:
+        if LATEX_INCLUDE_BEST_EPOCH:
+            row.append(format_latex_epoch(selected_epochs.get(run_label)))
+        for column_label in column_order:
+            if column_label not in metric_values:
                 row.append("--")
                 continue
-            value = metric_values[metric_label][1]
-            best_value = best_by_metric.get(metric_label)
+            value = metric_values[column_label][1]
+            best_value = best_by_metric.get(column_label)
             bold = best_value is not None and np.isclose(value, best_value, rtol=1e-9, atol=1e-12)
             row.append(format_latex_value(value, bold=bold))
         lines.append(" & ".join(row) + r" \\")
@@ -460,6 +535,29 @@ def save_latex_table(output_path: Path, latex_table: str) -> None:
     output_path.write_text(latex_table + "\n")
 
 
+def baseline_error_for_table_column(column: TableColumnConfig) -> float | None:
+    value = BASELINE_TABLE_ERRORS.get((column.split_tag_prefix, column.scalar_name))
+    if value is not None:
+        return float(value)
+    if column.scalar_name == "Aggregate validation error":
+        split_value = BASELINE_ERRORS_BY_SPLIT.get(column.split_tag_prefix)
+        if split_value is not None:
+            return float(split_value)
+        metric_value = BASELINE_ERRORS_BY_METRIC.get("combined")
+        return float(metric_value) if metric_value is not None else None
+    return None
+
+
+def baseline_table_row() -> dict[str, tuple[float, float]]:
+    values: dict[str, tuple[float, float]] = {}
+    for column in TABLE_COLUMNS:
+        baseline_value = baseline_error_for_table_column(column)
+        if baseline_value is None or not np.isfinite(float(baseline_value)):
+            continue
+        values[column.label] = (float("nan"), float(baseline_value))
+    return values
+
+
 def default_run_label(run_dir: Path) -> str:
     if run_dir.parent == LOG_ROOT:
         return run_dir.name
@@ -478,30 +576,77 @@ def run_label(run_dir: Path, run_idx: int | None = None) -> str:
     return default_label
 
 
-def final_marker_point(run_dir: Path, label: str, steps: np.ndarray, values: np.ndarray) -> tuple[float, float] | None:
-    if steps.size == 0 or values.size == 0:
-        return None
-    marker_step = None
+def is_highlighted_run(run_dir: Path, label: str) -> bool:
+    default_label = default_run_label(run_dir)
+    return (
+        label in HIGHLIGHT_RUN_LABELS
+        or default_label in HIGHLIGHT_RUN_KEYS
+        or str(run_dir) in HIGHLIGHT_RUN_KEYS
+    )
+
+
+def selected_epoch_override(run_dir: Path, label: str) -> float | None:
     default_label = default_run_label(run_dir)
     for key in (str(run_dir), default_label, label):
-        if key in FINAL_MARKER_STEPS_BY_RUN:
-            marker_step = float(FINAL_MARKER_STEPS_BY_RUN[key])
-            break
+        if key in SELECTED_EPOCHS_BY_RUN:
+            return float(SELECTED_EPOCHS_BY_RUN[key])
+    return None
 
-    if marker_step is None:
-        marker_step = float(steps[-1])
-        marker_value = float(values[-1])
-    else:
-        if marker_step < float(steps[0]) or marker_step > float(steps[-1]):
-            print(f"Warning: marker step {marker_step:g} outside logged range for {run_dir}; using final point.")
-            marker_step = float(steps[-1])
-            marker_value = float(values[-1])
-        else:
-            marker_value = float(np.interp(marker_step, steps, values))
 
-    if not np.isfinite(marker_step) or not np.isfinite(marker_value):
+def interpolated_point_at_step(steps: np.ndarray, values: np.ndarray, step: float) -> tuple[float, float] | None:
+    if steps.size == 0 or values.size == 0:
         return None
-    return marker_step, marker_value
+    step = float(step)
+    if not np.isfinite(step):
+        return None
+    if step < float(steps[0]) or step > float(steps[-1]):
+        return None
+    value = float(np.interp(step, steps, values))
+    if not np.isfinite(value):
+        return None
+    return step, value
+
+
+def selected_checkpoint_for_run(
+    run_dir: Path,
+    label: str,
+    tag_series: dict[str, ScalarSeries],
+) -> SelectedCheckpoint | None:
+    tag = f"{SELECTION_SPLIT_TAG_PREFIX}/{SELECTION_SCALAR_NAME}"
+    if tag not in tag_series:
+        print(f"Warning: selection metric {tag!r} missing in {run_dir}; using no selected checkpoint.")
+        return None
+
+    steps, smoothed, _lower, _upper = smooth_series(tag_series[tag])
+    if steps.size == 0:
+        return None
+    first_step = float(steps[0])
+    override_step = selected_epoch_override(run_dir, label)
+    if override_step is not None:
+        point = interpolated_point_at_step(steps, smoothed, override_step)
+        if point is not None:
+            step, value = point
+            return SelectedCheckpoint(
+                step=step,
+                value=value,
+                is_initial=np.isclose(step, first_step, rtol=0.0, atol=INITIAL_BEST_STEP_ATOL),
+            )
+        print(f"Warning: selected epoch override {override_step:g} outside logged range for {run_dir}; using minimum.")
+
+    finite = np.isfinite(smoothed)
+    if not np.any(finite):
+        return None
+    finite_indices = np.flatnonzero(finite)
+    best_idx = int(finite_indices[int(np.argmin(smoothed[finite]))])
+    best_step = float(steps[best_idx])
+    best_value = float(smoothed[best_idx])
+    if not np.isfinite(best_step) or not np.isfinite(best_value):
+        return None
+    return SelectedCheckpoint(
+        step=best_step,
+        value=best_value,
+        is_initial=np.isclose(best_step, first_step, rtol=0.0, atol=INITIAL_BEST_STEP_ATOL),
+    )
 
 
 def add_baseline_y_tick(ax, baseline_value: float) -> None:
@@ -533,12 +678,23 @@ def add_baseline_y_tick(ax, baseline_value: float) -> None:
     ax.set_ylim(ymin, ymax)
 
 
+def baseline_value_for(split: SplitConfig, metric: MetricConfig) -> float | None:
+    split_value = BASELINE_ERRORS_BY_SPLIT.get(split.tag_prefix)
+    if split_value is not None:
+        return float(split_value)
+    metric_value = BASELINE_ERRORS_BY_METRIC.get(metric.label)
+    return float(metric_value) if metric_value is not None else None
+
+
 def plot(run_dirs: list[Path]) -> None:
     if not run_dirs:
         raise ValueError(f"No TensorBoard runs found under {LOG_ROOT}")
+    if len(METRICS) != 1:
+        raise ValueError("This plotter expects exactly one aggregate metric when plotting splits as rows.")
 
-    plot_tags = [f"{split.tag_prefix}/{metric.scalar_name}" for split in SPLITS for metric in METRICS]
-    table_tags = [f"{split.tag_prefix}/{metric.scalar_name}" for split in SPLITS for metric in TABLE_METRICS]
+    metric = METRICS[0]
+    plot_tags = [f"{split.tag_prefix}/{metric.scalar_name}" for split in SPLITS]
+    table_tags = [f"{column.split_tag_prefix}/{column.scalar_name}" for column in TABLE_COLUMNS]
     tags = sorted({*plot_tags, *table_tags})
     print("Using runs:")
     for run_idx, run_dir in enumerate(run_dirs):
@@ -547,108 +703,137 @@ def plot(run_dirs: list[Path]) -> None:
     per_run = {run_dir: load_selected_scalars(run_dir, tags) for run_dir in run_dirs}
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(len(METRICS), 1, figsize=FIGSIZE, sharex=SHARE_X_AXIS)
+    fig, axes = plt.subplots(len(SPLITS), 1, figsize=FIGSIZE, sharex=SHARE_X_AXIS)
     axes_arr = np.atleast_1d(axes)
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     csv_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
     table_values: dict[str, dict[str, tuple[float, float]]] = {}
+    selected_epochs: dict[str, float] = {}
+    selected_checkpoints: dict[Path, SelectedCheckpoint] = {}
+    omitted_initial_best_plot_runs: set[Path] = set()
+    baseline_values = baseline_table_row() if LATEX_INCLUDE_BASELINE_ROW else {}
+    if baseline_values:
+        table_values[BASELINE_LABEL] = baseline_values
 
     for run_idx, (run_dir, tag_series) in enumerate(per_run.items()):
         label_base = run_label(run_dir, run_idx)
-        for split in SPLITS:
-            for table_metric in TABLE_METRICS:
-                tag = f"{split.tag_prefix}/{table_metric.scalar_name}"
-                if tag not in tag_series:
-                    print(f"Warning: table metric {tag!r} missing in {run_dir}.")
-                    continue
-                steps, smoothed, _lower, _upper = smooth_series(tag_series[tag])
-                marker_point = final_marker_point(run_dir, label_base, steps, smoothed)
-                if marker_point is None:
-                    continue
-                table_values.setdefault(label_base, {})[table_metric.label] = marker_point
+        selected_checkpoint = selected_checkpoint_for_run(run_dir, label_base, tag_series)
+        if selected_checkpoint is None:
+            continue
+        selected_checkpoints[run_dir] = selected_checkpoint
+        selected_step = selected_checkpoint.step
+        selected_value = selected_checkpoint.value
+        selected_epochs[label_base] = selected_step
+        print(
+            f"Selected {label_base!r}: epoch={selected_step:g}, "
+            f"{SELECTION_SPLIT_TAG_PREFIX}/{SELECTION_SCALAR_NAME}={selected_value:.6g}"
+        )
+        if OMIT_INITIAL_BEST_RUNS_FROM_PLOT and selected_checkpoint.is_initial:
+            omitted_initial_best_plot_runs.add(run_dir)
+            print(f"  - Keeping {label_base!r} in the table but omitting it from the plot because its best epoch is initial.")
+        for column in TABLE_COLUMNS:
+            tag = f"{column.split_tag_prefix}/{column.scalar_name}"
+            if tag not in tag_series:
+                print(f"Warning: table metric {tag!r} missing in {run_dir}.")
+                continue
+            steps, smoothed, _lower, _upper = smooth_series(tag_series[tag])
+            marker_point = interpolated_point_at_step(steps, smoothed, selected_step)
+            if marker_point is None:
+                print(f"Warning: selected epoch {selected_step:g} outside range for table metric {tag!r} in {run_dir}.")
+                continue
+            table_values.setdefault(label_base, {})[column.label] = marker_point
 
-    for ax, metric in zip(axes_arr, METRICS):
+    for ax, split in zip(axes_arr, SPLITS):
         plotted_count = 0
         marker_steps: list[float] = []
-        baseline_value = BASELINE_ERRORS_BY_METRIC.get(metric.label)
+        baseline_value = baseline_value_for(split, metric)
         if PLOT_BASELINE_LINES and baseline_value is not None and np.isfinite(float(baseline_value)):
             ax.axhline(
                 float(baseline_value),
-                color="black",
+                color=BASELINE_COLOR,
                 linestyle="--",
                 linewidth=BASELINE_LINE_WIDTH,
                 label=BASELINE_LABEL,
             )
 
         for run_idx, (run_dir, tag_series) in enumerate(per_run.items()):
-            color = colors[run_idx % len(colors)]
             label_base = run_label(run_dir, run_idx)
-            for split in SPLITS:
-                tag = f"{split.tag_prefix}/{metric.scalar_name}"
-                if tag not in tag_series:
-                    print(f"Warning: {tag!r} missing in {run_dir}.")
-                    continue
+            if run_dir in omitted_initial_best_plot_runs:
+                continue
+            highlighted = is_highlighted_run(run_dir, label_base)
+            color = HIGHLIGHT_COLOR if highlighted else colors[run_idx % len(colors)]
+            line_width = HIGHLIGHT_LINE_WIDTH if highlighted else LINE_WIDTH
+            marker_size = HIGHLIGHT_MARKER_SIZE if highlighted else FINAL_MARKER_SIZE
+            zorder = 4 if highlighted else 2
+            tag = f"{split.tag_prefix}/{metric.scalar_name}"
+            if tag not in tag_series:
+                print(f"Warning: {tag!r} missing in {run_dir}.")
+                continue
 
-                steps, smoothed, lower, upper = smooth_series(tag_series[tag])
-                label = f"{label_base} ({split.label})" if len(SPLITS) > 1 else label_base
+            steps, smoothed, lower, upper = smooth_series(tag_series[tag])
 
-                ax.plot(
-                    steps,
-                    smoothed,
-                    linewidth=LINE_WIDTH,
-                    color=color,
-                    linestyle=split.linestyle,
-                    label=label,
+            ax.plot(
+                steps,
+                smoothed,
+                linewidth=line_width,
+                color=color,
+                linestyle=split.linestyle,
+                label=label_base,
+                zorder=zorder,
+            )
+            if PLOT_ROLLING_STD_BANDS:
+                ax.fill_between(steps, lower, upper, color=color, alpha=BAND_ALPHA, linewidth=0)
+
+            if PLOT_FINAL_MARKERS or PLOT_FINAL_VALUE_LABELS:
+                selected_checkpoint = selected_checkpoints.get(run_dir)
+                marker_point = (
+                    interpolated_point_at_step(steps, smoothed, selected_checkpoint.step)
+                    if selected_checkpoint is not None
+                    else None
                 )
-                if PLOT_ROLLING_STD_BANDS:
-                    ax.fill_between(steps, lower, upper, color=color, alpha=BAND_ALPHA, linewidth=0)
-
-                if PLOT_FINAL_MARKERS or PLOT_FINAL_VALUE_LABELS:
-                    marker_point = final_marker_point(run_dir, label_base, steps, smoothed)
-                    if marker_point is not None:
-                        marker_step, marker_value = marker_point
-                        if PLOT_FINAL_MARKERS:
-                            ax.scatter(
-                                marker_step,
-                                marker_value,
-                                color=color,
-                                s=FINAL_MARKER_SIZE,
-                                zorder=3,
-                            )
-                        if PLOT_FINAL_VALUE_LABELS:
-                            ax.annotate(
-                                f"{marker_value:.3g}",
-                                xy=(marker_step, marker_value),
-                                xytext=(FINAL_LABEL_X_OFFSET_POINTS, 0),
-                                textcoords="offset points",
-                                va="center",
-                                fontsize=FINAL_LABEL_FONT_SIZE,
-                                color=color,
-                                annotation_clip=False,
-                            )
-                        marker_steps.append(marker_step)
-
-                plotted_count += 1
-                if SAVE_CSV:
-                    csv_rows.extend(
-                        (
-                            label_base,
-                            split.label,
-                            tag,
-                            metric.label,
-                            float(step),
-                            float(value),
-                            float(lo),
-                            float(hi),
+                if marker_point is not None:
+                    marker_step, marker_value = marker_point
+                    if PLOT_FINAL_MARKERS:
+                        ax.scatter(
+                            marker_step,
+                            marker_value,
+                            color=color,
+                            s=marker_size,
+                            zorder=zorder + 1,
                         )
-                        for step, value, lo, hi in zip(steps, smoothed, lower, upper)
+                    if PLOT_FINAL_VALUE_LABELS:
+                        ax.annotate(
+                            f"{marker_value:.3g}",
+                            xy=(marker_step, marker_value),
+                            xytext=(FINAL_LABEL_X_OFFSET_POINTS, 0),
+                            textcoords="offset points",
+                            va="center",
+                            fontsize=FINAL_LABEL_FONT_SIZE,
+                            color=color,
+                            annotation_clip=False,
+                        )
+                    marker_steps.append(marker_step)
+
+            plotted_count += 1
+            if SAVE_CSV:
+                csv_rows.extend(
+                    (
+                        label_base,
+                        split.label,
+                        tag,
+                        metric.label,
+                        float(step),
+                        float(value),
+                        float(lo),
+                        float(hi),
                     )
+                    for step, value, lo, hi in zip(steps, smoothed, lower, upper)
+                )
 
         if plotted_count == 0:
-            metric_tags = ", ".join(f"{split.tag_prefix}/{metric.scalar_name}" for split in SPLITS)
-            print(f"Warning: skipping {metric.scalar_name!r}; no selected runs contain any of: {metric_tags}.")
+            print(f"Warning: skipping {split.tag_prefix!r}; no selected runs contain {split.tag_prefix}/{metric.scalar_name}.")
         if SHOW_SUBPLOT_TITLES:
-            ax.set_title(metric.title)
+            ax.set_title(split.label)
         ax.set_ylabel(
             metric.y_label,
             fontsize=Y_LABEL_FONT_SIZE,
@@ -682,7 +867,7 @@ def plot(run_dirs: list[Path]) -> None:
     if SAVE_CSV:
         save_metric_csv(OUTPUT_DIR / f"{OUTPUT_BASENAME}_individual_runs.csv", csv_rows)
     if SAVE_LATEX_TABLE and table_values:
-        latex_table = make_latex_performance_table(table_values)
+        latex_table = make_latex_performance_table(table_values, selected_epochs)
         save_latex_table(OUTPUT_DIR / f"{OUTPUT_BASENAME}_performance_table.tex", latex_table)
         if PRINT_LATEX_TABLE:
             print("\nLaTeX performance table:\n")

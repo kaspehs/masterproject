@@ -130,6 +130,10 @@ monitoring:
   async_validation_num_workers: 0
   async_validation_num_threads: 1
   async_validation_max_concurrent: 6
+  surrogate_validation_enabled: true
+  surrogate_validation_npz: CFD_Data/analysis/surrogate_validation_points.npz
+  surrogate_validation_tag: val_surrogate
+  combined_validation_tag: val
 
 logging:
   run_dir_root: logs

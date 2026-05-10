@@ -27,7 +27,14 @@ from core.runtime import (
     setup_amp,
 )
 from HNN_helper import (
+    AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY,
+    AGGREGATE_FORCE_VALIDATION_ERROR_KEY,
+    AGGREGATE_VALIDATION_ERROR_KEY,
+    DISP_STD_REL_ERROR_KEY,
+    DOMINANT_FREQ_REL_ERROR_KEY,
     FORCE_MAPPING_NRMSE_KEY,
+    FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
+    FORCE_STD_REL_ERROR_KEY,
     Config,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
@@ -38,10 +45,12 @@ from HNN_helper import (
     _default_residual_kwargs,
     compute_validation_metrics,
     create_zoom_mask,
+    dominant_frequency,
     log_area_normalized_rollout_spectra,
     log_displacement_plots,
     log_final_rollout_errors_vs_ur,
     log_force_plots,
+    relative_error,
     resolve_cut_start_seconds,
     resolve_phnn_input_scaling_mode,
     sample_indices_per_ur,
@@ -483,6 +492,29 @@ class LatentRNNForceModel(nn.Module):
         flow_speed: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         h = self.encode(history)
+        return self.rollout_from_latent(
+            h=h,
+            z0=z0,
+            t_seq=t_seq,
+            ur=ur,
+            mass=mass,
+            damping_c=damping_c,
+            stiffness=stiffness,
+            flow_speed=flow_speed,
+        )
+
+    def rollout_from_latent(
+        self,
+        *,
+        h: torch.Tensor,
+        z0: torch.Tensor,
+        t_seq: torch.Tensor,
+        ur: torch.Tensor,
+        mass: torch.Tensor,
+        damping_c: torch.Tensor,
+        stiffness: torch.Tensor,
+        flow_speed: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         z = z0
         z_hist = [z0]
         force_hist: list[torch.Tensor] = []
@@ -778,6 +810,358 @@ def _trajectory_mass_key(mass_source: str) -> str:
     if key is None:
         raise ValueError("latent_rnn.td_mass_source must be one of: dry, effective, stored, label.")
     return key
+
+
+_SURROGATE_TARGET_KEYS = (
+    "disp_std",
+    "force_std",
+    "disp_dominant_frequency_hz",
+    "force_dominant_frequency_hz",
+)
+
+
+def _as_1d_npz_array(data: np.lib.npyio.NpzFile, key: str, *, path: Path) -> np.ndarray:
+    if key not in data:
+        raise KeyError(f"Surrogate validation file '{path}' is missing required array '{key}'.")
+    return np.asarray(data[key]).reshape(-1)
+
+
+def _finite_scalar_from_npz(data: np.lib.npyio.NpzFile, key: str, idx: int, *, path: Path) -> float:
+    arr = _as_1d_npz_array(data, key, path=path)
+    if idx >= arr.size:
+        raise ValueError(f"Surrogate validation array '{key}' in '{path}' is shorter than row {idx}.")
+    value = float(arr[idx])
+    if not np.isfinite(value):
+        raise ValueError(f"Surrogate validation row {idx} has non-finite '{key}'={value!r}.")
+    return value
+
+
+def _load_surrogate_validation_rows(path: Path, *, td_mass_source: str) -> list[dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Surrogate validation NPZ does not exist: {path}")
+    rows: list[dict[str, Any]] = []
+    with np.load(path, allow_pickle=True) as data:
+        ur_key = "ur_effective" if "ur_effective" in data else "ur"
+        ur = _as_1d_npz_array(data, ur_key, path=path).astype(float)
+        n = int(ur.size)
+        if n <= 0:
+            raise ValueError(f"Surrogate validation file '{path}' contains no rows.")
+        mass_key = "ic_dry_mass_kg" if str(td_mass_source).strip().lower() == "dry" else "ic_effective_mass_kg"
+        required_scalar_keys = (
+            "ic_y0",
+            "ic_dy0",
+            "ic_ddy0",
+            "ic_dt",
+            "ic_flow_speed0",
+            "ic_stiffness_n_m",
+            "ic_effective_mass_kg",
+            "ic_dry_mass_kg",
+            "ic_damping_c",
+            "rollout_steps",
+            "eval_steps_after_discard",
+            "rollout_discard_seconds",
+            "ic_diameter_m",
+            *_SURROGATE_TARGET_KEYS,
+        )
+        for idx in range(n):
+            if not np.isfinite(float(ur[idx])):
+                raise ValueError(f"Surrogate validation row {idx} has non-finite '{ur_key}'={ur[idx]!r}.")
+            row = {
+                "index": idx,
+                "ur": float(ur[idx]),
+                "ur_label": (
+                    _finite_scalar_from_npz(data, "ur_label", idx, path=path)
+                    if "ur_label" in data
+                    else float("nan")
+                ),
+                "mass_key": mass_key,
+            }
+            for key in required_scalar_keys:
+                row[key] = _finite_scalar_from_npz(data, key, idx, path=path)
+            row["mass"] = _finite_scalar_from_npz(data, mass_key, idx, path=path)
+            rows.append(row)
+    return rows
+
+
+def _maybe_reduce_surrogate_validation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    reduce_time: bool,
+    reduction_factor: int,
+) -> list[dict[str, Any]]:
+    rf = max(1, int(reduction_factor))
+    if not bool(reduce_time) or rf <= 1:
+        return rows
+    reduced_rows: list[dict[str, Any]] = []
+    for row in rows:
+        old_dt = float(row["ic_dt"])
+        if not np.isfinite(old_dt) or old_dt <= 0.0:
+            raise ValueError(f"Surrogate row {row['index']} has invalid ic_dt={old_dt!r}.")
+        old_eval_steps = int(round(float(row["eval_steps_after_discard"])))
+        old_rollout_steps = int(round(float(row["rollout_steps"])))
+        if old_eval_steps <= 1 or old_rollout_steps <= old_eval_steps:
+            raise ValueError(
+                f"Invalid surrogate rollout/eval steps for row {row['index']}: "
+                f"rollout_steps={old_rollout_steps}, eval_steps_after_discard={old_eval_steps}"
+            )
+        discard_seconds = float(row["rollout_discard_seconds"])
+        eval_seconds = float(old_eval_steps) * old_dt
+        new_dt = old_dt * float(rf)
+        new_discard_steps = int(np.ceil(discard_seconds / new_dt))
+        new_eval_steps = int(np.ceil(eval_seconds / new_dt))
+        new_rollout_steps = new_discard_steps + new_eval_steps
+        if new_discard_steps < 1 or new_eval_steps <= 1 or new_rollout_steps <= new_eval_steps:
+            raise ValueError(
+                f"Time reduction produced invalid surrogate rollout/eval steps for row {row['index']}: "
+                f"dt={new_dt}, rollout_steps={new_rollout_steps}, eval_steps_after_discard={new_eval_steps}"
+            )
+        reduced = dict(row)
+        reduced["ic_dt"] = float(new_dt)
+        reduced["rollout_steps"] = float(new_rollout_steps)
+        reduced["eval_steps_after_discard"] = float(new_eval_steps)
+        reduced_rows.append(reduced)
+    return reduced_rows
+
+
+def _surrogate_relative_abs(pred: float, target: float) -> float:
+    value = relative_error(float(pred), float(target))
+    return abs(float(value)) if np.isfinite(value) else float("nan")
+
+
+def _surrogate_aggregate_metric(metrics: dict[str, float], keys: tuple[str, ...]) -> float:
+    values = [float(metrics[key]) for key in keys if key in metrics and np.isfinite(float(metrics[key]))]
+    return float(np.mean(values)) if len(values) == len(keys) else float("nan")
+
+
+def _build_surrogate_encoder_reference_groups(
+    trajs: list[dict[str, np.ndarray]],
+    *,
+    encoder_length: int,
+    mass_source: str,
+    input_scaling_mode: str,
+    diameter: float,
+    ur_scale: float,
+    include_acceleration: bool,
+) -> list[dict[str, Any]]:
+    enc_len = max(1, int(encoder_length))
+    mass_key = _trajectory_mass_key(mass_source)
+    groups: dict[float, dict[str, Any]] = {}
+    for traj in trajs:
+        t = np.asarray(traj.get("t", []), dtype=float).reshape(-1)
+        if t.size < enc_len:
+            continue
+        ur_arr = np.asarray(traj.get("ur", []), dtype=float).reshape(-1)
+        if ur_arr.size == 0:
+            continue
+        ur_value = float(ur_arr[0])
+        if not np.isfinite(ur_value):
+            continue
+        history = _encoder_features_for_traj(
+            traj,
+            mass_key=mass_key,
+            input_scaling_mode=input_scaling_mode,
+            diameter=diameter,
+            ur_scale=ur_scale,
+            include_acceleration=include_acceleration,
+        )[:enc_len]
+        group_key = round(ur_value, 10)
+        group = groups.setdefault(group_key, {"ur_values": [], "histories": []})
+        group["ur_values"].append(ur_value)
+        group["histories"].append(history)
+    refs: list[dict[str, Any]] = []
+    for group in groups.values():
+        histories = group["histories"]
+        if not histories:
+            continue
+        refs.append(
+            {
+                "ur": float(np.mean(np.asarray(group["ur_values"], dtype=float))),
+                "histories": torch.stack(histories, dim=0),
+                "count": len(histories),
+            }
+        )
+    refs.sort(key=lambda item: float(item["ur"]))
+    return refs
+
+
+def _latent_from_nearest_encoder_references(
+    *,
+    row: dict[str, Any],
+    references: list[dict[str, Any]],
+    model: LatentRNNForceModel,
+    device: torch.device,
+    max_groups: int = 2,
+) -> tuple[torch.Tensor, list[float]]:
+    if not references:
+        raise ValueError("Surrogate latent validation requires at least one real encoder reference trajectory.")
+    selected = sorted(references, key=lambda item: abs(float(item["ur"]) - float(row["ur"])))[: max(1, int(max_groups))]
+    encoded_groups: list[torch.Tensor] = []
+    selected_urs: list[float] = []
+    for item in selected:
+        histories = item["histories"].to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            encoded = model.encode(histories)
+        encoded_groups.append(encoded.mean(dim=0, keepdim=True))
+        selected_urs.append(float(item["ur"]))
+    return torch.mean(torch.cat(encoded_groups, dim=0), dim=0, keepdim=True), selected_urs
+
+
+def _surrogate_force_scale(
+    *,
+    row: dict[str, Any],
+    model: LatentRNNForceModel,
+) -> float:
+    diameter = max(float(row.get("ic_diameter_m", float(model.D))), 1.0e-12)
+    if str(model.input_scaling_mode) == "convective":
+        flow_speed = float(row["ic_flow_speed0"])
+    else:
+        fn = math.sqrt(max(float(row["ic_stiffness_n_m"]) / max(float(row["ic_effective_mass_kg"]), 1.0e-12), 1.0e-12)) / (
+            2.0 * math.pi
+        )
+        flow_speed = float(row["ur"]) * fn * diameter
+    return max(0.5 * float(model.rho) * diameter * flow_speed * flow_speed, 1.0e-12)
+
+
+def _run_latent_surrogate_validation(
+    *,
+    rows: list[dict[str, Any]],
+    writer: SummaryWriter,
+    tb_step: int,
+    tag: str,
+    model: LatentRNNForceModel,
+    encoder_references: list[dict[str, Any]],
+    device: torch.device,
+) -> dict[str, Any]:
+    metrics_sum: dict[str, float] = {}
+    metrics_count: dict[str, int] = {}
+    diverged_count = 0
+
+    def _add_metric(name: str, value: float) -> None:
+        value_f = float(value)
+        if not np.isfinite(value_f):
+            return
+        metrics_sum[name] = metrics_sum.get(name, 0.0) + value_f
+        metrics_count[name] = metrics_count.get(name, 0) + 1
+
+    for row in rows:
+        steps = int(round(float(row["rollout_steps"])))
+        eval_steps = int(round(float(row["eval_steps_after_discard"])))
+        if steps <= 1 or eval_steps <= 1 or eval_steps > steps:
+            raise ValueError(
+                f"Invalid surrogate rollout/eval steps for row {row['index']}: "
+                f"rollout_steps={steps}, eval_steps_after_discard={eval_steps}"
+            )
+        dt = float(row["ic_dt"])
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError(f"Surrogate row {row['index']} has invalid ic_dt={dt!r}.")
+        discard_steps = int(round(float(row["rollout_discard_seconds"]) / dt))
+        if discard_steps < 0 or discard_steps >= steps:
+            raise ValueError(
+                f"Invalid surrogate discard window for row {row['index']}: "
+                f"rollout_discard_seconds={row['rollout_discard_seconds']}, dt={dt}, rollout_steps={steps}"
+            )
+        if steps - discard_steps != eval_steps:
+            discard_steps = steps - eval_steps
+        mass_value = float(row["mass"])
+        stiffness_value = float(row["ic_stiffness_n_m"])
+        damping_value = float(row["ic_damping_c"])
+        diameter_value = max(float(row.get("ic_diameter_m", float(model.D))), 1.0e-12)
+        h0, selected_ref_urs = _latent_from_nearest_encoder_references(
+            row,
+            references=encoder_references,
+            model=model,
+            device=device,
+            max_groups=2,
+        )
+        z0 = torch.tensor([[float(row["ic_y0"]), float(row["ic_dy0"]) * mass_value]], dtype=torch.float32, device=device)
+        t_seq = (torch.arange(steps + 1, dtype=torch.float32, device=device) * float(dt)).unsqueeze(0)
+        ur0 = torch.tensor([[float(row["ur"])]], dtype=torch.float32, device=device)
+        flow0 = torch.tensor([[float(row["ic_flow_speed0"])]], dtype=torch.float32, device=device)
+        mass_t = torch.full((1, 1), mass_value, dtype=torch.float32, device=device)
+        damping_t = torch.full((1, 1), damping_value, dtype=torch.float32, device=device)
+        stiffness_t = torch.full((1, 1), stiffness_value, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            rollout = model.rollout_from_latent(
+                h=h0,
+                z0=z0,
+                t_seq=t_seq,
+                ur=ur0,
+                mass=mass_t,
+                damping_c=damping_t,
+                stiffness=stiffness_t,
+                flow_speed=flow0,
+            )
+        y_pred = rollout["z"][0, :, 0].detach().cpu().numpy()
+        force_pred = rollout["force"][0, :, 0].detach().cpu().numpy()
+        if not np.all(np.isfinite(y_pred)) or not np.all(np.isfinite(force_pred)):
+            diverged_count += 1
+            continue
+        y_eval = y_pred[discard_steps + 1 :]
+        force_eval = force_pred[discard_steps:]
+        if y_eval.size < 4 or force_eval.size < 4:
+            raise ValueError(f"Surrogate row {row['index']} evaluation window is too short after discard.")
+        fn = float(np.sqrt(stiffness_value / float(row["ic_effective_mass_kg"])) / (2.0 * np.pi))
+        if not np.isfinite(fn) or fn <= 0.0:
+            raise ValueError(f"Surrogate row {row['index']} has invalid effective natural frequency.")
+        f0 = _surrogate_force_scale(row=row, model=model)
+        pred_disp_std = float(np.std(y_eval / diameter_value))
+        pred_force_std = float(np.std(force_eval / f0))
+        pred_disp_freq_ratio = float(dominant_frequency(y_eval, dt) / fn)
+        pred_force_freq_ratio = float(dominant_frequency(force_eval, dt) / fn)
+        target_disp_std = float(row["disp_std"])
+        target_force_std = float(row["force_std"])
+        target_disp_freq_ratio = float(row["disp_dominant_frequency_hz"] / fn)
+        target_force_freq_ratio = float(row["force_dominant_frequency_hz"] / fn)
+        row_metrics = {
+            DOMINANT_FREQ_REL_ERROR_KEY: _surrogate_relative_abs(pred_disp_freq_ratio, target_disp_freq_ratio),
+            DISP_STD_REL_ERROR_KEY: _surrogate_relative_abs(pred_disp_std, target_disp_std),
+            FORCE_DOMINANT_FREQ_REL_ERROR_KEY: _surrogate_relative_abs(pred_force_freq_ratio, target_force_freq_ratio),
+            FORCE_STD_REL_ERROR_KEY: _surrogate_relative_abs(pred_force_std, target_force_std),
+            "Predicted std(y/D)": pred_disp_std,
+            "Target std(y/D)": target_disp_std,
+            "Predicted std(F/F0)": pred_force_std,
+            "Target std(F/F0)": target_force_std,
+            "Predicted f_y/f_n": pred_disp_freq_ratio,
+            "Target f_y/f_n": target_disp_freq_ratio,
+            "Predicted f_F/f_n": pred_force_freq_ratio,
+            "Target f_F/f_n": target_force_freq_ratio,
+            "Encoder reference count": float(len(selected_ref_urs)),
+        }
+        row_metrics[AGGREGATE_DISPLACEMENT_VALIDATION_ERROR_KEY] = _surrogate_aggregate_metric(
+            row_metrics,
+            (DOMINANT_FREQ_REL_ERROR_KEY, DISP_STD_REL_ERROR_KEY),
+        )
+        row_metrics[AGGREGATE_FORCE_VALIDATION_ERROR_KEY] = _surrogate_aggregate_metric(
+            row_metrics,
+            (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, FORCE_STD_REL_ERROR_KEY),
+        )
+        row_metrics[AGGREGATE_VALIDATION_ERROR_KEY] = _surrogate_aggregate_metric(
+            row_metrics,
+            (
+                DOMINANT_FREQ_REL_ERROR_KEY,
+                DISP_STD_REL_ERROR_KEY,
+                FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
+                FORCE_STD_REL_ERROR_KEY,
+            ),
+        )
+        for name, value in row_metrics.items():
+            _add_metric(name, value)
+    averaged = {
+        name: total / float(max(1, metrics_count.get(name, 0)))
+        for name, total in metrics_sum.items()
+        if metrics_count.get(name, 0) > 0
+    }
+    averaged[ROLLOUT_DIVERGED_COUNT_KEY] = float(diverged_count)
+    averaged["sample_count"] = float(len(rows))
+    for name, value in averaged.items():
+        writer.add_scalar(f"{tag}/{name}", float(value), tb_step)
+    writer.flush()
+    return {
+        "loss_total": None,
+        "val_metrics": averaged,
+        "validation_wall_time_s": None,
+    }
 
 
 def _latent_force_scale_numpy(
@@ -1162,6 +1546,37 @@ def train(config: Config, config_name: str) -> None:
     )
     psd_peak_rel_bw = float(getattr(loss_cfg, "rollout_disp_psd_peak_rel_bandwidth", 0.0))
     psd_use_hann = bool(getattr(loss_cfg, "rollout_disp_psd_use_hann_window", True))
+    surrogate_enabled = bool(getattr(monitoring_cfg, "surrogate_validation_enabled", True))
+    surrogate_tag = str(getattr(monitoring_cfg, "surrogate_validation_tag", "val_surrogate")).strip() or "val_surrogate"
+    combined_tag = str(getattr(monitoring_cfg, "combined_validation_tag", "val")).strip() or "val"
+    surrogate_rows: list[dict[str, Any]] = []
+    if surrogate_enabled:
+        surrogate_rows = _load_surrogate_validation_rows(
+            Path(getattr(monitoring_cfg, "surrogate_validation_npz", "CFD_Data/analysis/surrogate_validation_points.npz")),
+            td_mass_source=mass_source,
+        )
+        surrogate_rows = _maybe_reduce_surrogate_validation_rows(
+            surrogate_rows,
+            reduce_time=reduce_time_enabled,
+            reduction_factor=reduction_factor,
+        )
+        surrogate_step_counts = [int(round(float(row["rollout_steps"]))) for row in surrogate_rows]
+        print(
+            f"[latent_rnn] loaded {len(surrogate_rows)} surrogate validation row(s) "
+            f"from {getattr(monitoring_cfg, 'surrogate_validation_npz', 'CFD_Data/analysis/surrogate_validation_points.npz')} "
+            f"(rollout_steps={surrogate_step_counts})"
+        )
+    surrogate_encoder_references = _build_surrogate_encoder_reference_groups(
+        train_trajs,
+        encoder_length=encoder_length,
+        mass_source=mass_source,
+        input_scaling_mode=input_scaling_mode,
+        diameter=float(model_cfg.D),
+        ur_scale=ur_scale,
+        include_acceleration=include_acceleration,
+    )
+    if surrogate_enabled and surrogate_rows and not surrogate_encoder_references:
+        raise ValueError("Surrogate validation is enabled, but no real latent encoder reference histories were available.")
 
     train_dataset = _build_latent_window_dataset(
         train_trajs,
@@ -1276,6 +1691,8 @@ def train(config: Config, config_name: str) -> None:
                 "train_windows": len(train_loader.dataset),
                 "val_unseen_windows": 0 if val_loader is None else len(val_loader.dataset),
                 "val_seen_windows": 0 if val_seen_loader is None else len(val_seen_loader.dataset),
+                "surrogate_validation_rows": len(surrogate_rows),
+                "surrogate_encoder_reference_groups": len(surrogate_encoder_references),
             },
             indent=2,
             sort_keys=True,
@@ -1291,7 +1708,9 @@ def train(config: Config, config_name: str) -> None:
                     f"Latent RNN setup: epochs={int(training_cfg.epochs)}, batch_size={rollout_batch_size}, "
                     f"train_windows={len(train_loader.dataset)}, "
                     f"val_unseen_windows={0 if val_loader is None else len(val_loader.dataset)}, "
-                    f"val_seen_windows={0 if val_seen_loader is None else len(val_seen_loader.dataset)}"
+                    f"val_seen_windows={0 if val_seen_loader is None else len(val_seen_loader.dataset)}, "
+                    f"surrogate_rows={len(surrogate_rows)}, "
+                    f"surrogate_encoder_ref_groups={len(surrogate_encoder_references)}"
                 ),
                 (
                     f"Ablation: no Vivana-TD force/context/phase/sigma/fhat inputs are loaded into the model; "
@@ -1402,7 +1821,8 @@ def train(config: Config, config_name: str) -> None:
                 f"roll={train_metrics.get('loss_rollout_det', float('nan')):.4e}, "
                 f"spectral={train_metrics.get('loss_rollout_spectral', float('nan')):.4e}"
             )
-        if val_loader is not None and ((epoch + 1) % validate_every == 0 or epoch == epochs - 1):
+        validation_due = (epoch + 1) % validate_every == 0 or epoch == epochs - 1
+        if validation_due and (val_loader is not None or val_seen_loader is not None or surrogate_rows):
             eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             eval_model.eval()
 
@@ -1462,7 +1882,10 @@ def train(config: Config, config_name: str) -> None:
                         metrics_count += 1
                     if metrics_count > 0:
                         for name, total in metrics_sum.items():
-                            writer.add_scalar(f"{split_tag}/{name}", total / float(metrics_count), epoch + 1)
+                            averaged_value = total / float(metrics_count)
+                            split_metrics[name] = float(averaged_value)
+                            writer.add_scalar(f"{split_tag}/{name}", averaged_value, epoch + 1)
+                        split_metrics[ROLLOUT_DIVERGED_COUNT_KEY] = float(diverged_count)
                         writer.add_scalar(f"{split_tag}/{ROLLOUT_DIVERGED_COUNT_KEY}", float(diverged_count), epoch + 1)
 
                     if log_rollout_plots:
@@ -1506,16 +1929,21 @@ def train(config: Config, config_name: str) -> None:
                 )
                 return split_metrics, split_metrics.get("loss_total", float("inf"))
 
-            val_metrics, val_loss = _validate_split(
-                split_tag="val_unseen",
-                split_loader=val_loader,
-                split_trajs=val_trajs,
-                log_rollout_plots=True,
-                log_all_rollout_plots=False,
-                log_force_plot=True,
-            )
+            split_results: dict[str, dict[str, Any]] = {}
+            val_metrics: dict[str, float] = {}
+            val_loss = float("inf")
+            if val_loader is not None:
+                val_metrics, val_loss = _validate_split(
+                    split_tag="val_unseen",
+                    split_loader=val_loader,
+                    split_trajs=val_trajs,
+                    log_rollout_plots=True,
+                    log_all_rollout_plots=False,
+                    log_force_plot=True,
+                )
+                split_results["val_unseen"] = {"loss_total": val_loss, "val_metrics": val_metrics}
             if val_seen_loader is not None:
-                _validate_split(
+                val_seen_metrics, val_seen_loss = _validate_split(
                     split_tag="val_seen",
                     split_loader=val_seen_loader,
                     split_trajs=val_seen_trajs,
@@ -1523,6 +1951,48 @@ def train(config: Config, config_name: str) -> None:
                     log_all_rollout_plots=True,
                     log_force_plot=False,
                 )
+                split_results["val_seen"] = {"loss_total": val_seen_loss, "val_metrics": val_seen_metrics}
+            if surrogate_enabled and surrogate_rows:
+                surrogate_start = time.perf_counter()
+                surrogate_result = _run_latent_surrogate_validation(
+                    rows=surrogate_rows,
+                    writer=writer,
+                    tb_step=epoch + 1,
+                    tag=surrogate_tag,
+                    model=eval_model,
+                    encoder_references=surrogate_encoder_references,
+                    device=device,
+                )
+                surrogate_result["validation_wall_time_s"] = float(time.perf_counter() - surrogate_start)
+                writer.add_scalar(
+                    f"{surrogate_tag}/validation_wall_time_s",
+                    surrogate_result["validation_wall_time_s"],
+                    epoch + 1,
+                )
+                split_results[surrogate_tag] = surrogate_result
+
+            combined_metrics: dict[str, float] = {}
+            seen_metrics = split_results.get("val_seen", {}).get("val_metrics", {})
+            surrogate_metrics = split_results.get(surrogate_tag, {}).get("val_metrics", {})
+            if seen_metrics and surrogate_metrics:
+                shared_names = sorted(set(seen_metrics).intersection(surrogate_metrics))
+                for name in shared_names:
+                    if str(name).startswith("loss_") or str(name) == "loss_total":
+                        continue
+                    seen_value = float(seen_metrics[name])
+                    surrogate_value = float(surrogate_metrics[name])
+                    if np.isfinite(seen_value) and np.isfinite(surrogate_value):
+                        combined_value = 0.5 * seen_value + 0.5 * surrogate_value
+                        combined_metrics[name] = float(combined_value)
+                        writer.add_scalar(f"{combined_tag}/{name}", combined_value, epoch + 1)
+                if combined_metrics:
+                    split_results[combined_tag] = {
+                        "loss_total": None,
+                        "val_metrics": combined_metrics,
+                    }
+                    writer.flush()
+            summary_metrics = combined_metrics or surrogate_metrics or seen_metrics or val_metrics
+            selection_value = float(summary_metrics.get(AGGREGATE_VALIDATION_ERROR_KEY, val_loss))
             ckpt_path = run_models_dir / f"{run_name}_epoch{epoch + 1:04d}.pt"
             state_source = model._orig_mod if hasattr(model, "_orig_mod") else model
             payload = {
@@ -1533,15 +2003,19 @@ def train(config: Config, config_name: str) -> None:
                 "latent_time_scale": latent_time_scale,
                 "epoch": epoch + 1,
                 "val_loss": val_loss,
+                "best_metric_name": AGGREGATE_VALIDATION_ERROR_KEY,
+                "best_metric_value": selection_value if np.isfinite(selection_value) else None,
+                "split_results": split_results,
             }
             torch.save(payload, ckpt_path)
             shutil.copyfile(ckpt_path, latest_path)
-            if val_loss < best_val:
-                best_val = val_loss
+            if np.isfinite(selection_value) and selection_value < best_val:
+                best_val = selection_value
                 shutil.copyfile(ckpt_path, run_models_dir / f"{run_name}_best_val.pt")
             print(
                 f"[latent_rnn][val_unseen] epoch {epoch + 1}: "
-                f"loss={val_loss:.4e}, state={val_metrics.get('loss_state', float('nan')):.4e}"
+                f"loss={val_loss:.4e}, state={val_metrics.get('loss_state', float('nan')):.4e}, "
+                f"selection={selection_value:.4e}"
             )
 
     final_val_trajs = [*val_trajs, *val_seen_trajs]

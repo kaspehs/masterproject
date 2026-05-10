@@ -68,7 +68,7 @@ DATA_DIR = THIS_DIR if (THIS_DIR / "npz_exports").exists() else THIS_DIR.parent 
 
 INPUT_NPZS: list[Path] | None = None
 INPUT_NPZ_GLOB = str(DATA_DIR / "npz_exports" / "*.npz")
-OUTPUT_DIR = DATA_DIR / "npz_exports_multi_theta0_modified"
+OUTPUT_DIR = DATA_DIR / "npz_exports_multi_theta0_baseline"
 METADATA_PATH = DATA_DIR / "analysis" / "CFD_metadata.csv"
 OVERWRITE = True
 SKIP_NO_CONVERGENCE = True
