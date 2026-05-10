@@ -36,6 +36,7 @@ from HNN_helper import (
     FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
     FORCE_STD_REL_ERROR_KEY,
     Config,
+    GradNormBalancer,
     ROLLOUT_DIVERGED_COUNT_KEY,
     ROLLOUT_DIVERGED_KEY,
     ODEPirateNet,
@@ -1556,6 +1557,8 @@ def train(config: Config, config_name: str) -> None:
     state_weight = float(getattr(loss_cfg, "state_weight", 1.0))
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
+    state_loss_active = state_weight > 0.0
+    data_loss_active = use_force_data_loss and force_data_weight > 0.0
     spectral_mode = _normalize_rollout_disp_spectral_loss_mode(
         getattr(loss_cfg, "rollout_disp_spectral_loss", "psd")
     )
@@ -1681,6 +1684,26 @@ def train(config: Config, config_name: str) -> None:
         corr_init_mode=str(lrnn_cfg.get("corr_init_mode", getattr(model_cfg, "corr_init_mode", "zero"))),
     ).to(device)
     model = maybe_compile_model(model, bool(compile_cfg.use_compile), str(compile_cfg.compile_mode))
+    gradnorm_balancer: GradNormBalancer | None = None
+    if bool(getattr(loss_cfg, "use_gradnorm", False)):
+        gradnorm_loss_names: list[str] = []
+        if state_loss_active:
+            gradnorm_loss_names.append("state")
+        if data_loss_active:
+            gradnorm_loss_names.append("data")
+        if rollout_active:
+            gradnorm_loss_names.append("rollout")
+        if len(gradnorm_loss_names) >= 2:
+            gradnorm_balancer = GradNormBalancer(
+                model,
+                gradnorm_loss_names,
+                alpha=float(getattr(loss_cfg, "gradnorm_alpha", 0.9)),
+                eps=float(getattr(loss_cfg, "gradnorm_eps", 1e-8)),
+                min_weight=float(getattr(loss_cfg, "gradnorm_min_weight", 0.1)),
+                max_weight=float(getattr(loss_cfg, "gradnorm_max_weight", 10.0)),
+            )
+        else:
+            print("loss.use_gradnorm is True but fewer than two latent_rnn loss groups are active; skipping GradNorm.")
 
     optimizer, scheduler = setup_optimizer_and_scheduler(
         model,
@@ -1749,6 +1772,16 @@ def train(config: Config, config_name: str) -> None:
             model.eval()
         sums: dict[str, torch.Tensor] = {}
         count = 0
+        gradnorm_state_w_sum = (
+            torch.zeros((), device=device) if train_mode and gradnorm_balancer is not None and state_loss_active else None
+        )
+        gradnorm_data_w_sum = (
+            torch.zeros((), device=device) if train_mode and gradnorm_balancer is not None and data_loss_active else None
+        )
+        gradnorm_rollout_w_sum = (
+            torch.zeros((), device=device) if train_mode and gradnorm_balancer is not None and rollout_active else None
+        )
+        gradnorm_count = 0
         for batch in loader:
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
@@ -1775,34 +1808,62 @@ def train(config: Config, config_name: str) -> None:
                         disp_psd_peak_rel_bandwidth=psd_peak_rel_bw,
                         disp_psd_use_hann_window=psd_use_hann,
                     )
-                    total_loss = (
-                        state_weight * losses["state_loss"]
-                        + rollout_det_weight * losses["trajectory_loss"]
+                    rollout_total_loss = (
+                        rollout_det_weight * losses["trajectory_loss"]
                         + rollout_disp_std_weight * (losses["disp_std_loss"] + losses["disp_mean_loss"])
                         + rollout_disp_spectral_weight * losses["disp_spectral_loss"]
                     )
-                    if use_force_data_loss:
-                        total_loss = total_loss + force_data_weight * losses["force_data_loss"]
+                    if train_mode and gradnorm_balancer is not None:
+                        loss_inputs: dict[str, torch.Tensor] = {}
+                        if state_loss_active:
+                            loss_inputs["state"] = losses["state_loss"].float()
+                        if data_loss_active:
+                            loss_inputs["data"] = losses["force_data_loss"].float()
+                        if rollout_active:
+                            loss_inputs["rollout"] = rollout_total_loss.float()
+                        weights = gradnorm_balancer.update(loss_inputs)
+                        total_loss = losses["state_loss"].new_zeros(())
+                        if state_loss_active:
+                            state_w = weights["state"]
+                            total_loss = total_loss + state_weight * state_w * losses["state_loss"]
+                            if gradnorm_state_w_sum is not None:
+                                gradnorm_state_w_sum = gradnorm_state_w_sum + state_w.detach()
+                        if data_loss_active:
+                            data_w = weights["data"]
+                            total_loss = total_loss + force_data_weight * data_w * losses["force_data_loss"]
+                            if gradnorm_data_w_sum is not None:
+                                gradnorm_data_w_sum = gradnorm_data_w_sum + data_w.detach()
+                        if rollout_active:
+                            rollout_w = weights["rollout"]
+                            total_loss = total_loss + rollout_w * rollout_total_loss
+                            if gradnorm_rollout_w_sum is not None:
+                                gradnorm_rollout_w_sum = gradnorm_rollout_w_sum + rollout_w.detach()
+                        gradnorm_count += 1
+                    else:
+                        total_loss = state_weight * losses["state_loss"] + rollout_total_loss
+                        if use_force_data_loss:
+                            total_loss = total_loss + force_data_weight * losses["force_data_loss"]
                 if train_mode:
                     scaler.scale(total_loss).backward()
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
                     grad_like = total_loss.detach()
                     grad_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    grad_parameters = list(grad_model.parameters())
                     grad_norm_encoder = _grad_norm_from_parameters(
                         list(grad_model.encoder.parameters()) + list(grad_model.encoder_out.parameters()),
                         like=grad_like,
                     )
                     grad_norm_backbone = _grad_norm_from_parameters(grad_model.backbone.parameters(), like=grad_like)
                     if float(training_cfg.max_grad_norm) > 0.0:
-                        grad_norm_raw = nn_utils.clip_grad_norm_(model.parameters(), float(training_cfg.max_grad_norm))
+                        grad_norm_raw = nn_utils.clip_grad_norm_(grad_parameters, float(training_cfg.max_grad_norm))
                         grad_norm_total = (
                             grad_norm_raw.detach()
                             if isinstance(grad_norm_raw, torch.Tensor)
                             else grad_like.new_tensor(float(grad_norm_raw))
                         )
                     else:
-                        grad_norm_total = _grad_norm_from_parameters(model.parameters(), like=grad_like)
+                        grad_norm_total = _grad_norm_from_parameters(grad_parameters, like=grad_like)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -1830,7 +1891,15 @@ def train(config: Config, config_name: str) -> None:
             for name, value in batch_metrics.items():
                 sums[name] = sums.get(name, value.detach().new_zeros(())) + value.detach() * batch_size
         denom = float(max(1, count))
-        return {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
+        metrics = {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
+        if gradnorm_count > 0:
+            if gradnorm_state_w_sum is not None:
+                metrics["gradnorm_weight_state"] = float((gradnorm_state_w_sum / float(gradnorm_count)).detach().cpu())
+            if gradnorm_data_w_sum is not None:
+                metrics["gradnorm_weight_data"] = float((gradnorm_data_w_sum / float(gradnorm_count)).detach().cpu())
+            if gradnorm_rollout_w_sum is not None:
+                metrics["gradnorm_weight_rollout"] = float((gradnorm_rollout_w_sum / float(gradnorm_count)).detach().cpu())
+        return metrics
 
     run_models_dir = Path("models") / run_name
     run_models_dir.mkdir(parents=True, exist_ok=True)
