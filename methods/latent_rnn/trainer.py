@@ -564,6 +564,24 @@ def _trajectory_state_scale(
     return torch.cat([q_scale, p_scale.expand_as(q_scale)], dim=2)
 
 
+def _grad_norm_from_parameters(
+    parameters: Any,
+    *,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    total = like.detach().new_zeros(())
+    found = False
+    for param in parameters:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        total = total + torch.sum(grad * grad)
+        found = True
+    if not found:
+        return total
+    return torch.sqrt(total)
+
+
 def _encoder_features_for_traj(
     traj: dict[str, np.ndarray],
     *,
@@ -1767,21 +1785,49 @@ def train(config: Config, config_name: str) -> None:
                         total_loss = total_loss + force_data_weight * losses["force_data_loss"]
                 if train_mode:
                     scaler.scale(total_loss).backward()
-                    if float(training_cfg.max_grad_norm) > 0.0:
+                    if scaler.is_enabled():
                         scaler.unscale_(optimizer)
-                        nn_utils.clip_grad_norm_(model.parameters(), float(training_cfg.max_grad_norm))
+                    grad_like = total_loss.detach()
+                    grad_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    grad_norm_encoder = _grad_norm_from_parameters(
+                        list(grad_model.encoder.parameters()) + list(grad_model.encoder_out.parameters()),
+                        like=grad_like,
+                    )
+                    grad_norm_backbone = _grad_norm_from_parameters(grad_model.backbone.parameters(), like=grad_like)
+                    if float(training_cfg.max_grad_norm) > 0.0:
+                        grad_norm_raw = nn_utils.clip_grad_norm_(model.parameters(), float(training_cfg.max_grad_norm))
+                        grad_norm_total = (
+                            grad_norm_raw.detach()
+                            if isinstance(grad_norm_raw, torch.Tensor)
+                            else grad_like.new_tensor(float(grad_norm_raw))
+                        )
+                    else:
+                        grad_norm_total = _grad_norm_from_parameters(model.parameters(), like=grad_like)
                     scaler.step(optimizer)
                     scaler.update()
+                else:
+                    grad_norm_total = total_loss.detach().new_zeros(())
+                    grad_norm_encoder = total_loss.detach().new_zeros(())
+                    grad_norm_backbone = total_loss.detach().new_zeros(())
             batch_size = int(batch[0].shape[0])
             count += batch_size
-            for name, value in {
+            batch_metrics = {
                 "loss_total": total_loss,
                 "loss_state": losses["state_loss"],
                 "loss_rollout_det": losses["trajectory_loss"],
                 "loss_rollout_disp_std": losses["disp_std_loss"],
                 "loss_rollout_disp_mean": losses["disp_mean_loss"],
                 "loss_rollout_spectral": losses["disp_spectral_loss"],
-            }.items():
+            }
+            if train_mode:
+                batch_metrics.update(
+                    {
+                        "grad_norm": grad_norm_total,
+                        "grad_norm_encoder": grad_norm_encoder,
+                        "grad_norm_backbone": grad_norm_backbone,
+                    }
+                )
+            for name, value in batch_metrics.items():
                 sums[name] = sums.get(name, value.detach().new_zeros(())) + value.detach() * batch_size
         denom = float(max(1, count))
         return {name: float((value / denom).detach().cpu()) for name, value in sums.items()}
