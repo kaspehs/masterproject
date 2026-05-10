@@ -1068,7 +1068,7 @@ def _run_latent_surrogate_validation(
         damping_value = float(row["ic_damping_c"])
         diameter_value = max(float(row.get("ic_diameter_m", float(model.D))), 1.0e-12)
         h0, selected_ref_urs = _latent_from_nearest_encoder_references(
-            row,
+            row=row,
             references=encoder_references,
             model=model,
             device=device,
