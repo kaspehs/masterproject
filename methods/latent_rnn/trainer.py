@@ -476,6 +476,7 @@ class LatentRNNForceModel(nn.Module):
             "z_next": z_next,
             "h_next": h_next,
             "force": force,
+            "raw_force": raw_force,
             "raw_dh": raw_dh,
             "acceleration_next": a_next,
         }
@@ -519,6 +520,7 @@ class LatentRNNForceModel(nn.Module):
         z = z0
         z_hist = [z0]
         force_hist: list[torch.Tensor] = []
+        raw_force_hist: list[torch.Tensor] = []
         h_hist = [h]
         for idx in range(int(t_seq.shape[1]) - 1):
             dt = torch.clamp((t_seq[:, idx + 1 : idx + 2] - t_seq[:, idx : idx + 1]), min=1.0e-12)
@@ -537,12 +539,18 @@ class LatentRNNForceModel(nn.Module):
             z_hist.append(z)
             h_hist.append(h)
             force_hist.append(step["force"])
+            raw_force_hist.append(step["raw_force"])
         return {
             "z": torch.stack(z_hist, dim=1),
             "h": torch.stack(h_hist, dim=1),
             "force": (
                 torch.stack(force_hist, dim=1)
                 if force_hist
+                else z0.new_zeros((z0.shape[0], 0, 1))
+            ),
+            "raw_force": (
+                torch.stack(raw_force_hist, dim=1)
+                if raw_force_hist
                 else z0.new_zeros((z0.shape[0], 0, 1))
             ),
         }
@@ -581,6 +589,15 @@ def _grad_norm_from_parameters(
     if not found:
         return total
     return torch.sqrt(total)
+
+
+def _regularizer(value: torch.Tensor, norm: str) -> torch.Tensor:
+    key = str(norm).strip().lower()
+    if key == "l1":
+        return torch.mean(torch.abs(value))
+    if key == "l2":
+        return torch.mean(value * value)
+    raise ValueError("Regularizer norm must be one of: l1, l2.")
 
 
 def _encoder_features_for_traj(
@@ -730,6 +747,7 @@ def _latent_losses_from_batch(
     disp_psd_relative: bool,
     disp_psd_peak_rel_bandwidth: float,
     disp_psd_use_hann_window: bool,
+    mean_reg_norm: str,
 ) -> dict[str, torch.Tensor]:
     history, z0, t_seq, z_traj, ur, flow, force_true, mass, damping, stiffness = _unpack_batch(
         batch,
@@ -807,6 +825,7 @@ def _latent_losses_from_batch(
                 relative=disp_psd_relative,
             )
     force_data_loss = torch.mean((rollout["force"] - force_true) ** 2)
+    mean_reg_loss = _regularizer(rollout["raw_force"], mean_reg_norm)
     return {
         "state_loss": state_loss,
         "trajectory_loss": trajectory_loss,
@@ -814,6 +833,7 @@ def _latent_losses_from_batch(
         "disp_mean_loss": disp_mean_loss,
         "disp_spectral_loss": disp_spectral_loss,
         "force_data_loss": force_data_loss,
+        "mean_reg_loss": mean_reg_loss,
         "z_pred": z_pred,
         "force_pred": rollout["force"],
     }
@@ -1555,6 +1575,10 @@ def train(config: Config, config_name: str) -> None:
     rollout_batch_size_raw = int(getattr(loss_cfg, "rollout_det_batch_size", 0))
     rollout_batch_size = int(training_cfg.batch_size) if rollout_batch_size_raw <= 0 else rollout_batch_size_raw
     state_weight = float(getattr(loss_cfg, "state_weight", 1.0))
+    mean_reg = float(getattr(loss_cfg, "mean_reg", 0.0))
+    mean_reg_norm = str(getattr(loss_cfg, "mean_reg_norm", "l1")).strip().lower()
+    if mean_reg_norm not in {"l1", "l2"}:
+        raise ValueError("loss.mean_reg_norm must be one of: l1, l2.")
     force_data_weight = float(getattr(loss_cfg, "force_data_weight", 1.0))
     use_force_data_loss = bool(getattr(loss_cfg, "use_force_data_loss", False))
     state_loss_active = state_weight > 0.0
@@ -1759,7 +1783,8 @@ def train(config: Config, config_name: str) -> None:
                     f"{force_data_weight if use_force_data_loss else 0.0:g}, rollout_det={rollout_det_weight:g}, "
                     f"rollout_disp_std={rollout_disp_std_weight:g}, "
                     f"rollout_disp_mean=same_as_std({rollout_disp_mean_in_std_loss}), "
-                    f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
+                    f"rollout_disp_spectral={rollout_disp_spectral_weight:g}, "
+                    f"mean_reg={mean_reg:g}({mean_reg_norm})"
                 ),
             ]
         )
@@ -1807,6 +1832,7 @@ def train(config: Config, config_name: str) -> None:
                         disp_psd_relative=bool(rollout_settings["disp_psd_relative"]),
                         disp_psd_peak_rel_bandwidth=psd_peak_rel_bw,
                         disp_psd_use_hann_window=psd_use_hann,
+                        mean_reg_norm=mean_reg_norm,
                     )
                     rollout_total_loss = (
                         rollout_det_weight * losses["trajectory_loss"]
@@ -1838,9 +1864,10 @@ def train(config: Config, config_name: str) -> None:
                             total_loss = total_loss + rollout_w * rollout_total_loss
                             if gradnorm_rollout_w_sum is not None:
                                 gradnorm_rollout_w_sum = gradnorm_rollout_w_sum + rollout_w.detach()
+                        total_loss = total_loss + mean_reg * losses["mean_reg_loss"]
                         gradnorm_count += 1
                     else:
-                        total_loss = state_weight * losses["state_loss"] + rollout_total_loss
+                        total_loss = state_weight * losses["state_loss"] + rollout_total_loss + mean_reg * losses["mean_reg_loss"]
                         if use_force_data_loss:
                             total_loss = total_loss + force_data_weight * losses["force_data_loss"]
                 if train_mode:
@@ -1879,6 +1906,7 @@ def train(config: Config, config_name: str) -> None:
                 "loss_rollout_disp_std": losses["disp_std_loss"],
                 "loss_rollout_disp_mean": losses["disp_mean_loss"],
                 "loss_rollout_spectral": losses["disp_spectral_loss"],
+                "loss_reg_mean": losses["mean_reg_loss"],
             }
             if train_mode:
                 batch_metrics.update(
