@@ -1449,13 +1449,10 @@ def train(config: Config, config_name: str) -> None:
     if not val_unseen_dir.exists():
         val_unseen_dir = train_series_root / "val"
     val_seen_dir = train_series_root / "val_seen"
-    if not train_dir.exists() or not val_unseen_dir.exists():
-        raise FileNotFoundError(
-            "latent_rnn expects train/ and val_unseen/ under data.train_series_dir "
-            "(legacy val/ is supported as a fallback)."
-        )
+    if not train_dir.exists():
+        raise FileNotFoundError("latent_rnn expects train/ under data.train_series_dir.")
     train_paths = sorted(train_dir.glob("*.npz"))
-    val_paths = sorted(val_unseen_dir.glob("*.npz"))
+    val_paths = sorted(val_unseen_dir.glob("*.npz")) if val_unseen_dir.exists() else []
     val_seen_paths = sorted(val_seen_dir.glob("*.npz")) if val_seen_dir.exists() else []
     if not train_paths:
         raise FileNotFoundError("No latent_rnn training trajectories were found.")
