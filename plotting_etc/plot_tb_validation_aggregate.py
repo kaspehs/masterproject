@@ -8,8 +8,10 @@ Edit the config block below, then run:
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -48,24 +50,24 @@ RUN_DIRS: list[str] = []
 # run labels.
 RUN_LABELS: list[str] = []
 RUN_LABELS_BY_RUN: dict[str, str] = {
-    "fhat/loss_ablation/ABLATION_onestep": r"Residual loss",
-    "fhat/loss_ablation/ABLATION_mse": r"+ MSE loss",
-    "fhat/loss_ablation/ABLATION_std": r"+ Std loss",
-    "fhat/loss_ablation/ABLATION_psd": r"+ PSD loss",
-    "fhat/loss_ablation/ABLATION_freq": r"+ Frequency loss",
-    "fhat/loss_ablation/ABLATION_std_freq": r"+ Std and Frequency losses",
-    "fhat/loss_ablation/ABLATION_std_psd": r"+ Std and PSD losses",
+    "combined/loss_ablation/sharedABLATION_onestep": r"Residual loss",
+    "combined/loss_ablation/sharedABLATION_mse": r"+ MSE loss",
+    "combined/loss_ablation/sharedABLATION_std": r"+ Std loss",
+    "combined/loss_ablation/sharedABLATION_psd": r"+ PSD loss",
+    "combined/loss_ablation/sharedABLATION_freq": r"+ Frequency loss",
+    "combined/loss_ablation/sharedABLATION_std_freq": r"+ Std and Frequency losses",
+    "combined/loss_ablation/sharedABLATION_std_psd": r"+ Std and PSD losses",
 }
 
 # Number of discovered runs to include. Set to None to use all discovered runs.
 NUM_RUNS: int | None = None
 
 # Used only when RUN_DIRS is empty.
-RUN_NAME_CONTAINS: str | None = "fhat/loss_ablation"
+RUN_NAME_CONTAINS: str | None = "combined/loss_ablation"
 SORT_RUNS_BY = "mtime_desc"  # "mtime_desc", "mtime_asc", or "name"
 
 OUTPUT_DIR = Path("figs/tensorboard_validation")
-OUTPUT_BASENAME = "aggregate_validation_split_rows"
+OUTPUT_BASENAME = "shared_combo_loss_ablation_validation_split_rows"
 DPI = 300
 
 PLOT_TITLE: str | None = None
@@ -83,7 +85,12 @@ SHARE_X_AXIS = True
 
 # Smoothing is applied across logged validation points, not raw epoch integers.
 # Set to 1 to disable smoothing.
-SMOOTH_WINDOW_POINTS = 7
+SMOOTH_WINDOW_POINTS = 3
+
+# Async validation writes one JSON summary per validation epoch. Prefer those
+# over mirrored TensorBoard event shards when available; they are the canonical
+# epoch/value sequence and avoid stale/duplicated event-file artifacts.
+PREFER_ASYNC_VALIDATION_JSON = True
 
 # Draw per-run rolling std bands around each smoothed line. Since each run is
 # plotted separately, this is temporal variation within a run, not cross-run std.
@@ -135,12 +142,12 @@ SAVE_CSV = True
 SAVE_LATEX_TABLE = True
 PRINT_LATEX_TABLE = True
 LATEX_TABLE_CAPTION = (
-    "Ablation performance at the selected best-performing checkpoints. "
+    "Shared combined-correction loss ablation performance at the selected best-performing checkpoints. "
     "Displacement and force aggregates are means of their frequency and standard-deviation errors; "
     "the total aggregate is the mean of all four component errors. "
     "Lower values indicate better performance."
 )
-LATEX_TABLE_LABEL = "tab:loss_ablation_performance"
+LATEX_TABLE_LABEL = "tab:shared_combo_loss_ablation_performance"
 LATEX_BOLD_BEST_PER_METRIC = True
 LATEX_TABLE_COLSEP_PT = 3
 LATEX_INCLUDE_BASELINE_ROW = True
@@ -247,7 +254,7 @@ BASELINE_TABLE_ERRORS: dict[tuple[str, str], float | None] = {
 
 
 # ---------------------------------------------------------------------------
-# TensorBoard loading
+# Scalar loading
 # ---------------------------------------------------------------------------
 
 
@@ -261,6 +268,10 @@ def _event_files(run_dir: Path) -> list[Path]:
     return sorted(run_dir.rglob("events.out.tfevents*"))
 
 
+def _async_result_files(run_dir: Path) -> list[Path]:
+    return sorted((run_dir / "async_validation" / "results").glob("epoch_*.json"))
+
+
 def _run_mtime(run_dir: Path) -> float:
     event_files = _event_files(run_dir)
     if event_files:
@@ -268,20 +279,54 @@ def _run_mtime(run_dir: Path) -> float:
     return run_dir.stat().st_mtime
 
 
+def _run_key_candidates(run_dir: Path, default_label: str | None = None) -> tuple[str, ...]:
+    default_label = default_label or default_run_label(run_dir)
+    candidates = [str(run_dir), default_label, run_dir.name]
+    if run_dir.is_relative_to(LOG_ROOT):
+        rel_parts = run_dir.relative_to(LOG_ROOT).parts
+        for start in range(len(rel_parts)):
+            candidates.append(str(Path(*rel_parts[start:])))
+    return tuple(dict.fromkeys(candidates))
+
+
+def _key_matches_run(candidate: str, key: str) -> bool:
+    if candidate == key:
+        return True
+    if candidate.endswith(f"/{key}"):
+        return True
+    # Timestamped training runs use the config stem followed by "_MMDD-HHMMSS".
+    timestamped_key = rf"{re.escape(key)}_\d{{4}}-\d{{6}}"
+    return (
+        re.fullmatch(timestamped_key, candidate) is not None
+        or re.search(rf"/{timestamped_key}(?:/|$)", candidate) is not None
+    )
+
+
+def _matching_run_label_key(run_dir: Path, default_label: str | None = None) -> str | None:
+    for key in RUN_LABELS_BY_RUN:
+        aliases = tuple(dict.fromkeys((key, Path(key).name)))
+        if any(
+            _key_matches_run(candidate, alias)
+            for alias in aliases
+            for candidate in _run_key_candidates(run_dir, default_label)
+        ):
+            return key
+    return None
+
+
 def _run_label_order_key(run_dir: Path) -> tuple[int, int, str]:
     label_order = {key: idx for idx, key in enumerate(RUN_LABELS_BY_RUN)}
     default_label = default_run_label(run_dir)
-    for key in (str(run_dir), default_label):
-        if key in label_order:
-            return (0, label_order[key], default_label)
+    matched_key = _matching_run_label_key(run_dir, default_label)
+    if matched_key in label_order:
+        return (0, label_order[matched_key], default_label)
     return (1, len(label_order), default_label)
 
 
 def _run_matches_label_config(run_dir: Path) -> bool:
     if not RUN_LABELS_BY_RUN:
         return True
-    default_label = default_run_label(run_dir)
-    return any(key in RUN_LABELS_BY_RUN for key in (str(run_dir), default_label))
+    return _matching_run_label_key(run_dir) is not None
 
 
 def discover_run_dirs() -> list[Path]:
@@ -321,8 +366,77 @@ def _summary_value_to_float(value) -> float | None:
     return float(value.simple_value)
 
 
+def _metric_from_async_payload(payload: dict, tag: str) -> float | None:
+    split_tag, sep, metric_name = tag.partition("/")
+    if not sep:
+        return None
+    split_results = payload.get("split_results")
+    if not isinstance(split_results, dict):
+        return None
+    split_payload = split_results.get(split_tag)
+    if not isinstance(split_payload, dict):
+        return None
+    metrics = split_payload.get("val_metrics")
+    if not isinstance(metrics, dict) or metric_name not in metrics:
+        return None
+    try:
+        value = float(metrics[metric_name])
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def load_selected_scalars_from_async_json(run_dir: Path, tags: Iterable[str]) -> dict[str, ScalarSeries]:
+    tags_set = set(tags)
+    by_tag: dict[str, dict[int, float]] = {tag: {} for tag in tags_set}
+    result_files = _async_result_files(run_dir)
+    if not result_files:
+        return {}
+
+    for result_file in result_files:
+        try:
+            payload = json.loads(result_file.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - protects against partial files.
+            print(f"Warning: failed to read {result_file}: {exc}")
+            continue
+        try:
+            step = int(payload.get("epoch", result_file.stem.removeprefix("epoch_")))
+        except (TypeError, ValueError):
+            print(f"Warning: async validation result {result_file} has no usable epoch.")
+            continue
+        for tag in tags_set:
+            value = _metric_from_async_payload(payload, tag)
+            if value is not None:
+                by_tag[tag][step] = value
+
+    return _series_from_values_by_step(by_tag)
+
+
+def _series_from_values_by_step(by_tag: dict[str, dict[int, float]]) -> dict[str, ScalarSeries]:
+    series: dict[str, ScalarSeries] = {}
+    for tag, values_by_step in by_tag.items():
+        if not values_by_step:
+            continue
+        steps = np.asarray(sorted(values_by_step), dtype=float)
+        values = np.asarray([values_by_step[int(step)] for step in steps], dtype=float)
+        series[tag] = ScalarSeries(steps=steps, values=values)
+    return series
+
+
 def load_selected_scalars(run_dir: Path, tags: Iterable[str]) -> dict[str, ScalarSeries]:
     tags_set = set(tags)
+    if PREFER_ASYNC_VALIDATION_JSON:
+        series = load_selected_scalars_from_async_json(run_dir, tags_set)
+        if series:
+            missing = sorted(tags_set - set(series))
+            if missing:
+                print(
+                    f"Warning: async validation JSON in {run_dir} is missing "
+                    f"{len(missing)} requested tag(s); falling back to TensorBoard event files."
+                )
+            else:
+                return series
+
     by_tag: dict[str, dict[int, float]] = {tag: {} for tag in tags_set}
     event_files = _event_files(run_dir)
     if not event_files:
@@ -344,14 +458,7 @@ def load_selected_scalars(run_dir: Path, tags: Iterable[str]) -> dict[str, Scala
         except Exception as exc:  # pragma: no cover - protects against partial event files.
             print(f"Warning: failed to read {event_file}: {exc}")
 
-    series: dict[str, ScalarSeries] = {}
-    for tag, values_by_step in by_tag.items():
-        if not values_by_step:
-            continue
-        steps = np.asarray(sorted(values_by_step), dtype=float)
-        values = np.asarray([values_by_step[int(step)] for step in steps], dtype=float)
-        series[tag] = ScalarSeries(steps=steps, values=values)
-    return series
+    return _series_from_values_by_step(by_tag)
 
 
 # ---------------------------------------------------------------------------
@@ -569,10 +676,9 @@ def run_label(run_dir: Path, run_idx: int | None = None) -> str:
     if run_idx is not None and run_idx < len(RUN_LABELS) and RUN_LABELS[run_idx]:
         return RUN_LABELS[run_idx]
 
-    for key in (str(run_dir), default_label):
-        label = RUN_LABELS_BY_RUN.get(key)
-        if label:
-            return label
+    matched_key = _matching_run_label_key(run_dir, default_label)
+    if matched_key is not None:
+        return RUN_LABELS_BY_RUN[matched_key]
     return default_label
 
 

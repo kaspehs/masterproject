@@ -286,6 +286,40 @@ def td_mean_active_from_mode(method_cfg: dict[str, Any]) -> bool:
     return bool(td_correction_mode_flags(resolve_td_correction_mode(method_cfg))["mean_active"])
 
 
+def resolve_td_fhat_correction_bounds(method_cfg: dict[str, Any]) -> tuple[float, float] | None:
+    raw_bounds = method_cfg.get("fhat_correction_bounds", None)
+    if raw_bounds is None:
+        raw_min = method_cfg.get("fhat_correction_bound_min", None)
+        raw_max = method_cfg.get("fhat_correction_bound_max", None)
+        if raw_min is None and raw_max is None:
+            return None
+        if raw_min is None or raw_max is None:
+            raise ValueError(
+                "Set both hnn.fhat_correction_bound_min and hnn.fhat_correction_bound_max, "
+                "or leave both null to use the Vivana-TD fhat bounds."
+            )
+        lo = float(raw_min)
+        hi = float(raw_max)
+    elif isinstance(raw_bounds, dict):
+        raw_min = raw_bounds.get("min", raw_bounds.get("lower", None))
+        raw_max = raw_bounds.get("max", raw_bounds.get("upper", None))
+        if raw_min is None or raw_max is None:
+            raise ValueError("hnn.fhat_correction_bounds mapping must contain min/max or lower/upper.")
+        lo = float(raw_min)
+        hi = float(raw_max)
+    else:
+        arr = np.asarray(raw_bounds, dtype=float).reshape(-1)
+        if arr.size != 2:
+            raise ValueError("hnn.fhat_correction_bounds must be null or a two-value [min, max] sequence.")
+        lo = float(arr[0])
+        hi = float(arr[1])
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        raise ValueError("hnn.fhat_correction_bounds values must be finite.")
+    if lo < 0.0 or hi <= lo:
+        raise ValueError("hnn.fhat_correction_bounds must satisfy 0 <= min < max.")
+    return lo, hi
+
+
 def td_bounded_delta_fhat_torch(
     raw_delta_fhat: torch.Tensor,
     *,
@@ -293,12 +327,18 @@ def td_bounded_delta_fhat_torch(
     fhat_min: float,
     fhat_max: float,
     fhat_bound_multiplier: float,
+    fhat_bound_min: float | None = None,
+    fhat_bound_max: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     mult = float(fhat_bound_multiplier)
     if not np.isfinite(mult) or mult <= 0.0:
         raise ValueError(f"fhat_bound_multiplier must be finite and positive, got {fhat_bound_multiplier!r}.")
-    f_lo = float(fhat_min) / mult
-    f_hi = float(fhat_max) * mult
+    base_min = float(fhat_min) if fhat_bound_min is None else float(fhat_bound_min)
+    base_max = float(fhat_max) if fhat_bound_max is None else float(fhat_bound_max)
+    if not np.isfinite(base_min) or not np.isfinite(base_max) or base_min < 0.0 or base_max <= base_min:
+        raise ValueError("fhat correction bounds must be finite and satisfy 0 <= min < max.")
+    f_lo = base_min / mult
+    f_hi = base_max * mult
     room_up = torch.clamp(torch.as_tensor(f_hi, device=fhat_td.device, dtype=fhat_td.dtype) - fhat_td, min=0.0)
     room_down = torch.clamp(fhat_td - torch.as_tensor(f_lo, device=fhat_td.device, dtype=fhat_td.dtype), min=0.0)
     bounded = torch.where(raw_delta_fhat >= 0.0, torch.tanh(raw_delta_fhat) * room_up, torch.tanh(raw_delta_fhat) * room_down)
@@ -5765,6 +5805,8 @@ def td_baseline_step_torch(
     params: dict[str, float],
     raw_delta_fhat: torch.Tensor | None = None,
     fhat_bound_multiplier: float = 1.5,
+    fhat_bound_min: float | None = None,
+    fhat_bound_max: float | None = None,
     return_diagnostics: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     if td_context.ndim < 2 or td_context.shape[-1] < 5:
@@ -5819,6 +5861,8 @@ def td_baseline_step_torch(
             fhat_min=float(params["fhat_min"]),
             fhat_max=float(params["fhat_max"]),
             fhat_bound_multiplier=float(fhat_bound_multiplier),
+            fhat_bound_min=fhat_bound_min,
+            fhat_bound_max=fhat_bound_max,
         )
     omega_vy = 2.0 * math.pi * fhat_corr * speed_mag / float(diameter)
     phi_vy_next = phi_vy + dt_t * omega_vy

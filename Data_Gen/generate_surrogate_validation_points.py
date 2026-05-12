@@ -47,7 +47,7 @@ os.environ.setdefault("XDG_CACHE_HOME", str(_CACHE_ROOT / "xdg"))
 # Config for direct script use
 # ---------------------------------------------------------------------------
 
-INPUT_NPZ_GLOB = "CFD_Data/npz_exports_multi_theta0_modified/train/*.npz"
+INPUT_NPZ_GLOB = "CFD_Data/npz_exports/*.npz"
 OUTPUT_NPZ = Path("CFD_Data/analysis/surrogate_validation_points.npz")
 OUTPUT_CSV = Path("CFD_Data/analysis/surrogate_validation_points.csv")
 OUTPUT_PLOT = Path("CFD_Data/analysis/surrogate_validation_points_diagnostic.png")

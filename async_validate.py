@@ -61,6 +61,7 @@ from HNN_helper import (
     resolve_td_correction_params,
     resolve_td_correction_mode,
     resolve_td_force_input_source,
+    resolve_td_fhat_correction_bounds,
     resolve_td_input_configs,
     resolve_td_phase_input_source,
     resolve_td_memory_config,
@@ -1084,6 +1085,12 @@ def _run_hnn_td_correction_validation(
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     input_scaling_mode = resolve_phnn_input_scaling_mode(getattr(cfg.model, "input_scaling_mode", "current"))
     fhat_bound_multiplier = float(ckpt.get("fhat_bound_multiplier", hnn_cfg.get("fhat_bound_multiplier", 1.5)))
+    if "fhat_correction_bounds" in ckpt:
+        fhat_correction_bounds = resolve_td_fhat_correction_bounds(
+            {"fhat_correction_bounds": ckpt.get("fhat_correction_bounds")}
+        )
+    else:
+        fhat_correction_bounds = resolve_td_fhat_correction_bounds(hnn_cfg)
     fhat_reg = float(getattr(loss_cfg, "fhat_reg", 0.0))
     fhat_reg_norm = str(getattr(loss_cfg, "fhat_reg_norm", "l2")).strip().lower()
     state_loss_mode = str(hnn_cfg.get("state_loss_mode", "mse")).strip().lower()
@@ -1201,6 +1208,7 @@ def _run_hnn_td_correction_validation(
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "td_force_input_source", td_force_input_source)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
+    setattr(model, "fhat_correction_bounds", fhat_correction_bounds)
     setattr(model, "force_zero_output", force_zero_output)
     setattr(model, "random_phase_training", random_phase_training)
     _load_state(model, ckpt["model_state"])

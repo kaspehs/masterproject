@@ -72,6 +72,7 @@ from HNN_helper import (
     resolve_td_memory_config,
     resolve_td_n_memory_torch,
     resolve_td_input_configs,
+    resolve_td_fhat_correction_bounds,
     resolve_phnn_input_scaling_mode,
     rollout_model,
     resolve_td_phase_input_source,
@@ -721,6 +722,12 @@ def _td_step_with_corrections(
         force_zero_output=force_zero_output,
     )
     if fhat_active:
+        fhat_correction_bounds = getattr(model, "fhat_correction_bounds", None)
+        if fhat_correction_bounds is None:
+            fhat_bound_min = None
+            fhat_bound_max = None
+        else:
+            fhat_bound_min, fhat_bound_max = fhat_correction_bounds
         td_force_next, td_context_next, td_diag = td_baseline_step_torch(
             velocity=velocity,
             acceleration=td_context[:, 0:1],
@@ -731,6 +738,8 @@ def _td_step_with_corrections(
             params=step_params,
             raw_delta_fhat=raw_delta_fhat,
             fhat_bound_multiplier=float(fhat_bound_multiplier),
+            fhat_bound_min=fhat_bound_min,
+            fhat_bound_max=fhat_bound_max,
             return_diagnostics=True,
         )
     else:
@@ -3798,6 +3807,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     use_sigma_inputs = bool(hnn_cfg.get("use_sigma_inputs", False))
     use_acceleration_input = bool(hnn_cfg.get("use_acceleration_input", False))
     fhat_bound_multiplier = float(hnn_cfg.get("fhat_bound_multiplier", 1.5))
+    fhat_correction_bounds = resolve_td_fhat_correction_bounds(hnn_cfg)
     init_from_checkpoint = _resolve_checkpoint_path(hnn_cfg.get("init_from_checkpoint"))
     freeze_mean_net = bool(hnn_cfg.get("freeze_mean_net", False))
     freeze_fhat_net = bool(hnn_cfg.get("freeze_fhat_net", False))
@@ -3928,6 +3938,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
     setattr(model, "correction_mode", correction_mode)
     setattr(model, "td_force_input_source", td_force_input_source)
     setattr(model, "fhat_bound_multiplier", float(fhat_bound_multiplier))
+    setattr(model, "fhat_correction_bounds", fhat_correction_bounds)
     setattr(model, "force_zero_output", force_zero_output)
     setattr(model, "random_phase_training", random_phase_training)
     shared_td_correction_trunk = bool(getattr(model, "shared_td_correction_trunk", False))
@@ -4090,6 +4101,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
                 "use_sigma_inputs": use_sigma_inputs,
                 "shared_td_correction_trunk": shared_td_correction_trunk,
                 "fhat_bound_multiplier": float(fhat_bound_multiplier),
+                "fhat_correction_bounds": fhat_correction_bounds,
                 "fhat_reg": float(fhat_reg),
                 "fhat_reg_norm": str(fhat_reg_norm),
             },
@@ -4222,6 +4234,13 @@ def _train_td_correction(config: Config, config_name: str) -> None:
         f"rollout_disp_mean=same_as_std({rollout_disp_mean_in_std_loss}), "
         f"rollout_disp_spectral={rollout_disp_spectral_weight:g}"
     )
+    if fhat_correction_bounds is None:
+        startup_lines.append("Fhat correction bounds: using Vivana-TD td_fhat_min/td_fhat_max as the base interval.")
+    else:
+        startup_lines.append(
+            "Fhat correction bounds: "
+            f"using explicit base interval [{fhat_correction_bounds[0]:g}, {fhat_correction_bounds[1]:g}]."
+        )
     if validation_theta0_values is not None:
         startup_lines.append(
             f"Validation theta sweep: {len(validation_theta0_values)} initial theta0 values {validation_theta0_values}"
@@ -5071,6 +5090,7 @@ def _train_td_correction(config: Config, config_name: str) -> None:
             "use_sigma_inputs": use_sigma_inputs,
             "shared_td_correction_trunk": shared_td_correction_trunk,
             "fhat_bound_multiplier": float(fhat_bound_multiplier),
+            "fhat_correction_bounds": fhat_correction_bounds,
             "fhat_reg": float(fhat_reg),
             "fhat_reg_norm": str(fhat_reg_norm),
         },
