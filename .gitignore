@@ -10,6 +10,7 @@
 /legacy_code
 /logs/*
 /figs
+/figures
 /tests
 /Data_Gen/legacy_datasets
 /Data_Gen/const_Ur
