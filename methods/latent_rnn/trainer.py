@@ -463,7 +463,7 @@ class LatentRNNForceModel(nn.Module):
             stiffness=stiffness,
             flow_speed=flow_speed,
         )
-        h_next = h + (dt / float(self.latent_time_scale)) * raw_dh
+        h_next = h + (dt / float(self.latent_time_scale)) * torch.tanh(raw_dh)
         y_next, v_next, a_next = structural_step_constant_force_torch(
             y=z[:, 0:1],
             velocity=z[:, 1:2] / torch.clamp(mass, min=1.0e-12),
