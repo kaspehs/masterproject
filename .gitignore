@@ -10,7 +10,7 @@
 /legacy_code
 /logs/*
 /figs
-/figures
+/figures/*
 /tests
 /Data_Gen/legacy_datasets
 /Data_Gen/const_Ur
@@ -23,7 +23,8 @@
 /Data_Gen/npz_exports_td_burnin_trimmed
 /Data_Gen/npz_exports_td_burnin_trimmed4
 /Data_Gen/npz_exports_multi_theta0_modified
-/Data_Gen/npz_exports_td_burnin_trimmed_old
+/Data_Gen/npz_exports_multi_theta0_baseline
+/Data_Gen/loo_ur_td_burnin_trimmed4
 /Experimental_Data/eval_models
 /CFD_Data
 __pycache__/
@@ -33,3 +34,4 @@ __pycache__/
 *.json
 *.mat
 *.xlsx
+*.pdf
