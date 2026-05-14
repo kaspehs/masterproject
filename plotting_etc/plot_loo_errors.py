@@ -122,6 +122,10 @@ plt.rcParams.update({
 # Must match the reduction_factor used during training.
 REDUCTION_FACTOR = 20
 
+# Match the spectral notebook's Block 9a LOO entries by default.
+# Use "final" to reproduce the previous behavior that preferred final/final.pt.
+LOO_CHECKPOINT_PREFERENCE = "best_val"  # "best_val" | "final"
+
 # Mapping: checkpoint suffix → (Ur float value, NPZ glob pattern)
 UR_MAP: dict[str, tuple[float, str]] = {
     "ur2":   (2.0,  "comb_Ur2__*.npz"),
@@ -163,8 +167,8 @@ _UR_ORDER = sorted(UR_MAP.keys(), key=lambda s: UR_MAP[s][0])
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def _find_loo_checkpoints(model_dir: Path) -> dict[str, Path]:
-    """Return {ur_suffix: checkpoint_path}, preferring final LOO checkpoints."""
-    result: dict[str, Path] = {}
+    """Return {ur_suffix: checkpoint_path} according to LOO_CHECKPOINT_PREFERENCE."""
+    final_result: dict[str, Path] = {}
     final_root = model_dir / "final"
     for pt in sorted(final_root.glob("*/final.pt")):
         m = _LOO_NAME_RE.search(pt.as_posix())
@@ -172,15 +176,25 @@ def _find_loo_checkpoints(model_dir: Path) -> dict[str, Path]:
             continue
         suffix = m.group(1).lower()
         if suffix in UR_MAP:
-            result[suffix] = pt
+            final_result[suffix] = pt
 
+    best_result: dict[str, Path] = {}
     for pt in sorted(model_dir.glob("*.pt")):
         m = _LOO_NAME_RE.search(pt.name)
         if m is None:
             continue
         suffix = m.group(1).lower()
-        if suffix in UR_MAP and suffix not in result:
-            result[suffix] = pt
+        if suffix in UR_MAP:
+            best_result[suffix] = pt
+
+    preference = str(LOO_CHECKPOINT_PREFERENCE).strip().lower()
+    if preference not in {"best_val", "final"}:
+        raise ValueError("LOO_CHECKPOINT_PREFERENCE must be 'best_val' or 'final'.")
+    primary = best_result if preference == "best_val" else final_result
+    fallback = final_result if preference == "best_val" else best_result
+    result = dict(primary)
+    for suffix, path in fallback.items():
+        result.setdefault(suffix, path)
     return result
 
 
@@ -428,12 +442,23 @@ def _rows_for_series(
     method: str,
     ur_values: list[float],
     metric_arrays: dict[str, list[float]],
+    held_out_suffixes: list[str] | None = None,
+    held_out_ur_labels: list[float] | None = None,
+    checkpoint_paths: list[Path | None] | None = None,
 ) -> list[dict[str, float | str]]:
     rows: list[dict[str, float | str]] = []
     for idx, ur_value in enumerate(ur_values):
+        checkpoint_path = None if checkpoint_paths is None or idx >= len(checkpoint_paths) else checkpoint_paths[idx]
         row: dict[str, float | str] = {
             "method": method,
-            "held_out_ur": float(ur_value),
+            "held_out_suffix": "" if held_out_suffixes is None or idx >= len(held_out_suffixes) else held_out_suffixes[idx],
+            "held_out_ur_label": (
+                float("nan") if held_out_ur_labels is None or idx >= len(held_out_ur_labels) else float(held_out_ur_labels[idx])
+            ),
+            "held_out_ur_effective_group": float(ur_value),
+            "checkpoint_path": "" if checkpoint_path is None else str(checkpoint_path),
+            "checkpoint_name": "" if checkpoint_path is None else checkpoint_path.name,
+            "checkpoint_preference": str(LOO_CHECKPOINT_PREFERENCE),
         }
         for metric_key, _ in METRICS:
             values = metric_arrays.get(metric_key, [])
@@ -463,6 +488,7 @@ def _rows_for_case_details(
             "case_index": int(idx),
             "checkpoint_path": "" if checkpoint_path is None else str(checkpoint_path),
             "checkpoint_name": "" if checkpoint_path is None else checkpoint_path.name,
+            "checkpoint_preference": str(LOO_CHECKPOINT_PREFERENCE),
         }
         row.update(case_metrics)
         rows.append(row)
@@ -938,6 +964,9 @@ def main() -> None:
             continue
 
         ur_values: list[float] = []
+        held_out_suffixes: list[str] = []
+        held_out_ur_labels: list[float] = []
+        checkpoint_paths: list[Path | None] = []
         metric_arrays: dict[str, list[float]] = {key: [] for key, _ in METRICS}
 
         for suffix in _UR_ORDER:
@@ -973,6 +1002,9 @@ def main() -> None:
 
             metrics, case_metrics = _eval_loo_model(model, ckpt, trajs, device)
             ur_values.append(ur_eff)
+            held_out_suffixes.append(suffix)
+            held_out_ur_labels.append(ur_val)
+            checkpoint_paths.append(checkpoints[suffix])
             for key, _ in METRICS:
                 metric_arrays[key].append(metrics.get(key, float("nan")))
             detailed_case_rows.extend(
@@ -992,12 +1024,17 @@ def main() -> None:
             "color": exp.get("color", "steelblue"),
             "marker": exp.get("marker", "o"),
             "ur_values": ur_values,
+            "held_out_suffixes": held_out_suffixes,
+            "held_out_ur_labels": held_out_ur_labels,
+            "checkpoint_paths": checkpoint_paths,
             "metrics": metric_arrays,
         })
 
     # Evaluate VIVANA-TD baseline — one point per unique (suffix, rf) combination
     # Use mean across all experiment rfs to get one baseline value per Ur
     td_ur_values: list[float] = []
+    td_held_out_suffixes: list[str] = []
+    td_held_out_ur_labels: list[float] = []
     td_metric_arrays: dict[str, list[float]] = {key: [] for key, _ in METRICS}
     if (
         ref_td_params is not None
@@ -1024,6 +1061,8 @@ def main() -> None:
                 device,
             )
             td_ur_values.append(ur_val)
+            td_held_out_suffixes.append(suffix)
+            td_held_out_ur_labels.append(UR_MAP[suffix][0])
             for key, _ in METRICS:
                 td_metric_arrays[key].append(metrics.get(key, float("nan")))
             detailed_case_rows.extend(
@@ -1047,6 +1086,9 @@ def main() -> None:
                 method=BASELINE_LABEL,
                 ur_values=td_ur_values,
                 metric_arrays=td_metric_arrays,
+                held_out_suffixes=td_held_out_suffixes,
+                held_out_ur_labels=td_held_out_ur_labels,
+                checkpoint_paths=[None] * len(td_ur_values),
             )
         )
     for res in experiment_results:
@@ -1055,6 +1097,9 @@ def main() -> None:
                 method=str(res["label"]),
                 ur_values=list(res["ur_values"]),
                 metric_arrays=res["metrics"],
+                held_out_suffixes=list(res["held_out_suffixes"]),
+                held_out_ur_labels=list(res["held_out_ur_labels"]),
+                checkpoint_paths=list(res["checkpoint_paths"]),
             )
         )
     summary_rows = _summary_rows(detail_rows)

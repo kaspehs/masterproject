@@ -1526,10 +1526,9 @@ def _td_correction_rollout_losses_from_batch(
             power=disp_std_power,
         )
     if compute_disp_mean_loss:
-        z_for_mean = torch.mean(z_pred_horizon, dim=0)
         disp_mean_loss = _displacement_mean_error_torch(
-            true_signal=z_traj_horizon[:, :, 0],
-            pred_signal=z_for_mean[:, :, 0],
+            true_signal=z_traj_samples[:, :, 0],
+            pred_signal=z_pred_samples[:, :, 0],
             relative=disp_std_relative,
             power=disp_std_power,
         )
