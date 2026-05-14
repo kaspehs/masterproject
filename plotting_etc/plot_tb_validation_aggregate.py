@@ -50,24 +50,26 @@ RUN_DIRS: list[str] = []
 # run labels.
 RUN_LABELS: list[str] = []
 RUN_LABELS_BY_RUN: dict[str, str] = {
-    "combined/loss_ablation/sharedABLATION_onestep": r"Residual loss",
-    "combined/loss_ablation/sharedABLATION_mse": r"+ MSE loss",
-    "combined/loss_ablation/sharedABLATION_std": r"+ Std loss",
-    "combined/loss_ablation/sharedABLATION_psd": r"+ PSD loss",
-    "combined/loss_ablation/sharedABLATION_freq": r"+ Frequency loss",
-    "combined/loss_ablation/sharedABLATION_std_freq": r"+ Std and Frequency losses",
-    "combined/loss_ablation/sharedABLATION_std_psd": r"+ Std and PSD losses",
+    "combined/div_ablation/comboBESTMODEL": "Reference model",
+    "combined/div_ablation/comboBESTMODEL_MLP": "MLP architecture",
+    "combined/div_ablation/comboBESTMODEL_RESIDUAL": "Residual architecture",
+    "combined/div_ablation/comboBESTMODEL_noGN": "No gradient normalization",
+    "combined/div_ablation/comboBESTMODEL_forcebound2": "Force correction bound = 2.0",
+    "combined/div_ablation/comboBESTMODEL_freqbound2": "Frequency correction bound = 2.0",
+}
+LATEX_ROW_LABELS_BY_LABEL: dict[str, str] = {
+    label: label for label in RUN_LABELS_BY_RUN.values()
 }
 
 # Number of discovered runs to include. Set to None to use all discovered runs.
 NUM_RUNS: int | None = None
 
 # Used only when RUN_DIRS is empty.
-RUN_NAME_CONTAINS: str | None = "combined/loss_ablation"
+RUN_NAME_CONTAINS: str | None = "combined/div_ablation"
 SORT_RUNS_BY = "mtime_desc"  # "mtime_desc", "mtime_asc", or "name"
 
 OUTPUT_DIR = Path("figs/tensorboard_validation")
-OUTPUT_BASENAME = "shared_combo_loss_ablation_validation_split_rows"
+OUTPUT_BASENAME = "combined_div_ablation_validation_split_rows"
 DPI = 300
 
 PLOT_TITLE: str | None = None
@@ -85,7 +87,7 @@ SHARE_X_AXIS = True
 
 # Smoothing is applied across logged validation points, not raw epoch integers.
 # Set to 1 to disable smoothing.
-SMOOTH_WINDOW_POINTS = 3
+SMOOTH_WINDOW_POINTS = 1
 
 # Async validation writes one JSON summary per validation epoch. Prefer those
 # over mirrored TensorBoard event shards when available; they are the canonical
@@ -98,8 +100,8 @@ PLOT_ROLLING_STD_BANDS = False
 BAND_STD_MULTIPLIER = 1.0
 BAND_ALPHA = 0.10
 LINE_WIDTH = 1.8
-HIGHLIGHT_RUN_LABELS: set[str] = set()
-HIGHLIGHT_RUN_KEYS: set[str] = set()
+HIGHLIGHT_RUN_LABELS: set[str] = {"Reference model"}
+HIGHLIGHT_RUN_KEYS: set[str] = {"combined/div_ablation/comboBESTMODEL"}
 HIGHLIGHT_LINE_WIDTH = LINE_WIDTH
 HIGHLIGHT_COLOR = "black"
 HIGHLIGHT_MARKER_SIZE = 34
@@ -110,7 +112,7 @@ SELECTION_SCALAR_NAME = "Aggregate validation error"
 # Optional manual checkpoint overrides. Leave empty to select the minimum
 # combined-validation aggregate error for each run.
 SELECTED_EPOCHS_BY_RUN: dict[str, float] = {}
-OMIT_INITIAL_BEST_RUNS_FROM_PLOT = True
+OMIT_INITIAL_BEST_RUNS_FROM_PLOT = False
 INITIAL_BEST_STEP_ATOL = 1e-9
 FINAL_MARKER_SIZE = 34
 FINAL_LABEL_FONT_SIZE = 8
@@ -142,12 +144,12 @@ SAVE_CSV = True
 SAVE_LATEX_TABLE = True
 PRINT_LATEX_TABLE = True
 LATEX_TABLE_CAPTION = (
-    "Shared combined-correction loss ablation performance at the selected best-performing checkpoints. "
+    "Combined-correction architecture/divergence ablation performance at the selected best-performing checkpoints. "
     "Displacement and force aggregates are means of their frequency and standard-deviation errors; "
     "the total aggregate is the mean of all four component errors. "
     "Lower values indicate better performance."
 )
-LATEX_TABLE_LABEL = "tab:shared_combo_loss_ablation_performance"
+LATEX_TABLE_LABEL = "tab:combined_div_ablation_performance"
 LATEX_BOLD_BEST_PER_METRIC = True
 LATEX_TABLE_COLSEP_PT = 3
 LATEX_INCLUDE_BASELINE_ROW = True
@@ -569,6 +571,10 @@ def format_latex_epoch(value: float | None) -> str:
     return f"{float(value):.3g}"
 
 
+def format_latex_row_label(label: str) -> str:
+    return LATEX_ROW_LABELS_BY_LABEL.get(label, latex_escape(label))
+
+
 def make_latex_performance_table(
     table_values: dict[str, dict[str, tuple[float, float]]],
     selected_epochs: dict[str, float] | None = None,
@@ -613,7 +619,7 @@ def make_latex_performance_table(
     ]
 
     for run_label, metric_values in table_values.items():
-        row = [latex_escape(run_label)]
+        row = [format_latex_row_label(run_label)]
         if LATEX_INCLUDE_BEST_EPOCH:
             row.append(format_latex_epoch(selected_epochs.get(run_label)))
         for column_label in column_order:
@@ -723,13 +729,15 @@ def selected_checkpoint_for_run(
         print(f"Warning: selection metric {tag!r} missing in {run_dir}; using no selected checkpoint.")
         return None
 
-    steps, smoothed, _lower, _upper = smooth_series(tag_series[tag])
+    selection_series = tag_series[tag]
+    steps = selection_series.steps
+    values = selection_series.values
     if steps.size == 0:
         return None
     first_step = float(steps[0])
     override_step = selected_epoch_override(run_dir, label)
     if override_step is not None:
-        point = interpolated_point_at_step(steps, smoothed, override_step)
+        point = interpolated_point_at_step(steps, values, override_step)
         if point is not None:
             step, value = point
             return SelectedCheckpoint(
@@ -739,13 +747,13 @@ def selected_checkpoint_for_run(
             )
         print(f"Warning: selected epoch override {override_step:g} outside logged range for {run_dir}; using minimum.")
 
-    finite = np.isfinite(smoothed)
+    finite = np.isfinite(values)
     if not np.any(finite):
         return None
     finite_indices = np.flatnonzero(finite)
-    best_idx = int(finite_indices[int(np.argmin(smoothed[finite]))])
+    best_idx = int(finite_indices[int(np.argmin(values[finite]))])
     best_step = float(steps[best_idx])
-    best_value = float(smoothed[best_idx])
+    best_value = float(values[best_idx])
     if not np.isfinite(best_step) or not np.isfinite(best_value):
         return None
     return SelectedCheckpoint(
@@ -842,8 +850,8 @@ def plot(run_dirs: list[Path]) -> None:
             if tag not in tag_series:
                 print(f"Warning: table metric {tag!r} missing in {run_dir}.")
                 continue
-            steps, smoothed, _lower, _upper = smooth_series(tag_series[tag])
-            marker_point = interpolated_point_at_step(steps, smoothed, selected_step)
+            series = tag_series[tag]
+            marker_point = interpolated_point_at_step(series.steps, series.values, selected_step)
             if marker_point is None:
                 print(f"Warning: selected epoch {selected_step:g} outside range for table metric {tag!r} in {run_dir}.")
                 continue
@@ -893,7 +901,11 @@ def plot(run_dirs: list[Path]) -> None:
             if PLOT_FINAL_MARKERS or PLOT_FINAL_VALUE_LABELS:
                 selected_checkpoint = selected_checkpoints.get(run_dir)
                 marker_point = (
-                    interpolated_point_at_step(steps, smoothed, selected_checkpoint.step)
+                    interpolated_point_at_step(
+                        tag_series[tag].steps,
+                        tag_series[tag].values,
+                        selected_checkpoint.step,
+                    )
                     if selected_checkpoint is not None
                     else None
                 )
@@ -905,6 +917,8 @@ def plot(run_dirs: list[Path]) -> None:
                             marker_value,
                             color=color,
                             s=marker_size,
+                            edgecolors="white",
+                            linewidths=0.7,
                             zorder=zorder + 1,
                         )
                     if PLOT_FINAL_VALUE_LABELS:

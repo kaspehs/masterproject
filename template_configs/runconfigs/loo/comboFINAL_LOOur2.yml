@@ -1,0 +1,274 @@
+method: hnn
+
+data:
+  cut_start_seconds_train: 0.0
+  cut_start_seconds_val: 0.0
+  # Optional temporal downsampling of TD trajectories.
+  reduce_time: true
+  reduction_factor: 20
+  # Training default is effectively true when reduce_time=true and reduction_factor>1 if left null.
+  stagger_reduced_time_train: false
+  # Validation default is false.
+  stagger_reduced_time_val: false
+  train_series_dir: Data_Gen/loo_ur_td_burnin_trimmed4/loo_Ur2
+
+model:
+  rho: 1.0
+  D: 1.0
+  structural_mass: 16.79
+  Ca: 1.0
+  k: 1218.0
+  damping_c: 1.0e-4
+  force_output: coefficient
+  # Optional tanh cap on coefficient-mode network output. In TD-correction mode this bounds the correction coefficient.
+  coefficient_output_bound: 2.0
+  sigma_min: 1.0e-6
+  # PHNN input scaling:
+  # current    -> y/D, v/(sqrt(k/m) D), optional TD inputs with omega=sqrt(k/m), flow feature U_r/ur_scale
+  # convective -> y/D, v/U, a D/U^2, sigma_dy/U, sigma_ddy D/U^2, flow feature U/D
+  input_scaling_mode: current
+  # Only used when input_scaling_mode: current.
+  ur_scale: 10.0
+
+architecture:
+  # If true, enforce odd force symmetry by construction: f(-state, U_r) = -f(state, U_r).
+  # Requires hnn.use_td_force_input: false and hnn.use_td_fhat_input: false.
+  hard_force_symmetry: false
+  # If true, TD correction modes use one shared feature trunk with separate mean/fhat/sigma heads.
+  # Most useful for combined correction modes such as mean_fhat_only or mean_sigma_fhat.
+  shared_td_correction_trunk: true
+  use_fourier_features: false
+  fourier_features: 64
+  fourier_sigma: 1.0
+  force_net_type: pirate
+  residual_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  mlp_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  pirate_force_kwargs:
+    depth: 2
+    fourier_features: 32
+    sigma: 0.5
+    use_rwf: false
+    activation: silu
+
+training:
+  batch_size: 2048
+  max_grad_norm: 200.0
+  epochs: 500
+
+optim:
+  lr: 0.001
+  optimizer: adam
+  weight_decay: 0.0
+  use_lr_scheduler: true
+  scheduler:
+    max_lr: 0.0003
+    decay_rate: 0.99
+    warmup_fraction: 0.05
+    min_lr: 0.00003
+    scheduler_type: cosine
+
+loss:
+  # Regularization
+  mean_reg: 1.0e-2
+  mean_reg_norm: l2
+  sigma_reg: 0.0
+  sigma_reg_norm: l2
+  fhat_reg: 1.0e-1
+  fhat_reg_norm: l1
+
+  # U_r-bin normalization
+  ur_bin_size: 1.0e-6
+  normalize_by_ur_bin_std: false
+  ur_bin_scale_eps: 1.0e-6
+  # One-step state loss weight. Set to 0.0 to disable the PHNN one-step state loss.
+  state_weight: 1.0
+
+  # Rollout loss
+  rollout_det_weight: 0.0
+  rollout_det_steps: 400
+  # Rollout loss mode: deterministic | stochastic_nll | stochastic_mse
+  rollout_loss_mode: deterministic
+  # Number of stochastic rollout samples K. Must be >= 2 for stochastic_nll/stochastic_mse.
+  rollout_stochastic_samples: 1
+  rollout_det_steps_final: 0
+  rollout_det_steps_warmup_epochs: 0
+  rollout_det_batch_size: 2048
+  # Legacy fallback when rollout_relative_losses is null.
+  rollout_det_amplitude_normalized_mse: false
+  # If set, apply the same absolute/relative choice to rollout MSE, std, PSD,
+  # and dominant-frequency losses. If null, legacy per-loss defaults are used.
+  rollout_relative_losses: false
+  # Auxiliary rollout displacement-std loss weight.
+  rollout_disp_std_weight: 1.0
+  # Legacy fallback when rollout_relative_losses is null.
+  rollout_disp_std_normalize_by_true: null
+  # Exponent p in |std(pred)-std(true)|^p.
+  rollout_disp_std_p: 2.0
+  # If true, also adds |mean(pred)-mean(true)|^p under rollout_disp_std_weight.
+  # Relative normalization uses the same true-displacement std scale as the std term.
+  rollout_disp_mean_in_std_loss: true
+  # Auxiliary rollout displacement spectral loss weight. If left null, legacy rollout_disp_psd_weight is used.
+  rollout_disp_spectral_weight: 1.0
+  # Spectral loss mode: psd | dominant_frequency
+  rollout_disp_spectral_loss: dominant_frequency
+  # Legacy alias for rollout_disp_spectral_weight.
+  rollout_disp_psd_weight: 0.0
+  # Optional narrowbanding around the ground-truth dominant displacement peak.
+  # 0.0 disables narrowbanding and compares the full non-DC spectrum.
+  rollout_disp_psd_peak_rel_bandwidth: 0.0
+  # If true, apply a Hann window before the FFT in the rollout displacement PSD loss.
+  rollout_disp_psd_use_hann_window: true
+  # Exponent p in |f_pred-f_true|^p.
+  rollout_disp_freq_p: 2.0
+  # Peak-concentration exponent alpha in the PSD-weighted dominant-frequency estimate.
+  rollout_disp_freq_alpha: 4.0
+
+  # Data / symmetry losses
+  use_force_data_loss: false
+  force_data_weight: 0.0
+  symmetry_weight: 0.0
+  symmetry_norm: l2
+
+  # GradNorm balancing
+  use_gradnorm: true
+  gradnorm_alpha: 0.9
+  gradnorm_min_weight: 0.001
+  gradnorm_max_weight: 1000.0
+
+runtime:
+  device: cuda
+  num_workers: 4
+
+precision:
+  use_tf32: false
+  use_amp: false
+  amp_dtype: bf16
+
+compile:
+  use_compile: false
+  compile_mode: reduce-overhead
+
+monitoring:
+  validate_every_epochs: 20
+  validation_samples_per_ur: 2
+  final_rollout_all_validation: true
+  log_every_epochs: 5
+  print_every_epochs: 50
+  log_component_grad_norms: false
+  async_validation: true
+  async_validation_device: cpu
+  async_validation_num_workers: 0
+  async_validation_num_threads: 1
+  async_validation_max_concurrent: 6
+  surrogate_validation_enabled: true
+  surrogate_validation_npz: Data_Gen/loo_ur_td_burnin_trimmed4/loo_Ur2/surrogate_validation_points.npz
+  surrogate_validation_tag: val_surrogate
+  combined_validation_tag: val
+
+logging:
+  run_dir_root: logs
+  run_name: null
+  append_timestamp: true
+
+hnn:
+  # TD-correction mode: learn a correction on top of the exported Vivana-TD baseline.
+  td_cv: 1.2
+  td_cd: 1.1
+  td_ca: 1.0
+  td_fhat0: 0.18
+  td_fhat_min: 0.11
+  td_fhat_max: 0.26
+  td_n_memory: 500
+  # TD memory handling:
+  # fixed_n_memory -> use td_n_memory directly
+  # fixed_tau -> use n_memory = td_memory_tau_s / dt
+  # tau_over_tref -> use tau = td_tau_over_tref * D / (td_fhat0 * U), then n_memory = tau / dt
+  td_memory_mode: tau_over_tref
+  td_tau_over_tref: 4.0
+  td_memory_tau_s: null
+  # If true, learn sigma on the correction force/coefficient output head.
+  # Legacy compatibility field; correction_mode is the primary switch.
+  predict_sigma: false
+  # Unified TD correction output mode:
+  # mean_only | mean_sigma_only | fhat_only | mean_fhat_only | mean_sigma_fhat
+  correction_mode: mean_fhat_only
+  # Extra TD force input selector for the correction networks:
+  # false -> disabled, true/total -> total Vivana-TD force, fcv -> vortex-shedding force component only.
+  # For combined mean+fhat modes, use input_configs below with shared_td_correction_trunk: false
+  # if only one correction head should receive this input.
+  use_td_force_input: false
+  # If true, include the current baseline Vivana-TD fhat as an extra correction-network input.
+  use_td_fhat_input: true
+  # Phase-input selector for TD hidden-state inputs:
+  # false -> disabled, true/phi_vy -> sin/cos(phi_vy_td),
+  # theta -> sin/cos(theta_td), both -> [sin(phi_vy_td), cos(phi_vy_td), sin(theta_td), cos(theta_td)]
+  use_phi_input: both
+  # If true, train the one-step loss with random phi_vy while forcing rollout starts to phi_vy=phi_dy (theta=0).
+  # Requires use_phi_input: phi_vy or both.
+  random_phase_training: false
+  # If true, keep stored phi_vy/sigma channels as estimates but recompute theta/fhat/omega/force_td
+  # in memory from the current config TD parameters.
+  recompute_td_observables_from_phi: false
+  # If true, append both normalized TD sigma states:
+  # sigma_dy/(omega D) and sigma_ddy/(omega^2 D).
+  use_sigma_inputs: true
+  # If true, append the normalized current TD acceleration: ddy/(omega^2 D).
+  use_acceleration_input: false
+  # Optional head-specific inputs for combined non-shared correction modes only.
+  # Ignored for fhat_only, mean_only, mean_sigma_only, and shared_td_correction_trunk: true.
+  # Missing keys fall back to the legacy/global input flags above.
+  # input_configs:
+  #   mean:
+  #     use_td_force_input: false
+  #     use_td_fhat_input: false
+  #     use_phi_input: theta
+  #     use_sigma_inputs: false
+  #     use_acceleration_input: true
+  #   fhat:
+  #     use_td_force_input: total
+  #     use_td_fhat_input: true
+  #     use_phi_input: theta
+  #     use_sigma_inputs: false
+  #     use_acceleration_input: true
+  # One-step state loss: mse | propagated_nll
+  state_loss_mode: mse
+  # Bounded delta_fhat range extension multiplier. 1.0 means the strict physical band.
+  fhat_bound_multiplier: 2.0
+
+  # Final-layer init for TD-correction heads only: mu_corr and, when enabled, sigma_corr.
+  # Only the output layer is zero/tiny-initialized; hidden layers keep standard random init.
+  corr_init_mode: standard
+  corr_init_tiny_std: 1.0e-4
+
+  # Optional pretrained initialization for PHNN training.
+  init_from_checkpoint: null
+  # Freeze individual TD-correction subnetworks after model init / checkpoint load.
+  freeze_mean_net: false
+  freeze_fhat_net: false
+  freeze_sigma_net: false
+
+  # Debug / structural convention
+  # Debug option: force the correction head output to zero so validation reduces to pure Vivana-TD.
+  force_zero_output: false
+  # Structural mass used in TD-correction mode: dry | effective
+  td_mass_source: dry
+
+  # Rollout behavior
+  # Validation/final rollout sampling:
+  # false -> deterministic drift-only rollout
+  # true  -> stochastic correction rollout using learned sigma_corr
+  rollout_stochastic: false
+  rollout_noise_scale: 1.0
+  rollout_seed: null
+  # If null, validation/final rollouts use the stored initial phi/theta from each .npz file.
+  # If set, validation/final rollout logging also runs one rollout per listed theta0 value,
+  # overriding only the initial phase and logging theta-sweep mean/std/max metrics.
+  validation_theta0_values: null
+
+pinn: {}

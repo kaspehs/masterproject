@@ -43,26 +43,34 @@ from tensorboard.util import tensor_util
 # Each entry is a folder whose subdirectories are seed runs.
 # Multiple entries produce multiple lines in each subplot.
 SEED_GROUP_DIRS: list[str] = [
+    "logs/mean/multi_seed",
     "logs/fhat/multi_seed",
+    "logs/combined/multi_seed",
 ]
 
 # One label per entry in SEED_GROUP_DIRS.  Used in the plot legend.
 # Leave empty to use folder names.
 SEED_GROUP_LABELS: list[str] = [
+    "Final mean correction model",
     "Final frequency correction model",
+    "Final combined correction model",
 ]
 
 # Optional LaTeX labels for table rows, one per SEED_GROUP_DIRS entry.
 # When provided, these are written verbatim (no escaping) — use raw LaTeX here.
 # When empty or shorter than SEED_GROUP_DIRS, falls back to latex_escape(label).
 SEED_GROUP_LATEX_LABELS: list[str] = [
+    r"Final mean correction model",
     r"Final frequency correction model",
+    r"Final combined correction model",
 ]
 
 # Optional legend labels shown in the plot (plain text or matplotlib mathtext).
 # When empty or shorter than SEED_GROUP_DIRS, falls back to SEED_GROUP_LABELS.
 SEED_GROUP_LEGEND_LABELS: list[str] = [
-    "Final frequency correction model",
+    "Mean correction",
+    "Frequency correction",
+    "Combined correction",
 ]
 
 OUTPUT_DIR = Path("figs/tensorboard_validation")
@@ -91,7 +99,7 @@ PREFER_ASYNC_VALIDATION_JSON = True
 # Cross-seed std bands — always meaningful here since std is across seeds.
 PLOT_STD_BANDS = True
 BAND_STD_MULTIPLIER = 1.0
-BAND_ALPHA = 0.18
+BAND_ALPHA = 0.30
 LINE_WIDTH = 1.8
 # Marker at the actual (epoch, value) of the best individual-seed result —
 # the checkpoint used as the final model.
@@ -156,7 +164,7 @@ LATEX_STD_TABLE_LABEL = "tab:multiseed_std_performance"
 LATEX_BOLD_BEST_PER_METRIC = True
 LATEX_TABLE_COLSEP_PT = 3
 LATEX_INCLUDE_BASELINE_ROW = True
-LATEX_INCLUDE_BEST_EPOCH = True
+LATEX_INCLUDE_BEST_EPOCH = False
 LATEX_BEST_EPOCH_HEADER = "Epoch"
 SHOW_FIGURE = False
 

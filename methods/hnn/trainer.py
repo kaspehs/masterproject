@@ -1512,11 +1512,16 @@ def _td_correction_rollout_losses_from_batch(
         nll = 0.5 * (((z_true_scaled - mu) ** 2) / var + torch.log(var))
         per = torch.mean(nll[..., 0], dim=1) + torch.mean(nll[..., 1], dim=1)
         trajectory_loss = torch.mean(per)
+    z_traj_samples = z_traj_horizon.unsqueeze(0).expand(samples, -1, -1, -1).reshape(
+        samples * batch_size,
+        *z_traj_horizon.shape[1:],
+    )
+    z_pred_samples = z_pred_horizon.reshape(samples * batch_size, *z_pred_horizon.shape[2:])
+    dt_values_samples = dt_values.unsqueeze(0).expand(samples, -1).reshape(samples * batch_size)
     if compute_disp_std_loss:
-        z_for_std = torch.mean(z_pred_horizon, dim=0)
         disp_std_loss = _displacement_std_error_torch(
-            true_signal=z_traj_horizon[:, :, 0],
-            pred_signal=z_for_std[:, :, 0],
+            true_signal=z_traj_samples[:, :, 0],
+            pred_signal=z_pred_samples[:, :, 0],
             relative=disp_std_relative,
             power=disp_std_power,
         )
@@ -1529,12 +1534,11 @@ def _td_correction_rollout_losses_from_batch(
             power=disp_std_power,
         )
     if compute_disp_spectral_loss:
-        z_for_psd = torch.mean(z_pred_horizon, dim=0)
         if disp_spectral_loss_mode == "dominant_frequency":
             disp_spectral_loss = _dominant_frequency_error_torch(
-                true_signal=z_traj_horizon[:, :, 0],
-                pred_signal=z_for_psd[:, :, 0],
-                dt=dt_values,
+                true_signal=z_traj_samples[:, :, 0],
+                pred_signal=z_pred_samples[:, :, 0],
+                dt=dt_values_samples,
                 peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
                 use_hann_window=disp_psd_use_hann_window,
                 relative=disp_freq_relative,
@@ -1543,9 +1547,9 @@ def _td_correction_rollout_losses_from_batch(
             )
         else:
             disp_spectral_loss = _psd_error_torch(
-                true_signal=z_traj_horizon[:, :, 0],
-                pred_signal=z_for_psd[:, :, 0],
-                dt=dt_values,
+                true_signal=z_traj_samples[:, :, 0],
+                pred_signal=z_pred_samples[:, :, 0],
+                dt=dt_values_samples,
                 peak_rel_bandwidth=disp_psd_peak_rel_bandwidth,
                 use_hann_window=disp_psd_use_hann_window,
                 relative=disp_psd_relative,
