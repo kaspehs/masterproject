@@ -1,6 +1,5 @@
 /HNNconfigs/*
 /HNNruns/*
-/VPINNruns/*
 /models/*
 /output/*
 /error/*
@@ -26,7 +25,12 @@
 /Data_Gen/npz_exports_multi_theta0_baseline
 /Data_Gen/loo_ur_td_burnin_trimmed4
 /Experimental_Data/eval_models
-/CFD_Data
+/vivana_cfd_data_pipeline/.plot_cache/
+/vivana_cfd_data_pipeline/**/.DS_Store
+/vivana_cfd_data_pipeline/**/__pycache__/
+/vivana_cfd_data_pipeline/raw/
+/vivana_cfd_data_pipeline/generated/
+/vivana_cfd_data_pipeline/outputs/
 __pycache__/
 *.pyc
 *.npz

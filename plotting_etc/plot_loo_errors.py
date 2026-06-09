@@ -1,7 +1,7 @@
-"""Plot LOO (leave-one-Ur-out) rollout errors as a function of reduced velocity.
+"""Plot LOO (leave-one-U_r-out) rollout errors as a function of reduced velocity.
 
-Edit LOO_EXPERIMENTS to overlay multiple sets of LOO models on the same axes.
-VIVANA-TD pure baseline is always shown as a dashed black line.
+By default this compares the three correction LOO models and the standalone LOO model.
+VIVANA-TD pure baseline is always shown as a gray dashed line.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from HNN_helper import (
+from training.training_utils import (
     AGGREGATE_VALIDATION_ERROR_KEY,
     DISP_STD_REL_ERROR_KEY,
     DOMINANT_FREQ_REL_ERROR_KEY,
@@ -44,75 +44,98 @@ from HNN_helper import (
     parse_config,
     resolve_td_correction_params,
     resolve_td_memory_config,
-    resolve_td_n_memory_torch,
-    structural_step_constant_force_torch,
-    td_baseline_step_torch,
 )
-from methods.hnn.trainer import (
+from training.methods.hnn.trainer import (
     _td_correction_state_rollout,
     _td_flow_feature_from_traj,
+)
+from vivana_cfd_data_pipeline.scripts.training_npz_loader import load_series as load_training_npz_series
+from vivana_cfd_data_pipeline.helpers.model_rollouts import (
+    _reduce_series_for_validation,
+    load_trained_model_sources,
+    simulate_checkpoint_series_rollout,
+    simulate_vivana_td_stepwise,
 )
 
 # ── configuration ──────────────────────────────────────────────────────────────
 
-DATA_DIR = ROOT / "CFD_Data" / "npz_exports_td_burnin_trimmed_alltimeseries"
+DATA_DIR = ROOT / "vivana_cfd_data_pipeline" / "generated" / "td_burnin_trimmed_alltimeseries"
 
 LOO_EXPERIMENTS: list[dict[str, Any]] = [
     {
         "label": "Force correction",
         "model_dir": ROOT / "models" / "mean" / "loo",
-        "color": "tab:orange",
-        "marker": "s",
+        "color": "#0072B2",
+        "marker": "o",
     },
     {
         "label": "Frequency correction",
         "model_dir": ROOT / "models" / "fhat" / "loo",
-        "color": "tab:blue",
-        "marker": "o",
+        "color": "#D55E00",
+        "marker": "^",
     },
     {
         "label": "Combined correction",
         "model_dir": ROOT / "models" / "combined" / "loo",
-        "color": "tab:green",
-        "marker": "^",
+        "color": "#009E73",
+        "marker": "v",
+    },
+    {
+        "label": "Standalone model",
+        "model_dir": ROOT / "models" / "latentrnn" / "loo",
+        "loader": "trained_model",
+        "color": "#882255",
+        "marker": "s",
     },
 ]
 
 OUTPUT_DIR = ROOT / "figs" / "loo_errors"
-AGGREGATE_OUTPUT_BASENAME = "loo_aggregate_error"
-COMPONENT_OUTPUT_BASENAME = "loo_component_errors"
+AGGREGATE_OUTPUT_BASENAME = "fig_07_louo_aggregate_error"
+COMPONENT_OUTPUT_BASENAME = "fig_07_louo_component_errors"
+ALL_UR_AGGREGATE_OUTPUT_BASENAME = "fig_07_louo_all_ur_aggregate_error"
 SUMMARY_TABLE_PATH = OUTPUT_DIR / "loo_errors_summary.csv"
+INTERIOR_SUMMARY_TABLE_PATH = OUTPUT_DIR / "loo_errors_summary_interior_ur.csv"
 DETAIL_BY_UR_TABLE_PATH = OUTPUT_DIR / "loo_errors_by_ur.csv"
 DETAIL_BY_CASE_TABLE_PATH = OUTPUT_DIR / "loo_errors_by_case.csv"
+ALL_UR_SUMMARY_TABLE_PATH = OUTPUT_DIR / "loo_errors_all_eval_ur_summary.csv"
+ALL_UR_DETAIL_TABLE_PATH = OUTPUT_DIR / "loo_errors_all_eval_ur_by_holdout.csv"
 DPI = 300
 
-X_LABEL = r"Reduced velocity $U_r$"
-BASE_FONT_SIZE = 9.0
-AXIS_LABEL_FONT_SIZE = 10.0
-TITLE_FONT_SIZE = 10.0
-TICK_FONT_SIZE = 9.0
-LEGEND_FONT_SIZE = 9.0
-Y_LABEL_FONT_SIZE = 11.0
+X_LABEL = r"Held-out reduced velocity $U_r$"
+BASE_FONT_SIZE = 8.0
+AXIS_LABEL_FONT_SIZE = 9.0
+TITLE_FONT_SIZE = 9.0
+TICK_FONT_SIZE = 8.0
+LEGEND_FONT_SIZE = 8.0
+Y_LABEL_FONT_SIZE = 9.0
 Y_LABEL_ROTATION = 0
 Y_LABEL_PAD = 11
 Y_SCALE = "log"
-GRID_ALPHA = 0.25
-LINE_WIDTH = 1.6
-MARKER_SIZE = 5
+LINE_WIDTH = 1.4
+MARKER_SIZE = 3.2
 X_LIMIT_MARGIN = 0.35
-BASELINE_LABEL = "Baseline VIVANA-TD"
-BASELINE_COLOR = "0.35"
-BASELINE_LINE_WIDTH = 1.4
-AGGREGATE_FIGSIZE = (7.0, 3.2)
-COMPONENT_FIGSIZE = (7.0, 8.0)
-SAVE_PNG = True
-SAVE_PDF = False
+BASELINE_LABEL = "VIVANA-TD baseline"
+BASELINE_COLOR = "0.45"
+BASELINE_LINE_WIDTH = 1.3
+SPINE_COLOR = "0.65"
+SPINE_LINE_WIDTH = 0.6
+Y_LIMIT_LOG_PAD_FACTOR = 1.20
+Y_LIMIT_LINEAR_PAD_FRACTION = 0.08
+PLOT_ERROR_SCALE = 100.0
+AGGREGATE_FIGSIZE = (5.85, 3.1)
+COMPONENT_FIGSIZE = (5.85, 6.4)
+SAVE_PNG = False
+SAVE_PDF = True
 SHOW_FIGURE = False
 
 plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Latin Modern Roman", "Computer Modern Roman", "DejaVu Serif"],
+    "mathtext.fontset": "cm",
     "font.size": BASE_FONT_SIZE,
     "axes.labelsize": AXIS_LABEL_FONT_SIZE,
     "axes.titlesize": TITLE_FONT_SIZE,
+    "axes.linewidth": SPINE_LINE_WIDTH,
     "xtick.labelsize": TICK_FONT_SIZE,
     "ytick.labelsize": TICK_FONT_SIZE,
     "legend.fontsize": LEGEND_FONT_SIZE,
@@ -122,35 +145,47 @@ plt.rcParams.update({
 # Must match the reduction_factor used during training.
 REDUCTION_FACTOR = 20
 
-# Match the spectral notebook's Block 9a LOO entries by default.
-# Use "final" to reproduce the previous behavior that preferred final/final.pt.
+# Use final checkpoints for the LOO figures. Some trained-model exports store
+# these as async_validation/model.pt instead of final.pt.
 LOO_CHECKPOINT_PREFERENCE = "best_val"  # "best_val" | "final"
 
-# Mapping: checkpoint suffix → (Ur float value, NPZ glob pattern)
+# Error normalization used for the plotted and exported LOO errors.
+# "case_true" keeps the legacy definition |pred - true| / |true|.
+# "dataset_mean_true" uses |pred - true| / mean_D(true metric), where D is all
+# NPZ cases in DATA_DIR after the same validation reduction.
+ERROR_NORMALIZATION_MODE = "case_true"  # "case_true" | "dataset_mean_true"
+
+# Also evaluate each leave-one-U_r checkpoint on every U_r group and plot the
+# full-dataset aggregate error against the removed training U_r.
+EVALUATE_ALL_UR_IMPORTANCE = True
+
+# Mapping: checkpoint suffix -> (effective U_r value, NPZ glob pattern).
+# The glob patterns still use the dry-mass labels from the exported filenames.
 UR_MAP: dict[str, tuple[float, str]] = {
-    "ur2":   (2.0,  "comb_Ur2__*.npz"),
-    "ur4":   (4.0,  "comb_Ur4__*.npz"),
-    "ur5":   (5.0,  "comb_Ur5__*.npz"),
-    "ur575": (5.75, "comb_Ur575__*.npz"),
-    "ur7":   (7.0,  "comb_Ur7__*.npz"),
-    "ur8":   (8.0,  "comb_Ur8__*.npz"),
-    "ur10":  (10.0, "comb_Ur10__*.npz"),
+    "ur2":   (2.25,  "comb_Ur2__*.npz"),
+    "ur4":   (4.49,  "comb_Ur4__*.npz"),
+    "ur5":   (5.62,  "comb_Ur5__*.npz"),
+    "ur575": (6.46,  "comb_Ur575__*.npz"),
+    "ur7":   (7.86,  "comb_Ur7__*.npz"),
+    "ur8":   (8.99,  "comb_Ur8__*.npz"),
+    "ur10":  (11.23, "comb_Ur10__*.npz"),
 }
 
 METRICS: list[tuple[str, str]] = [
-    (DISP_STD_REL_ERROR_KEY,            r"$\varepsilon_{\sigma}^{y}$"),
-    (DOMINANT_FREQ_REL_ERROR_KEY,       r"$\varepsilon_{\omega}^{y}$"),
-    (FORCE_STD_REL_ERROR_KEY,           r"$\varepsilon_{\sigma}^{F}$"),
-    (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, r"$\varepsilon_{\omega}^{F}$"),
-    (AGGREGATE_VALIDATION_ERROR_KEY,    r"$\bar{\varepsilon}$"),
+    (DISP_STD_REL_ERROR_KEY,            r"$\varepsilon_{\sigma}^{y}$ [%]"),
+    (DOMINANT_FREQ_REL_ERROR_KEY,       r"$\varepsilon_{\omega}^{y}$ [%]"),
+    (FORCE_STD_REL_ERROR_KEY,           r"$\varepsilon_{\sigma}^{F}$ [%]"),
+    (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, r"$\varepsilon_{\omega}^{F}$ [%]"),
+    (AGGREGATE_VALIDATION_ERROR_KEY,    r"$\bar{\varepsilon}$ [%]"),
 ]
 
-AGGREGATE_METRIC = (AGGREGATE_VALIDATION_ERROR_KEY, r"$\bar{\varepsilon}$")
+AGGREGATE_METRIC = (AGGREGATE_VALIDATION_ERROR_KEY, r"$\bar{\varepsilon}_{\mathrm{held-out}}$ [%]")
+ALL_UR_AGGREGATE_METRIC = (AGGREGATE_VALIDATION_ERROR_KEY, r"$\bar{\varepsilon}_{\mathrm{all}}$ [%]")
 COMPONENT_METRICS: list[tuple[str, str, str]] = [
-    (DISP_STD_REL_ERROR_KEY,            r"$\varepsilon_{\sigma}^{y}$", "Displacement std error"),
-    (DOMINANT_FREQ_REL_ERROR_KEY,       r"$\varepsilon_{\omega}^{y}$", "Displacement frequency error"),
-    (FORCE_STD_REL_ERROR_KEY,           r"$\varepsilon_{\sigma}^{F}$", "Force std error"),
-    (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, r"$\varepsilon_{\omega}^{F}$", "Force frequency error"),
+    (DISP_STD_REL_ERROR_KEY,            r"$\varepsilon_{\sigma}^{y}$ [%]", ""),
+    (DOMINANT_FREQ_REL_ERROR_KEY,       r"$\varepsilon_{\omega}^{y}$ [%]", ""),
+    (FORCE_STD_REL_ERROR_KEY,           r"$\varepsilon_{\sigma}^{F}$ [%]", ""),
+    (FORCE_DOMINANT_FREQ_REL_ERROR_KEY, r"$\varepsilon_{\omega}^{F}$ [%]", ""),
 ]
 
 TABLE_METRIC_LABELS: dict[str, str] = {
@@ -159,6 +194,13 @@ TABLE_METRIC_LABELS: dict[str, str] = {
     FORCE_STD_REL_ERROR_KEY: "force_std_rel_error",
     FORCE_DOMINANT_FREQ_REL_ERROR_KEY: "force_freq_rel_error",
     AGGREGATE_VALIDATION_ERROR_KEY: "aggregate_error",
+}
+
+DATASET_NORMALIZER_TABLE_LABELS: dict[str, str] = {
+    DISP_STD_REL_ERROR_KEY: "dataset_mean_disp_std_true",
+    DOMINANT_FREQ_REL_ERROR_KEY: "dataset_mean_disp_freq_true_hz",
+    FORCE_STD_REL_ERROR_KEY: "dataset_mean_force_std_true",
+    FORCE_DOMINANT_FREQ_REL_ERROR_KEY: "dataset_mean_force_freq_true_hz",
 }
 
 _LOO_NAME_RE = re.compile(r"LOO(ur\d+)(?:_|/)", re.IGNORECASE)
@@ -170,13 +212,14 @@ def _find_loo_checkpoints(model_dir: Path) -> dict[str, Path]:
     """Return {ur_suffix: checkpoint_path} according to LOO_CHECKPOINT_PREFERENCE."""
     final_result: dict[str, Path] = {}
     final_root = model_dir / "final"
-    for pt in sorted(final_root.glob("*/final.pt")):
-        m = _LOO_NAME_RE.search(pt.as_posix())
-        if m is None:
-            continue
-        suffix = m.group(1).lower()
-        if suffix in UR_MAP:
-            final_result[suffix] = pt
+    for pattern in ("*/final.pt", "*/async_validation/model.pt"):
+        for pt in sorted(final_root.glob(pattern)):
+            m = _LOO_NAME_RE.search(pt.as_posix())
+            if m is None:
+                continue
+            suffix = m.group(1).lower()
+            if suffix in UR_MAP:
+                final_result.setdefault(suffix, pt)
 
     best_result: dict[str, Path] = {}
     for pt in sorted(model_dir.glob("*.pt")):
@@ -190,6 +233,14 @@ def _find_loo_checkpoints(model_dir: Path) -> dict[str, Path]:
     preference = str(LOO_CHECKPOINT_PREFERENCE).strip().lower()
     if preference not in {"best_val", "final"}:
         raise ValueError("LOO_CHECKPOINT_PREFERENCE must be 'best_val' or 'final'.")
+    if preference == "final":
+        missing = [suffix for suffix in _UR_ORDER if suffix not in final_result]
+        if missing:
+            missing_labels = ", ".join(missing)
+            raise FileNotFoundError(
+                f"Missing final LOO checkpoint(s) under {final_root}: {missing_labels}"
+            )
+        return final_result
     primary = best_result if preference == "best_val" else final_result
     fallback = final_result if preference == "best_val" else best_result
     result = dict(primary)
@@ -252,6 +303,128 @@ def _load_model(path: Path, device: torch.device) -> tuple[PHVIV, dict]:
     return model, ckpt
 
 
+def _load_trained_model_source(path: Path, label: str, device: torch.device) -> Any:
+    sources = load_trained_model_sources(
+        [{"path": path, "label": label}],
+        repo_root=ROOT,
+        device=device,
+    )
+    if len(sources) != 1:
+        raise RuntimeError(f"Expected one loaded source for {path}, got {len(sources)}.")
+    return sources[0]
+
+
+def _series_array(value: Any, length: int, *, default: float | None = None) -> np.ndarray:
+    if value is None:
+        if default is None:
+            raise KeyError("Missing required series value.")
+        return np.full((length,), float(default), dtype=float)
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 0:
+        return np.full((length,), float(arr), dtype=float)
+    flat = arr.reshape(-1)
+    if flat.size == length:
+        return flat.astype(float, copy=False)
+    if flat.size == 1:
+        return np.full((length,), float(flat[0]), dtype=float)
+    raise ValueError(f"Cannot broadcast series value with length {flat.size} to {length}.")
+
+
+def _series_to_loo_traj(series: dict[str, Any], *, source_path: Path) -> dict[str, Any]:
+    """Convert the Block-10 loader series format to the LOO evaluator trajectory format."""
+    time = np.asarray(series["time"], dtype=float).reshape(-1)
+    td_context = np.asarray(series["td_context"], dtype=float)
+    if td_context.shape[0] != time.size or td_context.shape[1] < 5:
+        raise ValueError(f"{source_path} has invalid reconstructed td_context shape {td_context.shape}.")
+    ur = _series_array(series.get("ur"), time.size, default=float(series.get("ur_effective", np.nan)))
+    ur_label = _series_array(series.get("ur_label"), time.size, default=float(np.mean(ur)))
+    force_per_m = np.asarray(series["force_per_m"], dtype=np.float32).reshape(-1)
+    force_td = np.asarray(series["force_td_stored"], dtype=np.float32).reshape(-1)
+    return {
+        "name": str(series.get("name", source_path.name)),
+        "source_name": source_path.name,
+        "reduction_factor": np.asarray(int(series.get("validation_reduction_factor", 1)), dtype=np.int32),
+        "reduction_offset": np.asarray(int(series.get("validation_reduction_offset", 0)), dtype=np.int32),
+        "t": time.astype(np.float32),
+        "y": np.asarray(series["displacement"], dtype=np.float32).reshape(-1),
+        "dy": np.asarray(series["velocity"], dtype=np.float32).reshape(-1),
+        "ddy": np.asarray(series["acceleration"], dtype=np.float32).reshape(-1),
+        "force_total": force_per_m,
+        "force_per_m": force_per_m,
+        "force_td": force_td,
+        "force_td_per_m": force_td,
+        "force_corr": force_per_m - force_td,
+        "force_corr_per_m": force_per_m - force_td,
+        "phi_td": td_context[:, 1].astype(np.float32),
+        "sig_dy_td": td_context[:, 2].astype(np.float32),
+        "sig_ddy_td": td_context[:, 3].astype(np.float32),
+        "ur": ur.astype(np.float32),
+        "ur_stored": ur.astype(np.float32),
+        "ur_label": ur_label.astype(np.float32),
+        "flow_speed": td_context[:, 4].astype(np.float32),
+        "td_context": td_context.astype(np.float32),
+        "stiffness_n_m": np.asarray(float(series["stiffness"]), dtype=np.float32),
+        "effective_mass_kg": np.asarray(float(series["effective_mass"]), dtype=np.float32),
+        "dry_mass_kg": np.asarray(float(series["dry_mass"]), dtype=np.float32),
+        "damping_c": np.asarray(float(series["damping"]), dtype=np.float32),
+    }
+
+
+def _traj_to_block10_series(
+    traj: dict,
+    *,
+    rho: float,
+    diameter: float,
+) -> dict[str, Any]:
+    """Convert an LOO trajectory to the series schema used by Block 10 rollouts."""
+    time = np.asarray(traj["t"], dtype=float).reshape(-1)
+    force_per_m = np.asarray(traj["force_per_m"], dtype=float).reshape(-1)
+    force_td = np.asarray(traj.get("force_td_per_m", traj.get("force_td")), dtype=float).reshape(-1)
+    return {
+        "name": str(traj.get("name", "")),
+        "path": Path(str(traj.get("source_name", ""))),
+        "time": time,
+        "displacement": np.asarray(traj["y"], dtype=float).reshape(-1),
+        "velocity": np.asarray(traj["dy"], dtype=float).reshape(-1),
+        "acceleration": np.asarray(traj["ddy"], dtype=float).reshape(-1),
+        "force_total": force_per_m,
+        "force_per_m": force_per_m,
+        "force_td_stored": force_td,
+        "td_context": np.asarray(traj["td_context"], dtype=float),
+        "rho": float(rho),
+        "diameter": float(diameter),
+        "stiffness": _as_scalar(traj["stiffness_n_m"]),
+        "effective_mass": _as_scalar(traj["effective_mass_kg"]),
+        "dry_mass": _as_scalar(traj["dry_mass_kg"]),
+        "damping": _as_scalar(traj["damping_c"]),
+        "span": 1.0,
+        "ur": np.asarray(traj["ur"], dtype=float).reshape(-1),
+        "ur_effective": _trajectory_effective_reduced_velocity(traj, diameter=float(diameter)),
+    }
+
+
+def _load_trajs_with_training_npz_loader(
+    paths: list[Path],
+    reduction_factor: int,
+    *,
+    td_params: dict[str, float] | None,
+    td_memory_cfg: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    trajs: list[dict[str, Any]] = []
+    for path in paths:
+        series = load_training_npz_series(path)
+        reduced_series = _reduce_series_for_validation(
+            series,
+            reduce_time=int(reduction_factor) > 1,
+            reduction_factor=int(reduction_factor),
+            cut_start_seconds=0.0,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+        )
+        trajs.append(_series_to_loo_traj(reduced_series, source_path=path))
+    return trajs
+
+
 def _load_trajs(
     suffix: str,
     reduction_factor: int = 1,
@@ -264,14 +437,31 @@ def _load_trajs(
     paths = sorted(DATA_DIR.glob(glob_pat))
     if not paths:
         raise FileNotFoundError(f"No files matching '{glob_pat}' in {DATA_DIR}")
-    return load_td_correction_trajectories(
-        paths=paths,
-        reduce_time=reduction_factor > 1,
-        reduction_factor=reduction_factor,
-        ur_source=ur_source,
-        td_params=td_params,
-        td_memory_cfg=td_memory_cfg,
-    )
+    try:
+        return load_td_correction_trajectories(
+            paths=paths,
+            reduce_time=reduction_factor > 1,
+            reduction_factor=reduction_factor,
+            ur_source=ur_source,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+        )
+    except KeyError as exc:
+        message = str(exc)
+        missing_td_state = (
+            "TD force channels" in message
+            or "phi_vy_td" in message
+            or "sig_dy_loc_td" in message
+            or "sig_ddy_loc_td" in message
+        )
+        if not missing_td_state:
+            raise
+        return _load_trajs_with_training_npz_loader(
+            paths,
+            reduction_factor,
+            td_params=td_params,
+            td_memory_cfg=td_memory_cfg,
+        )
 
 
 def _avg_metrics(per_traj: list[dict[str, float]]) -> dict[str, float]:
@@ -280,6 +470,136 @@ def _avg_metrics(per_traj: list[dict[str, float]]) -> dict[str, float]:
         vals = [m[key] for m in per_traj if key in m and np.isfinite(float(m[key]))]
         result[key] = float(np.mean(vals)) if vals else float("nan")
     return result
+
+
+def _error_normalization_mode() -> str:
+    mode = str(ERROR_NORMALIZATION_MODE).strip().lower().replace("-", "_")
+    if mode not in {"case_true", "dataset_mean_true"}:
+        raise ValueError("ERROR_NORMALIZATION_MODE must be 'case_true' or 'dataset_mean_true'.")
+    return mode
+
+
+def _normalizer_context_fields(normalizers: dict[str, float] | None) -> dict[str, float | str]:
+    fields: dict[str, float | str] = {"error_normalization_mode": _error_normalization_mode()}
+    if normalizers is None:
+        return fields
+    for key, label in DATASET_NORMALIZER_TABLE_LABELS.items():
+        fields[label] = float(normalizers.get(key, float("nan")))
+    return fields
+
+
+def _metric_abs_error(pred: float, true: float, denom: float) -> float:
+    pred_f = float(pred)
+    true_f = float(true)
+    denom_f = float(denom)
+    if not (np.isfinite(pred_f) and np.isfinite(true_f) and np.isfinite(denom_f)):
+        return float("nan")
+    if abs(denom_f) <= 1e-12:
+        return float("nan")
+    return abs(pred_f - true_f) / abs(denom_f)
+
+
+def _aggregate_metric_values(metrics: dict[str, float], keys: tuple[str, ...]) -> float:
+    values = [float(metrics.get(key, float("nan"))) for key in keys]
+    if len(values) != len(keys) or not all(np.isfinite(value) for value in values):
+        return float("nan")
+    return float(np.mean(values))
+
+
+def _apply_error_normalization(
+    metrics: dict[str, float],
+    diagnostics: dict[str, float],
+    normalizers: dict[str, float] | None,
+) -> dict[str, float]:
+    """Return metrics under the configured LOO error normalization."""
+    if _error_normalization_mode() == "case_true":
+        return dict(metrics)
+    if normalizers is None:
+        raise ValueError("dataset_mean_true error normalization requires dataset metric normalizers.")
+
+    out = dict(metrics)
+    component_specs = {
+        DISP_STD_REL_ERROR_KEY: ("disp_std_pred", "disp_std_true"),
+        DOMINANT_FREQ_REL_ERROR_KEY: ("disp_dominant_freq_pred_hz", "disp_dominant_freq_true_hz"),
+        FORCE_STD_REL_ERROR_KEY: ("force_std_pred", "force_std_true"),
+        FORCE_DOMINANT_FREQ_REL_ERROR_KEY: ("force_dominant_freq_pred_hz", "force_dominant_freq_true_hz"),
+    }
+    for metric_key, (pred_key, true_key) in component_specs.items():
+        out[metric_key] = _metric_abs_error(
+            diagnostics.get(pred_key, float("nan")),
+            diagnostics.get(true_key, float("nan")),
+            normalizers.get(metric_key, float("nan")),
+        )
+    out[AGGREGATE_VALIDATION_ERROR_KEY] = _aggregate_metric_values(
+        out,
+        (
+            DOMINANT_FREQ_REL_ERROR_KEY,
+            DISP_STD_REL_ERROR_KEY,
+            FORCE_DOMINANT_FREQ_REL_ERROR_KEY,
+            FORCE_STD_REL_ERROR_KEY,
+        ),
+    )
+    return out
+
+
+def _metric_values_from_truth_series(time: np.ndarray, displacement: np.ndarray, force_per_m: np.ndarray) -> dict[str, float]:
+    time_arr = np.asarray(time, dtype=float).reshape(-1)
+    y_arr = np.asarray(displacement, dtype=float).reshape(-1)
+    force_arr = np.asarray(force_per_m, dtype=float).reshape(-1)
+    if time_arr.size < 2:
+        raise ValueError("Need at least two time samples to compute dataset metric normalizers.")
+    dt = float(np.median(np.diff(time_arr)))
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("Need a positive finite dt to compute dataset metric normalizers.")
+    return {
+        DISP_STD_REL_ERROR_KEY: float(np.std(y_arr)),
+        DOMINANT_FREQ_REL_ERROR_KEY: _dominant_frequency_or_nan(y_arr, dt),
+        FORCE_STD_REL_ERROR_KEY: float(np.std(force_arr)),
+        FORCE_DOMINANT_FREQ_REL_ERROR_KEY: _dominant_frequency_or_nan(force_arr, dt),
+    }
+
+
+def _compute_dataset_metric_normalizers() -> dict[str, float]:
+    """Compute mean true metric values over all NPZ cases in DATA_DIR."""
+    values_by_metric: dict[str, list[float]] = {
+        DISP_STD_REL_ERROR_KEY: [],
+        DOMINANT_FREQ_REL_ERROR_KEY: [],
+        FORCE_STD_REL_ERROR_KEY: [],
+        FORCE_DOMINANT_FREQ_REL_ERROR_KEY: [],
+    }
+    paths = sorted(DATA_DIR.glob("*.npz"))
+    for path in paths:
+        series = load_training_npz_series(path)
+        reduced = _reduce_series_for_validation(
+            series,
+            reduce_time=int(REDUCTION_FACTOR) > 1,
+            reduction_factor=int(REDUCTION_FACTOR),
+            cut_start_seconds=0.0,
+            td_params=None,
+            td_memory_cfg=None,
+        )
+        metric_values = _metric_values_from_truth_series(
+            np.asarray(reduced["time"], dtype=float),
+            np.asarray(reduced["displacement"], dtype=float),
+            np.asarray(reduced["force_per_m"], dtype=float),
+        )
+        for key, value in metric_values.items():
+            if np.isfinite(float(value)):
+                values_by_metric[key].append(float(value))
+
+    if not paths:
+        raise FileNotFoundError(f"No dataset '.npz' files found under {DATA_DIR}.")
+
+    normalizers: dict[str, float] = {}
+    for key, values in values_by_metric.items():
+        finite = [value for value in values if np.isfinite(value)]
+        if not finite:
+            raise ValueError(f"Could not compute a finite dataset normalizer for {key!r}.")
+        normalizer = float(np.mean(finite))
+        if not np.isfinite(normalizer) or abs(normalizer) <= 1e-12:
+            raise ValueError(f"Dataset normalizer for {key!r} is invalid: {normalizer!r}.")
+        normalizers[key] = normalizer
+    return normalizers
 
 
 def _effective_reduced_velocity(trajs: list[dict], *, diameter: float) -> float:
@@ -356,6 +676,16 @@ def _as_scalar(value: Any, default: float = float("nan")) -> float:
         return float(default)
     finite = arr[np.isfinite(arr)]
     return float(finite[0]) if finite.size else float(default)
+
+
+def _td_memory_tau_spec(td_memory_cfg: dict[str, Any] | None) -> float | str | None:
+    cfg = resolve_td_memory_config(td_memory_cfg)
+    mode = str(cfg.get("mode", "fixed_n_memory"))
+    if mode == "fixed_tau":
+        return float(cfg["tau_s"])
+    if mode == "tau_over_tref":
+        return f"tau_over_tref:{float(cfg['tau_over_tref']):.12g}"
+    return None
 
 
 def _dominant_frequency_or_nan(values: np.ndarray, dt: float) -> float:
@@ -445,6 +775,7 @@ def _rows_for_series(
     held_out_suffixes: list[str] | None = None,
     held_out_ur_labels: list[float] | None = None,
     checkpoint_paths: list[Path | None] | None = None,
+    error_normalizers: dict[str, float] | None = None,
 ) -> list[dict[str, float | str]]:
     rows: list[dict[str, float | str]] = []
     for idx, ur_value in enumerate(ur_values):
@@ -460,6 +791,7 @@ def _rows_for_series(
             "checkpoint_name": "" if checkpoint_path is None else checkpoint_path.name,
             "checkpoint_preference": str(LOO_CHECKPOINT_PREFERENCE),
         }
+        row.update(_normalizer_context_fields(error_normalizers))
         for metric_key, _ in METRICS:
             values = metric_arrays.get(metric_key, [])
             row[TABLE_METRIC_LABELS[metric_key]] = (
@@ -477,6 +809,7 @@ def _rows_for_case_details(
     held_out_ur_effective_group: float,
     checkpoint_path: Path | None,
     metrics_by_case: list[dict[str, float | str]],
+    error_normalizers: dict[str, float] | None = None,
 ) -> list[dict[str, float | str]]:
     rows: list[dict[str, float | str]] = []
     for idx, case_metrics in enumerate(metrics_by_case):
@@ -490,9 +823,51 @@ def _rows_for_case_details(
             "checkpoint_name": "" if checkpoint_path is None else checkpoint_path.name,
             "checkpoint_preference": str(LOO_CHECKPOINT_PREFERENCE),
         }
+        row.update(_normalizer_context_fields(error_normalizers))
         row.update(case_metrics)
         rows.append(row)
     return rows
+
+
+def _metrics_from_case_detail_rows(rows: list[dict[str, float | str]]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for metric_key, _ in METRICS:
+        label = TABLE_METRIC_LABELS[metric_key]
+        out[metric_key] = _finite_mean([float(row[label]) for row in rows if label in row])
+    return out
+
+
+def _row_for_all_eval_ur_detail(
+    *,
+    method: str,
+    held_out_suffix: str,
+    held_out_ur_label: float,
+    held_out_ur_effective_group: float,
+    checkpoint_path: Path | None,
+    eval_suffix: str,
+    eval_ur_label: float,
+    eval_ur_effective_group: float,
+    num_cases: int,
+    metrics: dict[str, float],
+    error_normalizers: dict[str, float] | None = None,
+) -> dict[str, float | str]:
+    row: dict[str, float | str] = {
+        "method": method,
+        "held_out_suffix": held_out_suffix,
+        "held_out_ur_label": float(held_out_ur_label),
+        "held_out_ur_effective_group": float(held_out_ur_effective_group),
+        "eval_suffix": eval_suffix,
+        "eval_ur_label": float(eval_ur_label),
+        "eval_ur_effective_group": float(eval_ur_effective_group),
+        "num_cases": int(num_cases),
+        "checkpoint_path": "" if checkpoint_path is None else str(checkpoint_path),
+        "checkpoint_name": "" if checkpoint_path is None else checkpoint_path.name,
+        "checkpoint_preference": str(LOO_CHECKPOINT_PREFERENCE),
+    }
+    row.update(_normalizer_context_fields(error_normalizers))
+    for metric_key, _ in METRICS:
+        row[TABLE_METRIC_LABELS[metric_key]] = float(metrics.get(metric_key, float("nan")))
+    return row
 
 
 def _summary_rows(detail_rows: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
@@ -516,6 +891,26 @@ def _summary_rows(detail_rows: list[dict[str, float | str]]) -> list[dict[str, f
     return rows
 
 
+def _detail_rows_excluding_outer_ur(
+    detail_rows: list[dict[str, float | str]],
+) -> tuple[list[dict[str, float | str]], tuple[float, float] | None]:
+    finite_urs = sorted({
+        float(row["held_out_ur_label"])
+        for row in detail_rows
+        if np.isfinite(float(row.get("held_out_ur_label", float("nan"))))
+    })
+    if len(finite_urs) <= 2:
+        return [], None
+
+    outer_urs = (finite_urs[0], finite_urs[-1])
+    filtered_rows = [
+        row
+        for row in detail_rows
+        if float(row.get("held_out_ur_label", float("nan"))) not in outer_urs
+    ]
+    return filtered_rows, outer_urs
+
+
 def _write_csv(rows: list[dict[str, float | str]], output_path: Path) -> None:
     if not rows:
         return
@@ -531,7 +926,7 @@ def _write_csv(rows: list[dict[str, float | str]], output_path: Path) -> None:
         writer.writerows(rows)
 
 
-def _print_summary_table(rows: list[dict[str, float | str]]) -> None:
+def _print_summary_table(rows: list[dict[str, float | str]], *, title: str) -> None:
     if not rows:
         return
     metric_labels = [TABLE_METRIC_LABELS[key] for key, _ in METRICS]
@@ -548,7 +943,7 @@ def _print_summary_table(rows: list[dict[str, float | str]]) -> None:
         max(len(header), *(len(row[idx]) for row in rendered_rows))
         for idx, header in enumerate(headers)
     ]
-    print("\nLOO mean errors across held-out U_r values")
+    print(f"\n{title}")
     print("  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers)))
     print("  ".join("-" * width for width in widths))
     for row in rendered_rows:
@@ -570,19 +965,17 @@ def _plot_metric_curves(
     if td_ur_values:
         ax.plot(
             td_ur_values,
-            td_metric_arrays[metric_key],
+            _scaled_plot_values(td_metric_arrays[metric_key]),
             color=BASELINE_COLOR,
             linestyle="--",
-            marker="x",
             linewidth=BASELINE_LINE_WIDTH,
-            markersize=MARKER_SIZE,
             label=BASELINE_LABEL,
             zorder=2,
         )
     for res in experiment_results:
         ax.plot(
             res["ur_values"],
-            res["metrics"][metric_key],
+            _scaled_plot_values(res["metrics"][metric_key]),
             color=res["color"],
             marker=res["marker"],
             linestyle="-",
@@ -592,6 +985,7 @@ def _plot_metric_curves(
             zorder=3,
         )
 
+    # No fixed held-out stripe here: each plotted LOO point is itself held out.
     if title:
         ax.set_title(title, fontsize=TITLE_FONT_SIZE)
     ax.set_ylabel(
@@ -602,16 +996,100 @@ def _plot_metric_curves(
         va="center",
     )
     ax.set_yscale(Y_SCALE)
+    _set_data_driven_ylim(
+        ax,
+        metric_key=metric_key,
+        td_metric_arrays=td_metric_arrays,
+        experiment_results=experiment_results,
+    )
     ax.set_xticks(all_ur_ticks)
     tick_labels = [_format_ur_tick(tick) for tick in all_ur_ticks]
     if all_ur_ticks:
         ax.set_xlim(float(all_ur_ticks[0]) - X_LIMIT_MARGIN, float(all_ur_ticks[-1]) + X_LIMIT_MARGIN)
-    ax.grid(alpha=GRID_ALPHA, which="both")
+    _apply_block10_axes_frame(ax)
     if show_xlabel:
         ax.set_xlabel(X_LABEL)
         ax.set_xticklabels(tick_labels)
     else:
         ax.set_xticklabels([])
+
+
+def _scaled_plot_values(values: list[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    return arr * float(PLOT_ERROR_SCALE)
+
+
+def _metric_plot_values(
+    *,
+    metric_key: str,
+    td_metric_arrays: dict[str, list[float]],
+    experiment_results: list[dict],
+) -> np.ndarray:
+    arrays: list[np.ndarray] = []
+    if metric_key in td_metric_arrays:
+        arrays.append(_scaled_plot_values(td_metric_arrays[metric_key]))
+    for res in experiment_results:
+        metrics = res.get("metrics", {})
+        if metric_key in metrics:
+            arrays.append(_scaled_plot_values(metrics[metric_key]))
+    if not arrays:
+        return np.asarray([], dtype=float)
+    return np.concatenate([arr.reshape(-1) for arr in arrays])
+
+
+def _set_data_driven_ylim(
+    ax: plt.Axes,
+    *,
+    metric_key: str,
+    td_metric_arrays: dict[str, list[float]],
+    experiment_results: list[dict],
+) -> None:
+    values = _metric_plot_values(
+        metric_key=metric_key,
+        td_metric_arrays=td_metric_arrays,
+        experiment_results=experiment_results,
+    )
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return
+
+    if str(Y_SCALE).lower() == "log":
+        positive = finite[finite > 0.0]
+        if positive.size == 0:
+            return
+        ymin = float(np.min(positive))
+        ymax = float(np.max(positive))
+        ax.set_ylim(ymin / Y_LIMIT_LOG_PAD_FACTOR, ymax * Y_LIMIT_LOG_PAD_FACTOR)
+        return
+
+    ymin = float(np.min(finite))
+    ymax = float(np.max(finite))
+    if np.isclose(ymin, ymax):
+        pad = max(abs(ymin) * Y_LIMIT_LINEAR_PAD_FRACTION, 1.0)
+    else:
+        pad = (ymax - ymin) * Y_LIMIT_LINEAR_PAD_FRACTION
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+
+def _apply_block10_axes_frame(ax: plt.Axes) -> None:
+    ax.grid(True, which="major", color="0.88", linewidth=0.5, alpha=0.75)
+    ax.grid(True, which="minor", color="0.94", linewidth=0.35, alpha=0.45)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(SPINE_LINE_WIDTH)
+        spine.set_edgecolor(SPINE_COLOR)
+
+
+def _add_panel_label(ax: plt.Axes, label: str) -> None:
+    ax.text(
+        0.015,
+        0.95,
+        label,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=TITLE_FONT_SIZE,
+    )
 
 
 def _add_shared_legend(fig: plt.Figure, axes: list[plt.Axes]) -> bool:
@@ -622,11 +1100,12 @@ def _add_shared_legend(fig: plt.Figure, axes: list[plt.Axes]) -> bool:
                 handles,
                 labels,
                 loc="upper center",
-                ncol=min(4, len(labels)),
+                ncol=min(3, len(labels)),
                 frameon=False,
                 fontsize=LEGEND_FONT_SIZE,
+                bbox_to_anchor=(0.5, 1.02),
                 handlelength=2.0,
-                columnspacing=1.6,
+                columnspacing=1.2,
                 markerscale=0.9,
             )
             return True
@@ -641,7 +1120,7 @@ def _save_plot(fig: plt.Figure, basename: str) -> None:
         print(f"Saved {out_path}")
     if SAVE_PDF:
         out_path = OUTPUT_DIR / f"{basename}.pdf"
-        fig.savefig(out_path, bbox_inches="tight", pad_inches=0.03)
+        fig.savefig(out_path, format="pdf", dpi=DPI, bbox_inches="tight", pad_inches=0.02)
         print(f"Saved {out_path}")
     if SHOW_FIGURE:
         plt.show()
@@ -669,9 +1148,92 @@ def _plot_aggregate_error(
         show_xlabel=True,
     )
     has_legend = _add_shared_legend(fig, [ax])
-    top = 0.86 if has_legend else 1.0
+    top = 0.88 if has_legend else 1.0
     fig.tight_layout(rect=(0.0, 0.0, 1.0, top))
     _save_plot(fig, AGGREGATE_OUTPUT_BASENAME)
+
+
+def _plot_all_ur_aggregate_error(
+    *,
+    experiment_results: list[dict],
+    all_ur_ticks: list[float],
+    baseline_all_ur_metrics: dict[str, float] | None,
+) -> None:
+    metric_key, y_label = ALL_UR_AGGREGATE_METRIC
+    plot_values: list[float] = []
+    fig, ax = plt.subplots(1, 1, figsize=AGGREGATE_FIGSIZE)
+
+    baseline_value = (
+        float(baseline_all_ur_metrics.get(metric_key, float("nan")))
+        if baseline_all_ur_metrics is not None
+        else float("nan")
+    )
+    if np.isfinite(baseline_value):
+        scaled_baseline = float(PLOT_ERROR_SCALE) * baseline_value
+        plot_values.append(scaled_baseline)
+        ax.axhline(
+            scaled_baseline,
+            color=BASELINE_COLOR,
+            linestyle="--",
+            linewidth=BASELINE_LINE_WIDTH,
+            label=BASELINE_LABEL,
+            zorder=2,
+        )
+
+    for res in experiment_results:
+        y_values = _scaled_plot_values(res["metrics"][metric_key])
+        finite = y_values[np.isfinite(y_values)]
+        plot_values.extend(float(value) for value in finite)
+        ax.plot(
+            res["ur_values"],
+            y_values,
+            color=res["color"],
+            marker=res["marker"],
+            linestyle="-",
+            linewidth=LINE_WIDTH,
+            markersize=MARKER_SIZE,
+            label=res["label"],
+            zorder=3,
+        )
+
+    ax.set_xlabel(X_LABEL)
+    ax.set_ylabel(
+        y_label,
+        fontsize=Y_LABEL_FONT_SIZE,
+        rotation=Y_LABEL_ROTATION,
+        labelpad=Y_LABEL_PAD,
+        va="center",
+    )
+    ax.set_yscale(Y_SCALE)
+    ax.set_xticks(all_ur_ticks)
+    ax.set_xticklabels([_format_ur_tick(tick) for tick in all_ur_ticks])
+    if all_ur_ticks:
+        ax.set_xlim(float(all_ur_ticks[0]) - X_LIMIT_MARGIN, float(all_ur_ticks[-1]) + X_LIMIT_MARGIN)
+
+    finite_plot_values = np.asarray([value for value in plot_values if np.isfinite(value)], dtype=float)
+    if finite_plot_values.size:
+        if str(Y_SCALE).lower() == "log":
+            positive = finite_plot_values[finite_plot_values > 0.0]
+            if positive.size:
+                ax.set_ylim(
+                    float(np.min(positive)) / Y_LIMIT_LOG_PAD_FACTOR,
+                    float(np.max(positive)) * Y_LIMIT_LOG_PAD_FACTOR,
+                )
+        else:
+            ymin = float(np.min(finite_plot_values))
+            ymax = float(np.max(finite_plot_values))
+            pad = (
+                max(abs(ymin) * Y_LIMIT_LINEAR_PAD_FRACTION, 1.0)
+                if np.isclose(ymin, ymax)
+                else (ymax - ymin) * Y_LIMIT_LINEAR_PAD_FRACTION
+            )
+            ax.set_ylim(ymin - pad, ymax + pad)
+
+    _apply_block10_axes_frame(ax)
+    has_legend = _add_shared_legend(fig, [ax])
+    top = 0.88 if has_legend else 1.0
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, top))
+    _save_plot(fig, ALL_UR_AGGREGATE_OUTPUT_BASENAME)
 
 
 def _plot_component_errors(
@@ -684,6 +1246,7 @@ def _plot_component_errors(
     fig, axes = plt.subplots(len(COMPONENT_METRICS), 1, figsize=COMPONENT_FIGSIZE, sharex=True)
     axes_arr = list(np.atleast_1d(axes))
     for idx, (ax, (metric_key, y_label, title)) in enumerate(zip(axes_arr, COMPONENT_METRICS)):
+        _add_panel_label(ax, f"({chr(ord('a') + idx)})")
         _plot_metric_curves(
             ax,
             metric_key=metric_key,
@@ -696,7 +1259,7 @@ def _plot_component_errors(
             show_xlabel=idx == len(axes_arr) - 1,
         )
     has_legend = _add_shared_legend(fig, axes_arr)
-    top = 0.92 if has_legend else 1.0
+    top = 0.95 if has_legend else 1.0
     fig.tight_layout(rect=(0.0, 0.0, 1.0, top))
     _save_plot(fig, COMPONENT_OUTPUT_BASENAME)
 
@@ -706,6 +1269,7 @@ def _eval_loo_model(
     ckpt: dict,
     trajs: list[dict],
     device: torch.device,
+    error_normalizers: dict[str, float] | None,
 ) -> tuple[dict[str, float], list[dict[str, float | str]]]:
     hnn_cfg = dict(ckpt["config"].get("hnn", {}))
     td_params = resolve_td_correction_params(hnn_cfg)
@@ -785,6 +1349,14 @@ def _eval_loo_model(
                 device=device,
                 rollout=rollout,
             )
+            diagnostics = _rollout_diagnostic_values(
+                traj=traj,
+                y_pred=y_pred,
+                force_pred=force_np,
+                dt=dt,
+                diameter=float(model.D),
+            )
+            metrics = _apply_error_normalization(metrics, diagnostics, error_normalizers)
             per_traj.append(metrics)
             detail = {
                 "trajectory_name": str(traj.get("name", "")),
@@ -801,13 +1373,104 @@ def _eval_loo_model(
                 "predict_sigma": int(predict_sigma),
                 "td_force_input_source": td_force_src,
             }
-            detail.update(_rollout_diagnostic_values(
+            detail.update(_normalizer_context_fields(error_normalizers))
+            detail.update(diagnostics)
+            for key, _ in METRICS:
+                detail[TABLE_METRIC_LABELS[key]] = float(metrics.get(key, float("nan")))
+            detail_rows.append(detail)
+
+    return _avg_metrics(per_traj), detail_rows
+
+
+def _eval_trained_model_source(
+    source: Any,
+    trajs: list[dict],
+    device: torch.device,
+    error_normalizers: dict[str, float] | None,
+) -> tuple[dict[str, float], list[dict[str, float | str]]]:
+    method_cfg = dict(getattr(source, "method_cfg", {}) or {})
+    mass_source = str(method_cfg.get("td_mass_source", "dry")).strip().lower()
+    if mass_source not in {"dry", "effective"}:
+        raise ValueError(f"Unsupported td_mass_source={mass_source!r}; expected 'dry' or 'effective'.")
+    mass_key = "dry_mass_kg" if mass_source == "dry" else "effective_mass_kg"
+    diameter = float(getattr(source.model, "D", getattr(source.model, "diameter", 1.0)))
+    rho = float(getattr(source.model, "rho", 1.0))
+
+    per_traj: list[dict[str, float]] = []
+    detail_rows: list[dict[str, float | str]] = []
+    with torch.no_grad():
+        for traj in trajs:
+            mass = float(np.asarray(traj[mass_key]).reshape(()))
+            damping = float(np.asarray(traj["damping_c"]).reshape(()))
+            stiffness = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
+            t_np = np.asarray(traj["t"], dtype=float)
+            dt = float(np.median(np.diff(t_np)))
+
+            y_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().to(device)
+            dy_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().to(device)
+            ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
+
+            series = _traj_to_block10_series(traj, rho=rho, diameter=diameter)
+            model_rollout = simulate_checkpoint_series_rollout(
+                source,
+                series,
+                mass_source=mass_source,
+            )
+
+            y_pred = np.asarray(model_rollout["displacement"], dtype=float).reshape(-1)
+            vel_pred = np.asarray(model_rollout["velocity"], dtype=float).reshape(-1)
+            if "force" in model_rollout:
+                force_np = np.asarray(model_rollout["force"], dtype=float).reshape(-1)
+            else:
+                force_np = np.asarray(model_rollout["force_total"], dtype=float).reshape(-1)
+
+            velocity_scale = np.sqrt(stiffness / mass) * diameter
+            rollout = {
+                "y_norm": y_pred / diameter,
+                "p_norm": vel_pred / velocity_scale,
+                "force_total": force_np,
+            }
+            metrics = compute_validation_metrics(
+                model=None,
+                y_data_t=y_t,
+                val_vel=dy_t,
+                reduced_velocity=ur_t[:, 0],
+                m_eff=mass,
+                dt=dt,
+                t=t_np,
+                y_data_raw=np.asarray(traj["y"], dtype=float),
+                force_data=np.asarray(traj["force_per_m"], dtype=float),
+                D=diameter,
+                k=stiffness,
+                device=device,
+                rollout=rollout,
+            )
+            diagnostics = _rollout_diagnostic_values(
                 traj=traj,
                 y_pred=y_pred,
                 force_pred=force_np,
                 dt=dt,
-                diameter=float(model.D),
-            ))
+                diameter=diameter,
+            )
+            metrics = _apply_error_normalization(metrics, diagnostics, error_normalizers)
+            per_traj.append(metrics)
+            detail = {
+                "trajectory_name": str(traj.get("name", "")),
+                "source_name": str(traj.get("source_name", "")),
+                "reduction_factor": int(_as_scalar(traj.get("reduction_factor"), default=1.0)),
+                "reduction_offset": int(_as_scalar(traj.get("reduction_offset"), default=0.0)),
+                "mass_source": mass_source,
+                "mass_kg": float(mass),
+                "damping_c": float(damping),
+                "stiffness_n_m": float(stiffness),
+                "td_memory_mode": str(resolve_td_memory_config(getattr(source, "td_memory_cfg", None)).get("mode", "")),
+                "mean_active": int(bool(getattr(source, "mean_active", False))),
+                "fhat_active": int(bool(getattr(source, "fhat_active", False))),
+                "predict_sigma": int(bool(getattr(source, "predict_sigma", False))),
+                "td_force_input_source": str(getattr(source, "td_force_input_source", "none")),
+            }
+            detail.update(_normalizer_context_fields(error_normalizers))
+            detail.update(diagnostics)
             for key, _ in METRICS:
                 detail[TABLE_METRIC_LABELS[key]] = float(metrics.get(key, float("nan")))
             detail_rows.append(detail)
@@ -823,69 +1486,32 @@ def _eval_td_baseline(
     rho: float,
     diameter: float,
     device: torch.device,
+    error_normalizers: dict[str, float] | None,
 ) -> tuple[dict[str, float], list[dict[str, float | str]]]:
     per_traj: list[dict[str, float]] = []
     detail_rows: list[dict[str, float | str]] = []
     with torch.no_grad():
         for traj in trajs:
+            mass_source = "dry" if mass_key == "dry_mass_kg" else "effective"
             mass = float(np.asarray(traj[mass_key]).reshape(()))
             damping = float(np.asarray(traj["damping_c"]).reshape(()))
             stiffness = float(np.asarray(traj["stiffness_n_m"]).reshape(()))
             t_np = np.asarray(traj["t"], dtype=float)
-            dt = float(t_np[1] - t_np[0])
+            dt = float(np.median(np.diff(t_np)))
 
             y_t = torch.from_numpy(np.ascontiguousarray(traj["y"])).float().to(device)
             dy_t = torch.from_numpy(np.ascontiguousarray(traj["dy"])).float().to(device)
             ur_t = torch.from_numpy(np.ascontiguousarray(traj["ur"])).float().unsqueeze(1).to(device)
-            td_ctx = torch.from_numpy(np.ascontiguousarray(traj["td_context"])).float().to(device)
+            series = _traj_to_block10_series(traj, rho=float(rho), diameter=float(diameter))
+            rollout_td = simulate_vivana_td_stepwise(
+                series,
+                td_params=td_params,
+                mass_source=mass_source,
+                td_memory_tau_s=_td_memory_tau_spec(td_memory_cfg),
+            )
 
-            mass_t = torch.full((1, 1), mass, dtype=torch.float32, device=device)
-            damp_t = torch.full((1, 1), damping, dtype=torch.float32, device=device)
-            stiff_t = torch.full((1, 1), stiffness, dtype=torch.float32, device=device)
-
-            z_cur = torch.cat([y_t[0:1].unsqueeze(1), dy_t[0:1].unsqueeze(1) * mass], dim=1)
-            td_ctx_cur = td_ctx[0:1].clone()
-            y_hist = [float(y_t[0].item())]
-            f_hist: list[float] = []
-
-            for _ in range(int(y_t.shape[0] - 1)):
-                velocity = z_cur[:, 1:2] / mass
-                step_params = dict(td_params)
-                step_params["n_memory"] = resolve_td_n_memory_torch(
-                    td_params,
-                    dt=dt,
-                    flow_speed=td_ctx_cur[:, 4:5],
-                    diameter=diameter,
-                    memory_cfg=td_memory_cfg,
-                )
-                td_force_next, td_ctx_next = td_baseline_step_torch(
-                    velocity=velocity,
-                    acceleration=td_ctx_cur[:, 0:1],
-                    td_context=td_ctx_cur,
-                    dt=dt,
-                    rho=rho,
-                    diameter=diameter,
-                    params=step_params,
-                )
-                y_next, v_next, a_next = structural_step_constant_force_torch(
-                    y=z_cur[:, 0:1],
-                    velocity=velocity,
-                    force=td_force_next,
-                    dt=dt,
-                    mass=mass_t,
-                    damping_c=damp_t,
-                    stiffness=stiff_t,
-                )
-                z_cur = torch.cat([y_next, v_next * mass], dim=1)
-                td_ctx_cur = td_ctx_next.clone()
-                td_ctx_cur[:, 0:1] = a_next
-                y_hist.append(float(y_next[0, 0].item()))
-                f_hist.append(float(td_force_next[0, 0].item()))
-
-            y_pred = np.array(y_hist, dtype=float)
-            force_np = np.array(f_hist, dtype=float)
-            if force_np.size:
-                force_np = np.concatenate([force_np[:1], force_np], axis=0)
+            y_pred = np.asarray(rollout_td["displacement_td"], dtype=float)
+            force_np = np.asarray(rollout_td["force_td"], dtype=float)
 
             rollout = {
                 "y_norm": y_pred / diameter,
@@ -907,13 +1533,21 @@ def _eval_td_baseline(
                 device=device,
                 rollout=rollout,
             )
+            diagnostics = _rollout_diagnostic_values(
+                traj=traj,
+                y_pred=y_pred,
+                force_pred=force_np,
+                dt=dt,
+                diameter=float(diameter),
+            )
+            metrics = _apply_error_normalization(metrics, diagnostics, error_normalizers)
             per_traj.append(metrics)
             detail = {
                 "trajectory_name": str(traj.get("name", "")),
                 "source_name": str(traj.get("source_name", "")),
                 "reduction_factor": int(_as_scalar(traj.get("reduction_factor"), default=1.0)),
                 "reduction_offset": int(_as_scalar(traj.get("reduction_offset"), default=0.0)),
-                "mass_source": "dry" if mass_key == "dry_mass_kg" else "effective",
+                "mass_source": mass_source,
                 "mass_kg": float(mass),
                 "damping_c": float(damping),
                 "stiffness_n_m": float(stiffness),
@@ -923,13 +1557,8 @@ def _eval_td_baseline(
                 "predict_sigma": 0,
                 "td_force_input_source": "none",
             }
-            detail.update(_rollout_diagnostic_values(
-                traj=traj,
-                y_pred=y_pred,
-                force_pred=force_np,
-                dt=dt,
-                diameter=float(diameter),
-            ))
+            detail.update(_normalizer_context_fields(error_normalizers))
+            detail.update(diagnostics)
             for key, _ in METRICS:
                 detail[TABLE_METRIC_LABELS[key]] = float(metrics.get(key, float("nan")))
             detail_rows.append(detail)
@@ -941,6 +1570,17 @@ def _eval_td_baseline(
 
 def main() -> None:
     device = torch.device("cpu")
+    error_normalizers: dict[str, float] | None = None
+    if _error_normalization_mode() == "dataset_mean_true":
+        print("Computing dataset-wide true metric normalizers...")
+        error_normalizers = _compute_dataset_metric_normalizers()
+        print(
+            "  "
+            + ", ".join(
+                f"{DATASET_NORMALIZER_TABLE_LABELS[key]}={value:.6g}"
+                for key, value in error_normalizers.items()
+            )
+        )
 
     # Physical params for baseline (extracted from first loaded model)
     ref_td_params: dict[str, float] | None = None
@@ -953,12 +1593,18 @@ def main() -> None:
 
     # Evaluate LOO experiments
     experiment_results: list[dict] = []
+    all_ur_experiment_results: list[dict] = []
     detailed_case_rows: list[dict[str, float | str]] = []
+    all_ur_detail_rows: list[dict[str, float | str]] = []
     for exp in LOO_EXPERIMENTS:
         label = str(exp["label"])
         model_dir = Path(exp["model_dir"])
         print(f"\nEvaluating '{label}' from {model_dir.name}/")
-        checkpoints = _find_loo_checkpoints(model_dir)
+        try:
+            checkpoints = _find_loo_checkpoints(model_dir)
+        except FileNotFoundError as exc:
+            print(f"  Skipping: {exc}")
+            continue
         if not checkpoints:
             print(f"  No LOO checkpoints found.")
             continue
@@ -968,26 +1614,58 @@ def main() -> None:
         held_out_ur_labels: list[float] = []
         checkpoint_paths: list[Path | None] = []
         metric_arrays: dict[str, list[float]] = {key: [] for key, _ in METRICS}
+        all_ur_values: list[float] = []
+        all_ur_held_out_suffixes: list[str] = []
+        all_ur_held_out_ur_labels: list[float] = []
+        all_ur_checkpoint_paths: list[Path | None] = []
+        all_ur_metric_arrays: dict[str, list[float]] = {key: [] for key, _ in METRICS}
 
         for suffix in _UR_ORDER:
             if suffix not in checkpoints:
                 continue
             ur_val = UR_MAP[suffix][0]
             print(f"  Ur={ur_val:g} ...", end=" ", flush=True)
-            model, ckpt = _load_model(checkpoints[suffix], device)
-            hnn_cfg = dict(ckpt["config"].get("hnn", {}))
-            td_params = resolve_td_correction_params(hnn_cfg)
-            td_memory_cfg = resolve_td_memory_config(hnn_cfg)
-            td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
-            if td_mass_source not in {"dry", "effective"}:
-                raise ValueError(f"Unsupported hnn.td_mass_source={td_mass_source!r}; expected 'dry' or 'effective'.")
+            if str(exp.get("loader", "phviv")).strip().lower() == "trained_model":
+                source = _load_trained_model_source(checkpoints[suffix], label, device)
+                ckpt = source.checkpoint
+                method_cfg = dict(getattr(source, "method_cfg", {}) or {})
+                td_params = dict(getattr(source, "base_td_params", resolve_td_correction_params({})))
+                td_memory_cfg = resolve_td_memory_config(getattr(source, "td_memory_cfg", None))
+                td_mass_source = str(method_cfg.get("td_mass_source", "dry")).strip().lower()
+                if td_mass_source not in {"dry", "effective"}:
+                    raise ValueError(f"Unsupported td_mass_source={td_mass_source!r}; expected 'dry' or 'effective'.")
+                model_diameter = float(getattr(source.model, "D", getattr(source.model, "diameter", 1.0)))
+                model_rho = float(getattr(source.model, "rho", 1000.0))
+                eval_fn = lambda loaded_trajs: _eval_trained_model_source(
+                    source,
+                    loaded_trajs,
+                    device,
+                    error_normalizers,
+                )
+            else:
+                model, ckpt = _load_model(checkpoints[suffix], device)
+                hnn_cfg = dict(ckpt["config"].get("hnn", {}))
+                td_params = resolve_td_correction_params(hnn_cfg)
+                td_memory_cfg = resolve_td_memory_config(hnn_cfg)
+                td_mass_source = str(hnn_cfg.get("td_mass_source", "dry")).strip().lower()
+                if td_mass_source not in {"dry", "effective"}:
+                    raise ValueError(f"Unsupported hnn.td_mass_source={td_mass_source!r}; expected 'dry' or 'effective'.")
+                model_diameter = float(model.D)
+                model_rho = float(getattr(parse_config(ckpt["config"]).model, "rho", 1000.0))
+                eval_fn = lambda loaded_trajs: _eval_loo_model(
+                    model,
+                    ckpt,
+                    loaded_trajs,
+                    device,
+                    error_normalizers,
+                )
 
             if ref_td_params is None:
                 ref_td_params = td_params
                 ref_td_memory_cfg = td_memory_cfg
                 ref_mass_key = "dry_mass_kg" if td_mass_source == "dry" else "effective_mass_kg"
-                ref_rho = float(getattr(parse_config(ckpt["config"]).model, "rho", 1000.0))
-                ref_diameter = float(model.D)
+                ref_rho = model_rho
+                ref_diameter = model_diameter
 
             trajs = _load_trajs(
                 suffix,
@@ -997,10 +1675,10 @@ def main() -> None:
                 td_memory_cfg=td_memory_cfg,
             )
             baseline_trajs[suffix] = trajs
-            ur_eff = _effective_reduced_velocity(trajs, diameter=float(model.D))
+            ur_eff = _effective_reduced_velocity(trajs, diameter=model_diameter)
             effective_ur_by_suffix[suffix] = ur_eff
 
-            metrics, case_metrics = _eval_loo_model(model, ckpt, trajs, device)
+            metrics, case_metrics = eval_fn(trajs)
             ur_values.append(ur_eff)
             held_out_suffixes.append(suffix)
             held_out_ur_labels.append(ur_val)
@@ -1015,8 +1693,63 @@ def main() -> None:
                     held_out_ur_effective_group=ur_eff,
                     checkpoint_path=checkpoints[suffix],
                     metrics_by_case=case_metrics,
+                    error_normalizers=error_normalizers,
                 )
             )
+
+            if EVALUATE_ALL_UR_IMPORTANCE:
+                all_eval_case_metrics = list(case_metrics)
+                all_ur_detail_rows.append(
+                    _row_for_all_eval_ur_detail(
+                        method=label,
+                        held_out_suffix=suffix,
+                        held_out_ur_label=ur_val,
+                        held_out_ur_effective_group=ur_eff,
+                        checkpoint_path=checkpoints[suffix],
+                        eval_suffix=suffix,
+                        eval_ur_label=UR_MAP[suffix][0],
+                        eval_ur_effective_group=ur_eff,
+                        num_cases=len(case_metrics),
+                        metrics=metrics,
+                        error_normalizers=error_normalizers,
+                    )
+                )
+                for eval_suffix in _UR_ORDER:
+                    if eval_suffix == suffix:
+                        continue
+                    eval_trajs = _load_trajs(
+                        eval_suffix,
+                        reduction_factor=REDUCTION_FACTOR,
+                        ur_source=td_mass_source,
+                        td_params=td_params,
+                        td_memory_cfg=td_memory_cfg,
+                    )
+                    eval_ur_eff = _effective_reduced_velocity(eval_trajs, diameter=model_diameter)
+                    effective_ur_by_suffix.setdefault(eval_suffix, eval_ur_eff)
+                    eval_metrics, eval_case_metrics = eval_fn(eval_trajs)
+                    all_eval_case_metrics.extend(eval_case_metrics)
+                    all_ur_detail_rows.append(
+                        _row_for_all_eval_ur_detail(
+                            method=label,
+                            held_out_suffix=suffix,
+                            held_out_ur_label=ur_val,
+                            held_out_ur_effective_group=ur_eff,
+                            checkpoint_path=checkpoints[suffix],
+                            eval_suffix=eval_suffix,
+                            eval_ur_label=UR_MAP[eval_suffix][0],
+                            eval_ur_effective_group=eval_ur_eff,
+                            num_cases=len(eval_case_metrics),
+                            metrics=eval_metrics,
+                            error_normalizers=error_normalizers,
+                        )
+                    )
+                all_eval_metrics = _metrics_from_case_detail_rows(all_eval_case_metrics)
+                all_ur_values.append(ur_eff)
+                all_ur_held_out_suffixes.append(suffix)
+                all_ur_held_out_ur_labels.append(ur_val)
+                all_ur_checkpoint_paths.append(checkpoints[suffix])
+                for key, _ in METRICS:
+                    all_ur_metric_arrays[key].append(all_eval_metrics.get(key, float("nan")))
             print(f"done (U_r,eff={ur_eff:.4g})")
 
         experiment_results.append({
@@ -1029,6 +1762,17 @@ def main() -> None:
             "checkpoint_paths": checkpoint_paths,
             "metrics": metric_arrays,
         })
+        if EVALUATE_ALL_UR_IMPORTANCE:
+            all_ur_experiment_results.append({
+                "label": label,
+                "color": exp.get("color", "steelblue"),
+                "marker": exp.get("marker", "o"),
+                "ur_values": all_ur_values,
+                "held_out_suffixes": all_ur_held_out_suffixes,
+                "held_out_ur_labels": all_ur_held_out_ur_labels,
+                "checkpoint_paths": all_ur_checkpoint_paths,
+                "metrics": all_ur_metric_arrays,
+            })
 
     # Evaluate VIVANA-TD baseline — one point per unique (suffix, rf) combination
     # Use mean across all experiment rfs to get one baseline value per Ur
@@ -1036,6 +1780,7 @@ def main() -> None:
     td_held_out_suffixes: list[str] = []
     td_held_out_ur_labels: list[float] = []
     td_metric_arrays: dict[str, list[float]] = {key: [] for key, _ in METRICS}
+    td_case_detail_rows: list[dict[str, float | str]] = []
     if (
         ref_td_params is not None
         and ref_td_memory_cfg is not None
@@ -1059,6 +1804,7 @@ def main() -> None:
                 ref_rho,
                 ref_diameter,
                 device,
+                error_normalizers,
             )
             td_ur_values.append(ur_val)
             td_held_out_suffixes.append(suffix)
@@ -1073,8 +1819,10 @@ def main() -> None:
                     held_out_ur_effective_group=ur_val,
                     checkpoint_path=None,
                     metrics_by_case=case_metrics,
+                    error_normalizers=error_normalizers,
                 )
             )
+            td_case_detail_rows.extend(case_metrics)
             print("done")
     else:
         print("\nSkipping VIVANA-TD baseline (no model loaded to extract physical params).")
@@ -1089,6 +1837,7 @@ def main() -> None:
                 held_out_suffixes=td_held_out_suffixes,
                 held_out_ur_labels=td_held_out_ur_labels,
                 checkpoint_paths=[None] * len(td_ur_values),
+                error_normalizers=error_normalizers,
             )
         )
     for res in experiment_results:
@@ -1100,18 +1849,51 @@ def main() -> None:
                 held_out_suffixes=list(res["held_out_suffixes"]),
                 held_out_ur_labels=list(res["held_out_ur_labels"]),
                 checkpoint_paths=list(res["checkpoint_paths"]),
+                error_normalizers=error_normalizers,
+            )
+        )
+    all_ur_summary_rows: list[dict[str, float | str]] = []
+    for res in all_ur_experiment_results:
+        all_ur_summary_rows.extend(
+            _rows_for_series(
+                method=str(res["label"]),
+                ur_values=list(res["ur_values"]),
+                metric_arrays=res["metrics"],
+                held_out_suffixes=list(res["held_out_suffixes"]),
+                held_out_ur_labels=list(res["held_out_ur_labels"]),
+                checkpoint_paths=list(res["checkpoint_paths"]),
+                error_normalizers=error_normalizers,
             )
         )
     summary_rows = _summary_rows(detail_rows)
+    interior_detail_rows, excluded_outer_urs = _detail_rows_excluding_outer_ur(detail_rows)
+    interior_summary_rows = _summary_rows(interior_detail_rows)
     _write_csv(summary_rows, SUMMARY_TABLE_PATH)
+    _write_csv(interior_summary_rows, INTERIOR_SUMMARY_TABLE_PATH)
     _write_csv(detail_rows, DETAIL_BY_UR_TABLE_PATH)
     _write_csv(detailed_case_rows, DETAIL_BY_CASE_TABLE_PATH)
-    _print_summary_table(summary_rows)
+    _write_csv(all_ur_summary_rows, ALL_UR_SUMMARY_TABLE_PATH)
+    _write_csv(all_ur_detail_rows, ALL_UR_DETAIL_TABLE_PATH)
+    _print_summary_table(summary_rows, title="LOO mean errors across all held-out U_r values")
+    if excluded_outer_urs is not None:
+        _print_summary_table(
+            interior_summary_rows,
+            title=(
+                "LOO mean errors excluding outer held-out U_r values "
+                f"({excluded_outer_urs[0]:g}, {excluded_outer_urs[1]:g})"
+            ),
+        )
     if detail_rows:
         print(f"\nSaved summary → {SUMMARY_TABLE_PATH}")
+        if interior_summary_rows:
+            print(f"Saved interior-U_r summary → {INTERIOR_SUMMARY_TABLE_PATH}")
         print(f"Saved per-U_r details → {DETAIL_BY_UR_TABLE_PATH}")
     if detailed_case_rows:
         print(f"Saved per-case details → {DETAIL_BY_CASE_TABLE_PATH}")
+    if all_ur_summary_rows:
+        print(f"Saved all-evaluation-U_r summary → {ALL_UR_SUMMARY_TABLE_PATH}")
+    if all_ur_detail_rows:
+        print(f"Saved all-evaluation-U_r details → {ALL_UR_DETAIL_TABLE_PATH}")
 
     all_ur_ticks = sorted(effective_ur_by_suffix.values()) or sorted({v for v, _ in UR_MAP.values()})
     _plot_aggregate_error(
@@ -1120,6 +1902,12 @@ def main() -> None:
         experiment_results=experiment_results,
         all_ur_ticks=all_ur_ticks,
     )
+    if EVALUATE_ALL_UR_IMPORTANCE:
+        _plot_all_ur_aggregate_error(
+            experiment_results=all_ur_experiment_results,
+            all_ur_ticks=all_ur_ticks,
+            baseline_all_ur_metrics=_metrics_from_case_detail_rows(td_case_detail_rows),
+        )
     _plot_component_errors(
         td_ur_values=td_ur_values,
         td_metric_arrays=td_metric_arrays,
