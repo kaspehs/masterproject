@@ -42,3 +42,4 @@ __pycache__/
 *.xlsx
 *.pdf
 /Master_Thesis/
+/config/
