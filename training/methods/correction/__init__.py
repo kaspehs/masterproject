@@ -1,5 +1,6 @@
 from __future__ import annotations
 
-from training.methods.latent_rnn.trainer import train
+from training.methods.correction.trainer import train
 
 __all__ = ["train"]
+

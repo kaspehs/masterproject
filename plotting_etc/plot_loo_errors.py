@@ -45,7 +45,7 @@ from training.training_utils import (
     resolve_td_correction_params,
     resolve_td_memory_config,
 )
-from training.methods.hnn.trainer import (
+from training.methods.correction.trainer import (
     _td_correction_state_rollout,
     _td_flow_feature_from_traj,
 )
@@ -254,8 +254,11 @@ def _load_model(path: Path, device: torch.device) -> tuple[PHVIV, dict]:
     config = parse_config(ckpt["config"])
     model_cfg = asdict(config.model)
     arch_cfg = asdict(config.architecture)
-    if "predict_sigma" in ckpt:
-        model_cfg["use_stochastic_process_noise"] = bool(ckpt["predict_sigma"])
+    raw_model_cfg = ckpt.get("config", {}).get("model", {}) if isinstance(ckpt.get("config", {}), dict) else {}
+    for key in ("structural_mass", "Ca", "k", "damping_c"):
+        if key in raw_model_cfg:
+            model_cfg[key] = raw_model_cfg[key]
+    model_cfg["use_stochastic_process_noise"] = False
     if "correction_mode" in ckpt:
         model_cfg["correction_mode"] = ckpt["correction_mode"]
     if "td_force_input_source" in ckpt:
@@ -270,8 +273,7 @@ def _load_model(path: Path, device: torch.device) -> tuple[PHVIV, dict]:
         model_cfg["use_phi_input"] = bool(ckpt["use_phi_input"])
     if "phi_input_source" in ckpt:
         model_cfg["phi_input_source"] = ckpt["phi_input_source"]
-    if "use_sigma_inputs" in ckpt:
-        model_cfg["use_sigma_inputs"] = bool(ckpt["use_sigma_inputs"])
+    model_cfg["use_sigma_inputs"] = False
     if "shared_td_correction_trunk" in ckpt:
         arch_cfg["shared_td_correction_trunk"] = bool(ckpt["shared_td_correction_trunk"])
 
@@ -1277,7 +1279,7 @@ def _eval_loo_model(
     mass_key = "dry_mass_kg" if str(hnn_cfg.get("td_mass_source", "dry")) == "dry" else "effective_mass_kg"
     mean_active = bool(ckpt.get("mean_active", False))
     fhat_active = bool(ckpt.get("fhat_active", False))
-    predict_sigma = bool(ckpt.get("predict_sigma", False))
+    predict_sigma = False
     td_force_src = str(ckpt.get("td_force_input_source", "none"))
     fhat_bound_mult = float(ckpt.get("fhat_bound_multiplier", 1.0))
     input_scaling = str(getattr(model, "input_scaling_mode", "current"))

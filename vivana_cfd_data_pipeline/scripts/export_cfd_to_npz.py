@@ -2,52 +2,42 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 
-try:
-    from vivana_cfd_data_pipeline.helpers.cfd_io import (
-        CfdRecord,
-        apply_cleaning_manifest,
-        build_cleaning_manifest,
-        infer_ur_from_path,
-        load_dog_file,
-        nondimensionalize_records_from_metadata,
-        remove_duplicate_timestamps,
-        resolve_computed_ur_value,
-        resolve_dry_structural_frequency_hz,
-        resolve_flow_speed_m_s,
-        resolve_stiffness_n_m,
-        resolve_structural_frequency_hz,
-    )
-except ModuleNotFoundError:
-    from vivana_cfd_data_pipeline.helpers.cfd_io import (
-        CfdRecord,
-        apply_cleaning_manifest,
-        build_cleaning_manifest,
-        infer_ur_from_path,
-        load_dog_file,
-        nondimensionalize_records_from_metadata,
-        remove_duplicate_timestamps,
-        resolve_computed_ur_value,
-        resolve_dry_structural_frequency_hz,
-        resolve_flow_speed_m_s,
-        resolve_stiffness_n_m,
-        resolve_structural_frequency_hz,
-    )
+DATA_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = DATA_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from vivana_cfd_data_pipeline.helpers.cfd_io import (
+    CfdRecord,
+    apply_cleaning_manifest,
+    build_cleaning_manifest,
+    infer_ur_from_path,
+    load_dog_file,
+    nondimensionalize_records_from_metadata,
+    remove_duplicate_timestamps,
+    resolve_computed_ur_value,
+    resolve_dry_structural_frequency_hz,
+    resolve_flow_speed_m_s,
+    resolve_stiffness_n_m,
+    resolve_structural_frequency_hz,
+)
 
 
 # Export configuration
-INPUT_DIR = Path("vivana_cfd_data_pipeline/raw")
-OUTPUT_DIR = Path("vivana_cfd_data_pipeline/generated/cfd_npz_exports")
+INPUT_DIR = DATA_ROOT / "raw"
+OUTPUT_DIR = DATA_ROOT / "generated" / "cfd_npz_exports"
 PATTERN = "*.dog"
 MAX_FILES = None
 OVERWRITE = True
 
 # Existing notebook-driven preprocessing inputs
-CLEANING_MANIFEST_PATH = Path("vivana_cfd_data_pipeline/metadata/cleaning_manifest.csv")
-METADATA_PATH = Path("vivana_cfd_data_pipeline/metadata/CFD_metadata.csv")
+CLEANING_MANIFEST_PATH = DATA_ROOT / "metadata" / "cleaning_manifest.csv"
+METADATA_PATH = DATA_ROOT / "metadata" / "CFD_metadata.csv"
 
 # Nondimensional time convention for the exported *_nd channels:
 # tau = omega_n * t

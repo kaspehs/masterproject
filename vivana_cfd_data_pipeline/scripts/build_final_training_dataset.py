@@ -3,8 +3,10 @@
 Pipeline:
   1. Replay Vivana-TD hidden state on each CFD export and trim burn-in.
   2. Assemble a delivery-style dataset root with train/ and val_seen/ splits.
-  3. Generate surrogate validation points from retained training anchors.
-  4. Optionally generate leave-one-U_r-out folders from the same final dataset.
+  3. Optionally exclude one or more label U_r values from the final splits.
+  4. Generate surrogate validation points from retained training anchors.
+     Dataset-level U_r exclusions are also excluded from surrogate anchors.
+  5. Optionally generate leave-one-U_r-out folders from the same final dataset.
 
 The script intentionally writes to new ``*_final`` folders so older experiment
 outputs remain available for comparison.
@@ -44,7 +46,9 @@ BURNIN_DIAGNOSTIC_DIR = DATA_ROOT / "outputs" / "td_preprocess_diagnostics_final
 
 UR_SOURCE = "label"
 VAL_SEEN_POLICY = "first_per_ur"
-SURROGATE_EXCLUDE_URS = surrogate.EXCLUDE_URS
+# Optional label U_r exclusions for the main final train/val_seen dataset.
+# These are the source of truth for final-dataset surrogate anchor exclusions.
+DATASET_EXCLUDE_URS: tuple[float, ...] = ()
 CREATE_LOO_DATASETS = False
 HELD_OUT_URS = loo.HELD_OUT_URS
 
@@ -82,6 +86,13 @@ class SplitRow:
     split: str
     source: str
     destination: str
+    label_ur: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExcludedRow:
+    source: str
     label_ur: float
     reason: str
 
@@ -176,6 +187,26 @@ def _load_label_ur(path: Path) -> float:
     return float(surrogate.load_reduced_velocity(Path(path), ur_source=UR_SOURCE))
 
 
+def _normalize_urs(values: Sequence[float] | None) -> tuple[float, ...]:
+    if values is None:
+        return ()
+    normalized: list[float] = []
+    for value in values:
+        ur = float(value)
+        if not np.isfinite(ur):
+            raise ValueError(f"Reduced velocity exclusions must be finite, got {value!r}.")
+        if not any(np.isclose(ur, existing, rtol=0.0, atol=surrogate.EXCLUDE_UR_ATOL) for existing in normalized):
+            normalized.append(ur)
+    return tuple(normalized)
+
+
+def _is_excluded_ur(label_ur: float, exclude_urs: Sequence[float]) -> bool:
+    exclude = np.asarray(list(exclude_urs), dtype=float).reshape(-1)
+    if exclude.size == 0:
+        return False
+    return bool(np.any(np.isclose(float(label_ur), exclude, rtol=0.0, atol=surrogate.EXCLUDE_UR_ATOL)))
+
+
 def _select_val_seen_files(paths: Sequence[Path]) -> list[Path]:
     if VAL_SEEN_POLICY != "first_per_ur":
         raise ValueError(f"Unsupported VAL_SEEN_POLICY={VAL_SEEN_POLICY!r}")
@@ -187,7 +218,13 @@ def _select_val_seen_files(paths: Sequence[Path]) -> list[Path]:
     return [selected[key] for key in sorted(selected)]
 
 
-def _copy_split_files(flat_dir: Path, final_dir: Path, *, overwrite: bool) -> list[SplitRow]:
+def _copy_split_files(
+    flat_dir: Path,
+    final_dir: Path,
+    *,
+    overwrite: bool,
+    exclude_urs: Sequence[float] = (),
+) -> tuple[list[SplitRow], list[ExcludedRow]]:
     source_paths = sorted(Path(flat_dir).glob("*.npz"))
     if not source_paths:
         raise FileNotFoundError(f"No burn-in trimmed NPZ files found in {flat_dir}")
@@ -198,8 +235,26 @@ def _copy_split_files(flat_dir: Path, final_dir: Path, *, overwrite: bool) -> li
     train_dir.mkdir(parents=True, exist_ok=True)
     val_seen_dir.mkdir(parents=True, exist_ok=True)
 
-    rows: list[SplitRow] = []
+    excluded_rows: list[ExcludedRow] = []
+    retained_paths: list[Path] = []
     for src_path in source_paths:
+        label_ur = _load_label_ur(src_path)
+        if _is_excluded_ur(label_ur, exclude_urs):
+            excluded_rows.append(
+                ExcludedRow(
+                    source=str(src_path),
+                    label_ur=float(label_ur),
+                    reason="dataset_exclude_ur",
+                )
+            )
+            continue
+        retained_paths.append(src_path)
+
+    if not retained_paths:
+        raise ValueError("All burn-in trimmed NPZ files were excluded from the final dataset.")
+
+    rows: list[SplitRow] = []
+    for src_path in retained_paths:
         dst_path = train_dir / src_path.name
         shutil.copy2(src_path, dst_path)
         rows.append(
@@ -212,7 +267,7 @@ def _copy_split_files(flat_dir: Path, final_dir: Path, *, overwrite: bool) -> li
             )
         )
 
-    for src_path in _select_val_seen_files(source_paths):
+    for src_path in _select_val_seen_files(retained_paths):
         dst_path = val_seen_dir / src_path.name
         shutil.copy2(src_path, dst_path)
         rows.append(
@@ -226,7 +281,9 @@ def _copy_split_files(flat_dir: Path, final_dir: Path, *, overwrite: bool) -> li
         )
 
     _write_split_manifest(final_dir / "split_manifest.csv", rows)
-    return rows
+    if excluded_rows:
+        _write_exclusion_manifest(final_dir / "dataset_exclusion_manifest.csv", excluded_rows)
+    return rows, excluded_rows
 
 
 def _write_split_manifest(path: Path, rows: Sequence[SplitRow]) -> None:
@@ -240,12 +297,28 @@ def _write_split_manifest(path: Path, rows: Sequence[SplitRow]) -> None:
         writer.writerows(asdict(row) for row in rows)
 
 
-def _generate_surrogate_files(final_dir: Path) -> dict[str, np.ndarray]:
+def _write_exclusion_manifest(path: Path, rows: Sequence[ExcludedRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("source", "label_ur", "reason"),
+        )
+        writer.writeheader()
+        writer.writerows(asdict(row) for row in rows)
+
+
+def _effective_surrogate_exclude_urs(dataset_exclude_urs: Sequence[float]) -> tuple[float, ...]:
+    return _normalize_urs(dataset_exclude_urs)
+
+
+def _generate_surrogate_files(final_dir: Path, *, dataset_exclude_urs: Sequence[float] = ()) -> dict[str, np.ndarray]:
     train_paths = sorted((Path(final_dir) / "train").glob("*.npz"))
+    exclude_urs = _effective_surrogate_exclude_urs(dataset_exclude_urs)
     anchors = surrogate.collect_anchor_points(
         train_paths,
         ur_source=UR_SOURCE,
-        exclude_urs=SURROGATE_EXCLUDE_URS,
+        exclude_urs=exclude_urs,
         exclude_ur_atol=surrogate.EXCLUDE_UR_ATOL,
     )
     points = surrogate.generate_surrogate_validation_points(
@@ -288,9 +361,11 @@ def _write_dataset_manifest(
     input_dir: Path,
     burnin_work_dir: Path,
     split_rows: Sequence[SplitRow],
+    excluded_rows: Sequence[ExcludedRow],
     surrogate_points: dict[str, np.ndarray],
     create_loo: bool,
     loo_output_root: Path,
+    dataset_exclude_urs: Sequence[float],
 ) -> None:
     train_paths = sorted((final_dir / "train").glob("*.npz"))
     val_seen_paths = sorted((final_dir / "val_seen").glob("*.npz"))
@@ -303,10 +378,12 @@ def _write_dataset_manifest(
         "surrogate_validation_npz": str(final_dir / "surrogate_validation_points.npz"),
         "surrogate_validation_csv": str(final_dir / "surrogate_validation_points.csv"),
         "surrogate_validation_diagnostic_plot": str(final_dir / "surrogate_validation_points_diagnostic.pdf"),
+        "dataset_exclusion_manifest": str(final_dir / "dataset_exclusion_manifest.csv") if excluded_rows else None,
         "loo_output_root": str(loo_output_root) if create_loo else None,
         "ur_source": UR_SOURCE,
         "val_seen_policy": VAL_SEEN_POLICY,
-        "surrogate_exclude_urs": [float(value) for value in SURROGATE_EXCLUDE_URS],
+        "dataset_exclude_urs": [float(value) for value in dataset_exclude_urs],
+        "surrogate_exclude_urs": [float(value) for value in _effective_surrogate_exclude_urs(dataset_exclude_urs)],
         "held_out_urs": [float(value) for value in HELD_OUT_URS] if create_loo else [],
         "vivana_td": {
             "params": {key: float(value) for key, value in VIVANA_TD_PARAMS.items()},
@@ -324,6 +401,7 @@ def _write_dataset_manifest(
             "val_seen_npz": len(val_seen_paths),
             "surrogate_rows": int(np.asarray(surrogate_points["ur"]).reshape(-1).size),
             "split_manifest_rows": len(split_rows),
+            "excluded_npz": len(excluded_rows),
         },
         "train_label_urs": _unique_urs(train_paths),
         "val_seen_label_urs": _unique_urs(val_seen_paths),
@@ -344,6 +422,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--burnin-diagnostics", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--loo", action=argparse.BooleanOptionalAction, default=CREATE_LOO_DATASETS)
+    parser.add_argument(
+        "--exclude-ur",
+        type=float,
+        action="append",
+        default=None,
+        help=(
+            "Exclude this label U_r from the main final train/val_seen dataset. "
+            "Can be passed multiple times. The same U_r is also excluded from surrogate anchors."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -353,8 +441,11 @@ def main() -> None:
     burnin_work_dir = Path(args.burnin_work_dir)
     output_dir = Path(args.output_dir)
     loo_output_root = Path(args.loo_output_root)
+    dataset_exclude_urs = _normalize_urs([*DATASET_EXCLUDE_URS, *(args.exclude_ur or [])])
 
     print(f"Building final TD training dataset from {input_dir}")
+    if dataset_exclude_urs:
+        print(f"Excluding label U_r from final train/val_seen dataset: {', '.join(f'{value:g}' for value in dataset_exclude_urs)}")
     _clean_dir(burnin_work_dir, overwrite=bool(args.overwrite))
     _run_burnin_preprocessing(
         input_dir=input_dir,
@@ -362,12 +453,13 @@ def main() -> None:
         overwrite=bool(args.overwrite),
         write_diagnostics=bool(args.burnin_diagnostics),
     )
-    split_rows = _copy_split_files(
+    split_rows, excluded_rows = _copy_split_files(
         burnin_work_dir,
         output_dir,
         overwrite=bool(args.overwrite),
+        exclude_urs=dataset_exclude_urs,
     )
-    surrogate_points = _generate_surrogate_files(output_dir)
+    surrogate_points = _generate_surrogate_files(output_dir, dataset_exclude_urs=dataset_exclude_urs)
     if bool(args.loo):
         _generate_loo_datasets(source_root=output_dir, output_root=loo_output_root)
     _write_dataset_manifest(
@@ -375,15 +467,19 @@ def main() -> None:
         input_dir=input_dir,
         burnin_work_dir=burnin_work_dir,
         split_rows=split_rows,
+        excluded_rows=excluded_rows,
         surrogate_points=surrogate_points,
         create_loo=bool(args.loo),
         loo_output_root=loo_output_root,
+        dataset_exclude_urs=dataset_exclude_urs,
     )
 
     print(f"Wrote final dataset: {output_dir}")
     print(f"  train: {len(list((output_dir / 'train').glob('*.npz')))} files")
     print(f"  val_seen: {len(list((output_dir / 'val_seen').glob('*.npz')))} files")
     print(f"  surrogate rows: {int(np.asarray(surrogate_points['ur']).reshape(-1).size)}")
+    if excluded_rows:
+        print(f"  excluded by U_r: {len(excluded_rows)} files")
     if bool(args.loo):
         print(f"  leave-one-U_r-out datasets: {loo_output_root}")
 

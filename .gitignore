@@ -9,6 +9,8 @@
 /legacy_code
 /logs/*
 /figs
+/models
+
 /figures/*
 /tests
 /Data_Gen/legacy_datasets
@@ -39,3 +41,4 @@ __pycache__/
 *.mat
 *.xlsx
 *.pdf
+/Master_Thesis/

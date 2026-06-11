@@ -15,11 +15,12 @@ try:
 except ModuleNotFoundError:
     tqdm = None
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = DATA_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from training.training_utils import resolve_td_memory_config, resolve_td_n_memory
+from vivana_cfd_data_pipeline.vivana_td.td_memory import resolve_td_memory_config, resolve_td_n_memory
 
 try:
     from td_hidden_state import (
@@ -46,7 +47,6 @@ except ModuleNotFoundError:
 
 
 # Case selection
-DATA_ROOT = Path(__file__).resolve().parents[1]
 INPUT_NPZS: list[Path] | None = None  # None -> use all files matching INPUT_NPZ_GLOB
 #INPUT_NPZ_GLOB = str(DATA_ROOT / "generated" / "cfd_npz_exports" / "comb_Ur7__2Hydro.npz")
 INPUT_NPZ_GLOB = str(DATA_ROOT / "generated" / "cfd_npz_exports" / "*.npz")

@@ -41,6 +41,7 @@ from training.training_utils import (
     FORCE_STD_REL_ERROR_KEY,
     PHVIV,
     dominant_frequency,
+    normalize_method_name,
     parse_config,
     relative_error,
     resolve_phnn_input_scaling_mode,
@@ -54,10 +55,10 @@ from training.training_utils import (
     td_baseline_step_torch,
     _recompute_td_baseline_on_grid,
 )
-from training.methods.hnn.trainer import _td_step_with_corrections
+from training.methods.correction.trainer import _td_step_with_corrections
 
 try:
-    from training.methods.latent_rnn.trainer import LatentRNNForceModel
+    from training.methods.standalone.trainer import LatentRNNForceModel
 except ImportError:
     LatentRNNForceModel = None
 
@@ -348,7 +349,7 @@ def _load_checkpoint_file(path: Path) -> dict[str, Any]:
 class Polynomial3DCorrectionModel(torch.nn.Module):
     def __init__(self, checkpoint: dict[str, Any], *, device: torch.device) -> None:
         super().__init__()
-        self.force_output = str(checkpoint.get("force_output", "force"))
+        self.force_output = str(checkpoint.get("force_output", "coefficient"))
         self.use_td_force_input = False
         self.predict_sigma_default = bool(checkpoint.get("predict_sigma", True))
         self.register_buffer(
@@ -450,18 +451,16 @@ def load_trained_model_sources(
             raise FileNotFoundError(f"Model checkpoint not found: {path}")
         checkpoint = _load_checkpoint_file(path)
         config = _parse_checkpoint_config(checkpoint.get("config", {}))
-        method_name = str(checkpoint.get("method", getattr(config, "method", "phnn"))).strip().lower()
-        if method_name == "hnn":
-            method_name = "phnn"
-        if method_name in {"latent_rnn", "scratch_latent_rnn"}:
-            method_cfg = dict(config.latent_rnn or {})
+        method_name = normalize_method_name(checkpoint.get("method", getattr(config, "method", "correction")))
+        if method_name == "standalone":
+            method_cfg = dict(config.standalone or {})
         else:
-            method_cfg = dict(config.hnn or {})
-        td_correction_cfg = dict(config.hnn or {}) if method_name in {"latent_rnn", "scratch_latent_rnn"} else method_cfg
+            method_cfg = dict(config.correction or {})
+        td_correction_cfg = dict(config.correction or {}) if method_name == "standalone" else method_cfg
         correction_mode = resolve_td_correction_mode(td_correction_cfg)
         mode_flags = td_correction_mode_flags(correction_mode)
         mean_active = bool(mode_flags["mean_active"])
-        predict_sigma = bool(mode_flags["sigma_active"])
+        predict_sigma = False
         fhat_active = bool(mode_flags["fhat_active"])
         td_force_input_source = resolve_td_force_input_source(
             checkpoint.get("td_force_input_source", td_correction_cfg.get("use_td_force_input", checkpoint.get("use_td_force_input", False)))
@@ -476,10 +475,10 @@ def load_trained_model_sources(
             )
         )
         use_phi_input = phi_input_source != "none"
-        use_sigma_inputs = bool(td_correction_cfg.get("use_sigma_inputs", checkpoint.get("use_sigma_inputs", False)))
+        use_sigma_inputs = False
         fhat_bound_multiplier = float(td_correction_cfg.get("fhat_bound_multiplier", checkpoint.get("fhat_bound_multiplier", 1.5)))
         force_zero_output = bool(td_correction_cfg.get("force_zero_output", checkpoint.get("force_zero_output", False)))
-        sigma_min = float(td_correction_cfg.get("sigma_min", checkpoint.get("sigma_min", 1.0e-6)))
+        sigma_min = 0.0
         td_memory_cfg = resolve_td_memory_config(td_correction_cfg)
         base_td_params = dict(checkpoint.get("base_td_params", resolve_td_correction_params(td_correction_cfg)))
         if fhat_active and use_td_force_input:
@@ -491,8 +490,8 @@ def load_trained_model_sources(
             model.eval()
             method_name = "poly3d"
             kind = "poly3d_correction"
-            predict_sigma = bool(checkpoint.get("predict_sigma", True)) and ("sigma_model" in checkpoint)
-            correction_mode = "mean_sigma_only" if predict_sigma else "mean_only"
+            predict_sigma = False
+            correction_mode = "mean_only"
             mean_active = True
             fhat_active = False
             use_td_force_input = False
@@ -532,13 +531,13 @@ def load_trained_model_sources(
             sigma_min = 0.0
             force_zero_output = False
             td_memory_cfg = None
-        elif method_name in {"latent_rnn", "scratch_latent_rnn"}:
+        elif method_name == "standalone":
             if LatentRNNForceModel is None:
                 raise ImportError(
                     f"{path.name}: latent_rnn checkpoint support is unavailable because "
-                    "`training.methods.latent_rnn.trainer.LatentRNNForceModel` could not be imported."
+                    "`training.methods.standalone.trainer.LatentRNNForceModel` could not be imported."
                 )
-            lrnn_cfg = dict(config.latent_rnn or {})
+            lrnn_cfg = dict(config.standalone or {})
             latent_dim = int(lrnn_cfg.get("latent_dim", 3))
             encoder_length = int(lrnn_cfg.get("encoder_length", 50))
             if latent_dim < 1:
@@ -575,7 +574,6 @@ def load_trained_model_sources(
                 architecture_cfg=arch_cfg,
                 rho=float(getattr(model_cfg_obj, "rho", 1.0)),
                 diameter=float(getattr(model_cfg_obj, "D", 1.0)),
-                force_output=str(getattr(model_cfg_obj, "force_output", "force")),
                 coefficient_output_bound=(
                     None
                     if getattr(model_cfg_obj, "coefficient_output_bound", None) is None
@@ -604,9 +602,16 @@ def load_trained_model_sources(
             sigma_min = 0.0
             force_zero_output = False
             td_memory_cfg = None
-        elif method_name == "phnn":
+        elif method_name == "correction":
             dt = float(checkpoint.get("dt", 1.0))
             model_dict = asdict(config.model)
+            raw_model_cfg = {}
+            raw_config = checkpoint.get("config", {})
+            if isinstance(raw_config, dict) and isinstance(raw_config.get("model"), dict):
+                raw_model_cfg = raw_config["model"]
+            for key in ("structural_mass", "Ca", "k", "damping_c"):
+                if key in raw_model_cfg:
+                    model_dict[key] = raw_model_cfg[key]
             model_dict["use_td_force_input"] = use_td_force_input
             model_dict["use_td_fhat_input"] = use_td_fhat_input
             model_dict["use_acceleration_input"] = use_acceleration_input

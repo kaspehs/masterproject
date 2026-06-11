@@ -1,0 +1,112 @@
+method: standalone
+
+data:
+  downsample: true  # downsample trajectories before training
+  downsample_factor: 20
+  dataset_root: vivana_cfd_data_pipeline/generated/final_dataset
+
+model:
+  fluid_density: 1.0
+  diameter: 1.0
+  input_scaling_basis: structural_frequency  # structural_frequency | convective
+  reduced_velocity_scale: 10.0  # only used with structural_frequency scaling
+
+constraints:
+  force_coefficient_bound: 2.0  # tanh cap on force-coefficient output
+  force_regularization_weight: 0.0
+  force_regularization_norm: l1  # l1 | l2
+
+architecture:
+  backbone_type: pirate
+  residual_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  mlp_kwargs:
+    hidden: 128
+    layers: 2
+    activation: gelu
+  pirate_kwargs:
+    depth: 2
+    fourier_features: 64
+    sigma: 1.0
+    activation: gelu
+
+training:
+  batch_size: 256
+  max_grad_norm: 200.0
+  epochs: 500
+  output_init_mode: zero  # zero | tiny | standard
+
+optim:
+  lr: 0.001
+  optimizer: adam
+  weight_decay: 0.0
+  use_lr_scheduler: true
+  scheduler:
+    max_lr: 0.001
+    decay_rate: 0.99
+    warmup_fraction: 0.05
+    min_lr: 0.0001
+    scheduler_type: cosine
+
+loss:
+  one_step_state_weight: 1.0
+
+  multi_step_state_weight: 1.0
+  rollout_horizon_steps: 20
+  rollout_det_steps_final: 0
+  rollout_det_steps_warmup_epochs: 0
+  rollout_batch_size: 256
+  multi_step_amplitude_weight: 1.0
+  rollout_disp_std_p: 2.0  # exponent for displacement std error
+  rollout_disp_mean_in_std_loss: true  # include displacement mean error with std loss
+  multi_step_frequency_weight: 1.0
+  multi_step_frequency_loss: dominant_frequency  # spectral_amplitude | dominant_frequency
+  frequency_loss_peak_relative_bandwidth: 0.0  # 0.0 compares full non-DC spectrum
+  frequency_loss_use_hann_window: true
+  dominant_frequency_p: 1.0  # exponent for dominant-frequency error
+  dominant_frequency_peak_alpha: 12.0  # PSD peak-concentration exponent
+
+  use_gradient_normalization: true
+  gradnorm_alpha: 0.9
+  gradnorm_min_weight: 0.001
+  gradnorm_max_weight: 1000.0
+
+runtime:
+  device: cpu
+  num_workers: 4
+
+precision:
+  use_tf32: false
+  use_amp: false
+  amp_dtype: bf16
+
+compile:
+  use_compile: false
+  compile_mode: reduce-overhead
+
+logging:
+  run_dir_root: logs
+  run_name: null
+  append_timestamp: true
+  validate_every_epochs: 10
+  log_every_epochs: 5
+  print_every_epochs: 50
+  log_component_grad_norms: false
+  async_validation: false
+  async_validation_device: cpu
+  async_validation_num_workers: 0
+  async_validation_num_threads: 1
+  async_validation_max_concurrent: 6
+
+standalone:
+  latent_dim: 3
+  history_length: 50
+  encoder_type: gru
+  encoder_hidden: 128
+  encoder_layers: 1
+  encoder_dropout: 0.0
+  history_include_acceleration: true
+  latent_update_scheme: dt_scaled
+  latent_time_scale: auto

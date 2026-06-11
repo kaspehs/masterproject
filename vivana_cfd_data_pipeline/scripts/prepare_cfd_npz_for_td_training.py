@@ -15,7 +15,7 @@ for _path in (REPO_ROOT, DATA_ROOT):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from training.training_utils import resolve_td_memory_config, resolve_td_n_memory
+from vivana_cfd_data_pipeline.vivana_td.td_memory import resolve_td_memory_config, resolve_td_n_memory
 
 try:
     from tqdm.auto import tqdm

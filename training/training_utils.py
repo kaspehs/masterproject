@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib
 import math
 import warnings
@@ -14,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
-from torch.utils.tensorboard import SummaryWriter
 
 try:
     from scipy.signal import savgol_filter, welch
@@ -76,10 +77,8 @@ SIGNED_PHASE_CMAP = LinearSegmentedColormap.from_list(
 
 TD_CORRECTION_MODES = (
     "mean_only",
-    "mean_sigma_only",
     "fhat_only",
     "mean_fhat_only",
-    "mean_sigma_fhat",
 )
 TD_PHASE_INPUT_SOURCES = (
     "phi_vy",
@@ -99,7 +98,7 @@ TD_FORCE_INPUT_SOURCES = (
 def resolve_td_correction_mode(method_cfg: dict[str, Any]) -> str:
     raw_mode = method_cfg.get("correction_mode")
     if raw_mode is None or str(raw_mode).strip() == "":
-        return "mean_sigma_only" if bool(method_cfg.get("predict_sigma", False)) else "mean_only"
+        return "mean_only"
     mode = str(raw_mode).strip().lower()
     if mode not in TD_CORRECTION_MODES:
         raise ValueError(f"correction_mode must be one of {TD_CORRECTION_MODES}, got {raw_mode!r}.")
@@ -111,9 +110,9 @@ def td_correction_mode_flags(mode: str) -> dict[str, bool]:
     if key not in TD_CORRECTION_MODES:
         raise ValueError(f"Unknown TD correction mode {mode!r}.")
     return {
-        "mean_active": key in {"mean_only", "mean_sigma_only", "mean_fhat_only", "mean_sigma_fhat"},
-        "sigma_active": key in {"mean_sigma_only", "mean_sigma_fhat"},
-        "fhat_active": key in {"fhat_only", "mean_fhat_only", "mean_sigma_fhat"},
+        "mean_active": key in {"mean_only", "mean_fhat_only"},
+        "sigma_active": False,
+        "fhat_active": key in {"fhat_only", "mean_fhat_only"},
     }
 
 
@@ -196,35 +195,57 @@ def resolve_td_force_input_source(
     )
 
 
-def td_uses_head_specific_input_configs(*, correction_mode: str, shared_td_correction_trunk: bool) -> bool:
-    flags = td_correction_mode_flags(correction_mode)
-    return bool(flags["mean_active"] and flags["fhat_active"] and not shared_td_correction_trunk)
+def _resolve_td_force_input_source_from_config(cfg: dict[str, Any]) -> str:
+    has_total = "use_td_total_force_input" in cfg
+    has_fcv = "use_td_fcv_force_input" in cfg
+    if has_total or has_fcv:
+        use_total = bool(cfg.get("use_td_total_force_input", False))
+        use_fcv = bool(cfg.get("use_td_fcv_force_input", False))
+        if use_total and use_fcv:
+            raise ValueError("Only one of model.use_td_total_force_input and model.use_td_fcv_force_input can be true.")
+        if use_total:
+            return "total"
+        if use_fcv:
+            return "fcv"
+        return "none"
+    return resolve_td_force_input_source(cfg.get("td_force_input_source", cfg.get("use_td_force_input", False)))
 
 
-def _resolve_td_single_input_config(base_cfg: dict[str, Any], head_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+def _resolve_td_phase_input_source_from_config(cfg: dict[str, Any]) -> str:
+    has_phi = "use_phi_vy_input" in cfg
+    has_theta = "use_theta_input" in cfg
+    if has_phi or has_theta:
+        use_phi = bool(cfg.get("use_phi_vy_input", False))
+        use_theta = bool(cfg.get("use_theta_input", False))
+        if use_phi and use_theta:
+            return "both"
+        if use_phi:
+            return "phi_vy"
+        if use_theta:
+            return "theta"
+        return "none"
+    phase_raw = cfg.get("phase_input_source", None)
+    if phase_raw is None:
+        phase_raw = cfg.get("phi_input_source", None)
+    if phase_raw is None:
+        phase_raw = cfg.get("use_phi_input", False)
+    return resolve_td_phase_input_source(phase_raw)
+
+
+def _resolve_td_single_input_config(base_cfg: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(base_cfg)
-    if head_cfg:
-        cfg.update(head_cfg)
-    if head_cfg and "use_td_force_input" in head_cfg and "td_force_input_source" not in head_cfg:
-        td_force_raw = head_cfg["use_td_force_input"]
-    else:
-        td_force_raw = cfg.get("td_force_input_source", cfg.get("use_td_force_input", False))
-    if head_cfg and "use_phi_input" in head_cfg and "phi_input_source" not in head_cfg and "phase_input_source" not in head_cfg:
-        phase_raw = head_cfg["use_phi_input"]
-    else:
-        phase_raw = cfg.get("phase_input_source", None)
-        if phase_raw is None:
-            phase_raw = cfg.get("phi_input_source", None)
-        if phase_raw is None:
-            phase_raw = cfg.get("use_phi_input", False)
-    td_force_input_source = resolve_td_force_input_source(td_force_raw)
-    phase_input_source = resolve_td_phase_input_source(phase_raw)
+    td_force_input_source = _resolve_td_force_input_source_from_config(cfg)
+    phase_input_source = _resolve_td_phase_input_source_from_config(cfg)
     return {
         "use_td_force_input": td_force_input_source != "none",
         "td_force_input_source": td_force_input_source,
+        "use_td_total_force_input": td_force_input_source == "total",
+        "use_td_fcv_force_input": td_force_input_source == "fcv",
         "use_td_fhat_input": bool(cfg.get("use_td_fhat_input", False)),
         "use_acceleration_input": bool(cfg.get("use_acceleration_input", False)),
         "use_phi_input": phase_input_source != "none",
+        "use_phi_vy_input": phase_input_source in {"phi_vy", "both"},
+        "use_theta_input": phase_input_source in {"theta", "both"},
         "phase_input_source": phase_input_source,
         "phi_input_source": None if phase_input_source == "none" else phase_input_source,
         "use_sigma_inputs": bool(cfg.get("use_sigma_inputs", False)),
@@ -236,42 +257,25 @@ def resolve_td_input_configs(
     *,
     shared_td_correction_trunk: bool,
 ) -> dict[str, dict[str, Any]]:
-    correction_mode = resolve_td_correction_mode(method_cfg)
     base_cfg = {
         "use_td_force_input": method_cfg.get("use_td_force_input", False),
+        "td_force_input_source": method_cfg.get("td_force_input_source", None),
         "use_td_fhat_input": method_cfg.get("use_td_fhat_input", False),
         "use_acceleration_input": method_cfg.get("use_acceleration_input", False),
         "use_phi_input": method_cfg.get("use_phi_input", False),
         "phi_input_source": method_cfg.get("phi_input_source", None),
+        "phase_input_source": method_cfg.get("phase_input_source", None),
         "use_sigma_inputs": method_cfg.get("use_sigma_inputs", False),
     }
+    for key in ("use_td_total_force_input", "use_td_fcv_force_input", "use_phi_vy_input", "use_theta_input"):
+        if key in method_cfg:
+            base_cfg[key] = method_cfg[key]
     base_resolved = _resolve_td_single_input_config(base_cfg)
-    resolved = {
+    return {
         "mean": dict(base_resolved),
         "fhat": dict(base_resolved),
         "sigma": dict(base_resolved),
     }
-    if not td_uses_head_specific_input_configs(
-        correction_mode=correction_mode,
-        shared_td_correction_trunk=shared_td_correction_trunk,
-    ):
-        return resolved
-
-    raw_input_configs = method_cfg.get("input_configs", None)
-    if raw_input_configs is None:
-        return resolved
-    if not isinstance(raw_input_configs, dict):
-        raise ValueError("hnn.input_configs must be a mapping with optional 'mean' and 'fhat' entries.")
-    for head in ("mean", "fhat"):
-        raw_head = raw_input_configs.get(head, None)
-        if raw_head is None:
-            continue
-        if not isinstance(raw_head, dict):
-            raise ValueError(f"hnn.input_configs.{head} must be a mapping.")
-        resolved[head] = _resolve_td_single_input_config(base_cfg, dict(raw_head))
-    # Sigma is force-correction uncertainty; keep it aligned with the mean head.
-    resolved["sigma"] = dict(resolved["mean"])
-    return resolved
 
 
 def td_predict_sigma_from_mode(method_cfg: dict[str, Any]) -> bool:
@@ -295,7 +299,7 @@ def resolve_td_fhat_correction_bounds(method_cfg: dict[str, Any]) -> tuple[float
             return None
         if raw_min is None or raw_max is None:
             raise ValueError(
-                "Set both hnn.fhat_correction_bound_min and hnn.fhat_correction_bound_max, "
+                "Set both constraints.fhat_correction_bound_min and constraints.fhat_correction_bound_max, "
                 "or leave both null to use the Vivana-TD fhat bounds."
             )
         lo = float(raw_min)
@@ -304,19 +308,19 @@ def resolve_td_fhat_correction_bounds(method_cfg: dict[str, Any]) -> tuple[float
         raw_min = raw_bounds.get("min", raw_bounds.get("lower", None))
         raw_max = raw_bounds.get("max", raw_bounds.get("upper", None))
         if raw_min is None or raw_max is None:
-            raise ValueError("hnn.fhat_correction_bounds mapping must contain min/max or lower/upper.")
+            raise ValueError("constraints.fhat_correction_bounds mapping must contain min/max or lower/upper.")
         lo = float(raw_min)
         hi = float(raw_max)
     else:
         arr = np.asarray(raw_bounds, dtype=float).reshape(-1)
         if arr.size != 2:
-            raise ValueError("hnn.fhat_correction_bounds must be null or a two-value [min, max] sequence.")
+            raise ValueError("constraints.fhat_correction_bounds must be null or a two-value [min, max] sequence.")
         lo = float(arr[0])
         hi = float(arr[1])
     if not np.isfinite(lo) or not np.isfinite(hi):
-        raise ValueError("hnn.fhat_correction_bounds values must be finite.")
+        raise ValueError("constraints.fhat_correction_bounds values must be finite.")
     if lo < 0.0 or hi <= lo:
-        raise ValueError("hnn.fhat_correction_bounds must satisfy 0 <= min < max.")
+        raise ValueError("constraints.fhat_correction_bounds must satisfy 0 <= min < max.")
     return lo, hi
 
 
@@ -370,19 +374,21 @@ class DataConfig:
 class ModelConfig:
     rho: float = 1000.0
     D: float = 0.1
-    structural_mass: float = 16.79
-    Ca: float = 1.0
-    k: float = 1218.0
-    damping_c: float = 1e-4
-    force_output: str = "force"  # "force" or "coefficient"
+    correction_mode: str = "mean_only"
     coefficient_output_bound: float | None = None
     use_reduced_velocity: bool = True
+    use_td_total_force_input: bool = False
+    use_td_fcv_force_input: bool = False
     use_td_force_input: bool | str = False
+    td_force_input_source: str | None = None
     use_td_fhat_input: bool = False
     use_acceleration_input: bool = False
-    sigma_min: float = 1e-6
-    corr_init_mode: str = "zero"  # "zero" | "tiny" | "standard"
-    corr_init_tiny_std: float = 1e-4
+    use_phi_vy_input: bool = False
+    use_theta_input: bool = False
+    use_phi_input: bool | str = False
+    phi_input_source: str | None = None
+    phase_input_source: str | None = None
+    use_sigma_inputs: bool = False
     q_scale: float | None = None
     p_scale: float | None = None
     ur_scale: float | None = None
@@ -446,6 +452,8 @@ class TrainingConfig:
     max_grad_norm: float = 1e4
     batch_size: int = 32
     epochs: int = 2000
+    corr_init_mode: str = "zero"  # "zero" | "tiny" | "standard"
+    corr_init_tiny_std: float = 1e-4
 
 @dataclass
 class OptimConfig:
@@ -467,25 +475,15 @@ class LossConfig:
     num_sine_test: int = 0
     mean_reg: float = 0.0
     mean_reg_norm: str = "l1"  # "l1" or "l2"
-    sigma_reg: float = 1e-2
-    sigma_reg_norm: str = "l2"  # "l1" or "l2"
     fhat_reg: float = 0.0
     fhat_reg_norm: str = "l2"  # "l1" or "l2"
-    ur_bin_size: float = 1e-6
-    normalize_by_ur_bin_std: bool = False
-    ur_bin_scale_eps: float = 1e-6
     state_weight: float = 1.0
     rollout_det_weight: float = 0.0
     rollout_det_steps: int = 0
-    rollout_loss_mode: str = "deterministic"  # "deterministic" | "stochastic_nll" | "stochastic_mse"
-    rollout_stochastic_samples: int = 1
     rollout_det_steps_final: int = 0  # <=0 keeps rollout_det_steps fixed
     rollout_det_steps_warmup_epochs: int = 0
     rollout_det_batch_size: int = 0  # <=0 -> fallback to training.batch_size
-    rollout_det_amplitude_normalized_mse: bool = False  # additionally RMS-normalize the fixed-normalized rollout MSE
-    rollout_relative_losses: bool | None = None  # None -> preserve legacy per-loss relative/absolute defaults
     rollout_disp_std_weight: float = 0.0
-    rollout_disp_std_normalize_by_true: bool | None = None  # None -> reuse rollout_det_amplitude_normalized_mse
     rollout_disp_std_p: float = 2.0
     rollout_disp_mean_in_std_loss: bool = True  # add displacement-mean error under rollout_disp_std_weight
     rollout_disp_spectral_weight: float | None = None  # preferred name; falls back to rollout_disp_psd_weight when unset
@@ -501,10 +499,40 @@ class LossConfig:
     gradnorm_min_weight: float = 0.1
     gradnorm_max_weight: float = 10.0
     gradnorm_update_every_steps: int = 1
-    use_force_data_loss: bool = False
-    force_data_weight: float = 1.0
-    symmetry_weight: float = 0.0
-    symmetry_norm: str = "l2"  # "l2" (default) or "l1"
+
+@dataclass
+class ConstraintsConfig:
+    # Optional tanh cap on coefficient-mode force output.
+    coefficient_output_bound: float | None = None
+    # Regularization of learned force/correction outputs.
+    mean_reg: float = 0.0
+    mean_reg_norm: str = "l1"  # "l1" or "l2"
+    fhat_reg: float = 0.0
+    fhat_reg_norm: str = "l2"  # "l1" or "l2"
+    # Optional base [min, max] interval used to bound corrected fhat.
+    # None means use the Vivana-TD fhat_min/fhat_max values.
+    fhat_correction_bounds: Any = None
+    fhat_correction_bound_min: float | None = None
+    fhat_correction_bound_max: float | None = None
+    # The final corrected-fhat interval is [base_min / multiplier, base_max * multiplier].
+    fhat_bound_multiplier: float = 1.5
+    # Debug option: force correction heads to zero so validation reduces to pure Vivana-TD.
+    force_zero_output: bool = False
+
+@dataclass
+class VivanaTDConfig:
+    # Vivana-TD baseline parameters used by PHNN TD-correction training.
+    td_cv: float = 1.2
+    td_cd: float = 1.1
+    td_ca: float = 1.0
+    td_fhat0: float = 0.18
+    td_fhat_min: float = 0.11
+    td_fhat_max: float = 0.26
+    td_n_memory: int = 500
+    # fixed_n_memory | fixed_tau | tau_over_tref
+    td_memory_mode: str = "fixed_n_memory"
+    td_tau_over_tref: float = 4.0
+    td_memory_tau_s: float | None = None
 
 @dataclass
 class RuntimeConfig:
@@ -529,40 +557,36 @@ class MonitoringConfig:
     print_every_epochs: int = 1
     log_component_grad_norms: bool = False
     log_extra_validation_metrics: bool = False
-    validation_samples_per_ur: int = 1
-    final_rollout_all_validation: bool = False
     async_validation: bool = False
     async_validation_device: str = "cpu"
     async_validation_num_workers: int = 0
     async_validation_num_threads: int = 4
     async_validation_max_concurrent: int = 1
-    surrogate_validation_enabled: bool = True
-    surrogate_validation_npz: str = "vivana_cfd_data_pipeline/outputs/analysis/surrogate_validation_points.npz"
-    surrogate_validation_tag: str = "val_surrogate"
-    combined_validation_tag: str = "val"
 
 @dataclass
 class LoggingConfig:
-    run_dir_root: str = "HNNruns"
+    run_dir_root: str = "logs"
     run_name: str | None = None
     append_timestamp: bool = True
 
 @dataclass
 class Config:
-    method: str = "hnn"
+    method: str = "correction"
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     loss: LossConfig = field(default_factory=LossConfig)
+    constraints: ConstraintsConfig = field(default_factory=ConstraintsConfig)
+    vivana_td: VivanaTDConfig = field(default_factory=VivanaTDConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     compile: CompileConfig = field(default_factory=CompileConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    hnn: dict[str, Any] = field(default_factory=dict)
-    latent_rnn: dict[str, Any] = field(default_factory=dict)
+    correction: dict[str, Any] = field(default_factory=dict)
+    standalone: dict[str, Any] = field(default_factory=dict)
 
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
@@ -599,25 +623,200 @@ def _filter_dataclass_kwargs(cls: type[Any], raw_cfg: dict[str, Any]) -> dict[st
     return {key: value for key, value in raw_cfg.items() if key in allowed}
 
 
+def normalize_method_name(method: Any) -> str:
+    key = str(method or "").strip().lower()
+    aliases = {
+        "hnn": "correction",
+        "phnn": "correction",
+        "td_correction": "correction",
+        "latent_rnn": "standalone",
+        "scratch_latent_rnn": "standalone",
+    }
+    return aliases.get(key, key)
+
+
+def _normalize_public_config_value(canonical_key: str, value: Any) -> Any:
+    if canonical_key == "input_scaling_mode":
+        key = str(value).strip().lower()
+        aliases = {
+            "structural_frequency": "current",
+            "structural": "current",
+            "natural_frequency": "current",
+            "current": "current",
+            "convective": "convective",
+        }
+        return aliases.get(key, value)
+    if canonical_key == "correction_mode":
+        key = str(value).strip().lower()
+        aliases = {
+            "force": "mean_only",
+            "force_correction": "mean_only",
+            "mean": "mean_only",
+            "mean_only": "mean_only",
+            "frequency": "fhat_only",
+            "frequency_correction": "fhat_only",
+            "fhat": "fhat_only",
+            "fhat_only": "fhat_only",
+            "combined": "mean_fhat_only",
+            "combined_correction": "mean_fhat_only",
+            "force_frequency": "mean_fhat_only",
+            "mean_fhat_only": "mean_fhat_only",
+        }
+        return aliases.get(key, value)
+    if canonical_key == "rollout_disp_spectral_loss":
+        key = str(value).strip().lower()
+        aliases = {
+            "spectral_amplitude": "psd",
+            "spectral_amp": "psd",
+            "psd": "psd",
+            "dominant_frequency": "dominant_frequency",
+            "dominant_freq": "dominant_frequency",
+        }
+        return aliases.get(key, value)
+    return value
+
+
+def _config_values_equal(left: Any, right: Any, *, canonical_key: str) -> bool:
+    left_norm = _normalize_public_config_value(canonical_key, left)
+    right_norm = _normalize_public_config_value(canonical_key, right)
+    try:
+        return bool(left_norm == right_norm)
+    except ValueError:
+        return False
+
+
+def _apply_public_key_aliases(
+    cfg: dict[str, Any],
+    *,
+    section: str,
+    aliases: dict[str, str],
+) -> None:
+    for public_key, internal_key in aliases.items():
+        if public_key not in cfg:
+            continue
+        public_value = _normalize_public_config_value(internal_key, cfg[public_key])
+        if internal_key in cfg:
+            internal_value = cfg[internal_key]
+            if not _config_values_equal(internal_value, public_value, canonical_key=internal_key):
+                raise ValueError(
+                    f"Conflicting config aliases in {section}: "
+                    f"{internal_key}={internal_value!r} and {public_key}={cfg[public_key]!r}."
+                )
+            continue
+        cfg[internal_key] = public_value
+
+
 def parse_config(raw: dict[str, Any] | Any) -> Config:
     raw_cfg = _coerce_config_dict(raw)
-    method = raw_cfg.get("method", "hnn")
+    method = normalize_method_name(raw_cfg.get("method", "correction"))
     data_cfg = dict(raw_cfg.get("data", {}) or {})
     model_cfg = dict(raw_cfg.get("model", {}) or {})
     architecture_cfg = dict(raw_cfg.get("architecture", {}) or {})
     training_cfg = dict(raw_cfg.get("training", {}) or {})
     optim_cfg = dict(raw_cfg.get("optim", {}) or {})
     loss_cfg = dict(raw_cfg.get("loss", {}) or {})
+    constraints_cfg = dict(raw_cfg.get("constraints", {}) or {})
+    vivana_td_cfg = dict(raw_cfg.get("vivana_td", {}) or {})
     runtime_cfg = dict(raw_cfg.get("runtime", {}) or {})
     precision_cfg = dict(raw_cfg.get("precision", {}) or {})
     compile_cfg = dict(raw_cfg.get("compile", {}) or {})
-    monitoring_cfg = dict(raw_cfg.get("monitoring", raw_cfg.get("train_logging", {})) or {})
     logging_cfg = dict(raw_cfg.get("logging", {}) or {})
-    hnn_block = dict(raw_cfg.get("hnn", {}) or {})
-    latent_rnn_block = dict(raw_cfg.get("latent_rnn", {}) or {})
+    monitoring_cfg = dict(raw_cfg.get("monitoring", raw_cfg.get("train_logging", {})) or {})
+    correction_block = dict(raw_cfg.get("correction", raw_cfg.get("hnn", {})) or {})
+    standalone_block = dict(raw_cfg.get("standalone", raw_cfg.get("latent_rnn", {})) or {})
 
-    method_key = str(method).strip().lower()
-    if method_key in {"hnn", "phnn"}:
+    data_aliases = {
+        "downsample": "reduce_time",
+        "downsample_factor": "reduction_factor",
+        "dataset_root": "train_series_dir",
+    }
+    model_aliases = {
+        "fluid_density": "rho",
+        "diameter": "D",
+        "input_scaling_basis": "input_scaling_mode",
+        "reduced_velocity_scale": "ur_scale",
+        "correction_strategy": "correction_mode",
+        "use_baseline_frequency_input": "use_td_fhat_input",
+        "use_memory_std_inputs": "use_sigma_inputs",
+    }
+    constraints_aliases = {
+        "force_coefficient_bound": "coefficient_output_bound",
+        "force_regularization_weight": "mean_reg",
+        "force_regularization_norm": "mean_reg_norm",
+        "frequency_regularization_weight": "fhat_reg",
+        "frequency_regularization_norm": "fhat_reg_norm",
+        "frequency_bound_base_interval": "fhat_correction_bounds",
+        "frequency_bound_multiplier": "fhat_bound_multiplier",
+        "debug_zero_correction_output": "force_zero_output",
+    }
+    architecture_aliases = {
+        "backbone_type": "force_net_type",
+        "pirate_kwargs": "pirate_force_kwargs",
+    }
+    training_aliases = {
+        "output_init_mode": "corr_init_mode",
+        "output_init_tiny_std": "corr_init_tiny_std",
+    }
+    loss_aliases = {
+        "one_step_state_weight": "state_weight",
+        "multi_step_state_weight": "rollout_det_weight",
+        "rollout_horizon_steps": "rollout_det_steps",
+        "rollout_batch_size": "rollout_det_batch_size",
+        "multi_step_amplitude_weight": "rollout_disp_std_weight",
+        "multi_step_frequency_weight": "rollout_disp_spectral_weight",
+        "multi_step_frequency_loss": "rollout_disp_spectral_loss",
+        "frequency_loss_peak_relative_bandwidth": "rollout_disp_psd_peak_rel_bandwidth",
+        "frequency_loss_use_hann_window": "rollout_disp_psd_use_hann_window",
+        "dominant_frequency_p": "rollout_disp_freq_p",
+        "dominant_frequency_peak_alpha": "rollout_disp_freq_alpha",
+        "use_gradient_normalization": "use_gradnorm",
+    }
+    vivana_td_aliases = {
+        "cv": "td_cv",
+        "cd": "td_cd",
+        "ca": "td_ca",
+        "fhat0": "td_fhat0",
+        "fhat_min": "td_fhat_min",
+        "fhat_max": "td_fhat_max",
+        "n_memory": "td_n_memory",
+        "memory_mode": "td_memory_mode",
+        "tau_over_tref": "td_tau_over_tref",
+        "memory_tau_s": "td_memory_tau_s",
+    }
+    standalone_aliases = {
+        "history_length": "encoder_length",
+        "history_include_acceleration": "encoder_include_acceleration",
+        "latent_update_scheme": "latent_update",
+    }
+    _apply_public_key_aliases(data_cfg, section="data", aliases=data_aliases)
+    _apply_public_key_aliases(model_cfg, section="model", aliases=model_aliases)
+    _apply_public_key_aliases(architecture_cfg, section="architecture", aliases=architecture_aliases)
+    _apply_public_key_aliases(training_cfg, section="training", aliases=training_aliases)
+    _apply_public_key_aliases(loss_cfg, section="loss", aliases=loss_aliases)
+    _apply_public_key_aliases(vivana_td_cfg, section="vivana_td", aliases=vivana_td_aliases)
+    _apply_public_key_aliases(standalone_block, section="standalone", aliases=standalone_aliases)
+    for cfg, section in (
+        (constraints_cfg, "constraints"),
+        (model_cfg, "model"),
+        (loss_cfg, "loss"),
+        (correction_block, "correction"),
+    ):
+        _apply_public_key_aliases(cfg, section=section, aliases=constraints_aliases)
+    for cfg, section in ((model_cfg, "model"), (correction_block, "correction")):
+        _apply_public_key_aliases(cfg, section=section, aliases=model_aliases)
+    _apply_public_key_aliases(correction_block, section="correction", aliases=vivana_td_aliases)
+    for cfg in (model_cfg, correction_block):
+        for canonical_key in ("input_scaling_mode", "correction_mode"):
+            if canonical_key in cfg:
+                cfg[canonical_key] = _normalize_public_config_value(canonical_key, cfg[canonical_key])
+    if "rollout_disp_spectral_loss" in loss_cfg:
+        loss_cfg["rollout_disp_spectral_loss"] = _normalize_public_config_value(
+            "rollout_disp_spectral_loss",
+            loss_cfg["rollout_disp_spectral_loss"],
+        )
+
+    method_key = normalize_method_name(method)
+    if method_key == "correction":
         forbidden = sorted(key for key in _PHNN_HISTORY_MODEL_KEYS if key in model_cfg)
         if forbidden:
             joined = ", ".join(forbidden)
@@ -671,14 +870,6 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
     pirate_kwargs.update(pirate_overrides)
     architecture_cfg["pirate_force_kwargs"] = pirate_kwargs
 
-    if "normalize_by_ur_bin_std" not in loss_cfg:
-        loss_cfg["normalize_by_ur_bin_std"] = bool(
-            loss_cfg.pop("normalize_residual_by_ur_bin_std", False)
-            or loss_cfg.pop("normalize_rollout_by_ur_bin_std", False)
-        )
-    else:
-        loss_cfg.pop("normalize_residual_by_ur_bin_std", None)
-        loss_cfg.pop("normalize_rollout_by_ur_bin_std", None)
 
     # Backwards compatible mapping: allow legacy keys to live under training:
     legacy_training = dict(training_cfg)
@@ -694,24 +885,13 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
         "num_sine_test",
         "mean_reg",
         "mean_reg_norm",
-        "sigma_reg",
-        "force_reg",
-        "sigma_reg_norm",
-        "ur_bin_size",
-        "normalize_by_ur_bin_std",
-        "ur_bin_scale_eps",
         "state_weight",
         "rollout_det_weight",
         "rollout_det_steps",
-        "rollout_loss_mode",
-        "rollout_stochastic_samples",
         "rollout_det_steps_final",
         "rollout_det_steps_warmup_epochs",
         "rollout_det_batch_size",
-        "rollout_det_amplitude_normalized_mse",
-        "rollout_relative_losses",
         "rollout_disp_std_weight",
-        "rollout_disp_std_normalize_by_true",
         "rollout_disp_std_p",
         "rollout_disp_spectral_weight",
         "rollout_disp_spectral_loss",
@@ -726,10 +906,6 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
         "gradnorm_min_weight",
         "gradnorm_max_weight",
         "gradnorm_update_every_steps",
-        "use_force_data_loss",
-        "force_data_weight",
-        "symmetry_weight",
-        "symmetry_norm",
     }
     runtime_keys = {"device", "num_workers"}
     precision_keys = {"use_tf32", "use_amp", "amp_dtype"}
@@ -741,8 +917,15 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
         "print_every_epochs",
         "log_component_grad_norms",
         "log_extra_validation_metrics",
-        "validation_samples_per_ur",
+        "async_validation",
+        "async_validation_device",
+        "async_validation_num_workers",
+        "async_validation_num_threads",
+        "async_validation_max_concurrent",
     }
+    for key in monitoring_keys:
+        if key in logging_cfg and key not in monitoring_cfg:
+            monitoring_cfg[key] = logging_cfg[key]
 
     for key, value in legacy_training.items():
         if key in optim_keys and key not in optim_cfg:
@@ -758,10 +941,96 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
         elif key in monitoring_keys and key not in monitoring_cfg:
             monitoring_cfg[key] = value
 
-    training_cfg = {k: v for k, v in training_cfg.items() if k in {"batch_size", "max_grad_norm", "epochs"}}
+    constraint_keys = {
+        "coefficient_output_bound",
+        "mean_reg",
+        "mean_reg_norm",
+        "fhat_reg",
+        "fhat_reg_norm",
+        "fhat_correction_bounds",
+        "fhat_correction_bound_min",
+        "fhat_correction_bound_max",
+        "fhat_bound_multiplier",
+        "force_zero_output",
+    }
+    for key in constraint_keys:
+        if key in model_cfg and key not in constraints_cfg:
+            constraints_cfg[key] = model_cfg[key]
+        if key in loss_cfg and key not in constraints_cfg:
+            constraints_cfg[key] = loss_cfg[key]
+        if key in correction_block and key not in constraints_cfg:
+            constraints_cfg[key] = correction_block[key]
+
+    vivana_td_keys = {
+        "td_cv",
+        "td_cd",
+        "td_ca",
+        "td_fhat0",
+        "td_fhat_min",
+        "td_fhat_max",
+        "td_n_memory",
+        "td_memory_mode",
+        "td_tau_over_tref",
+        "td_memory_tau_s",
+    }
+    for key in vivana_td_keys:
+        if key in correction_block and key not in vivana_td_cfg:
+            vivana_td_cfg[key] = correction_block[key]
+
+    model_input_keys = {
+        "correction_mode",
+        "use_td_total_force_input",
+        "use_td_fcv_force_input",
+        "use_td_force_input",
+        "td_force_input_source",
+        "use_td_fhat_input",
+        "use_acceleration_input",
+        "use_phi_vy_input",
+        "use_theta_input",
+        "use_phi_input",
+        "phi_input_source",
+        "phase_input_source",
+        "use_sigma_inputs",
+    }
+    for key in model_input_keys:
+        if key in correction_block and key not in model_cfg:
+            model_cfg[key] = correction_block[key]
+
+    for source_cfg in (correction_block, standalone_block, model_cfg):
+        for key in ("corr_init_mode", "corr_init_tiny_std"):
+            if key in source_cfg and key not in training_cfg:
+                training_cfg[key] = source_cfg[key]
+
+    if "use_td_force_input" in model_cfg and not (
+        "use_td_total_force_input" in model_cfg or "use_td_fcv_force_input" in model_cfg
+    ):
+        legacy_force_source = resolve_td_force_input_source(model_cfg.get("use_td_force_input", False))
+        model_cfg["use_td_total_force_input"] = legacy_force_source == "total"
+        model_cfg["use_td_fcv_force_input"] = legacy_force_source == "fcv"
+    if (
+        "td_force_input_source" in model_cfg
+        and "use_td_total_force_input" not in model_cfg
+        and "use_td_fcv_force_input" not in model_cfg
+    ):
+        legacy_force_source = resolve_td_force_input_source(model_cfg.get("td_force_input_source", False))
+        model_cfg["use_td_total_force_input"] = legacy_force_source == "total"
+        model_cfg["use_td_fcv_force_input"] = legacy_force_source == "fcv"
+    has_legacy_phase = any(key in model_cfg for key in ("use_phi_input", "phi_input_source", "phase_input_source"))
+    if has_legacy_phase and not ("use_phi_vy_input" in model_cfg or "use_theta_input" in model_cfg):
+        legacy_phase_source = _resolve_td_phase_input_source_from_config(model_cfg)
+        model_cfg["use_phi_vy_input"] = legacy_phase_source in {"phi_vy", "both"}
+        model_cfg["use_theta_input"] = legacy_phase_source in {"theta", "both"}
+
+    training_cfg = {
+        k: v
+        for k, v in training_cfg.items()
+        if k in {"batch_size", "max_grad_norm", "epochs", "corr_init_mode", "corr_init_tiny_std"}
+    }
 
     if "input_scaling_mode" in model_cfg:
         model_cfg["input_scaling_mode"] = resolve_phnn_input_scaling_mode(model_cfg["input_scaling_mode"])
+    if "correction_mode" in model_cfg:
+        model_cfg["correction_mode"] = resolve_td_correction_mode(model_cfg)
 
     data = DataConfig(**_filter_dataclass_kwargs(DataConfig, data_cfg))
     model = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_cfg))
@@ -772,10 +1041,9 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
     scheduler = SchedulerConfig(**_filter_dataclass_kwargs(SchedulerConfig, dict(scheduler_dict)))
     optim_fields = _filter_dataclass_kwargs(OptimConfig, {k: v for k, v in optim_cfg.items() if k != "scheduler"})
     optim = OptimConfig(**optim_fields, scheduler=scheduler)
-    if "sigma_reg" not in loss_cfg and "force_reg" in loss_cfg:
-        loss_cfg["sigma_reg"] = loss_cfg["force_reg"]
-    loss_cfg.pop("force_reg", None)
     loss = LossConfig(**_filter_dataclass_kwargs(LossConfig, loss_cfg))
+    constraints = ConstraintsConfig(**_filter_dataclass_kwargs(ConstraintsConfig, constraints_cfg))
+    vivana_td = VivanaTDConfig(**_filter_dataclass_kwargs(VivanaTDConfig, vivana_td_cfg))
     runtime = RuntimeConfig(**_filter_dataclass_kwargs(RuntimeConfig, runtime_cfg))
     precision = PrecisionConfig(**_filter_dataclass_kwargs(PrecisionConfig, precision_cfg))
     compile_cfg_obj = CompileConfig(**_filter_dataclass_kwargs(CompileConfig, compile_cfg))
@@ -795,138 +1063,23 @@ def parse_config(raw: dict[str, Any] | Any) -> Config:
     monitoring = MonitoringConfig(**_filter_dataclass_kwargs(MonitoringConfig, monitoring_cfg))
     logging = LoggingConfig(**_filter_dataclass_kwargs(LoggingConfig, logging_cfg))
     return Config(
-        method=str(method),
+        method=method_key,
         data=data,
         model=model,
         architecture=architecture,
         training=training,
         optim=optim,
         loss=loss,
+        constraints=constraints,
+        vivana_td=vivana_td,
         runtime=runtime,
         precision=precision,
         compile=compile_cfg_obj,
         monitoring=monitoring,
         logging=logging,
-        hnn=hnn_block,
-        latent_rnn=latent_rnn_block,
+        correction=correction_block,
+        standalone=standalone_block,
     )
-
-
-def _ur_bin_id(value: float, ur_bin_size: float) -> int:
-    return int(np.rint(float(value) / float(ur_bin_size)))
-
-
-def build_ur_bin_state_scale_info_from_dataset(
-    dataset: Any,
-    *,
-    ur_tensor_index: int,
-    state_tensor_indices: Sequence[int],
-    ur_bin_size: float,
-    eps: float = 1e-6,
-) -> dict[str, Any]:
-    cache_key = (
-        "ur_bin_state_scales:"
-        f"{int(ur_tensor_index)}:"
-        f"{','.join(str(int(idx)) for idx in state_tensor_indices)}:"
-        f"{float(ur_bin_size):.12g}:"
-        f"{float(eps):.12g}"
-    )
-    cache = getattr(dataset, "_codex_cache", None)
-    if isinstance(cache, dict) and cache_key in cache:
-        return dict(cache[cache_key])
-
-    stats_by_bin: dict[int, dict[str, Any]] = {}
-    global_count = 0
-    global_sum = np.zeros(2, dtype=np.float64)
-    global_sumsq = np.zeros(2, dtype=np.float64)
-
-    def _accumulate(ds: Any) -> None:
-        nonlocal global_count, global_sum, global_sumsq
-        if isinstance(ds, ConcatDataset):
-            for subdataset in ds.datasets:
-                _accumulate(subdataset)
-            return
-        if not isinstance(ds, TensorDataset):
-            raise TypeError(f"Unsupported dataset type for U_r bin scales: {type(ds)!r}")
-        ur_tensor = ds.tensors[int(ur_tensor_index)]
-        ur_vals = ur_tensor.reshape(ur_tensor.shape[0], -1)[:, 0].detach().cpu().numpy()
-        state_arrays = [
-            ds.tensors[int(idx)].reshape(ds.tensors[int(idx)].shape[0], -1)[:, :2].detach().cpu().numpy()
-            for idx in state_tensor_indices
-        ]
-        repeated_ur = np.repeat(ur_vals, len(state_arrays))
-        stacked_states = np.concatenate(state_arrays, axis=0)
-        for ur_val, state_vec in zip(repeated_ur, stacked_states):
-            key = _ur_bin_id(float(ur_val), ur_bin_size)
-            stat = stats_by_bin.setdefault(
-                key,
-                {"count": 0, "sum": np.zeros(2, dtype=np.float64), "sumsq": np.zeros(2, dtype=np.float64)},
-            )
-            vec = np.asarray(state_vec, dtype=np.float64)
-            stat["count"] += 1
-            stat["sum"] += vec
-            stat["sumsq"] += vec * vec
-            global_count += 1
-            global_sum += vec
-            global_sumsq += vec * vec
-
-    def _finalize(count: int, sum_vec: np.ndarray, sumsq_vec: np.ndarray) -> np.ndarray:
-        denom = float(max(int(count), 1))
-        mean = sum_vec / denom
-        var = np.maximum(sumsq_vec / denom - mean * mean, 0.0)
-        return np.sqrt(var)
-
-    _accumulate(dataset)
-    global_scale = _finalize(global_count, global_sum, global_sumsq)
-    global_scale = np.maximum(global_scale, float(eps))
-    by_bin: dict[str, list[float]] = {}
-    for key, stat in stats_by_bin.items():
-        scale = _finalize(int(stat["count"]), stat["sum"], stat["sumsq"])
-        if not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
-            scale = global_scale.copy()
-        scale = np.maximum(scale, float(eps))
-        by_bin[str(int(key))] = [float(scale[0]), float(scale[1])]
-    out = {
-        "global": [float(global_scale[0]), float(global_scale[1])],
-        "by_bin": by_bin,
-    }
-    if cache is None or not isinstance(cache, dict):
-        cache = {}
-        setattr(dataset, "_codex_cache", cache)
-    cache[cache_key] = dict(out)
-    return out
-
-
-def lookup_ur_bin_state_scale_tensor(
-    ur_values: torch.Tensor | np.ndarray | float | None,
-    *,
-    scale_info: dict[str, Any] | None,
-    ur_bin_size: float,
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    if not scale_info:
-        return torch.ones((int(batch_size), 2), device=device, dtype=dtype)
-    global_scale = np.asarray(scale_info.get("global", [1.0, 1.0]), dtype=np.float64).reshape(2)
-    by_bin = dict(scale_info.get("by_bin", {}) or {})
-    if ur_values is None:
-        scale_arr = np.repeat(global_scale.reshape(1, 2), int(batch_size), axis=0)
-        return torch.as_tensor(scale_arr, device=device, dtype=dtype)
-    if torch.is_tensor(ur_values):
-        ur_flat = ur_values.reshape(-1).detach().cpu().numpy()
-    else:
-        ur_flat = np.asarray(ur_values, dtype=np.float64).reshape(-1)
-    if ur_flat.size == 1 and int(batch_size) > 1:
-        ur_flat = np.repeat(ur_flat, int(batch_size))
-    scales: list[list[float]] = []
-    for ur_val in ur_flat[: int(batch_size)]:
-        key = str(_ur_bin_id(float(ur_val), ur_bin_size))
-        scale = by_bin.get(key, global_scale.tolist())
-        scales.append([float(scale[0]), float(scale[1])])
-    if len(scales) < int(batch_size):
-        scales.extend([global_scale.tolist()] * (int(batch_size) - len(scales)))
-    return torch.as_tensor(scales, device=device, dtype=dtype)
 
 
 def scaled_residual_loss_per_sample(
@@ -936,8 +1089,6 @@ def scaled_residual_loss_per_sample(
     reduced_velocity: torch.Tensor | np.ndarray | float | None = None,
     *,
     history_context: torch.Tensor | None = None,
-    ur_bin_state_scale_info: dict[str, Any] | None = None,
-    ur_bin_size: float = 1e-6,
 ) -> torch.Tensor:
     batch_size = int(zi.shape[0])
     if model.use_stochastic_process_noise:
@@ -947,18 +1098,6 @@ def scaled_residual_loss_per_sample(
             reduced_velocity=reduced_velocity,
             history_context=history_context,
         )
-        if ur_bin_state_scale_info is not None:
-            state_scale = lookup_ur_bin_state_scale_tensor(
-                reduced_velocity,
-                scale_info=ur_bin_state_scale_info,
-                ur_bin_size=ur_bin_size,
-                batch_size=batch_size,
-                device=innovation.device,
-                dtype=innovation.dtype,
-            )
-            p_scale = torch.clamp(state_scale[..., 1:2], min=1e-12)
-            innovation = innovation / p_scale
-            var = var / torch.clamp(p_scale * p_scale, min=1e-12)
         nll = 0.5 * (innovation * innovation / var + torch.log(var))
         return nll.squeeze(-1)
 
@@ -978,16 +1117,6 @@ def scaled_residual_loss_per_sample(
         )
         res_scaled = res_scaled.clone()
         res_scaled[..., 1:2] = res_scaled[..., 1:2] / torch.clamp(f0, min=1e-12)
-    if ur_bin_state_scale_info is not None:
-        state_scale = lookup_ur_bin_state_scale_tensor(
-            reduced_velocity,
-            scale_info=ur_bin_state_scale_info,
-            ur_bin_size=ur_bin_size,
-            batch_size=batch_size,
-            device=res_scaled.device,
-            dtype=res_scaled.dtype,
-        )
-        res_scaled = res_scaled / torch.clamp(state_scale, min=1e-12)
     return torch.sum(res_scaled * res_scaled, dim=1)
 
 
@@ -1023,9 +1152,6 @@ def log_validation_epoch(
     *,
     log_extra_metrics: bool = False,
     log_metrics: bool = True,
-    rollout_stochastic: bool = False,
-    rollout_noise_scale: float = 1.0,
-    rollout_seed: int | None = None,
     tag_prefix: str = "val/rollout",
     step: int | None = None,
     title_suffix: str = "",
@@ -1042,9 +1168,6 @@ def log_validation_epoch(
         D,
         k,
         device,
-        stochastic=rollout_stochastic,
-        rollout_seed=rollout_seed,
-        noise_scale=rollout_noise_scale,
     )
     metrics = compute_validation_metrics(
         model=model,
@@ -1061,9 +1184,6 @@ def log_validation_epoch(
         device=device,
         log_extra_metrics=log_extra_metrics,
         rollout=rollout,
-        rollout_stochastic=rollout_stochastic,
-        rollout_noise_scale=rollout_noise_scale,
-        rollout_seed=rollout_seed,
     )
     if torch.is_tensor(reduced_velocity):
         reduced_velocity_scalar = float(reduced_velocity.reshape(-1)[0].detach().cpu())
@@ -1165,9 +1285,6 @@ def compute_validation_metrics(
     device: torch.device,
     log_extra_metrics: bool = False,
     rollout: dict[str, np.ndarray] | None = None,
-    rollout_stochastic: bool = False,
-    rollout_noise_scale: float = 1.0,
-    rollout_seed: int | None = None,
 ) -> dict[str, float]:
     if rollout is None:
         rollout = rollout_model(
@@ -1181,9 +1298,6 @@ def compute_validation_metrics(
             D,
             k,
             device,
-            stochastic=rollout_stochastic,
-            rollout_seed=rollout_seed,
-            noise_scale=rollout_noise_scale,
         )
     metrics: dict[str, float] = {}
 
@@ -2172,7 +2286,6 @@ class PHVIV(nn.Module):
         q_scale=0.1,
         p_scale=10.0,
         damping_c: float | None = None,
-        force_output: str = "force",
         coefficient_output_bound: float | None = None,
         use_fourier_features: bool = False,
         fourier_features: int = 64,
@@ -2184,8 +2297,8 @@ class PHVIV(nn.Module):
         use_phi_input: bool | str = False,
         phi_input_source: str | None = None,
         use_sigma_inputs: bool = False,
-        use_stochastic_process_noise: bool = True,
-        sigma_min: float = 1e-6,
+        use_stochastic_process_noise: bool = False,
+        sigma_min: float = 0.0,
         ur_scale: float | None = None,
         input_scaling_mode: str = "current",
         force_net_type: str | None = None,
@@ -2204,10 +2317,7 @@ class PHVIV(nn.Module):
         self.D = D
         self.q_scale = q_scale
         self.p_scale = p_scale
-        force_output = str(force_output).strip().lower()
-        if force_output not in {"force", "coefficient"}:
-            raise ValueError("force_output must be one of: force, coefficient")
-        self.force_output = force_output
+        self.force_output = "coefficient"
         if coefficient_output_bound is None:
             self.coefficient_output_bound = None
         else:
@@ -2229,6 +2339,8 @@ class PHVIV(nn.Module):
             "use_td_fhat_input": bool(use_td_fhat_input),
             "use_acceleration_input": bool(use_acceleration_input),
             "use_phi_input": resolved_phase_input_source != "none",
+            "use_phi_vy_input": resolved_phase_input_source in {"phi_vy", "both"},
+            "use_theta_input": resolved_phase_input_source in {"theta", "both"},
             "phi_input_source": None if resolved_phase_input_source == "none" else resolved_phase_input_source,
             "use_sigma_inputs": bool(use_sigma_inputs),
         }
@@ -2245,21 +2357,19 @@ class PHVIV(nn.Module):
                 "sigma": dict(input_configs.get("sigma", input_configs.get("mean", legacy_input_cfg))),
             }
         for head_cfg in self.td_input_configs.values():
-            force_raw = head_cfg.get("td_force_input_source", head_cfg.get("use_td_force_input", False))
-            phase_raw = head_cfg.get("phase_input_source", None)
-            if phase_raw is None:
-                phase_raw = head_cfg.get("phi_input_source", None)
-            if phase_raw is None:
-                phase_raw = head_cfg.get("use_phi_input", False)
-            force_source = resolve_td_force_input_source(force_raw)
-            phase_source = resolve_td_phase_input_source(phase_raw)
+            force_source = _resolve_td_force_input_source_from_config(head_cfg)
+            phase_source = _resolve_td_phase_input_source_from_config(head_cfg)
             head_cfg["use_td_force_input"] = force_source != "none"
             head_cfg["td_force_input_source"] = force_source
+            head_cfg["use_td_total_force_input"] = force_source == "total"
+            head_cfg["use_td_fcv_force_input"] = force_source == "fcv"
             head_cfg["use_td_fhat_input"] = bool(head_cfg.get("use_td_fhat_input", False))
             head_cfg["use_acceleration_input"] = bool(head_cfg.get("use_acceleration_input", False))
             head_cfg["use_phi_input"] = phase_source != "none"
             head_cfg["phase_input_source"] = phase_source
             head_cfg["phi_input_source"] = None if phase_source == "none" else phase_source
+            head_cfg["use_phi_vy_input"] = phase_source in {"phi_vy", "both"}
+            head_cfg["use_theta_input"] = phase_source in {"theta", "both"}
             head_cfg["use_sigma_inputs"] = bool(head_cfg.get("use_sigma_inputs", False))
         self.use_td_force_input = any(bool(cfg["use_td_force_input"]) for cfg in self.td_input_configs.values())
         self.use_td_fhat_input = any(bool(cfg["use_td_fhat_input"]) for cfg in self.td_input_configs.values())
@@ -2280,11 +2390,8 @@ class PHVIV(nn.Module):
                 "use_td_fhat_input=false, use_acceleration_input=false, use_phi_input=false, and "
                 "use_sigma_inputs=false because those auxiliary inputs do not have a defined sign-flip symmetry."
             )
-        self.use_stochastic_process_noise = bool(use_stochastic_process_noise)
-        sigma_min_val = float(sigma_min)
-        if not np.isfinite(sigma_min_val) or sigma_min_val < 0.0:
-            raise ValueError(f"sigma_min must be finite and non-negative, got {sigma_min_val}")
-        self.register_buffer("sigma_min", torch.tensor(sigma_min_val, dtype=torch.float32))
+        self.use_stochastic_process_noise = False
+        self.register_buffer("sigma_min", torch.tensor(0.0, dtype=torch.float32))
         ur_scale_val = 1.0 if ur_scale is None else float(ur_scale)
         if not np.isfinite(ur_scale_val) or ur_scale_val == 0.0:
             raise ValueError(f"ur_scale must be finite and non-zero, got {ur_scale_val}")
@@ -2427,16 +2534,12 @@ class PHVIV(nn.Module):
             self.td_corr_shared_trunk, td_corr_head_dim = _build_shared_trunk(force_in_features)
             self.u_base_net = nn.Linear(td_corr_head_dim, 1)
             self.fhat_net = nn.Linear(td_corr_head_dim, 1)
-            self.sigma_net = nn.Linear(td_corr_head_dim, 1) if self.use_stochastic_process_noise else None
+            self.sigma_net = None
         else:
             self.td_corr_shared_trunk = None
             self.u_base_net = _build_scalar_net(force_in_features_by_head["mean"], use_selected_backbone=True)
             self.fhat_net = _build_scalar_net(force_in_features_by_head["fhat"], use_selected_backbone=True)
-            self.sigma_net = (
-                _build_scalar_net(force_in_features_by_head["sigma"], use_selected_backbone=True)
-                if self.use_stochastic_process_noise
-                else None
-            )
+            self.sigma_net = None
         # Backward-compatible alias used throughout the codebase.
         self.u_net = self.u_base_net
 
@@ -2464,27 +2567,34 @@ class PHVIV(nn.Module):
         arch_cfg: dict[str, object] | None = None,
         device: torch.device | None = None,
     ) -> tuple["PHVIV", dict[str, float]]:
+        def _required_float(name: str) -> float:
+            if name not in cfg or cfg[name] is None:
+                raise ValueError(
+                    f"model.{name} must be supplied by the training data before PHVIV.from_config is called."
+                )
+            value = float(cfg[name])
+            if not np.isfinite(value):
+                raise ValueError(f"model.{name} must be finite, got {value!r}.")
+            return value
+
         rho = float(cfg.get("rho", 1000.0))
         D = float(cfg.get("D", 0.1))
-        Ca = float(cfg.get("Ca", 1.0))
-        k = float(cfg.get("k", 1218.0))
-        damping_c = float(cfg.get("damping_c", 1e-4))
-        structural_mass = float(cfg.get("structural_mass", 16.79))
-        force_output = str(cfg.get("force_output", "force")).strip().lower()
+        Ca = _required_float("Ca")
+        k = _required_float("k")
+        damping_c = _required_float("damping_c")
+        structural_mass = _required_float("structural_mass")
         coefficient_output_bound_raw = cfg.get("coefficient_output_bound", None)
         coefficient_output_bound = None if coefficient_output_bound_raw is None else float(coefficient_output_bound_raw)
         use_reduced_velocity = bool(cfg.get("use_reduced_velocity", True))
-        td_force_input_source = resolve_td_force_input_source(cfg.get("use_td_force_input", False))
+        td_force_input_source = _resolve_td_force_input_source_from_config(cfg)
         use_td_force_input = td_force_input_source != "none"
         use_td_fhat_input = bool(cfg.get("use_td_fhat_input", False))
         use_acceleration_input = bool(cfg.get("use_acceleration_input", False))
-        phase_input_source = resolve_td_phase_input_source(
-            cfg.get("phi_input_source", cfg.get("use_phi_input", False))
-        )
+        phase_input_source = _resolve_td_phase_input_source_from_config(cfg)
         use_phi_input = phase_input_source != "none"
         use_sigma_inputs = bool(cfg.get("use_sigma_inputs", False))
-        use_stochastic_process_noise = bool(cfg.get("use_stochastic_process_noise", True))
-        sigma_min = float(cfg.get("sigma_min", 1e-6))
+        use_stochastic_process_noise = False
+        sigma_min = 0.0
         ur_scale_val = cfg.get("ur_scale")
         ur_scale = None if ur_scale_val is None else float(ur_scale_val)
         input_scaling_mode = resolve_phnn_input_scaling_mode(cfg.get("input_scaling_mode", "current"))
@@ -2529,7 +2639,6 @@ class PHVIV(nn.Module):
             q_scale=q_scale,
             p_scale=p_scale,
             damping_c=damping_c,
-            force_output=force_output,
             coefficient_output_bound=coefficient_output_bound,
             use_fourier_features=use_fourier_features,
             fourier_features=fourier_features,
@@ -4873,9 +4982,9 @@ def resolve_td_correction_params(raw_cfg: dict[str, Any] | None) -> dict[str, fl
         for name, key in keys.items():
             out[name] = float(cfg[key])
     if not (out["fhat_min"] <= out["fhat0"] <= out["fhat_max"]):
-        raise ValueError("Require td_fhat_min <= td_fhat0 <= td_fhat_max.")
+        raise ValueError("Require vivana_td.td_fhat_min <= vivana_td.td_fhat0 <= vivana_td.td_fhat_max.")
     if out["n_memory"] < 1.0:
-        raise ValueError("td_n_memory must be >= 1.")
+        raise ValueError("vivana_td.td_n_memory must be >= 1.")
     return out
 
 
@@ -4894,16 +5003,16 @@ def resolve_td_memory_config(raw_cfg: dict[str, Any] | None) -> dict[str, Any]:
     }
     mode = aliases.get(mode, mode)
     if mode not in {"fixed_n_memory", "fixed_tau", "tau_over_tref"}:
-        raise ValueError("hnn.td_memory_mode must be one of: fixed_n_memory, fixed_tau, tau_over_tref.")
+        raise ValueError("vivana_td.td_memory_mode must be one of: fixed_n_memory, fixed_tau, tau_over_tref.")
     tau_s_raw = cfg.get("td_memory_tau_s", cfg.get("tau_s", None))
     tau_s = None if tau_s_raw is None else float(tau_s_raw)
     tau_over_tref = float(cfg.get("td_tau_over_tref", cfg.get("tau_over_tref", 4.0)))
     if tau_s is not None and (not np.isfinite(tau_s) or tau_s <= 0.0):
-        raise ValueError("hnn.td_memory_tau_s must be positive and finite when provided.")
+        raise ValueError("vivana_td.td_memory_tau_s must be positive and finite when provided.")
     if not np.isfinite(tau_over_tref) or tau_over_tref <= 0.0:
-        raise ValueError("hnn.td_tau_over_tref must be positive and finite.")
+        raise ValueError("vivana_td.td_tau_over_tref must be positive and finite.")
     if mode == "fixed_tau" and tau_s is None:
-        raise ValueError("hnn.td_memory_mode='fixed_tau' requires hnn.td_memory_tau_s.")
+        raise ValueError("vivana_td.td_memory_mode='fixed_tau' requires vivana_td.td_memory_tau_s.")
     return {
         "mode": mode,
         "tau_s": tau_s,
@@ -5115,65 +5224,6 @@ def _recompute_td_baseline_on_grid(
     }
 
 
-def _recompute_td_observables_from_fixed_phi(
-    *,
-    dy: np.ndarray,
-    ddy: np.ndarray,
-    phi_td: np.ndarray,
-    sig_dy_td: np.ndarray,
-    sig_ddy_td: np.ndarray,
-    flow_speed: np.ndarray,
-    rho: float,
-    diameter: float,
-    td_params: dict[str, float],
-) -> dict[str, np.ndarray]:
-    dy_arr = np.asarray(dy, dtype=float).reshape(-1)
-    ddy_arr = np.asarray(ddy, dtype=float).reshape(-1)
-    phi_arr = np.asarray(phi_td, dtype=float).reshape(-1)
-    sig_dy_arr = np.asarray(sig_dy_td, dtype=float).reshape(-1)
-    sig_ddy_arr = np.asarray(sig_ddy_td, dtype=float).reshape(-1)
-    flow_arr = np.asarray(flow_speed, dtype=float).reshape(-1)
-    n = min(dy_arr.size, ddy_arr.size, phi_arr.size, sig_dy_arr.size, sig_ddy_arr.size, flow_arr.size)
-    if n < 1:
-        raise ValueError("Need at least one sample to recompute TD observables from fixed phi.")
-    dy_arr = dy_arr[:n]
-    ddy_arr = ddy_arr[:n]
-    phi_arr = phi_arr[:n]
-    sig_dy_arr = sig_dy_arr[:n]
-    sig_ddy_arr = sig_ddy_arr[:n]
-    flow_arr = flow_arr[:n]
-    diameter_value = float(diameter)
-    if not np.isfinite(diameter_value) or diameter_value <= 0.0:
-        raise ValueError(f"diameter must be finite and positive, got {diameter!r}.")
-    speed_mag = np.sqrt(np.clip(flow_arr * flow_arr + dy_arr * dy_arr, 1.0e-12, None))
-    projection = flow_arr / np.clip(speed_mag, 1.0e-12, None)
-    dy_r = dy_arr * projection
-    ddy_r = ddy_arr * projection
-    cos_phi_dy = dy_r / np.clip(sig_dy_arr, 1.0e-12, None)
-    sin_phi_dy = -ddy_r / np.clip(sig_ddy_arr, 1.0e-12, None)
-    phi_dy = np.arctan2(sin_phi_dy, cos_phi_dy)
-    theta_td = np.arctan2(np.sin(phi_dy - phi_arr), np.cos(phi_dy - phi_arr))
-    fhat_td = np.where(
-        theta_td <= 0.0,
-        float(td_params["fhat0"]) + (float(td_params["fhat0"]) - float(td_params["fhat_min"])) * np.sin(theta_td),
-        float(td_params["fhat0"]) + (float(td_params["fhat_max"]) - float(td_params["fhat0"])) * np.sin(theta_td),
-    )
-    omega_vy_td = 2.0 * np.pi * fhat_td * speed_mag / diameter_value
-    force_dy = -0.5 * float(rho) * diameter_value * float(td_params["Cd"]) * speed_mag * dy_arr
-    force_cv = 0.5 * float(rho) * diameter_value * float(td_params["Cv"]) * speed_mag * flow_arr * np.cos(phi_arr)
-    force_ca = -0.25 * float(rho) * float(td_params["Ca"]) * np.pi * (diameter_value ** 2) * ddy_arr
-    force_td = force_ca + force_cv + force_dy
-    return {
-        "force_td": np.asarray(force_td, dtype=float),
-        "force_cv": np.asarray(force_cv, dtype=float),
-        "force_dy": np.asarray(force_dy, dtype=float),
-        "force_ca": np.asarray(force_ca, dtype=float),
-        "theta_td": np.asarray(theta_td, dtype=float),
-        "fhat_td": np.asarray(fhat_td, dtype=float),
-        "omega_vy_td": np.asarray(omega_vy_td, dtype=float),
-    }
-
-
 def td_phase_input_dim(phase_input_source: Any) -> int:
     resolved = resolve_td_phase_input_source(phase_input_source)
     if resolved == "none":
@@ -5353,7 +5403,6 @@ def load_td_correction_trajectories(
     ur_source: str = "stored",
     td_params: dict[str, float] | None = None,
     td_memory_cfg: dict[str, Any] | None = None,
-    recompute_td_observables_from_phi: bool = False,
 ) -> list[dict[str, np.ndarray]]:
     trajectories: list[dict[str, np.ndarray]] = []
     for path in paths:
@@ -5663,48 +5712,6 @@ def load_td_correction_trajectories(
                 theta_td_reduced = recomputed_td["theta_td"]
                 fhat_td_reduced = recomputed_td["fhat_td"]
                 omega_vy_td_reduced = recomputed_td["omega_vy_td"]
-                hidden_inputs_dry_reduced = _td_hidden_inputs_from_arrays_numpy(
-                    phi_td=phi_td_reduced,
-                    sig_dy_td=sig_dy_td_reduced,
-                    sig_ddy_td=sig_ddy_td_reduced,
-                    theta_td=theta_td_reduced,
-                    structural_mass=dry_mass_kg,
-                    stiffness=stiffness_n_m,
-                    diameter=diameter_m,
-                )
-                hidden_inputs_effective_reduced = _td_hidden_inputs_from_arrays_numpy(
-                    phi_td=phi_td_reduced,
-                    sig_dy_td=sig_dy_td_reduced,
-                    sig_ddy_td=sig_ddy_td_reduced,
-                    theta_td=theta_td_reduced,
-                    structural_mass=effective_mass_kg,
-                    stiffness=stiffness_n_m,
-                    diameter=diameter_m,
-                )
-                phi_sin_td_reduced = hidden_inputs_dry_reduced["phi_sin"]
-                phi_cos_td_reduced = hidden_inputs_dry_reduced["phi_cos"]
-                theta_sin_td_reduced = hidden_inputs_dry_reduced["theta_sin"]
-                theta_cos_td_reduced = hidden_inputs_dry_reduced["theta_cos"]
-                sig_dy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_dy_norm"]
-                sig_ddy_norm_dry_td_reduced = hidden_inputs_dry_reduced["sig_ddy_norm"]
-                sig_dy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_dy_norm"]
-                sig_ddy_norm_effective_td_reduced = hidden_inputs_effective_reduced["sig_ddy_norm"]
-            if bool(recompute_td_observables_from_phi) and td_params is not None:
-                fixed_phi_td = _recompute_td_observables_from_fixed_phi(
-                    dy=dy_reduced,
-                    ddy=ddy_reduced,
-                    phi_td=phi_td_reduced,
-                    sig_dy_td=sig_dy_td_reduced,
-                    sig_ddy_td=sig_ddy_td_reduced,
-                    flow_speed=flow_speed_reduced,
-                    rho=float(rho_kg_m3),
-                    diameter=float(diameter_m),
-                    td_params=td_params,
-                )
-                force_td_per_m_reduced = fixed_phi_td["force_td"]
-                theta_td_reduced = fixed_phi_td["theta_td"]
-                fhat_td_reduced = fixed_phi_td["fhat_td"]
-                omega_vy_td_reduced = fixed_phi_td["omega_vy_td"]
                 hidden_inputs_dry_reduced = _td_hidden_inputs_from_arrays_numpy(
                     phi_td=phi_td_reduced,
                     sig_dy_td=sig_dy_td_reduced,
@@ -6393,10 +6400,6 @@ def rollout_model(
     D: float,
     k: float,
     device: torch.device,
-    *,
-    stochastic: bool = False,
-    rollout_seed: int | None = None,
-    noise_scale: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """Roll the model forward over the full time grid and return normalised traces."""
     total_steps = int(min(len(t), int(y0.shape[0]), int(vel.shape[0])))
@@ -6426,10 +6429,6 @@ def rollout_model(
     force_coeff_delta: list[torch.Tensor] = []
     force_coeff_sigma: list[torch.Tensor] = []
     hamiltonian_model_vals: list[torch.Tensor] = []
-    generator: torch.Generator | None = None
-    if rollout_seed is not None:
-        generator = torch.Generator(device=device)
-        generator.manual_seed(int(rollout_seed))
     with torch.no_grad():
         for step_idx in range(total_steps):
             rv_step = rv_series[step_idx : step_idx + 1]
@@ -6445,24 +6444,7 @@ def rollout_model(
             hamiltonian_model_vals.append(H_val)
             if step_idx == total_steps - 1:
                 break
-            if stochastic and getattr(model, "use_stochastic_process_noise", False):
-                noise = torch.randn(
-                    state.shape[0],
-                    1,
-                    device=state.device,
-                    dtype=state.dtype,
-                    generator=generator,
-                )
-                state = model.step_rk4_stochastic(
-                    state,
-                    t,
-                    dt,
-                    reduced_velocity=rv_step,
-                    noise=noise,
-                    noise_scale=noise_scale,
-                )
-            else:
-                state = model.step_rk4(state, t, dt, reduced_velocity=rv_step)
+            state = model.step_rk4(state, t, dt, reduced_velocity=rv_step)
 
     y_samples_arr = torch.stack(y_samples).detach().cpu().numpy()
     p_samples_arr = torch.stack(p_samples).detach().cpu().numpy()

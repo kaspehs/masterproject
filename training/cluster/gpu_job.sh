@@ -32,7 +32,7 @@ cd "$SLURM_SUBMIT_DIR"
 mkdir -p output error gpu_usage
 
 # Config file path (option 3: pass as first arg to sbatch)
-CONFIG_PATH="${1:-training/configs/phnn_smoke.yml}"
+CONFIG_PATH="${1:-training/configs/correction_smoke.yml}"
 
 # Olivia: load GPU stack and run inside an ARM64 PyTorch container
 module load NRIS/GPU

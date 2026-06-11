@@ -22,12 +22,14 @@ This was previously named `HNN_helper.py`.
 `methods/`
 : Method-specific training implementations:
 
-- `hnn/`
-- `latent_rnn/`
+- `correction/`
+- `standalone/`
 
 `configs/`
-: YAML experiment configs. `configs/best_configs/` contains the delivery
-configs; the top-level smoke configs are useful for quick checks.
+: YAML experiment configs. `configs/final_configs/` contains the delivery
+configs; the top-level smoke configs are useful for quick checks. See
+`configs/README.md` for the public config-key reference and thesis-section
+cross-references.
 
 `cluster/`
 : Slurm/Olivia helper scripts for running training jobs.
@@ -37,16 +39,16 @@ configs; the top-level smoke configs are useful for quick checks.
 From the repository root:
 
 ```bash
-python -m training.train --config training/configs/phnn_smoke.yml
+python -m training.train --config training/configs/correction_smoke.yml
 ```
 
 Example delivery configs:
 
 ```bash
-python -m training.train --config training/configs/best_configs/standalone_model.yml
-python -m training.train --config training/configs/best_configs/frequency_correction_model.yml
-python -m training.train --config training/configs/best_configs/force_correction_model.yml
-python -m training.train --config training/configs/best_configs/combined_correction_model.yml
+python -m training.train --config training/configs/final_configs/standalone_model.yml
+python -m training.train --config training/configs/final_configs/frequency_correction_model.yml
+python -m training.train --config training/configs/final_configs/force_correction_model.yml
+python -m training.train --config training/configs/final_configs/combined_correction_model.yml
 ```
 
 The configs expect training data under `vivana_cfd_data_pipeline/generated/`.
@@ -54,4 +56,13 @@ Build those datasets first with:
 
 ```bash
 python vivana_cfd_data_pipeline/scripts/build_final_training_dataset.py
+```
+
+## Viewing Logs
+
+Training writes TensorBoard event files under `logs/` by default. From the
+repository root, start TensorBoard with:
+
+```bash
+tensorboard --logdir logs --port 6006
 ```

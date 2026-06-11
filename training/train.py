@@ -28,7 +28,7 @@ def main() -> None:
     raw_cfg = load_config(args.config)
     cfg = parse_config(raw_cfg)
     config_name = args.config.stem
-    trainer = get_trainer(getattr(cfg, "method", "hnn"))
+    trainer = get_trainer(getattr(cfg, "method", "correction"))
     trainer(cfg, config_name)
 
 

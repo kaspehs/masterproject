@@ -77,8 +77,10 @@ INTERPOLATION_KIND = "pchip"  # "quadratic" | "makima" | "akima" | "pchip" | "cu
 SMOOTHING_STRENGTH = 0.05
 INCLUDE_ANCHOR_POINTS = False
 
-# Use this to protect final test points from entering the surrogate target file.
-EXCLUDE_URS: Sequence[float] = (5.75,)
+# Direct script default: no protected reduced velocities. Final-dataset builds
+# should pass exclusions from build_final_training_dataset.py so the surrogate
+# anchors stay coupled to the actual train/val_seen exclusions.
+EXCLUDE_URS: Sequence[float] = ()
 EXCLUDE_UR_ATOL = 1.0e-8
 
 MAKE_DIAGNOSTIC_PLOT = True
@@ -389,7 +391,7 @@ def load_anchor_point(path: Path, *, ur_source: str = INTERPOLATION_UR_SOURCE) -
         force_td0 = _series_first(data, ("F_total_td_per_m", "F_total_td"), default=np.nan)
         ur = _reduced_velocity(data, ur_source, path=path)
         ur_label = _reduced_velocity(data, "label", path=path)
-        flow_speed0 = _series_first(
+        flow_speed0 = _finite_scalar(
             data,
             ("python_flow_speed_m_s", "model_flow_speed_m_s", "training_flow_speed_m_s", "flow_speed_m_s"),
             default=np.nan,
@@ -922,6 +924,10 @@ def _save_diagnostic_plot_figure(
     metric_ylabels = {
         "disp_std": r"$\sigma_{y/D}$",
         "force_std": r"$\sigma_{C_F}$",
+        "disp_dominant_frequency_hz": r"$f_y$ [Hz]",
+        "force_dominant_frequency_hz": r"$f_F$ [Hz]",
+    }
+    normalized_frequency_ylabels = {
         "disp_dominant_frequency_hz": r"$\omega_y/\omega_n$",
         "force_dominant_frequency_hz": r"$\omega_F/\omega_n$",
     }
@@ -949,6 +955,7 @@ def _save_diagnostic_plot_figure(
         )
         plot_y = np.asarray(curve_interp(plot_ur), dtype=float)
         plot_y = _clip_nonnegative(plot_y)
+        ylabel = metric_ylabels[key]
         if key in {"disp_dominant_frequency_hz", "force_dominant_frequency_hz"}:
             anchor_mass = np.asarray(grouped["ic_effective_mass_kg"], dtype=float)[anchor_order]
             anchor_flow = np.asarray(grouped["ic_flow_speed0"], dtype=float)[anchor_order]
@@ -960,7 +967,6 @@ def _save_diagnostic_plot_figure(
                 diameter_m=anchor_diameter,
             )
             anchor_fn = _natural_frequency_hz(anchor_stiffness, anchor_mass)
-            anchor_y = anchor_metric / anchor_fn
 
             mass_interp = _make_interpolator(
                 anchor_ur,
@@ -992,8 +998,20 @@ def _save_diagnostic_plot_figure(
                 np.asarray(points["ic_stiffness_n_m"], dtype=float),
                 np.asarray(points["ic_effective_mass_kg"], dtype=float),
             )
-            plot_y = plot_y / plot_fn
-            synthetic_y = synthetic_y / synthetic_fn
+            finite_plot_ur = np.isfinite(plot_ur)
+            can_normalize = (
+                np.all(np.isfinite(anchor_fn))
+                and np.all(anchor_fn > 0.0)
+                and np.all(np.isfinite(plot_fn[finite_plot_ur]))
+                and np.all(plot_fn[finite_plot_ur] > 0.0)
+                and np.all(np.isfinite(synthetic_fn))
+                and np.all(synthetic_fn > 0.0)
+            )
+            if can_normalize:
+                anchor_y = anchor_y / anchor_fn
+                plot_y = plot_y / plot_fn
+                synthetic_y = synthetic_y / synthetic_fn
+                ylabel = normalized_frequency_ylabels[key]
 
         line_mask = np.isfinite(plot_ur) & np.isfinite(plot_y)
         if np.count_nonzero(line_mask) >= 2:
@@ -1040,7 +1058,7 @@ def _save_diagnostic_plot_figure(
                 zorder=4,
                 label="Anchor rows in output",
             )
-        ax.set_ylabel(metric_ylabels[key])
+        ax.set_ylabel(ylabel)
         ax.set_ylim(bottom=0.0)
         ax.grid(True, color="0.88", linewidth=0.6)
 

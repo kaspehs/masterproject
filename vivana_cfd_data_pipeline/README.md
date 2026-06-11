@@ -72,8 +72,15 @@ Useful options:
 ```bash
 python vivana_cfd_data_pipeline/scripts/build_final_training_dataset.py --no-overwrite
 python vivana_cfd_data_pipeline/scripts/build_final_training_dataset.py --no-burnin-diagnostics
+python vivana_cfd_data_pipeline/scripts/build_final_training_dataset.py --exclude-ur 5.75
 python vivana_cfd_data_pipeline/scripts/build_final_training_dataset.py --loo
 ```
+
+`--exclude-ur` removes the matching label reduced velocity from both `train/`
+and `val_seen`. The same value is automatically excluded from the surrogate
+validation anchor set so the surrogate targets are generated only from retained
+training reduced velocities. If no reduced velocity is excluded from the final
+dataset, no reduced velocity is excluded from the surrogate anchors.
 
 ## Delivery Notes
 
@@ -82,6 +89,9 @@ Keep `metadata/`, `scripts/`, `helpers/`, `analysis/`, `plotting/`, and
 out of git unless a specific small artifact is intentionally needed for the
 thesis delivery.
 
-The final dataset build configuration is defined at the top of
-`scripts/build_final_training_dataset.py`, including Vivana-TD coefficients,
-TD memory settings, phase wrapping, and the force phase convention.
+Many pipeline configuration options are defined as constants near the top of
+the two rebuild scripts listed above. `scripts/export_cfd_to_npz.py` controls
+the raw CFD export and cleaning choices, while
+`scripts/build_final_training_dataset.py` controls the final dataset build,
+including Vivana-TD coefficients, TD memory settings, phase wrapping, and the
+force phase convention.

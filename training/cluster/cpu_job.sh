@@ -28,7 +28,7 @@ cd "$SLURM_SUBMIT_DIR"
 mkdir -p output error
 
 # Config file path (option 3: pass as first arg to sbatch)
-CONFIG_PATH="${1:-training/configs/phnn_smoke.yml}"
+CONFIG_PATH="${1:-training/configs/correction_smoke.yml}"
 
 # Olivia: load a stack, then use a containerized Python env (hpc-container-wrapper)
 module load NRIS/CPU

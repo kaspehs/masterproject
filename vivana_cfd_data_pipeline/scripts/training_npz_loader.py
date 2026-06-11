@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib
 from pathlib import Path
+import sys
 from typing import Any, Sequence
 
 import numpy as np
@@ -10,6 +11,8 @@ import numpy as np
 
 DATA_PIPELINE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DATA_PIPELINE_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_ORDERED_SPLIT_DIRS = ("train", "val")
 DEFAULT_CFD_FORCE_TOTAL_SCALE = 4.0
 DEFAULT_DATASET_ROOT_RELATIVE_PATHS = (
